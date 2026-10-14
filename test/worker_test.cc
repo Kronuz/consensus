@@ -1759,6 +1759,14 @@ void worker_api_guards() {
 			unopened.applied_index() == 0 && unopened.retained_log_bytes() == 0 && unopened.retired_log_bytes() == 0 && unopened.retired_log_entries() == 0 &&
 			unopened.base_index() == 0 && unopened.base_boundary() == LogBoundary{} && unopened.epoch() == 0 && !unopened.ready(), "an unopened worker reports an empty follower");
 		check(throws([&] { unopened.run_one({0, 100}); }), "an unopened worker refuses a turn");
+		auto refused = [&](WorkerLimits scheduling, kronuz::journal::AdmissionLimits admission = SnapshotFixture::quota()) {
+			return throws([&] { Worker bad(io, SnapshotFixture::fixed(), admission, limits(), compact, scheduling); });
+		};
+		auto few_slots = SnapshotFixture::quota(); few_slots.control_slots = 2; auto few_tickets = SnapshotFixture::quota(); few_tickets.maximum_tickets = 4;
+		check(refused({0, 1}) && refused({1048577, 1}) && refused({4, 0}) && refused({4, 4097}) && refused({4, 1}, few_slots) && refused({4, 1}, few_tickets),
+			"a worker needs bounded scheduling, three control slots, and five tickets");
+		FaultIO borrowed(directory.path);
+		check(throws([&] { Worker bad(borrowed, SnapshotFixture::fixed(), SnapshotFixture::quota(), limits(), compact, {4, 1, true}); }), "borrowed IO cannot run asynchronous storage");
 	}
 	SnapshotFixture owner("guards-owner"), other("guards-other");
 	auto id = owner.worker.reserve_snapshot(owner.context("data")); check(id.has_value(), "the owner reserves a snapshot");

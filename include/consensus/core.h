@@ -23,6 +23,7 @@
 #pragma once
 
 #include "types.h"
+#include "membership.h"
 #include "retained_log.h"
 #include "retirement.h"
 #include <algorithm>
@@ -42,12 +43,21 @@ public:
 	Core(FixedConfiguration configuration, RecoveredState recovered, Limits limits = {}, Timing timing = {})
 		: configuration_(std::move(configuration)), hard_(recovered.hard), durable_(hard_),
 		entries_(std::move(recovered.entries)), base_index_(recovered.base_index), base_term_(recovered.base_term), limits_(limits), timing_(timing), election_delay_(timing.election_min), applied_(recovered.applied_index) {
-		if (configuration_ != recovered.configuration || configuration_.local == 0 || configuration_.voters.empty() ||
-			configuration_.voters.size() > limits.voters || limits.voters > 31 || !member(configuration_.local)) {
+		if (configuration_ != recovered.configuration || configuration_.local == 0 || limits.voters > 31) {
 			throw std::invalid_argument("invalid or mismatched fixed configuration");
 		}
-		std::set<NodeId> voters(configuration_.voters.begin(), configuration_.voters.end());
-		if (voters.size() != configuration_.voters.size() || voters.contains(0)) { throw std::invalid_argument("invalid voters"); }
+		if (recovered.membership) {
+			// A joining node (Track C, D5) starts with no membership; it learns one from the log.
+			base_membership_ = *recovered.membership;
+			if (!base_membership_.members.empty()) { validate_membership(base_membership_, limits); }
+		} else {
+			std::set<NodeId> voters(configuration_.voters.begin(), configuration_.voters.end());
+			if (configuration_.voters.empty() || configuration_.voters.size() > limits.voters || voters.size() != configuration_.voters.size() ||
+				voters.contains(0) || !voters.contains(configuration_.local)) {
+				throw std::invalid_argument("invalid voters");
+			}
+			base_membership_ = fixed_membership(configuration_);
+		}
 		if (limits.command_bytes == 0 || limits.rpc_entries == 0 || limits.log_entries == 0 || limits.reads == 0 || limits.uncommitted_entries == 0 ||
 			limits.control_entries == 0 || limits.control_entries > limits.log_entries ||
 			limits.command_bytes > limits.rpc_bytes || limits.rpc_bytes > limits.log_bytes ||
@@ -57,7 +67,7 @@ public:
 			entries_.size() >= maximum - base_index_ || recovered.applied_index != base_index_ || hard_.commit_index < base_index_) {
 			throw std::invalid_argument("invalid recovered checkpoint boundary");
 		}
-		if (hard_.voted_for && !member(*hard_.voted_for)) { throw std::invalid_argument("recovered ballot names a nonvoter"); }
+		if (hard_.voted_for && *hard_.voted_for == 0) { throw std::invalid_argument("recovered ballot names no incarnation"); }
 		if (hard_.term == 0 && hard_.voted_for) { throw std::invalid_argument("term zero cannot contain a ballot"); }
 		if (entries_.size() > limits_.log_entries || hard_.commit_index > last_index()) { throw std::invalid_argument("invalid recovered log bounds"); }
 		Term previous_term = base_term_;
@@ -66,6 +76,7 @@ public:
 			if (entry.index != base_index_ + i + 1 || !valid_entry(entry) || entry.term > hard_.term || entry.term < previous_term ||
 				entry.payload.size() > limits_.log_bytes - log_bytes_) { throw std::invalid_argument("invalid recovered entry"); }
 			log_bytes_ += entry.payload.size(); previous_term = entry.term;
+			if (entry.kind == EntryKind::Configuration) { configs_.emplace(entry.index, decode_membership(entry.payload, limits_)); }
 		}
 	}
 	~Core() { capture_owner_->core = nullptr; }
@@ -143,6 +154,23 @@ public:
 	bool busy() const noexcept { return pending_.has_value() || install_.has_value(); }
 	const HardState& durable_hard_state() const noexcept { return durable_; }
 	const FixedConfiguration& configuration() const noexcept { return configuration_; }
+	// The membership in force (the newest Configuration entry in the log, committed or not)
+	// and the newest committed one (Track C, D1).
+	const Membership& membership() const noexcept { return configs_.empty() ? base_membership_ : configs_.rbegin()->second; }
+	const Membership& committed_membership() const noexcept { return membership_at(durable_.commit_index); }
+	// Whether a ChangeMembership would pass D3's preconditions now: a leader, not busy, that
+	// committed an entry of its term, with no configuration above its commit index.
+	bool can_change_membership() const noexcept {
+		return started_ && role_ == Role::Leader && !busy() && durable_.commit_index > base_index_ &&
+			log_term(durable_.commit_index) == hard_.term && (configs_.empty() || configs_.rbegin()->first <= durable_.commit_index);
+	}
+	// A member's matched index, as the leader knows it (D8).
+	std::optional<Index> progress(NodeId incarnation) const {
+		if (role_ != Role::Leader) { return std::nullopt; }
+		if (incarnation == configuration_.local) { return last_index(); }
+		auto found = peers_.find(incarnation);
+		return found == peers_.end() ? std::nullopt : std::optional<Index>(found->second.matched);
+	}
 
 	class FrozenCheckpoint {
 	public:
@@ -200,6 +228,7 @@ private:
 	struct PendingInstall {
 		Token token, prepared; RequestId request; LogBoundary boundary; HardState hard;
 		Actions deferred; bool retain_suffix, published = false;
+		std::optional<Membership> membership{};
 	};
 	struct Flight { Token rpc; Index previous, through; Token read_probe; std::uint64_t sent; bool keepalive = false; };
 	enum class SnapshotPhase { AwaitSource, Sending };
@@ -207,13 +236,49 @@ private:
 	struct Peer { Index next = 1, matched = 0; std::optional<Flight> flight; std::uint64_t retry_after = 0; std::optional<SnapshotFlight> snapshot{}; std::optional<std::uint64_t> snapshot_retry_clock{}; };
 	struct PendingRead { RequestId request; Token probe; Term term; Index index; std::set<NodeId> acknowledgements; };
 	static constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
-	bool member(NodeId node) const { return std::find(configuration_.voters.begin(), configuration_.voters.end(), node) != configuration_.voters.end(); }
-	std::size_t quorum() const { return configuration_.voters.size() / 2 + 1; }
+	const Membership& membership_at(Index index) const {
+		auto it = configs_.upper_bound(index);
+		return it == configs_.begin() ? base_membership_ : std::prev(it)->second;
+	}
+	bool is_voter(NodeId incarnation) const { return votes_in(membership(), incarnation); }
+	std::vector<NodeId> voters() const {
+		std::vector<NodeId> out;
+		for (const auto& x : membership().members) { if (voting(x.role)) { out.push_back(x.incarnation); } }
+		return out;
+	}
+	std::size_t quorum() const { return voter_count(membership()) / 2 + 1; }
+	// The incarnations a leader replicates to: every member in force, and those of the
+	// committed membership until their removal commits (D4).
+	std::set<NodeId> replicas() const {
+		std::set<NodeId> out;
+		for (const auto& x : membership().members) { out.insert(x.incarnation); }
+		for (const auto& x : committed_membership().members) { out.insert(x.incarnation); }
+		out.erase(configuration_.local);
+		return out;
+	}
+	// What a checkpoint or install records as its base membership: nothing for a fixed
+	// configuration's founding membership, so a fixed group's bytes stay as they were.
+	std::optional<Membership> retain_base_membership(std::optional<Membership> m) const {
+		if (!m || *m == fixed_membership(configuration_)) { return std::nullopt; }
+		return m;
+	}
+	void note_append(const Entry& entry) {
+		if (entry.kind == EntryKind::Configuration) { configs_[entry.index] = decode_membership(entry.payload, limits_); }
+	}
+	void note_truncate(Index from) { configs_.erase(configs_.lower_bound(from), configs_.end()); }
+	void note_base(Index through) {
+		base_membership_ = membership_at(through);
+		configs_.erase(configs_.begin(), configs_.upper_bound(through));
+	}
 	Token needed_probe(NodeId peer) const {
 		for (const auto& read : reads_) {
-			if (read.acknowledgements.size() < quorum() && !read.acknowledgements.contains(peer)) { return read.probe; }
+			if (acknowledged(read) < quorum() && !read.acknowledgements.contains(peer) && is_voter(peer)) { return read.probe; }
 		}
 		return 0;
+	}
+	// A read counts acknowledgements only from voters of the membership in force (D4).
+	std::size_t acknowledged(const PendingRead& read) const {
+		return std::size_t(std::count_if(read.acknowledgements.begin(), read.acknowledgements.end(), [&](NodeId id) { return is_voter(id); }));
 	}
 	std::size_t log_offset(Index index) const {
 		if (index <= base_index_ || index > last_index()) { throw std::out_of_range("log index outside retained suffix"); }
@@ -222,8 +287,17 @@ private:
 	const Entry& log_entry(Index index) const { return entries_.at(log_offset(index)); }
 	Term log_term(Index index) const { return index == base_index_ ? base_term_ : log_entry(index).term; }
 	bool valid_entry(const Entry& entry) const {
-		return entry.index > 0 && entry.index < maximum && entry.term > 0 && entry.payload.size() <= limits_.command_bytes &&
-			((entry.kind == EntryKind::NoOp && entry.payload.empty()) || entry.kind == EntryKind::Command);
+		if (entry.index == 0 || entry.index == maximum || entry.term == 0 || entry.payload.size() > limits_.command_bytes) { return false; }
+		if (entry.kind == EntryKind::NoOp) { return entry.payload.empty(); }
+		if (entry.kind == EntryKind::Configuration) {
+			try {
+				(void)decode_membership(entry.payload, limits_);
+			} catch (const std::exception&) {
+				return false;
+			}
+			return true;
+		}
+		return entry.kind == EntryKind::Command;
 	}
 	std::uint64_t deadline(std::uint64_t delay) const { return delay > maximum - now_ ? maximum : now_ + delay; }
 	void reset_election() { election_deadline_ = deadline(election_delay_); }
@@ -263,10 +337,14 @@ private:
 			if (install_->published || completion.token != install_->token) { return; }
 			auto& operation = *install_;
 			if (operation.retain_suffix) {
+				note_base(operation.boundary.index);
 				auto count = static_cast<std::size_t>(operation.boundary.index - base_index_);
 				log_bytes_ = entries_.suffix_bytes(count);
 				entries_.erase_prefix(count);
-			} else { entries_.clear(); log_bytes_ = 0; }
+			} else {
+				entries_.clear(); log_bytes_ = 0; configs_.clear();
+				if (operation.membership) { base_membership_ = *operation.membership; }
+			}
 			base_index_ = operation.boundary.index; base_term_ = operation.boundary.term;
 			hard_ = durable_ = operation.hard; operation.published = true;
 			output = std::move(operation.deferred);
@@ -277,6 +355,7 @@ private:
 		auto completed = std::move(*pending_); pending_.reset(); durable_ = completed.hard;
 		if (completed.checkpoint) {
 			auto [through, term] = *completed.checkpoint;
+			note_base(through);
 			auto count = static_cast<std::size_t>(through - base_index_);
 			log_bytes_ = entries_.suffix_bytes(count);
 			entries_.erase_prefix(count);
@@ -293,7 +372,7 @@ private:
 	void handle(InstallPrepared request, Actions& output) {
 		auto reject = [&](InstallRejectReason reason) { output.emplace_back(InstallRejected{request.request, request.prepared, reason}); };
 		if (!started_ || busy()) { reject(InstallRejectReason::Busy); return; }
-		if (request.request == 0 || request.prepared == 0 || request.authenticated_peer == configuration_.local || !member(request.authenticated_peer) ||
+		if (request.request == 0 || request.prepared == 0 || request.authenticated_peer == configuration_.local || request.authenticated_peer == 0 ||
 			request.cluster != configuration_.cluster || request.configuration != configuration_.configuration ||
 			request.leader_term == 0 || request.boundary.index == 0 || request.boundary.index == maximum ||
 			request.boundary.term == 0 || request.boundary.term > request.leader_term) { reject(InstallRejectReason::Invalid); return; }
@@ -310,6 +389,7 @@ private:
 		bool retain = request.boundary.index <= last_index() && log_term(request.boundary.index) == request.boundary.term;
 		next_hard.commit_index = request.boundary.index;
 		RecoveredState state{configuration_, next_hard, request.boundary.index, request.boundary.term, {}, request.boundary.index};
+		state.membership = retain_base_membership(retain ? std::optional<Membership>(membership_at(request.boundary.index)) : request.membership);
 		if (retain) {
 			auto first = static_cast<std::size_t>(request.boundary.index - base_index_);
 			if (!capture_mode_) {
@@ -319,6 +399,7 @@ private:
 		}
 		Actions deferred; hard_ = next_hard; follower(request.authenticated_peer, deferred); leader_contact_ = now_;
 		auto id = token(); install_.emplace(PendingInstall{id, request.prepared, request.request, request.boundary, next_hard, std::move(deferred), retain});
+		install_->membership = request.membership;
 		if (capture_mode_) { captured_ = FrozenCheckpoint(*this, id, state, retain ? entries_.size() - static_cast<std::size_t>(request.boundary.index - base_index_) : 0); }
 		output.emplace_back(PersistInstall{id, request.prepared, std::move(state)});
 	}
@@ -365,6 +446,7 @@ private:
 			if (peer.snapshot && peer.snapshot->phase == SnapshotPhase::Sending && request.through > peer.snapshot->key.boundary.index) { output.emplace_back(Reject{request.request, RejectReason::Busy}); return; }
 		}
 		RecoveredState state{configuration_, durable_, request.through, request.term, {}, request.through};
+		state.membership = retain_base_membership(membership_at(request.through));
 		auto first = static_cast<std::size_t>(request.through - base_index_);
 		if (!capture_mode_) {
 			state.entries.reserve(entries_.size() - first);
@@ -386,7 +468,7 @@ private:
 	void handle(Repair request, Actions& output) {
 		auto reject = [&](RejectReason reason) { output.emplace_back(Reject{request.request, reason}); };
 		if (!started_ || busy() || delivered_through_) { reject(RejectReason::Busy); return; }
-		if (role_ == Role::Leader && configuration_.voters.size() > 1) { reject(RejectReason::LeaderMustTransfer); return; }
+		if (role_ == Role::Leader && voter_count(membership()) > 1) { reject(RejectReason::LeaderMustTransfer); return; }
 		const auto b = request.boundary;
 		if (b.index < base_index_ || b.index > durable_.commit_index || (b.index == base_index_ ? b.term != base_term_ : log_term(b.index) != b.term)) {
 			reject(RejectReason::InvalidRepair);
@@ -404,6 +486,43 @@ private:
 		applied_ = completion.through; delivered_through_ = 0;
 		if (!busy()) { deliver(output); ready_reads(output); }
 	}
+	void handle(ChangeMembership change, Actions& output) {
+		auto reject = [&](RejectReason reason) { output.emplace_back(Reject{change.request, reason}); };
+		if (busy()) { reject(RejectReason::Busy); return; }
+		if (!started_ || role_ != Role::Leader) { reject(RejectReason::NotLeader); return; }
+		const auto& current = membership();
+		// D3: (a) the leader committed an entry of its term; (b) no configuration above the
+		// commit index; (c) a promoted learner has matched the commit index.
+		if (durable_.commit_index == 0 || log_term(durable_.commit_index) != hard_.term ||
+			(!configs_.empty() && configs_.rbegin()->first > durable_.commit_index)) { reject(RejectReason::NotReady); return; }
+		try {
+			validate_change(current, change.next, limits_);
+		} catch (const std::invalid_argument&) {
+			reject(RejectReason::InvalidMembership); return;
+		}
+		for (const auto& x : change.next.members) {
+			auto old = find_member(current, x.incarnation);
+			if (old && !voting(old->role) && voting(x.role)) {
+				auto progress = this->progress(x.incarnation);
+				if (!progress || *progress < durable_.commit_index) { reject(RejectReason::NotReady); return; }
+			}
+		}
+		propose_membership(change.request, change.next, output);
+	}
+	void propose_membership(RequestId request, const Membership& next, Actions& output) {
+		if (last_index() >= maximum - 1 || entries_.charged_entries() >= limits_.log_entries) {
+			if (request) { output.emplace_back(Reject{request, RejectReason::LogFull}); }
+			return;
+		}
+		Entry entry{last_index() + 1, hard_.term, EntryKind::Configuration, encode_membership(next)};
+		log_bytes_ += entry.payload.size(); entries_.push_back(entry); note_append(entry);
+		for (NodeId replica : replicas()) {
+			if (!peers_.contains(replica)) { peers_.emplace(replica, Peer{last_index(), 0, {}}); }
+		}
+		Actions deferred;
+		if (request) { deferred.emplace_back(ProposalPlaced{request, hard_.term, entry.index}); }
+		persist(StorageBatch{std::nullopt, LogMutation{entry.index, {std::move(entry)}}}, std::move(deferred), output);
+	}
 	void handle(Propose proposal, Actions& output) {
 		if (busy()) { output.emplace_back(Reject{proposal.request, RejectReason::Busy}); return; }
 		if (!started_ || role_ != Role::Leader) { output.emplace_back(Reject{proposal.request, RejectReason::NotLeader}); return; }
@@ -415,7 +534,7 @@ private:
 			output.emplace_back(Reject{proposal.request, RejectReason::LogFull}); return;
 		}
 		Entry entry{last_index() + 1, hard_.term, EntryKind::Command, std::move(proposal.command)};
-		log_bytes_ += entry.payload.size(); entries_.push_back(entry);
+		log_bytes_ += entry.payload.size(); entries_.push_back(entry); note_append(entry);
 		Actions deferred; deferred.emplace_back(ProposalPlaced{proposal.request, hard_.term, entry.index});
 		persist(StorageBatch{std::nullopt, LogMutation{entry.index, {std::move(entry)}}}, std::move(deferred), output);
 	}
@@ -430,7 +549,7 @@ private:
 			if (pending.request == read.request) { output.emplace_back(Reject{read.request, RejectReason::DuplicateRequest}); return; }
 		}
 		auto probe = token();
-		reads_.push_back(PendingRead{read.request, probe, hard_.term, durable_.commit_index, {configuration_.local}});
+		reads_.push_back(PendingRead{read.request, probe, hard_.term, durable_.commit_index, {configuration_.local}});  // counted while a voter
 		// Preserve data/probe correlation. Later reads queue behind the oldest
 		// pending probe; each quorum observation must follow its admission.
 		for (auto& [id, peer] : peers_) {
@@ -440,12 +559,14 @@ private:
 		ready_reads(output);
 	}
 	void handle(Receive receive, Actions& output) {
-		if (!started_ || busy() || receive.authenticated_peer == configuration_.local || !member(receive.authenticated_peer)) { return; }
+		// Any authenticated incarnation of the group (D5): a follower can lag the membership
+		// that made its sender leader; terms and the log comparison decide.
+		if (!started_ || busy() || receive.authenticated_peer == configuration_.local || receive.authenticated_peer == 0) { return; }
 		if (!std::visit([&](const auto& message) { return valid(message); }, receive.message)) { return; }
 		// A pre-vote request names the term its sender would campaign at: answered without
 		// changing this node's term or ballot (Track C, D7).
 		if (auto request = std::get_if<PreVoteRequest>(&receive.message)) {
-			bool grant = request->term > hard_.term && !heard_from_leader() && log_up_to_date(request->last_index, request->last_term);
+			bool grant = request->term > hard_.term && is_voter(configuration_.local) && !heard_from_leader() && log_up_to_date(request->last_index, request->last_term);
 			output.emplace_back(Send{receive.authenticated_peer, PreVoteResponse{hard_.term, request->term, grant}}); return;
 		}
 		// The leader-contact guard: a voter that heard from a current leader within
@@ -494,17 +615,17 @@ private:
 		return true;
 	}
 	void receive_message(NodeId source, VoteRequest request, StorageBatch&, Actions& output) {
-		bool grant = request.term == hard_.term && (!hard_.voted_for || *hard_.voted_for == source) && log_up_to_date(request.last_index, request.last_term);
+		bool grant = request.term == hard_.term && is_voter(configuration_.local) && (!hard_.voted_for || *hard_.voted_for == source) && log_up_to_date(request.last_index, request.last_term);
 		if (grant) { hard_.voted_for = source; reset_election(); }
 		output.emplace_back(Send{source, VoteResponse{hard_.term, grant}});
 	}
 	void receive_message(NodeId, PreVoteRequest, StorageBatch&, Actions&) {}  // answered in handle(Receive)
 	void receive_message(NodeId source, PreVoteResponse response, StorageBatch&, Actions& output) {
-		if (!prevote_ || response.request_term != *prevote_ || !response.granted || role_ == Role::Leader) { return; }
+		if (!prevote_ || response.request_term != *prevote_ || !response.granted || role_ == Role::Leader || !is_voter(source)) { return; }
 		prevotes_.insert(source);  // handle(Receive) campaigns once the quorum is in and nothing persists
 	}
 	void receive_message(NodeId source, VoteResponse response, StorageBatch&, Actions& output) {
-		if (response.term != hard_.term || role_ != Role::Candidate || !response.granted) { return; }
+		if (response.term != hard_.term || role_ != Role::Candidate || !response.granted || !is_voter(source)) { return; }
 		grants_.insert(source);
 		if (grants_.size() >= quorum()) { become_leader(output); }
 	}
@@ -553,8 +674,8 @@ private:
 				output.emplace_back(Send{source, AppendResponse{hard_.term, request.rpc, false, 0, replace_from, request.read_probe}}); return;
 			}
 			std::vector<Entry> suffix(request.entries.begin() + static_cast<std::ptrdiff_t>(first), request.entries.end());
-			entries_.resize(static_cast<std::size_t>(replace_from - base_index_ - 1));
-			for (const auto& entry : suffix) { entries_.push_back(entry); } log_bytes_ = retained_bytes;
+			entries_.resize(static_cast<std::size_t>(replace_from - base_index_ - 1)); note_truncate(replace_from);
+			for (const auto& entry : suffix) { entries_.push_back(entry); note_append(entry); } log_bytes_ = retained_bytes;
 			batch.log = LogMutation{replace_from, std::move(suffix)};
 		}
 		auto verified = request.previous + request.entries.size();
@@ -564,7 +685,9 @@ private:
 	void receive_message(NodeId source, AppendResponse response, StorageBatch&, Actions& output) {
 		if (role_ != Role::Leader || response.term != hard_.term) { return; }
 		answered_[source] = now_;
-		auto& peer = peers_.at(source);
+		auto found = peers_.find(source);
+		if (found == peers_.end()) { return; }
+		auto& peer = found->second;
 		if (!peer.flight || peer.flight->rpc != response.rpc) { return; }
 		auto flight = *peer.flight;
 		if (response.read_probe != flight.read_probe) { return; }
@@ -604,7 +727,9 @@ private:
 	void receive_message(NodeId source, SnapshotResponse response, StorageBatch&, Actions& output) {
 		if (role_ != Role::Leader || response.term != hard_.term || response.key.leader_term != durable_.term) { return; }
 		answered_[source] = now_;
-		auto& peer = peers_.at(source);
+		auto found = peers_.find(source);
+		if (found == peers_.end()) { return; }
+		auto& peer = found->second;
 		if (!peer.snapshot || peer.snapshot->phase != SnapshotPhase::Sending || peer.snapshot->key != response.key) { return; }
 		if (response.result == SnapshotReply::Installed) {
 			auto boundary = peer.snapshot->key.boundary;
@@ -621,20 +746,33 @@ private:
 			// Campaigns require a separately admitted Tick. Slow persistence
 			// must not start another election from its completion callback.
 			if (!allow_campaign || now_ < election_deadline_ || hard_.term == maximum) { return; }
+			if (!is_voter(configuration_.local)) { reset_election(); return; }  // learners and joiners never campaign
 			if (quorum() == 1) { campaign(output); return; }
 			// Pre-vote first (Track C, D7): only a quorum of grants starts a campaign, so a
 			// node that cannot win never raises the group's term.
 			prevote_ = hard_.term + 1; prevotes_ = {configuration_.local}; reset_election();
-			for (NodeId voter : configuration_.voters) {
+			for (NodeId voter : voters()) {
 				if (voter != configuration_.local) { output.emplace_back(Send{voter, PreVoteRequest{*prevote_, last_index(), log_term(last_index())}}); }
 			}
 			return;
 		}
 		// CheckQuorum (Track C, D7): a leader whose voters have not answered within an
 		// election timeout steps down.
-		std::size_t answering = 1;
-		for (const auto& [id, at] : answered_) { answering += now_ - at < timing_.election_max; }
+		std::size_t answering = is_voter(configuration_.local);
+		for (const auto& [id, at] : answered_) { answering += is_voter(id) && now_ - at < timing_.election_max; }
 		if (answering < quorum()) { follower(0, output); return; }
+		// D4: a leader whose own removal committed steps down, transfer or not. D3: a
+		// committed replacement's leaving voter is removed next, by whichever leader holds
+		// the committed membership, so the replacement completes across leader changes.
+		const auto& committed = committed_membership();
+		if (!votes_in(committed, configuration_.local) && committed == membership()) { follower(0, output); return; }
+		if (committed.leaving && committed == membership() && log_term(durable_.commit_index) == hard_.term) {
+			Membership next = committed;
+			std::erase_if(next.members, [&](const Member& x) { return x.incarnation == committed.leaving; });
+			next.leaving = 0;
+			propose_membership(0, next, output);
+			if (busy()) { return; }
+		}
 		bool heartbeat = now_ >= heartbeat_deadline_;
 		for (auto& [id, peer] : peers_) {
 			if (peer.snapshot && peer.snapshot->phase == SnapshotPhase::AwaitSource && peer.snapshot->key.boundary != LogBoundary{base_index_, base_term_}) { release_snapshot(id, peer, SnapshotReleaseReason::Stale, output); }
@@ -651,7 +789,7 @@ private:
 		++hard_.term; hard_.voted_for = configuration_.local; prevote_.reset(); prevotes_.clear();
 		role_ = Role::Candidate; leader_ = 0; grants_ = {configuration_.local}; reset_election();
 		Actions deferred; deferred.emplace_back(RoleChanged{role_, hard_.term, 0});
-		for (NodeId voter : configuration_.voters) {
+		for (NodeId voter : voters()) {
 			if (voter != configuration_.local) { deferred.emplace_back(Send{voter, VoteRequest{hard_.term, last_index(), log_term(last_index())}}); }
 		}
 		persist(StorageBatch{hard_, std::nullopt}, std::move(deferred), output, quorum() == 1);
@@ -662,8 +800,9 @@ private:
 			follower(0, output); return; // Control reserve exhausted: fail closed.
 		}
 		role_ = Role::Leader; leader_ = configuration_.local; peers_.clear(); grants_.clear(); answered_.clear();
-		for (NodeId voter : configuration_.voters) {
-			if (voter != configuration_.local) { peers_.emplace(voter, Peer{last_index() + 1, 0, {}}); answered_[voter] = now_; }
+		for (NodeId replica : replicas()) {
+			peers_.emplace(replica, Peer{last_index() + 1, 0, {}});
+			if (is_voter(replica)) { answered_[replica] = now_; }
 		}
 		Entry noop{last_index() + 1, hard_.term, EntryKind::NoOp, {}}; entries_.push_back(noop);
 		Actions deferred; deferred.emplace_back(RoleChanged{role_, hard_.term, leader_});
@@ -697,8 +836,14 @@ private:
 	}
 	void advance_commit(Actions& output) {
 		if (busy() || role_ != Role::Leader) { return; }
-		std::vector<Index> matches{last_index()};
-		for (const auto& [id, peer] : peers_) { matches.push_back(peer.matched); }
+		// Voters and witnesses of the membership in force count; the leader itself only while
+		// it is one (D4), learners never.
+		std::vector<Index> matches;
+		if (is_voter(configuration_.local)) { matches.push_back(last_index()); }
+		for (const auto& [id, peer] : peers_) {
+			if (is_voter(id)) { matches.push_back(peer.matched); }
+		}
+		if (matches.size() < quorum()) { return; }
 		std::sort(matches.begin(), matches.end(), std::greater<Index>());
 		auto candidate = matches[quorum() - 1];
 		if (candidate <= durable_.commit_index || log_term(candidate) != hard_.term) { return; }
@@ -719,13 +864,15 @@ private:
 	void ready_reads(Actions& output) {
 		if (busy() || role_ != Role::Leader) { return; }
 		for (auto read = reads_.begin(); read != reads_.end();) {
-			if (read->term == hard_.term && read->acknowledgements.size() >= quorum() && applied_ >= read->index) {
+			if (read->term == hard_.term && acknowledged(*read) >= quorum() && applied_ >= read->index) {
 				output.emplace_back(ReadReady{read->request, read->index}); read = reads_.erase(read);
 			} else { ++read; }
 		}
 	}
 
 	FixedConfiguration configuration_;
+	Membership base_membership_;           // in force at base_index
+	std::map<Index, Membership> configs_;  // the Configuration entries in the retained log
 	HardState hard_, durable_;
 	detail::RetainedLog entries_;
 	Index base_index_ = 0;

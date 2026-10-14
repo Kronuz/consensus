@@ -44,6 +44,7 @@ inline std::string encode_checkpoint(const RecoveredState& state, std::uint64_t 
 		if (entry.payload.size() > std::numeric_limits<std::uint32_t>::max()) { throw std::length_error("checkpoint payload framing overflow"); }
 	}
 	auto encoded_size = std::size_t(application_format ? 96 : 92) + initialization.size() + state.entries.size() * 21 + payload_bytes;
+	if (state.membership) { encoded_size += 8 + encode_membership(*state.membership).size(); }
 	if (encoded_size > maximum) { throw std::length_error("checkpoint exceeds encoded bound"); }
 	std::string result; result.reserve(encoded_size);
 	IncrementalCheckpointEncoder encoder(BorrowedCheckpointState{&state}, storage_sequence, application, limits, application_format);
@@ -66,11 +67,17 @@ inline CheckpointBundle decode_checkpoint(std::string_view bytes, const FixedCon
 	using namespace storage_detail;
 	if (bytes.size() > checkpoint_detail::maximum_size(limits)) { throw Corruption("oversized checkpoint bundle"); }
 	auto magic = get64(bytes);
-	if (magic != checkpoint_detail::magic && magic != checkpoint_detail::magic_v2) {
+	if (magic != checkpoint_detail::magic && magic != checkpoint_detail::magic_v2 && magic != checkpoint_detail::magic_v3) {
 		throw Corruption("unsupported or oversized checkpoint bundle");
 	}
 	CheckpointBundle bundle;
-	if (magic == checkpoint_detail::magic_v2) { bundle.application_format = get32(bytes); }
+	bool has_format = magic == checkpoint_detail::magic_v2;
+	if (magic == checkpoint_detail::magic_v3) {
+		auto flags = get32(bytes);
+		if (flags > 1) { throw Corruption("checkpoint flags"); }
+		has_format = flags & 1;
+	}
+	if (has_format) { bundle.application_format = get32(bytes); }
 	bundle.storage_sequence = get64(bytes);
 	bundle.application.identity = identity(bytes); bundle.application.length = get64(bytes); bundle.application.checksum = get32(bytes);
 	if (bundle.storage_sequence == 0 || bundle.storage_sequence != covered_sequence || bundle.application != application) { throw Corruption("checkpoint dependency or storage sequence mismatch"); }
@@ -79,6 +86,12 @@ inline CheckpointBundle decode_checkpoint(std::string_view bytes, const FixedCon
 		throw Corruption("checkpoint fixed configuration mismatch");
 	}
 	bytes.remove_prefix(length); bundle.state.configuration = expected;
+	if (magic == checkpoint_detail::magic_v3) {
+		auto size = get32(bytes);
+		if (size > bytes.size()) { throw Corruption("checkpoint membership exceeds bound"); }
+		bundle.state.membership = decode_membership(bytes.substr(0, size), limits);
+		bytes.remove_prefix(size);
+	}
 	bundle.state.base_index = get64(bytes); bundle.state.base_term = get64(bytes); bundle.state.applied_index = bundle.state.base_index;
 	bundle.state.hard.term = get64(bytes); auto vote = get64(bytes); if (vote) { bundle.state.hard.voted_for = vote; }
 	bundle.state.hard.commit_index = get64(bytes); auto count = get32(bytes);
@@ -86,10 +99,12 @@ inline CheckpointBundle decode_checkpoint(std::string_view bytes, const FixedCon
 	std::size_t payload = 0;
 	for (std::uint32_t i = 0; i < count; ++i) {
 		Entry entry; entry.index = get64(bytes); entry.term = get64(bytes);
-		if (bytes.empty() || static_cast<unsigned char>(bytes[0]) > static_cast<unsigned char>(EntryKind::NoOp)) { throw Corruption("checkpoint entry kind invalid"); }
+		if (bytes.empty() || static_cast<unsigned char>(bytes[0]) > static_cast<unsigned char>(EntryKind::Configuration)) { throw Corruption("checkpoint entry kind invalid"); }
 		entry.kind = static_cast<EntryKind>(bytes[0]); bytes.remove_prefix(1); auto size = get32(bytes);
 		if (size > limits.command_bytes || size > limits.log_bytes - payload || size > bytes.size()) { throw Corruption("checkpoint payload exceeds bound"); }
-		entry.payload.assign(bytes.substr(0, size)); bytes.remove_prefix(size); payload += size; bundle.state.entries.push_back(std::move(entry));
+		entry.payload.assign(bytes.substr(0, size)); bytes.remove_prefix(size); payload += size;
+		if (entry.kind == EntryKind::Configuration) { (void)decode_membership(entry.payload, limits); }
+		bundle.state.entries.push_back(std::move(entry));
 	}
 	end(bytes);
 	Recovery validator(expected, limits); validator.validate_checkpoint_state(bundle.state);

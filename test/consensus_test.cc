@@ -21,6 +21,7 @@
  */
 
 #include "consensus/core.h"
+#include "consensus/membership.h"
 #include "consensus/admission.h"
 #include "consensus/storage.h"
 #include "consensus/checkpoint.h"
@@ -199,7 +200,10 @@ void persistence_barriers() {
 	}
 	auto second_vote = follower.step(Receive{3, VoteRequest{3, 0, 0}}); auto denial = find<Send>(second_vote);
 	check(denial && !std::get<VoteResponse>(denial->message).granted, "second same-term vote is denied");
-	check(follower.step(Receive{99, VoteRequest{10, 0, 0}}).empty() && follower.term() == 3, "nonvoter cannot inflate term");
+	// The core admits any incarnation the transport authenticated (Track C, D5); a follower
+	// that heard from its leader within election_min ignores a stranger's vote request (D7).
+	follower.step(Receive{1, AppendRequest{3, 50, 0, 0, 0, 0, {}}});
+	check(follower.step(Receive{99, VoteRequest{10, 0, 0}}).empty() && follower.term() == 3, "a follower in contact with its leader ignores a stranger's vote request");
 }
 
 void delayed_completions_do_not_campaign() {
@@ -233,6 +237,166 @@ void delayed_completions_do_not_campaign() {
 }
 
 // Track C, D7: pre-vote, the leader-contact guard, and CheckQuorum.
+// Track C, D1: the membership's encoding, the storage batch that carries it, and the
+// checkpoint bundle version that records a base membership.
+void membership_formats() {
+	using kronuz::journal::Corruption;
+	Limits limits;
+	Membership m{{{1, 1, MemberRole::Voter}, {2, 2, MemberRole::Voter}, {5, 9, MemberRole::Learner}, {6, 6, MemberRole::Witness}}, 7, 2};
+	auto bytes = encode_membership(m);
+	check(decode_membership(bytes, limits) == m, "a membership round-trips");
+	auto rejects = [&](std::string b) { return throws([&] { (void)decode_membership(b, limits); }); };
+	auto damaged = [&](auto change) { Membership x = m; change(x); return encode_membership(x); };
+	check(rejects("XXXX" + bytes.substr(4)), "a membership with another magic is refused");
+	check(rejects(bytes.substr(0, bytes.size() - 1)) && rejects(bytes + "x"), "a truncated or extended membership is refused");
+	check(rejects(damaged([](Membership& x) { std::swap(x.members[0], x.members[1]); })), "unsorted incarnations are refused");
+	check(rejects(damaged([](Membership& x) { x.members[1].incarnation = 1; })), "a repeated incarnation is refused");
+	check(rejects(damaged([](Membership& x) { x.next_incarnation = 6; })), "an incarnation at or above the counter is refused");
+	check(rejects(damaged([](Membership& x) { x.leaving = 5; })), "a learner cannot be leaving");
+	check(rejects(damaged([](Membership& x) { for (auto& y : x.members) { y.role = MemberRole::Learner; } x.leaving = 0; })), "a membership without a voter is refused");
+	auto role = bytes; role[4 + 8 + 8 + 16] = 3;  // the first member's role
+	check(rejects(role), "an unknown role is refused");
+	// Storage: a batch holding a Configuration entry uses the membership magic, which a
+	// reader before it refuses; a batch without one keeps its bytes.
+	StorageBatch plain{std::nullopt, LogMutation{1, {{1, 1, EntryKind::NoOp, {}}}}};
+	StorageBatch changing{std::nullopt, LogMutation{1, {{1, 1, EntryKind::Configuration, bytes}}}};
+	auto plain_bytes = encode_storage_batch(plain), changing_bytes = encode_storage_batch(changing);
+	check(plain_bytes.substr(0, 8) != changing_bytes.substr(0, 8), "a batch with a configuration has its own magic");
+	StorageBatch hard{HardState{1, 1, 0}, std::nullopt};
+	{
+		Recovery recovery(config(1), limits);
+		recovery.replay(1, encode_initialization(config(1)));
+		recovery.replay(2, encode_storage_batch(hard));
+		recovery.replay(3, changing_bytes);
+		auto recovered = recovery.finish(3);
+		check(recovered.entries.size() == 1 && recovered.entries[0].payload == bytes, "a configuration batch replays");
+	}
+	auto as_plain = changing_bytes; std::copy(plain_bytes.begin(), plain_bytes.begin() + 8, as_plain.begin());
+	check(throws([&] {
+		Recovery recovery(config(1), limits);
+		recovery.replay(1, encode_initialization(config(1)));
+		recovery.replay(2, encode_storage_batch(hard));
+		recovery.replay(3, as_plain);
+	}), "a configuration entry under the old magic is refused");
+	// Checkpoint: a base membership makes the bundle version 3 and round-trips.
+	RecoveredState state = empty(1); state.hard = HardState{1, 1, 1}; state.base_index = state.applied_index = 1; state.base_term = 1;
+	kronuz::journal::ArtifactDescriptor application{{'A'}, 5, 7};
+	auto fixed = encode_checkpoint(CheckpointBundle{40, application, state});
+	state.membership = m;
+	auto versioned = encode_checkpoint(CheckpointBundle{40, application, state});
+	check(fixed.substr(0, 8) != versioned.substr(0, 8), "a bundle with a membership is version 3");
+	auto decoded = decode_checkpoint(versioned, config(1), 40, application);
+	check(decoded.state.membership == m && !decode_checkpoint(fixed, config(1), 40, application).state.membership, "a bundle's membership round-trips, and a fixed one has none");
+}
+
+const AppendRequest* append_to(const Actions& actions, NodeId peer);
+// Track C, D1, D3, and D4, scripted where random schedules rarely go.
+void membership_scripts() {
+	auto removal = [](const Membership& m, NodeId gone) {
+		Membership next = m;
+		std::erase_if(next.members, [&](const Member& x) { return x.incarnation == gone; });
+		return next;
+	};
+	// D1: a configuration entry in a suffix a new leader replaces rolls the node's membership
+	// back to the one before it.
+	{
+		Network cluster(4); cluster.start(); cluster.elect(1);
+		auto& old_leader = cluster.host(1);
+		const Membership founding = old_leader.core->membership();
+		cluster.isolated = {2, 3, 4};
+		auto placed = old_leader.core->step(ChangeMembership{900, removal(founding, 4)});
+		cluster.consume(1, std::move(placed));
+		check(voter_count(old_leader.core->membership()) == 3, "the leader uses its uncommitted configuration at once");
+		cluster.isolated = {1};
+		for (unsigned round = 0; round < 300; ++round) { cluster.tick(cluster.now + 10); cluster.pump(); }
+		NodeId leader = 0;
+		for (NodeId id : {2u, 3u, 4u}) { if (cluster.host(id).core->role() == Role::Leader) { leader = id; } }
+		check(leader != 0, "the other voters elect a leader without the configuration");
+		cluster.isolated.clear();
+		for (unsigned round = 0; round < 200; ++round) { cluster.tick(cluster.now + 10); cluster.pump(); }
+		check(old_leader.core->membership() == founding, "a replaced configuration entry rolls the membership back");
+	}
+	// D3(a), exactly: a leader whose commit index is from an earlier term (recovered at
+	// commit 1, term 1) wins term 2 and has not committed its no-op: a change is refused.
+	{
+		RecoveredState state = empty(1, 4); state.hard = HardState{1, 1, 1}; state.entries = {{1, 1, EntryKind::NoOp, {}}};
+		Core leader(config(1, 4), state); leader.step(Start{}); leader.step(Applied{1});
+		auto ballot_actions = campaign(leader, Tick{100, 100});
+		auto ballot = find<Persist>(ballot_actions);
+		if (ballot) { leader.step(Persisted{ballot->token}); }
+		leader.step(Receive{2, VoteResponse{2, true}});
+		auto second = leader.step(Receive{3, VoteResponse{2, true}});
+		auto noop = find<Persist>(second);
+		if (noop) { leader.step(Persisted{noop->token}); }
+		check(leader.role() == Role::Leader && leader.committed() == 1 && !leader.can_change_membership(), "a leader with only an earlier term's commit");
+		auto refusal_actions = leader.step(ChangeMembership{903, removal(leader.membership(), 4)});
+		auto refused = find<Reject>(refusal_actions);
+		check(refused && refused->reason == RejectReason::NotReady, "a change before the leader commits in its term is refused (D3(a))");
+	}
+	// D4: a leader that removes itself does not count itself: with one peer's acknowledgement
+	// of the removal, out of three remaining voters, the removal does not commit.
+	{
+		Core leader(config(1, 4), empty(1, 4)); leader.step(Start{});
+		auto ballot_actions = campaign(leader, Tick{100, 100});  // find returns into it
+		auto ballot = find<Persist>(ballot_actions);
+		if (ballot) { leader.step(Persisted{ballot->token}); }
+		leader.step(Receive{2, VoteResponse{1, true}});
+		auto elected = leader.step(Receive{3, VoteResponse{1, true}});
+		auto noop = find<Persist>(elected);
+		Actions sent;
+		if (noop) { sent = leader.step(Persisted{noop->token}); }
+		for (NodeId peer : {2u, 3u}) {
+			if (auto append = append_to(sent, peer)) {
+				auto actions = leader.step(Receive{peer, AppendResponse{1, append->rpc, true, 1, 2, 0}});
+				if (auto commit = find<Persist>(actions)) { leader.step(Persisted{commit->token}); }
+			}
+		}
+		check(leader.committed() == 1 && leader.can_change_membership(), "the self-removal fixture committed its no-op");
+		auto placed = leader.step(ChangeMembership{904, removal(leader.membership(), 1)});
+		auto entry = find<Persist>(placed);
+		Actions flights;
+		if (entry) { flights = leader.step(Persisted{entry->token}); }
+		auto append = append_to(flights, 2);
+		if (append) {
+			auto actions = leader.step(Receive{2, AppendResponse{1, append->rpc, true, 2, 3, 0}});
+			if (auto commit = find<Persist>(actions)) { leader.step(Persisted{commit->token}); }
+		}
+		check(append && leader.committed() == 1, "a self-removing leader does not count itself toward the new membership's quorum");
+	}
+	// D3(a): a new leader that has not committed an entry of its term refuses a change.
+	{
+		Network cluster(4); cluster.start(); cluster.elect(1);
+		cluster.isolated = {1, 3};  // 2 and 4 cannot commit 2's no-op among four voters
+		for (unsigned round = 0; round < 300 && cluster.host(2).core->role() != Role::Leader; ++round) {
+			cluster.tick(cluster.now + 10); cluster.pump();
+			if (cluster.host(4).core->role() == Role::Leader) { std::swap(cluster.hosts.at(2), cluster.hosts.at(4)); break; }
+		}
+		Core* fresh = nullptr; NodeId fresh_id = 0;
+		for (NodeId id : {2u, 4u}) { if (cluster.host(id).core->role() == Role::Leader) { fresh = cluster.host(id).core.get(); fresh_id = id; } }
+		if (!fresh) {
+			// Without 1 and 3 there is no quorum of four, so elect 2 with 3's vote, then cut 3.
+			cluster.isolated = {1};
+			for (unsigned round = 0; round < 300 && !fresh; ++round) {
+				cluster.tick(cluster.now + 10); cluster.pump();
+				for (NodeId id : {2u, 3u, 4u}) { if (cluster.host(id).core->role() == Role::Leader) { fresh = cluster.host(id).core.get(); fresh_id = id; } }
+			}
+		}
+		check(fresh != nullptr, "a new leader is elected");
+		if (fresh) {
+			// Its no-op is placed; cut it off from all but one peer, so the no-op cannot commit.
+			std::set<NodeId> cut;
+			for (NodeId id : {1u, 2u, 3u, 4u}) { if (id != fresh_id) { cut.insert(id); } }
+			cluster.isolated = cut;
+			auto proposal = fresh->step(Propose{901, "after election"});
+			cluster.consume(fresh_id, std::move(proposal));
+			const bool committed_own = fresh->committed() && fresh->can_change_membership();
+			auto refused = fresh->step(ChangeMembership{902, removal(fresh->membership(), fresh_id == 4 ? 3 : 4)});
+			auto r = find<Reject>(refused);
+			check(committed_own || (r && r->reason == RejectReason::NotReady), "a leader refuses a change before committing an entry of its term");
+		}
+	}
+}
+
 void prevote_guard_checkquorum() {
 	// A pre-vote request never changes the receiver's term or ballot.
 	Core follower(config(2), empty(2)); follower.step(Start{});
@@ -1128,7 +1292,7 @@ void portable_snapshot_installation() {
 		Core core(config(1), fixture()); core.step(Start{}); auto prepared = request();
 		switch (invalid) {
 		case 0: prepared.request = 0; break; case 1: prepared.prepared = 0; break;
-		case 2: prepared.authenticated_peer = 1; break; case 3: prepared.authenticated_peer = 4; break;
+		case 2: prepared.authenticated_peer = 1; break; case 3: prepared.authenticated_peer = 0; break;  // any authenticated incarnation may send (D5)
 		case 4: prepared.cluster[0] ^= 1; break; case 5: prepared.configuration[0] ^= 1; break;
 		case 6: prepared.leader_term = 0; break; case 7: prepared.leader_term = 2; break;
 		case 8: prepared.boundary.index = 0; break; case 9: prepared.boundary.index = std::numeric_limits<Index>::max(); break;
@@ -1287,7 +1451,8 @@ void snapshot_sender_lost_ack_and_terms() {
 	SnapshotSenderFixture malformed; malformed.ready();
 	for (unsigned invalid = 0; invalid < 5; ++invalid) {
 		auto key = malformed.key; SnapshotReply result = SnapshotReply::Installed; NodeId peer = 2;
-		switch (invalid) { case 0: key.transfer = 0; break; case 1: key.boundary.term = 3; break; case 2: result = static_cast<SnapshotReply>(99); break; case 3: peer = 99; break; case 4: peer = 1; break; }
+		// Peer authentication is the transport's (D5); the core refuses only itself and id 0.
+		switch (invalid) { case 0: key.transfer = 0; break; case 1: key.boundary.term = 3; break; case 2: result = static_cast<SnapshotReply>(99); break; case 3: peer = 0; break; case 4: peer = 1; break; }
 		auto output = malformed.core.step(Receive{peer, SnapshotResponse{99, key, result}}); check(output.empty() && malformed.core.term() == 2 && malformed.core.role() == Role::Leader, "invalid response or unauthenticated member assertion cannot mutate term or flight state");
 	}
 	auto fenced = malformed.core.step(StorageFault{"uncertain storage"}); auto released = find<SnapshotReleased>(fenced);
@@ -1379,7 +1544,7 @@ void terminal_retirement() {
 }
 
 int main() {
-	try { terminal_retirement(); snapshot_sender_maximum_fanout(); snapshot_sender_lost_ack_and_terms(); snapshot_sender_receiver_contact(); snapshot_sender_restart_clock_and_admission(); snapshot_sender_correlation(); snapshot_sender_keepalive_pacing(); snapshot_sender_retries_and_retention(); snapshot_timeout_retries(); portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); repair_at_or_below_commit(); prevote_guard_checkquorum(); }
+	try { terminal_retirement(); snapshot_sender_maximum_fanout(); snapshot_sender_lost_ack_and_terms(); snapshot_sender_receiver_contact(); snapshot_sender_restart_clock_and_admission(); snapshot_sender_correlation(); snapshot_sender_keepalive_pacing(); snapshot_sender_retries_and_retention(); snapshot_timeout_retries(); portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); repair_at_or_below_commit(); prevote_guard_checkquorum(); membership_scripts(); membership_formats(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " consensus checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

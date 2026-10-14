@@ -56,7 +56,12 @@ template <class Source> class IncrementalCheckpointEncoder {
 		}
 		previous_ = state.base_term;
 		auto initialization = encode_initialization(state.configuration);
-		put64(header_, format ? checkpoint_detail::magic_v2 : checkpoint_detail::magic);
+		if (state.membership) {
+			put64(header_, checkpoint_detail::magic_v3);
+			put32(header_, format ? 1 : 0);
+		} else {
+			put64(header_, format ? checkpoint_detail::magic_v2 : checkpoint_detail::magic);
+		}
 		if (format) {
 			put32(header_, *format);
 		}
@@ -66,6 +71,11 @@ template <class Source> class IncrementalCheckpointEncoder {
 		put32(header_, application.checksum);
 		put32(header_, static_cast<std::uint32_t>(initialization.size()));
 		header_.append(initialization);
+		if (state.membership) {
+			auto membership = encode_membership(*state.membership);
+			put32(header_, static_cast<std::uint32_t>(membership.size()));
+			header_.append(membership);
+		}
 		put64(header_, state.base_index);
 		put64(header_, state.base_term);
 		put64(header_, state.hard.term);
@@ -118,7 +128,7 @@ template <class Source> class IncrementalCheckpointEncoder {
 						entry.payload.size() > limits_.command_bytes ||
 						entry.payload.size() > limits_.log_bytes - payload_bytes_ ||
 						entry.payload.size() > std::numeric_limits<std::uint32_t>::max() ||
-						(entry.kind != EntryKind::Command && entry.kind != EntryKind::NoOp) ||
+						(entry.kind != EntryKind::Command && entry.kind != EntryKind::NoOp && entry.kind != EntryKind::Configuration) ||
 						(entry.kind == EntryKind::NoOp && !entry.payload.empty())) {
 						throw storage_detail::Corruption("invalid consensus checkpoint suffix");
 					}

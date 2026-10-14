@@ -44,7 +44,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	add_test(NAME consensus_worker COMMAND consensus_worker_test)
 	# Each seeded fault in tools/mutants.sh must fail the simulation (it reads Ninja's commands).
 	if(CMAKE_GENERATOR MATCHES "Ninja")
-		add_test(NAME consensus_mutants COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/mutants.sh ${CMAKE_BINARY_DIR} 200 10000)
+		add_test(NAME consensus_mutants COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/mutants.sh ${CMAKE_BINARY_DIR} 400 10000)
 	endif()
 	set_tests_properties(consensus_worker PROPERTIES TIMEOUT 180)
 	add_test(NAME consensus_worker_terminal COMMAND consensus_worker_test --terminal-regressions)

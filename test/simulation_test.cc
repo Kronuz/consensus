@@ -36,6 +36,7 @@
 // After the run the group heals, elects a leader, and commits a new entry.
 //   simulation_test [seeds] [steps] [first seed]   (defaults 200, 10000, 1)
 #include "consensus/core.h"
+#include "consensus/membership.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -83,6 +84,7 @@ struct Durable {
 
 struct Node {
 	NodeId id;
+	bool joiner = false;  // started from a join record (Track C, D5), no membership
 	double rate;  // local clock rate
 	double local = 0;  // local clock, advanced at `rate`
 	std::unique_ptr<Core> core;
@@ -102,7 +104,7 @@ struct Envelope {
 
 class Simulation {
 public:
-	Simulation(std::uint64_t seed, std::size_t voters) : random_(seed), voters_(voters) {
+	Simulation(std::uint64_t seed, std::size_t voters, bool membership) : random_(seed), voters_(voters), membership_changes_(membership) {
 		// Small RPC batches leave replication partial across leader changes.
 		limits_.rpc_entries = 1 + random_() % 4;
 		for (NodeId id = 1; id <= voters; ++id) {
@@ -117,8 +119,9 @@ public:
 		for (std::size_t step = 0; step < steps && !failures; ++step) {
 			advance(1 + random_() % 5);
 			const auto pick = random_() % 1000;
-			NodeId id = 1 + random_() % voters_;
-			auto& n = nodes_.at(id);
+			auto pick_node = std::next(nodes_.begin(), std::ptrdiff_t(random_() % nodes_.size()));
+			NodeId id = pick_node->first;
+			auto& n = pick_node->second;
 			if (pick < 80) {
 				tick(n);
 			} else if (pick < 180) {
@@ -131,6 +134,8 @@ public:
 				if (n.up && n.applying) { complete_apply(n); }
 			} else if (pick < 701) {
 				repair(n);
+			} else if (pick < 712 && membership_changes_) {
+				change_membership();
 			} else if (pick < 702) {
 				crash(random_() % 2 ? leader_or(n) : n);
 			} else if (pick < 706) {
@@ -162,13 +167,13 @@ public:
 				if (n.applying) { complete_apply(n); }
 			}
 			while (!network_.empty()) { deliver_front(); }
-			if (round >= 2000 && round % 50 == 0 && applied_healed() < voters_ / 2 + 1) {  // until a majority applies it
+			if (round >= 2000 && round % 50 == 0 && applied_healed() < healed_quorum()) {  // until a majority applies it
 				for (auto& [id, n] : nodes_) {
 					if (n.core->role() == Role::Leader) { act(n, n.core->step(Propose{++request_, "healed"})); }
 				}
 			}
 		}
-		if (applied_healed() < voters_ / 2 + 1) {
+		if (applied_healed() < healed_quorum()) {
 			fail("healed group did not commit a new entry on a majority");
 			for (auto& [id, n] : nodes_) {
 				std::fprintf(stderr, "  node %llu: up %d role %d term %llu committed %llu applied %llu last %llu durable log %zu pending %d applying %d\n", (unsigned long long)id, n.up,
@@ -179,7 +184,8 @@ public:
 		check_logs();
 	}
 
-	std::uint64_t restarts = 0, kept = 0, lost = 0, elections = 0, led_steps = 0, repairs = 0;
+	std::uint64_t restarts = 0, kept = 0, lost = 0, elections = 0, led_steps = 0, repairs = 0, changes_proposed = 0, memberships_committed = 0;
+	std::map<int, std::uint64_t> reject_reasons;
 	Term max_term() const {
 		Term t = 0;
 		for (const auto& [id, n] : nodes_) { if (n.up) { t = std::max(t, n.core->term()); } }
@@ -195,8 +201,12 @@ private:
 		return n;
 	}
 	std::size_t applied_healed() const {
+		const Membership* latest = &founding_;
+		if (!memberships_.empty()) { latest = &memberships_.rbegin()->second; }
 		std::size_t done = 0;
-		for (const auto& [id, n] : nodes_) { done += std::find(n.applied.begin(), n.applied.end(), "healed") != n.applied.end(); }
+		for (const auto& [id, n] : nodes_) {
+			done += votes_in(*latest, id) && std::find(n.applied.begin(), n.applied.end(), "healed") != n.applied.end();
+		}
 		return done;
 	}
 	std::uint64_t local_time(const Node& n) const { return std::uint64_t(n.local); }
@@ -205,12 +215,18 @@ private:
 		for (auto& [id, n] : nodes_) { n.local += double(dt) * n.rate; }
 	}
 
+	FixedConfiguration node_config(const Node& n) const {
+		auto c = config(n.id, voters_);
+		if (n.joiner) { c.voters.clear(); }
+		return c;
+	}
 	void restart(Node& n) {
 		RecoveredState state;
-		state.configuration = config(n.id, voters_);
+		state.configuration = node_config(n);
 		state.hard = n.durable.hard;
 		state.entries = n.durable.log;
-		n.core = std::make_unique<Core>(config(n.id, voters_), std::move(state), limits_, timing_);
+		if (n.joiner) { state.membership = Membership{}; }  // the join record: no membership yet
+		n.core = std::make_unique<Core>(node_config(n), std::move(state), limits_, timing_);
 		n.pending.reset();
 		n.applying.reset();
 		n.applied.clear();
@@ -254,7 +270,9 @@ private:
 	void complete_persist(Node& n) {
 		auto p = std::move(*n.pending);
 		n.pending.reset();
+		const Index before = n.durable.hard.commit_index;
 		n.durable.apply(p.batch);
+		if (n.durable.hard.commit_index > before && n.core->role() == Role::Leader) { check_commit(n, n.durable.hard.commit_index); }
 		act(n, n.core->step(Persisted{p.token}));
 	}
 	void complete_apply(Node& n) {
@@ -262,6 +280,7 @@ private:
 		n.applying.reset();
 		for (const auto& e : c.entries) {
 			record_applied(e);
+			if (e.kind == EntryKind::Configuration) { record_membership(e); }
 			if (e.kind == EntryKind::Command) { n.applied.push_back(e.payload); }
 			n.applied_entries.push_back(e);
 		}
@@ -269,6 +288,54 @@ private:
 		act(n, n.core->step(Applied{c.entries.back().index}));
 	}
 
+	// Track C, D1, D3: the leader adds a learner, promotes one (as a plain add or a
+	// replacement whose leaving voter the core removes next), or removes a voter, itself
+	// included; joiners start from a join record.
+	void change_membership() {
+		Node* leader = nullptr;
+		for (auto& [id, m] : nodes_) {
+			// Half the proposals wait for can_change_membership(); the rest only for an idle leader
+			// with no configuration pending, leaving D3(a) to the core, so a mutant without it shows.
+			const bool weak = random_() % 2;
+			if (m.up && (weak ? m.core->role() == Role::Leader && !m.core->busy() && m.core->committed_membership() == m.core->membership()
+							  : m.core->can_change_membership())) {
+				leader = &m;
+			}
+		}
+		if (!leader) { return; }
+		Membership next = leader->core->membership();
+		std::vector<NodeId> learners, voters;
+		for (const auto& x : next.members) { (voting(x.role) ? voters : learners).push_back(x.incarnation); }
+		const auto choice = random_() % 3;
+		if (choice == 0 && next.members.size() < 7) {
+			const NodeId incarnation = next.next_incarnation++;
+			next.members.push_back({incarnation, incarnation, MemberRole::Learner});
+			auto& joiner = nodes_[incarnation];
+			if (!joiner.core) {
+				joiner.id = incarnation;
+				joiner.joiner = true;
+				joiner.rate = 0.5 + double(random_() % 1501) / 1000.0;
+				joiner.local = leader->local;
+				restart(joiner);
+			}
+		} else if (choice == 1 && !learners.empty() && !next.leaving) {
+			const NodeId promoted = learners[random_() % learners.size()];
+			if (auto p = leader->core->progress(promoted); !p || *p < leader->core->committed()) { return; }  // D3(c): caught up first
+			for (auto& x : next.members) { if (x.incarnation == promoted) { x.role = MemberRole::Voter; } }
+			if (voters.size() >= 5 || random_() % 2) { next.leaving = voters[random_() % voters.size()]; }  // a replacement
+		} else if (choice == 2 && voters.size() > 3 && !next.leaving) {
+			const NodeId removed = voters[random_() % voters.size()];
+			std::erase_if(next.members, [&](const Member& x) { return x.incarnation == removed; });
+		} else {
+			return;
+		}
+		++changes_proposed;
+		auto actions = leader->core->step(ChangeMembership{++request_, std::move(next)});
+		for (const auto& a : actions) {
+			if (auto r = std::get_if<Reject>(&a); r && r->request == request_ && std::getenv("SIM_DEBUG")) { ++reject_reasons[int(r->reason)]; }
+		}
+		act(*leader, std::move(actions));
+	}
 	// Track C, D10: the node restores its application at a boundary in [0, applied] and
 	// replays from its own log; a leader of more than one voter or a busy node is refused.
 	void repair(Node& n) {
@@ -289,7 +356,7 @@ private:
 		act(n, std::move(actions));
 	}
 	void toggle_partition(NodeId id) {
-		if (!isolated_.erase(id) && isolated_.size() + 1 < voters_) { isolated_.insert(id); }
+		if (!isolated_.erase(id) && isolated_.size() + 1 < nodes_.size()) { isolated_.insert(id); }
 	}
 	void deliver_one() {
 		if (network_.empty()) { return; }
@@ -351,6 +418,48 @@ private:
 		auto [it, fresh] = committed_.emplace(e.index, e);
 		if (!fresh && it->second != e) { fail("two different entries applied at index " + std::to_string(e.index)); }
 	}
+	// Commit safety: when a leader commits an index, the entry there is already durable on a
+	// quorum of the voters of the membership it uses, itself counted only while it is one.
+	void check_commit(const Node& leader, Index index) {
+		// The membership its durable log puts in force, not the core's own view of it.
+		Membership m = founding_;  // every log here starts at index 1, over the founding membership
+		for (const auto& e : leader.durable.log) {
+			if (e.kind == EntryKind::Configuration) { m = decode_membership(e.payload, limits_); }
+		}
+		if (m.members.empty()) { return; }
+		const Entry& entry = leader.durable.log.at(index - 1);
+		std::size_t holding = 0;
+		for (const auto& x : m.members) {
+			if (!voting(x.role)) { continue; }
+			auto it = nodes_.find(x.incarnation);
+			if (it == nodes_.end()) { continue; }
+			const auto& log = it->second.durable.log;
+			holding += index <= log.size() && log[index - 1] == entry;
+		}
+		if (holding < voter_count(m) / 2 + 1) {
+			fail("leader " + std::to_string(leader.id) + " committed index " + std::to_string(index) + " held by " + std::to_string(holding) + " of " +
+				std::to_string(voter_count(m)) + " voters");
+		}
+	}
+	// Every committed membership is a single-voter step from the one before (D3).
+	void record_membership(const Entry& e) {
+		auto [it, fresh] = memberships_.emplace(e.index, decode_membership(e.payload, limits_));
+		if (!fresh) { return; }
+		if (it != memberships_.begin()) {
+			const auto& before = std::prev(it)->second;
+			try {
+				validate_change(before, it->second, limits_);
+			} catch (const std::exception& error) {
+				fail(std::string("committed membership at ") + std::to_string(e.index) + " is not a single step: " + error.what());
+			}
+		}
+		++memberships_committed;
+	}
+	std::size_t healed_quorum() const {
+		const Membership* latest = &founding_;
+		if (!memberships_.empty()) { latest = &memberships_.rbegin()->second; }
+		return voter_count(*latest) / 2 + 1;
+	}
 	void check_send(const Node& n, const Send& s) {
 		if (auto v = std::get_if<VoteResponse>(&s.message); v && v->granted) {
 			auto [it, fresh] = ballots_.emplace(std::pair{n.id, v->term}, s.peer);
@@ -390,6 +499,9 @@ private:
 
 	std::mt19937_64 random_;
 	std::size_t voters_;
+	bool membership_changes_;
+	Membership founding_ = fixed_membership(config(1, voters_));
+	std::map<Index, Membership> memberships_;
 	Limits limits_;
 	Timing timing_{60, 300, 600, 1200, 60000};
 	std::map<NodeId, Node> nodes_;
@@ -408,21 +520,24 @@ int main(int argc, char** argv) {
 	const std::uint64_t seeds = argc > 1 ? std::strtoull(argv[1], nullptr, 10) : 200;
 	const std::uint64_t steps = argc > 2 ? std::strtoull(argv[2], nullptr, 10) : 10000;
 	const std::uint64_t first = argc > 3 ? std::strtoull(argv[3], nullptr, 10) : 1;
-	std::uint64_t restarts = 0, kept = 0, lost = 0, elections = 0, repairs = 0;
+	std::uint64_t restarts = 0, kept = 0, lost = 0, elections = 0, repairs = 0, changes = 0, committed_changes = 0;
 	for (std::uint64_t seed = first; seed < first + seeds && !failures; ++seed) {
 		current_seed = seed;
-		Simulation sim(seed, 3 + 2 * (seed % 3 == 0));
+		Simulation sim(seed, 3 + 2 * (seed % 3 == 0), seed % 2 == 0);  // even seeds change membership
 		sim.run(steps);
-		if (std::getenv("SIM_DEBUG")) { std::fprintf(stderr, "seed %llu: elections %llu led %llu of %llu steps, max term %llu\n", (unsigned long long)seed, (unsigned long long)sim.elections, (unsigned long long)sim.led_steps, (unsigned long long)steps, (unsigned long long)sim.max_term()); }
+		if (std::getenv("SIM_DEBUG")) {
+			for (auto [r, n] : sim.reject_reasons) { std::fprintf(stderr, "  reject %d: %llu\n", r, (unsigned long long)n); } std::fprintf(stderr, "seed %llu: elections %llu led %llu of %llu steps, max term %llu\n", (unsigned long long)seed, (unsigned long long)sim.elections, (unsigned long long)sim.led_steps, (unsigned long long)steps, (unsigned long long)sim.max_term()); }
 		if (!failures) { sim.heal(); }
 		restarts += sim.restarts;
 		kept += sim.kept;
 		lost += sim.lost;
 		elections += sim.elections;
 		repairs += sim.repairs;
+		changes += sim.changes_proposed;
+		committed_changes += sim.memberships_committed;
 	}
-	std::printf("simulation: %llu seeds x %llu steps, %llu elections, %llu restarts (%llu kept a pending batch, %llu lost one), %llu repairs: %s\n",
+	std::printf("simulation: %llu seeds x %llu steps, %llu elections, %llu restarts (%llu kept a pending batch, %llu lost one), %llu repairs, %llu membership changes proposed, %llu committed memberships applied: %s\n",
 		(unsigned long long)seeds, (unsigned long long)steps, (unsigned long long)elections, (unsigned long long)restarts, (unsigned long long)kept,
-		(unsigned long long)lost, (unsigned long long)repairs, failures ? "FAILED" : "ok");
+		(unsigned long long)lost, (unsigned long long)repairs, (unsigned long long)changes, (unsigned long long)committed_changes, failures ? "FAILED" : "ok");
 	return failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }

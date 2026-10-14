@@ -23,6 +23,7 @@
 #pragma once
 
 #include "types.h"
+#include "membership.h"
 #include "journal/codec.h"
 #include <algorithm>
 #include <limits>
@@ -39,6 +40,8 @@ using kronuz::journal::put32;
 using kronuz::journal::put64;
 constexpr std::uint64_t initial_magic = 0x3154494e49544652ull;
 constexpr std::uint64_t batch_magic = 0x3148435442544652ull;
+// A batch holding a Configuration entry (Track C, D1), so a reader before it refuses it.
+constexpr std::uint64_t membership_batch_magic = 0x3248435442544652ull;
 inline void identity(std::string& bytes, Identity value) { bytes.append(value.data(), value.size()); }
 inline Identity identity(std::string_view& bytes) {
 	if (bytes.size() < 16) { throw Corruption("truncated consensus identity"); }
@@ -92,7 +95,9 @@ inline std::size_t storage_batch_size(const StorageBatch& batch) {
 
 inline std::string encode_storage_batch(const StorageBatch& batch) {
 	using namespace storage_detail;
-	std::string result; result.reserve(storage_batch_size(batch)); put64(result, batch_magic);
+	std::string result; result.reserve(storage_batch_size(batch));
+	const bool membership = batch.log && std::any_of(batch.log->entries.begin(), batch.log->entries.end(), [](const Entry& e) { return e.kind == EntryKind::Configuration; });
+	put64(result, membership ? membership_batch_magic : batch_magic);
 	result.push_back(batch.hard ? 1 : 0);
 	if (batch.hard) {
 		put64(result, batch.hard->term); put64(result, batch.hard->voted_for.value_or(0)); put64(result, batch.hard->commit_index);
@@ -128,7 +133,7 @@ public:
 			state.applied_index != state.base_index || state.hard.commit_index < state.base_index ||
 			entry_count > limits_.log_entries || entry_count >= std::numeric_limits<Index>::max() - state.base_index ||
 			state.hard.commit_index > state.base_index + entry_count ||
-			(state.hard.voted_for && std::find(expected_.voters.begin(), expected_.voters.end(), *state.hard.voted_for) == expected_.voters.end())) {
+			(state.hard.voted_for && *state.hard.voted_for == 0)) {
 			throw storage_detail::Corruption("invalid consensus checkpoint state");
 		}
 	}
@@ -188,9 +193,12 @@ private:
 		// Metadata has its own bound; payload accounting below is independent.
 		if (limits_.rpc_entries > (std::numeric_limits<std::size_t>::max() - 46) / 21 ||
 			limits_.rpc_bytes > std::numeric_limits<std::size_t>::max() - 46 - limits_.rpc_entries * 21 ||
-			bytes.size() > 46 + limits_.rpc_entries * 21 + limits_.rpc_bytes || get64(bytes) != batch_magic) {
+			bytes.size() > 46 + limits_.rpc_entries * 21 + limits_.rpc_bytes) {
 			throw Corruption("invalid consensus storage batch size or version");
 		}
+		const auto magic = get64(bytes);
+		if (magic != batch_magic && magic != membership_batch_magic) { throw Corruption("invalid consensus storage batch size or version"); }
+		const auto highest_kind = magic == batch_magic ? EntryKind::NoOp : EntryKind::Configuration;
 		StorageBatch batch;
 		if (flag(bytes)) {
 			HardState hard; hard.term = get64(bytes); auto vote = get64(bytes); hard.commit_index = get64(bytes);
@@ -202,11 +210,12 @@ private:
 			std::size_t total = 0;
 			for (std::uint32_t i = 0; i < count; ++i) {
 				Entry entry; entry.index = get64(bytes); entry.term = get64(bytes);
-				if (bytes.empty() || static_cast<unsigned char>(bytes[0]) > static_cast<unsigned char>(EntryKind::NoOp)) { throw Corruption("invalid storage entry kind"); }
+				if (bytes.empty() || static_cast<unsigned char>(bytes[0]) > static_cast<unsigned char>(highest_kind)) { throw Corruption("invalid storage entry kind"); }
 				entry.kind = static_cast<EntryKind>(bytes[0]); bytes.remove_prefix(1);
 				auto length = get32(bytes);
 				if (length > limits_.command_bytes || length > limits_.rpc_bytes - total || length > bytes.size()) { throw Corruption("storage payload exceeds bound"); }
 				entry.payload.assign(bytes.substr(0, length)); bytes.remove_prefix(length); total += length;
+				if (entry.kind == EntryKind::Configuration) { (void)decode_membership(entry.payload, limits_); }
 				mutation.entries.push_back(std::move(entry));
 			}
 			batch.log = std::move(mutation);
@@ -219,7 +228,7 @@ private:
 		using storage_detail::Corruption;
 		auto hard = batch.hard.value_or(state_.hard);
 		if (hard.term < state_.hard.term || hard.commit_index < state_.hard.commit_index ||
-			(hard.voted_for && std::find(expected_.voters.begin(), expected_.voters.end(), *hard.voted_for) == expected_.voters.end()) ||
+			(hard.voted_for && *hard.voted_for == 0) ||  // a ballot may name any incarnation (Track C, R2)
 			(hard.term == 0 && hard.voted_for) ||
 			(hard.term == state_.hard.term && state_.hard.voted_for && hard.voted_for != state_.hard.voted_for)) {
 			throw Corruption("invalid durable hard-state transition");

@@ -23,6 +23,7 @@
 #pragma once
 
 #include "storage.h"
+#include "membership.h"
 #include "journal/admission.h"
 #include <array>
 #include <type_traits>
@@ -70,7 +71,7 @@ inline EventAdmissionPlan plan_event(const Event& event, bool busy, Limits limit
 					bool command = false;
 					for (const auto& entry : message.entries) {
 						if (entry.payload.size() > limits.command_bytes || payload > limits.rpc_bytes || entry.payload.size() > limits.rpc_bytes - payload ||
-							(entry.kind != EntryKind::Command && (entry.kind != EntryKind::NoOp || !entry.payload.empty()))) {
+							(entry.kind != EntryKind::Command && entry.kind != EntryKind::Configuration && (entry.kind != EntryKind::NoOp || !entry.payload.empty()))) {
 							throw std::length_error("RPC payload admission bound");
 						}
 						payload += entry.payload.size(); command |= entry.kind == EntryKind::Command;
@@ -90,6 +91,11 @@ inline EventAdmissionPlan plan_event(const Event& event, bool busy, Limits limit
 					static_assert(std::is_same_v<M, void>, "new consensus message requires an admission plan");
 				}
 			}, value.message);
+		} else if constexpr (std::is_same_v<T, ChangeMembership>) {
+			if (!busy) {
+				add(AdmissionClass::Control, storage_batch_size(false, true, 1, encode_membership(value.next).size()));
+				add(AdmissionClass::Control, hard);
+			}
 		} else if constexpr (std::is_same_v<T, Start> || std::is_same_v<T, Read> || std::is_same_v<T, Repair>) {
 			// These events emit no persistence action.
 		} else {

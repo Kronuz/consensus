@@ -1,6 +1,7 @@
 #pragma once
 #include <algorithm>
 #include <consensus/types.h>
+#include <consensus/membership.h>
 #include <journal/codec.h>
 #include <limits>
 #include <type_traits>
@@ -69,7 +70,7 @@ inline std::string encode(const kronuz::consensus::Message &message,
 				number(value.entries.size());
 				std::size_t payload_bytes = 0;
 				for (const auto &entry : value.entries) {
-					if (static_cast<unsigned>(entry.kind) > static_cast<unsigned>(EntryKind::NoOp))
+					if (static_cast<unsigned>(entry.kind) > static_cast<unsigned>(EntryKind::Configuration))
 						throw std::invalid_argument("invalid control entry kind");
 					number(entry.index);
 					number(entry.term);
@@ -155,12 +156,14 @@ inline kronuz::consensus::Message decode(std::string_view bytes, kronuz::consens
 		for (std::uint64_t i = 0; i < count; ++i) {
 			auto index = get64(bytes), entry_term = get64(bytes), entry_kind = get64(bytes),
 				 size = get64(bytes);
-			if (entry_kind > static_cast<unsigned>(EntryKind::NoOp) || size > limits.command_bytes ||
+			if (entry_kind > static_cast<unsigned>(EntryKind::Configuration) || size > limits.command_bytes ||
 				size > bytes.size() || size > limits.rpc_bytes - payload_bytes)
 				throw Corruption("invalid control entry");
 			auto payload = bytes.substr(0, static_cast<std::size_t>(size));
 			payload_bytes += payload.size();
 			bytes.remove_prefix(payload.size());
+			if (entry_kind == static_cast<unsigned>(EntryKind::Configuration))
+				(void)decode_membership(payload, limits);  // throws Corruption
 			value.entries.push_back(
 				{index, entry_term, static_cast<EntryKind>(entry_kind), std::string(payload)});
 		}

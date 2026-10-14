@@ -1746,7 +1746,9 @@ void hostile_transfer_frames() {
 	bool limited = false;
 	for (NodeId peer = 3; peer < 3 + limits().members && !limited; ++peer) { limited = throws([&] { channel.register_session({peer, local, remote}); }); }
 	check(limited && channel.channel_count() == limits().members, "channels stop at the node's member limit");
-	fixture.worker.close(); channel.run_one({60, 100});
+	channel.register_session(session); fixture.worker.close();
+	check(channel.receive(session, std::span<const char>(accepted.data(), accepted.size())).result == TransferReceive::Closed, "a closing worker's open session is closed");
+	channel.run_one({60, 100});
 	check(!channel.outbound() && !channel.session_open(session) && channel.receive(session, std::span<const char>(accepted.data(), accepted.size())).result == TransferReceive::Closed,
 		"a closing worker's channel sends and accepts nothing");
 	channel.register_session(session); check(!channel.session_open(session), "a closing worker registers no session");
@@ -1762,6 +1764,7 @@ void worker_api_guards() {
 			unopened.applied_index() == 0 && unopened.retained_log_bytes() == 0 && unopened.retired_log_bytes() == 0 && unopened.retired_log_entries() == 0 &&
 			unopened.base_index() == 0 && unopened.base_boundary() == LogBoundary{} && unopened.epoch() == 0 && !unopened.ready(), "an unopened worker reports an empty follower");
 		check(throws([&] { unopened.run_one({0, 100}); }), "an unopened worker refuses a turn");
+		unopened.applied({1}); unopened.application_failed(1, "none"); check(!unopened.fenced() && !unopened.reserve_checkpoint(5), "an unopened worker ignores application reports and reserves nothing");
 		auto refused = [&](WorkerLimits scheduling, kronuz::journal::AdmissionLimits admission = SnapshotFixture::quota()) {
 			return throws([&] { Worker bad(io, SnapshotFixture::fixed(), admission, limits(), compact, scheduling); });
 		};
@@ -1808,10 +1811,12 @@ void worker_api_guards() {
 		throws([&] { w.offer_snapshot_chunk(*id, 0, "dat", true); }) && throws([&] { w.offer_snapshot_chunk(*id, 0, std::string(65537, 'x')); }),
 		"snapshot input is sequential, bounded, and ends exactly at the image's size");
 	check(w.validation_succeeded(*id, 1) == ValidationAck::NotReady && w.consume_validation(*id, 1) == ValidationAck::Stale, "validation answers follow the snapshot's phase");
-	w.close();
+	w.close(); w.applied({1}); w.application_failed(1, "closing");
+	check(!w.reserve_checkpoint(5) && !w.fenced(), "a closing worker reserves nothing and ignores application reports");
 	check(w.consume_validation(*id, 1) == ValidationAck::NotReady && w.validation_succeeded(*id, 1) == ValidationAck::NotReady && w.request_install(*id) == SubmitResult::Busy &&
 		w.snapshot_activation_failed(*id, 1) == ValidationAck::NotReady && w.offer_snapshot_chunk(*id, 0, "data", true).result == SubmitResult::Busy && !w.snapshot_activation(),
 		"a closing worker accepts no snapshot progress");
+	SnapshotChannel doomed(worker); Identity l{}, r{}; l[0] = 'l'; r[0] = 'r'; TrustedSession open{2, l, r}; doomed.register_session(open);
 	// A granted pre-vote starts a campaign, whose durable term meets the failing sync.
 	other.io.fail_sync = true; worker.try_submit(Tick{1000, 100}); worker.run_one({1000, 100}); worker.take_actions();
 	worker.try_submit(Receive{2, PreVoteResponse{worker.term(), worker.term() + 1, true}});
@@ -1820,6 +1825,8 @@ void worker_api_guards() {
 	check(worker.consume_validation(*id, 1) == ValidationAck::Fenced && worker.validation_succeeded(*id, 1) == ValidationAck::Fenced && worker.request_install(*id) == SubmitResult::Fenced &&
 		worker.snapshot_activated(*id, 1) == ValidationAck::Fenced && worker.snapshot_activation_failed(*id, 1) == ValidationAck::Fenced &&
 		worker.source_peer_failed(2) == ValidationAck::Fenced && worker.run_one({0, 100}) == TurnResult::Fenced && !worker.snapshot_source(), "a fenced worker answers Fenced");
+	worker.applied({1}); worker.application_failed(1, "fenced"); std::string frame(12, 'X');
+	check(doomed.receive(open, std::span<const char>(frame.data(), frame.size())).result == TransferReceive::Closed && !doomed.outbound(), "a fenced worker's channel closes its sessions");
 }
 
 // A receiving transfer refuses chunks it does not own or that break its sequence, and holds

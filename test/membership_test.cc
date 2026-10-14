@@ -28,6 +28,7 @@
 #include "consensus/membership.h"
 #include "consensus/snapshot.h"
 #include "consensus/storage.h"
+#include "consensus/transport/codec.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -615,6 +616,35 @@ void validators() {
 	check(change({{{1, 1, R::Voter}, {2, 2, R::Voter}, {3, 3, R::Voter}, {4, 4, R::Learner}}, 5, 3}), "a leaving voter needs a promotion beside it");
 }
 
+// Bounds past the fuzzer's input length, and the empty storage batch it never built.
+template <class F> bool corrupt(F&& f, std::string_view what) {
+	try { f(); return false; } catch (const kronuz::journal::Corruption& error) { return std::string_view(error.what()).find(what) != std::string_view::npos; }
+}
+void decoder_bounds() {
+	using kronuz::journal::put32; using kronuz::journal::put64;
+	Limits small; small.command_bytes = 100; small.rpc_bytes = 150;
+	check(corrupt([&] { transport::decode(std::string(transport::control_frame_bound(small) + 1, 'D'), small); }, "invalid control frame"),
+		"a control frame above its bound is refused");
+	AppendRequest two{7, 11, 9, 6, 8, 13, {{10, 7, EntryKind::Command, std::string(100, 'a')}, {11, 7, EntryKind::Command, std::string(100, 'b')}}, 9};
+	check(corrupt([&] { transport::decode(transport::encode(two), small); }, "invalid control entry"), "control payloads above the RPC bound are refused");
+	const auto c = founding_config(1);
+	SnapshotPolicy policy{c.cluster, c.configuration, 7, 1 << 20};
+	check(corrupt([&] { decode_snapshot("RFTSNP02" + std::string(maximum_snapshot_descriptor_bytes, '\0'), policy); }, "framing"),
+		"a snapshot descriptor above its bound is refused");
+	check(corrupt([&] { Recovery recovery(c); recovery.replay(1, std::string(8192, '\0')); }, "invalid consensus initialization"),
+		"an initialization record above its bound is refused");
+	auto replay = [&](const std::string& batch) { Recovery recovery(c); recovery.replay(1, encode_initialization(c)); recovery.replay(2, batch); };
+	std::string empty; put64(empty, storage_detail::batch_magic); empty.append(2, '\0');
+	check(corrupt([&] { replay(empty); }, "empty consensus storage operation"), "a storage batch with neither part is refused");
+	// Four entries at the command ceiling fill the RPC ceiling; a fifth byte exceeds it.
+	std::string full; put64(full, storage_detail::batch_magic); full.push_back(0); full.push_back(1); put64(full, 1); put32(full, 5);
+	for (std::uint64_t i = 1; i <= 5; ++i) {
+		const auto size = i < 5 ? ceilings.command_bytes : 1;
+		put64(full, i); put64(full, 1); full.push_back(0); put32(full, static_cast<std::uint32_t>(size)); full.append(size, 'x');
+	}
+	check(corrupt([&] { replay(full); }, "storage payload exceeds bound"), "storage payloads above the RPC ceiling are refused");
+}
+
 }  // namespace
 
 int main() {
@@ -635,6 +665,7 @@ int main() {
 		joiner_retained_install();
 		lowered_node_limits_reopen();
 		validators();
+		decoder_bounds();
 	} catch (const std::exception& error) {
 		check(false, error.what());
 	}

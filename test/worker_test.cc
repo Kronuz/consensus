@@ -1757,7 +1757,7 @@ void worker_api_guards() {
 		Worker unopened(io, SnapshotFixture::fixed(), SnapshotFixture::quota(), limits(), compact, {4, 1}, SnapshotLimits{7, 100000});
 		check(unopened.role() == Role::Follower && !unopened.busy() && unopened.term() == 0 && !unopened.membership() && unopened.committed() == 0 &&
 			unopened.applied_index() == 0 && unopened.retained_log_bytes() == 0 && unopened.retired_log_bytes() == 0 && unopened.retired_log_entries() == 0 &&
-			unopened.base_index() == 0 && unopened.base_boundary() == LogBoundary{} && !unopened.ready(), "an unopened worker reports an empty follower");
+			unopened.base_index() == 0 && unopened.base_boundary() == LogBoundary{} && unopened.epoch() == 0 && !unopened.ready(), "an unopened worker reports an empty follower");
 		check(throws([&] { unopened.run_one({0, 100}); }), "an unopened worker refuses a turn");
 	}
 	SnapshotFixture owner("guards-owner"), other("guards-other");
@@ -1773,6 +1773,15 @@ void worker_api_guards() {
 		worker.snapshot_activated(*id, 1) == ValidationAck::Stale && worker.snapshot_activation_failed(*id, 1) == ValidationAck::Stale &&
 		worker.cancel_snapshot(*id) == CancelResult::Stale && throws([&] { worker.offer_snapshot_chunk(*id, 0, "data", true); }), "another worker's snapshot id is stale");
 	check(worker.source_peer_failed(2) == ValidationAck::NotReady, "a peer with no source has nothing to fail");
+	worker.applied({0}); worker.application_failed(0, "stale"); check(!worker.fenced(), "stale application reports change nothing");
+	check(!owner.worker.reserve_checkpoint(100), "one checkpoint or snapshot at a time");
+	if (auto checkpoint = worker.reserve_checkpoint(5)) {
+		check(throws([&] { worker.offer_application_chunk(*checkpoint, "image", true); }), "application chunks wait for the capture");
+		check(throws([&] { worker.attach_capture(*checkpoint, {70, 0, 1}); }) && throws([&] { worker.attach_capture(*checkpoint, {70, 1, 0}); }), "a capture names a boundary");
+		worker.attach_capture(*checkpoint, {70, 1, 1});
+		check(throws([&] { worker.offer_application_chunk(*checkpoint, "too long", true); }), "an application chunk stays within the reserved image");
+		check(worker.cancel_checkpoint(*checkpoint) == CancelResult::Canceled, "an idle checkpoint cancels");
+	} else { check(false, "a healthy worker reserves a checkpoint"); }
 	auto& w = owner.worker;
 	check(throws([&] { w.offer_snapshot_chunk(*id, 1, "data", true); }) && throws([&] { w.offer_snapshot_chunk(*id, 0, "", false); }) &&
 		throws([&] { w.offer_snapshot_chunk(*id, 0, "dat", true); }) && throws([&] { w.offer_snapshot_chunk(*id, 0, std::string(65537, 'x')); }),

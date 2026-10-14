@@ -90,8 +90,13 @@ struct Timing {
 	std::uint64_t snapshot_timeout = 60000;
 };
 
-struct VoteRequest { Term term; Index last_index; Term last_term; };
+// transfer: sent on TimeoutNow (Track C, D6); it bypasses the leader-contact guard.
+struct VoteRequest { Term term; Index last_index; Term last_term; bool transfer = false; };
 struct VoteResponse { Term term; bool granted; };
+// Pre-vote (Track C, D7): `term` is the term the candidate would campaign at; neither side
+// changes its term or ballot. A response carries the responder's own term.
+struct PreVoteRequest { Term term; Index last_index; Term last_term; };
+struct PreVoteResponse { Term term; Term request_term; bool granted; };
 struct AppendRequest {
 	Term term;
 	Token rpc;
@@ -124,7 +129,7 @@ struct AppendResponse {
 	Token read_probe;
 	std::optional<LogBoundary> compacted{};
 };
-using Message = std::variant<VoteRequest, VoteResponse, AppendRequest, AppendResponse, SnapshotResponse>;
+using Message = std::variant<VoteRequest, VoteResponse, AppendRequest, AppendResponse, SnapshotResponse, PreVoteRequest, PreVoteResponse>;
 
 struct Start {};
 // The host supplies absolute monotonic time and a fresh randomized election

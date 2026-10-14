@@ -146,12 +146,11 @@ public:
 		check_logs();
 	}
 
-	// Heals partitions, crashes, and clock skew. Without pre-vote (Track C, D7), a node
-	// with a stale log and a fast clock disrupts elections for as long as the skew lasts
-	// (seed 217 at 2,000 steps): its vote requests keep resetting slower voters' timers.
+	// Heals partitions and crashes; clocks keep their skew. Pre-vote (Track C, D7) keeps a
+	// node with a stale log and a fast clock from disrupting elections: before it, seed 217
+	// at 2,000 steps stayed leaderless while its vote requests reset slower voters' timers.
 	void heal() {
 		isolated_.clear();
-		for (auto& [id, n] : nodes_) { n.rate = 1.0; }
 		for (auto& [id, n] : nodes_) {
 			if (!n.up) { restart(n); }
 		}
@@ -328,7 +327,7 @@ private:
 			} else if (auto r = std::get_if<RoleChanged>(&a)) {
 				if (r->role == Role::Leader) { on_leader(n, r->term); }
 			} else if (std::holds_alternative<Fenced>(a)) {
-				fail("node " + std::to_string(n.id) + " fenced");
+				fail("node " + std::to_string(n.id) + " fenced: " + std::get<Fenced>(a).reason);
 			}
 		}
 	}

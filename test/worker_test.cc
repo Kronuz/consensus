@@ -468,6 +468,10 @@ void failures_and_multi_action_output() {
 		Worker worker(io, fixed, admission(), limits()); kronuz::journal::Identity identity{}; identity[0] = 'F';
 		worker.create(identity); while (!worker.ready()) { worker.run_one({100, 100}); }
 		worker.try_submit(Start{}); worker.try_submit(Tick{100, 100});
+		if (fixed.voters.size() > 1) {  // pre-vote (Track C, D7): one peer's grant starts the campaign
+			worker.take_actions();
+			worker.try_submit(Receive{2, PreVoteResponse{worker.term(), worker.term() + 1, true}});
+		}
 		check(worker.run_one({100, 100}) == TurnResult::Stored && worker.run_one({100, 100}) == TurnResult::Completed, "worker establishes candidate output through matching durable completion");
 		if (inject) {
 			io.fail_sync = true;
@@ -591,6 +595,7 @@ void preparation_preserves_protocol_timers() {
 		for (const auto& action : worker.take_actions()) {
 			if (auto batch = std::get_if<Committed>(&action)) { worker.applied({batch->entries.back().index}); }
 			if (auto send = std::get_if<Send>(&action)) {
+				if (auto pre = std::get_if<PreVoteRequest>(&send->message)) { responses.insert_or_assign(send->peer, Receive{send->peer, PreVoteResponse{pre->term - 1, pre->term, true}}); }
 				if (auto vote = std::get_if<VoteRequest>(&send->message)) { responses.insert_or_assign(send->peer, Receive{send->peer, VoteResponse{vote->term, true}}); }
 				if (auto append = std::get_if<AppendRequest>(&send->message)) {
 					++sends; auto matched = append->previous + append->entries.size();
@@ -628,6 +633,7 @@ void maintenance_preserves_protocol_timers() {
 		for (const auto& action : worker.take_actions()) {
 			if (auto batch = std::get_if<Committed>(&action)) { worker.applied({batch->entries.back().index}); }
 			if (auto send = std::get_if<Send>(&action)) {
+				if (auto pre = std::get_if<PreVoteRequest>(&send->message)) { responses.insert_or_assign(send->peer, Receive{send->peer, PreVoteResponse{pre->term - 1, pre->term, true}}); }
 				if (auto vote = std::get_if<VoteRequest>(&send->message)) { responses.insert_or_assign(send->peer, Receive{send->peer, VoteResponse{vote->term, true}}); }
 				if (auto append = std::get_if<AppendRequest>(&send->message)) {
 					++sends; auto matched = append->previous + append->entries.size();
@@ -869,6 +875,8 @@ void completion_channel_cancellation() {
 	auto chunk = encode_transfer(TransferKind::Chunk, envelope, transfer_chunk_body(90, 0, "data", true));
 	auto discarded = channel.receive(session, std::span<const char>(chunk.data(), chunk.size()));
 	check(discarded.result == TransferReceive::Accepted && discarded.consumed == chunk.size() && channel.outbound()->token == output_token, "canceling receiver consumes already-sent data without credit or mailbox reuse");
+	worker.run_one({1000, 100}); channel.run_one({1000, 100}); worker.take_actions();  // the expired timer sends pre-votes (D7)
+	worker.try_submit(Receive{2, PreVoteResponse{worker.term(), worker.term() + 1, true}});
 	check(worker.run_one({1000, 100}) == TurnResult::IOPending && worker.busy(), "held maintenance IO permits a fully funded election persistence request");
 	channel.session_closed(session); check(!channel.drained(), "disconnect retains canceling receiver through original IO");
 	check(pending->complete(std::move(original)), "disconnected receiver reaps original accepted creation"); kronuz::journal::drive_synchronously(*pending);
@@ -1139,6 +1147,7 @@ void snapshot_protocol_progress() {
 		for (const auto& action : worker.take_actions()) {
 			if (auto range = std::get_if<Committed>(&action)) { worker.applied({range->entries.back().index}); }
 			if (auto send = std::get_if<Send>(&action)) {
+				if (auto pre = std::get_if<PreVoteRequest>(&send->message)) { responses.insert_or_assign(send->peer, Receive{send->peer, PreVoteResponse{pre->term - 1, pre->term, true}}); }
 				if (auto vote = std::get_if<VoteRequest>(&send->message)) { responses.insert_or_assign(send->peer, Receive{send->peer, VoteResponse{vote->term, true}}); }
 				if (auto append = std::get_if<AppendRequest>(&send->message)) {
 					++sends; auto matched = append->previous + append->entries.size();
@@ -1362,7 +1371,11 @@ void snapshot_install_admission() {
 		SnapshotFixture fixture("install-admission-" + std::to_string(all_control_slots)); auto& worker = fixture.worker;
 		auto context = fixture.context("image"); context.descriptor.through = 2;
 		auto id = worker.reserve_snapshot(context); if (!id) { continue; } validate_incoming(fixture, *id, "image");
-		Event event = all_control_slots ? Event{Tick{100, 100}} : Event{Receive{2, AppendRequest{1, 39, 0, 0, 1, 0, {{1, 1, EntryKind::NoOp, ""}}}}};
+		if (all_control_slots) {  // the tick sends pre-votes; a grant then starts the campaign's persistence
+			for (unsigned turn = 0; turn < 100 && worker.try_submit(Tick{100, 100}) != SubmitResult::Accepted; ++turn) { fixture.pump(); }
+			worker.take_actions();
+		}
+		Event event = all_control_slots ? Event{Receive{2, PreVoteResponse{worker.term(), worker.term() + 1, true}}} : Event{Receive{2, AppendRequest{1, 39, 0, 0, 1, 0, {{1, 1, EntryKind::NoOp, ""}}}}};
 		for (unsigned turn = 0; turn < 100 && worker.try_submit(event) != SubmitResult::Accepted; ++turn) { fixture.pump(); }
 		check(worker.busy(), "installation admission fixture holds a real ordinary persistence continuation");
 		auto reservations = worker.accounting()->outstanding; auto before = worker.storage_frontier(); auto result = worker.request_install(*id);
@@ -1421,7 +1434,9 @@ void owned_snapshot_sources() {
 			for (const auto& action : worker.take_actions()) {
 				if (auto committed = std::get_if<Committed>(&action)) { worker.applied({committed->entries.back().index}); }
 				if (auto send = std::get_if<Send>(&action)) {
-					if (auto vote = std::get_if<VoteRequest>(&send->message); vote && send->peer == 3) { responses.insert_or_assign(3, Receive{3, VoteResponse{vote->term, true}}); }
+					if (auto pre = std::get_if<PreVoteRequest>(&send->message); pre && send->peer == 3) { responses.insert_or_assign(3, Receive{3, PreVoteResponse{pre->term - 1, pre->term, true}}); }
+					if (auto pre = std::get_if<PreVoteRequest>(&send->message); pre && send->peer == 3) { responses.insert_or_assign(3, Receive{3, PreVoteResponse{pre->term - 1, pre->term, true}}); }
+			if (auto vote = std::get_if<VoteRequest>(&send->message); vote && send->peer == 3) { responses.insert_or_assign(3, Receive{3, VoteResponse{vote->term, true}}); }
 					if (auto append = std::get_if<AppendRequest>(&send->message)) {
 						if (send->peer == 3) { auto matched = append->previous + append->entries.size(); responses.insert_or_assign(3, Receive{3, AppendResponse{append->term, append->rpc, true, matched, matched + 1, append->read_probe}}); }
 						else if (!append->previous && append->entries.empty()) { ++contacts; }
@@ -1640,6 +1655,7 @@ void legacy_source_export_rejection() {
 		if (std::holds_alternative<SnapshotNeeded>(action)) { ++needed; }
 		if (auto committed = std::get_if<Committed>(&action)) { worker.applied({committed->entries.back().index}); }
 		if (auto send = std::get_if<Send>(&action)) {
+			if (auto pre = std::get_if<PreVoteRequest>(&send->message); pre && send->peer == 3) { responses.insert_or_assign(3, Receive{3, PreVoteResponse{pre->term - 1, pre->term, true}}); }
 			if (auto vote = std::get_if<VoteRequest>(&send->message); vote && send->peer == 3) { responses.insert_or_assign(3, Receive{3, VoteResponse{vote->term, true}}); }
 			if (auto append = std::get_if<AppendRequest>(&send->message)) { auto matched = append->previous + append->entries.size(); responses.insert_or_assign(send->peer, Receive{send->peer, AppendResponse{append->term, append->rpc, send->peer == 3, send->peer == 3 ? matched : 0, send->peer == 3 ? matched + 1 : 1, append->read_probe}}); }
 		}

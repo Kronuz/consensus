@@ -18,7 +18,7 @@ inline std::string encode(const kronuz::consensus::Message &message,
 						  kronuz::consensus::Limits limits = {}) {
 	using namespace kronuz::consensus;
 	using kronuz::journal::put64;
-	std::string bytes("DTC1", 4);
+	std::string bytes("DTC2", 4);
 	const auto frame_bound = control_frame_bound(limits);
 	auto number = [&](std::uint64_t value) {
 		if (bytes.size() > frame_bound || 8 > frame_bound - bytes.size())
@@ -39,12 +39,23 @@ inline std::string encode(const kronuz::consensus::Message &message,
 				number(4);
 			else if constexpr (std::is_same_v<T, SnapshotResponse>)
 				number(5);
+			else if constexpr (std::is_same_v<T, PreVoteRequest>)
+				number(6);
+			else if constexpr (std::is_same_v<T, PreVoteResponse>)
+				number(7);
 			else
 				static_assert(!sizeof(T), "missing control wire tag");
 			number(value.term);
 			if constexpr (std::is_same_v<T, VoteRequest>) {
 				number(value.last_index);
 				number(value.last_term);
+				number(value.transfer);
+			} else if constexpr (std::is_same_v<T, PreVoteRequest>) {
+				number(value.last_index);
+				number(value.last_term);
+			} else if constexpr (std::is_same_v<T, PreVoteResponse>) {
+				number(value.request_term);
+				number(value.granted);
 			} else if constexpr (std::is_same_v<T, VoteResponse>) {
 				number(value.granted);
 			} else if constexpr (std::is_same_v<T, AppendRequest>) {
@@ -100,7 +111,7 @@ inline kronuz::consensus::Message decode(std::string_view bytes, kronuz::consens
 	using namespace kronuz::consensus;
 	using kronuz::journal::Corruption;
 	using kronuz::journal::get64;
-	if (bytes.size() > control_frame_bound(limits) || !bytes.starts_with("DTC1"))
+	if (bytes.size() > control_frame_bound(limits) || !bytes.starts_with("DTC2"))
 		throw Corruption("invalid control frame");
 	bytes.remove_prefix(4);
 	auto boolean = [&] {
@@ -116,7 +127,18 @@ inline kronuz::consensus::Message decode(std::string_view bytes, kronuz::consens
 	case 1: {
 		auto index = get64(bytes);
 		auto last_term = get64(bytes);
-		result = VoteRequest{term, index, last_term};
+		result = VoteRequest{term, index, last_term, boolean()};
+		break;
+	}
+	case 6: {
+		auto index = get64(bytes);
+		auto last_term = get64(bytes);
+		result = PreVoteRequest{term, index, last_term};
+		break;
+	}
+	case 7: {
+		auto request_term = get64(bytes);
+		result = PreVoteResponse{term, request_term, boolean()};
 		break;
 	}
 	case 2:

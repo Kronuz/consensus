@@ -18,7 +18,7 @@ compile=$(ninja -C "$build" -t commands consensus_simulation_test | grep -- '-c 
 # D12) carry a commit without entries; it joins this list with them.
 mutants=(
 	$'sends before durability\tif (batch.hard || batch.log) { persist(std::move(batch), std::move(deferred), output); }\tif (batch.hard || batch.log) { for (auto& a : deferred) { output.push_back(a); } persist(std::move(batch), {}, output); }'
-	$'vote without the log check\t(request.last_term > log_term(last_index()) || (request.last_term == log_term(last_index()) && request.last_index >= last_index()));\ttrue;'
+	$'votes and pre-votes without the log check\treturn term > log_term(last_index()) || (term == log_term(last_index()) && index >= last_index());\treturn true;'
 	$'repair with a delivery outstanding\tif (!started_ || busy() || delivered_through_) { reject(RejectReason::Busy); return; }\tif (!started_ || busy()) { reject(RejectReason::Busy); return; }'
 	$'commit of an earlier term by counting\tif (candidate <= durable_.commit_index || log_term(candidate) != hard_.term) { return; }\tif (candidate <= durable_.commit_index) { return; }'
 )

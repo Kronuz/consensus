@@ -57,6 +57,24 @@ template <class T> const T* find(const Actions& actions) {
 	return nullptr;
 }
 
+// Ticks a multi-voter core past its election timeout and grants its pre-votes (Track C,
+// D7) from enough peers to start the campaign; returns the actions that hold the ballot.
+Actions campaign(Core& core, Tick tick) {
+	auto actions = core.step(tick);
+	if (find<Persist>(actions)) { return actions; }  // a single voter campaigns at once
+	std::size_t granted = 1;
+	const std::size_t quorum = core.configuration().voters.size() / 2 + 1;
+	for (const auto& action : actions) {
+		auto send = std::get_if<Send>(&action);
+		auto request = send ? std::get_if<PreVoteRequest>(&send->message) : nullptr;
+		if (!request || granted >= quorum) { continue; }
+		auto reply = core.step(Receive{send->peer, PreVoteResponse{core.term(), request->term, true}});
+		++granted;
+		if (granted >= quorum) { return reply; }
+	}
+	return actions;
+}
+
 struct Host {
 	NodeId id;
 	Limits limits;
@@ -155,7 +173,7 @@ struct Network {
 
 void persistence_barriers() {
 	Core core(config(1), empty(1)); core.step(Start{});
-	auto election = core.step(Tick{100, 100}); auto persist = find<Persist>(election);
+	auto election = campaign(core, Tick{100, 100}); auto persist = find<Persist>(election);
 	check(persist && election.size() == 1 && !find<Send>(election), "term and self-vote persistence precedes election requests");
 	if (!persist) { return; }
 	auto token = persist->token;
@@ -186,18 +204,18 @@ void persistence_barriers() {
 
 void delayed_completions_do_not_campaign() {
 	Core candidate(config(1), empty(1)); candidate.step(Start{});
-	auto election = candidate.step(Tick{100, 100}); auto ballot = find<Persist>(election);
+	auto election = campaign(candidate, Tick{100, 100}); auto ballot = find<Persist>(election);
 	if (!ballot) { check(false, "delayed candidate has an election ballot"); return; }
 	candidate.step(Tick{1000, 100}); auto completed = candidate.step(Persisted{ballot->token});
 	check(candidate.term() == 1 && !candidate.busy() && !find<Persist>(completed) && find<Send>(completed), "delayed candidate completion releases votes without another campaign");
-	auto next = candidate.step(Tick{1000, 100});
+	auto next = campaign(candidate, Tick{1000, 100});  // the tick starts a pre-vote; its quorum, the campaign
 	check(find<Persist>(next) && candidate.term() == 2, "separately admitted tick at the same time may start the next campaign");
 	Core follower(config(2), empty(2)); follower.step(Start{});
 	auto voted = follower.step(Receive{1, VoteRequest{3, 0, 0}}); auto vote = find<Persist>(voted);
 	if (!vote) { check(false, "delayed follower has a durable vote transition"); return; }
 	follower.step(Tick{1000, 100}); auto response = follower.step(Persisted{vote->token});
 	check(follower.term() == 3 && follower.role() == Role::Follower && !find<Persist>(response) && find<Send>(response), "delayed follower completion cannot opportunistically campaign");
-	check(find<Persist>(follower.step(Tick{1000, 100})) && follower.term() == 4, "next admitted tick campaigns after delayed follower persistence");
+	check(find<Persist>(campaign(follower, Tick{1000, 100})) && follower.term() == 4, "next admitted tick campaigns after delayed follower persistence");
 	Core single(config(1, 1), empty(1, 1)); single.step(Start{});
 	auto actions = single.step(Tick{100, 100}); unsigned completions = 0;
 	while (auto persist = find<Persist>(actions)) {
@@ -208,10 +226,51 @@ void delayed_completions_do_not_campaign() {
 	single.step(Applied{1});
 	check(find<ReadReady>(single.step(Read{99})), "application delivery and fresh single-voter reads still complete immediately");
 	Core leader(config(1), empty(1)); leader.step(Start{});
-	auto initial = leader.step(Tick{100, 100}); leader.step(Persisted{find<Persist>(initial)->token});
+	auto initial = campaign(leader, Tick{100, 100}); leader.step(Persisted{find<Persist>(initial)->token});
 	auto elected = leader.step(Receive{2, VoteResponse{1, true}}); auto noop = find<Persist>(elected);
-	leader.step(Tick{1000, 100}); auto replication = leader.step(Persisted{noop->token});
+	leader.step(Tick{250, 100}); auto replication = leader.step(Persisted{noop->token});  // slow, within CheckQuorum's window
 	check(find<Send>(replication) && leader.role() == Role::Leader, "leader replication still drives immediately after slow no-op persistence");
+}
+
+// Track C, D7: pre-vote, the leader-contact guard, and CheckQuorum.
+void prevote_guard_checkquorum() {
+	// A pre-vote request never changes the receiver's term or ballot.
+	Core follower(config(2), empty(2)); follower.step(Start{});
+	auto answer = follower.step(Receive{1, PreVoteRequest{5, 0, 0}});
+	auto reply = find<Send>(answer);
+	auto pre = reply ? std::get_if<PreVoteResponse>(&reply->message) : nullptr;
+	check(pre && pre->granted && pre->request_term == 5 && follower.term() == 0 && !follower.durable_hard_state().voted_for && !find<Persist>(answer),
+		"a pre-vote is granted without changing the receiver's term or ballot");
+	// A refusal that carries a higher term updates the pre-candidate's term.
+	Core pre_candidate(config(1), empty(1)); pre_candidate.step(Start{});
+	auto asked = pre_candidate.step(Tick{100, 100});
+	check(!find<Persist>(asked) && pre_candidate.term() == 0, "an expired timer sends pre-votes, not a campaign");
+	auto refused = pre_candidate.step(Receive{2, PreVoteResponse{7, 1, false}});
+	check(pre_candidate.term() == 7 && find<Persist>(refused), "a refusal with a higher term updates the pre-candidate's term");
+	// A pre-vote whose candidate's log is behind is refused, and never starts a campaign.
+	RecoveredState ahead = empty(2); ahead.hard = HardState{2, std::nullopt, 0}; ahead.entries = {{1, 2, EntryKind::NoOp, {}}};
+	Core current(config(2), ahead); current.step(Start{});
+	auto stale_actions = current.step(Receive{1, PreVoteRequest{3, 0, 0}});
+	auto stale = find<Send>(stale_actions);
+	auto stale_reply = stale ? std::get_if<PreVoteResponse>(&stale->message) : nullptr;
+	check(stale_reply && !stale_reply->granted && current.term() == 2, "a pre-vote from a stale log is refused");
+	// The guard: a follower that heard from its leader within election_min ignores a vote
+	// request, unless it comes from a leadership transfer.
+	Network cluster; cluster.start(); cluster.elect();
+	auto& voter = cluster.host(2);
+	const Term term = voter.core->term();
+	auto ignored = voter.core->step(Receive{3, VoteRequest{term + 1, voter.core->last_index(), voter.core->term()}});
+	check(ignored.empty() && voter.core->term() == term, "a vote request within election_min of the leader's contact is ignored");
+	auto transfer = voter.core->step(Receive{3, VoteRequest{term + 1, voter.core->last_index(), voter.core->term(), true}});
+	check(voter.core->term() == term + 1 && find<Persist>(transfer), "a transfer's vote request passes the guard");
+	// CheckQuorum: a leader whose voters stop answering steps down within election_max.
+	Network quiet; quiet.start(); quiet.elect();
+	auto& leader = quiet.host(1);
+	quiet.isolated = {2, 3};
+	for (std::uint64_t now = quiet.now + 10; now <= quiet.now + 400 && leader.core->role() == Role::Leader; now += 10) {
+		leader.core->step(Tick{now, 150});
+	}
+	check(leader.core->role() == Role::Follower, "a leader without answers from a quorum steps down");
 }
 
 void replication_and_restart() {
@@ -227,7 +286,7 @@ void replication_and_restart() {
 
 void affirmative_majority_and_inheritance() {
 	Core candidate(config(1, 5), empty(1, 5)); candidate.step(Start{});
-	auto initial = candidate.step(Tick{100, 100}); candidate.step(Persisted{find<Persist>(initial)->token});
+	auto initial = campaign(candidate, Tick{100, 100}); candidate.step(Persisted{find<Persist>(initial)->token});
 	candidate.step(Receive{2, VoteResponse{1, true}}); candidate.step(Receive{3, VoteResponse{1, false}});
 	check(candidate.role() == Role::Candidate, "two affirmative voters and denial cannot elect in five-voter configuration");
 	candidate.step(Receive{2, VoteResponse{1, true}});
@@ -390,14 +449,14 @@ void bounds_and_semantic_recovery() {
 	RecoveredState exhausted = empty(1); exhausted.hard = HardState{1, 1, 4};
 	for (Index index = 1; index <= 4; ++index) { exhausted.entries.push_back(Entry{index, 1, EntryKind::NoOp, {}}); }
 	Core full_core(config(1), std::move(exhausted), limits); full_core.step(Start{});
-	auto election = full_core.step(Tick{100, 100}); full_core.step(Persisted{find<Persist>(election)->token});
+	auto election = campaign(full_core, Tick{100, 100}); full_core.step(Persisted{find<Persist>(election)->token});
 	auto unable_to_lead = full_core.step(Receive{2, VoteResponse{2, true}});
 	check(full_core.role() == Role::Follower && full_core.last_index() == 4 && !find<Persist>(unable_to_lead),
 		"exhausted control reserve cannot publish leadership or append beyond log bound");
 
 	RecoveredState last_term = empty(1); last_term.hard = HardState{std::numeric_limits<Term>::max() - 1, std::nullopt, 0};
 	Core term_core(config(1), std::move(last_term)); term_core.step(Start{});
-	auto last_election = term_core.step(Tick{100, 100}); term_core.step(Persisted{find<Persist>(last_election)->token});
+	auto last_election = campaign(term_core, Tick{100, 100}); term_core.step(Persisted{find<Persist>(last_election)->token});
 	auto last_noop = term_core.step(Receive{2, VoteResponse{std::numeric_limits<Term>::max(), true}});
 	check(term_core.role() == Role::Leader && find<Persist>(last_noop), "final representable term may elect and append its no-op");
 	term_core.step(Persisted{find<Persist>(last_noop)->token});
@@ -446,7 +505,7 @@ void compacted_index_exhaustion() {
 	for (Index base : {std::numeric_limits<Index>::max() - 1, std::numeric_limits<Index>::max() - 2}) {
 		auto state = empty(1, 1); state.base_index = state.applied_index = state.hard.commit_index = base;
 		state.base_term = state.hard.term = 1;
-		Core core(config(1, 1), state); core.step(Start{}); auto election = core.step(Tick{100, 100});
+		Core core(config(1, 1), state); core.step(Start{}); auto election = campaign(core, Tick{100, 100});
 		auto vote = find<Persist>(election); check(vote, "near-exhausted voter durably records its ballot"); if (!vote) { continue; }
 		auto elected = core.step(Persisted{vote->token});
 		if (base == std::numeric_limits<Index>::max() - 1) {
@@ -471,9 +530,12 @@ const AppendRequest* append_to(const Actions& actions, NodeId peer) {
 	}
 	return nullptr;
 }
+// Snapshot and retry tests run a leader for long stretches with one peer answering; a long
+// election_max keeps CheckQuorum (Track C, D7) out of what they measure.
+Timing patient() { Timing t; t.election_max = 1'000'000'000; return t; }
 Actions elect_checkpoint_fixture(Core& core) {
 	core.step(Start{}); if (core.committed() > core.applied()) { core.step(Applied{core.committed()}); }
-	auto election = core.step(Tick{100, 100}); auto vote = find<Persist>(election);
+	auto election = campaign(core, Tick{100, 100}); auto vote = find<Persist>(election);
 	if (!vote) { throw std::runtime_error("fixture election ballot"); }
 	core.step(Persisted{vote->token}); auto majority = core.step(Receive{2, VoteResponse{core.term(), true}});
 	auto noop = find<Persist>(majority); if (!noop) { throw std::runtime_error("fixture no-op"); }
@@ -503,7 +565,7 @@ void compacted_replication() {
 	check(find<ReadReady>(ready), "fresh verified Append establishes the pending read quorum");
 
 	state.base_index = state.applied_index = 2; state.base_term = 1; state.entries.erase(state.entries.begin(), state.entries.begin() + 2);
-	Core compacted(config(1), state); auto election = elect_checkpoint_fixture(compacted); auto append = append_to(election, 2);
+	Core compacted(config(1), state, {}, patient()); auto election = elect_checkpoint_fixture(compacted); auto append = append_to(election, 2);
 	if (!append) { throw std::runtime_error("compacted fixture flight"); }
 	auto needed = compacted.step(Receive{2, AppendResponse{2, append->rpc, false, 0, 1, 0}});
 	check(find<SnapshotNeeded>(needed), "leader requests snapshot when a peer needs compacted history");
@@ -839,7 +901,9 @@ void repair_at_or_below_commit() {
 		cluster.consume(f, std::move(at_base));
 		check(v.applying.has_value(), "the redelivery is outstanding");
 		const Term t = std::max(v.core->term(), cluster.host(other).core->term()) + 1;
-		cluster.consume(f, v.core->step(Receive{other, VoteRequest{t, cluster.host(other).core->last_index(), cluster.host(other).core->term()}}));
+		// A transfer's request: the voter heard from its leader recently, so the guard (D7)
+		// would ignore any other.
+		cluster.consume(f, v.core->step(Receive{other, VoteRequest{t, cluster.host(other).core->last_index(), cluster.host(other).core->term(), true}}));
 		if (v.pending) { cluster.complete_disk(f); }
 		const auto& hard = v.core->durable_hard_state();
 		check(hard.term == t && hard.voted_for == other, "a voter votes while its redelivery is outstanding");
@@ -1047,7 +1111,7 @@ void portable_snapshot_installation() {
 			check(committed && committed->first == 4 && committed->entries.size() == 1 && committed->entries.front() == next, "resumed application receives the retained or newly appended suffix payload");
 			core.step(Applied{4}); check(core.committed() == 4 && core.applied() == 4 && core.base_index() == 3, "resumed follower durably commits and applies beyond the installed image");
 		}
-		auto election = core.step(Tick{1200, 100}); check(find<Persist>(election), "a separately admitted expired Tick may campaign after installation activation");
+		auto election = campaign(core, Tick{1200, 100}); check(find<Persist>(election), "a separately admitted expired Tick may campaign after installation activation");
 	} } }
 	for (bool higher : {false, true}) {
 		Core core(config(1), fixture()); core.step(Start{}); auto prepared = request(); prepared.boundary = {2, 1}; prepared.leader_term += higher;
@@ -1076,7 +1140,7 @@ void portable_snapshot_installation() {
 	{
 		Core unstarted(config(1), fixture()); auto rejected = unstarted.step(request());
 		check(find<InstallRejected>(rejected) && find<InstallRejected>(rejected)->reason == InstallRejectReason::Busy && !unstarted.busy(), "unstarted Core does not admit installation");
-		Core core(config(1), fixture()); core.step(Start{}); core.step(Tick{100, 100}); auto term = core.term();
+		Core core(config(1), fixture()); core.step(Start{}); campaign(core, Tick{100, 100}); auto term = core.term();
 		auto prepared = request(); prepared.leader_term = 9; rejected = core.step(prepared);
 		check(find<InstallRejected>(rejected) && find<InstallRejected>(rejected)->reason == InstallRejectReason::Busy && core.busy() && core.term() == term, "ordinary pending persistence rejects installation without observing another term");
 	}
@@ -1111,7 +1175,7 @@ void portable_snapshot_installation() {
 
 void snapshot_timeout_retries() {
 	auto state = empty(1); state.hard = HardState{1, 1, 2}; state.base_index = state.applied_index = 2; state.base_term = 1; state.entries = {{3, 1, EntryKind::Command, "tail"}};
-	Core core(config(1), state); auto election = elect_checkpoint_fixture(core); auto first = append_to(election, 2); if (!first) { throw std::runtime_error("snapshot retry fixture flight"); }
+	Core core(config(1), state, {}, patient()); auto election = elect_checkpoint_fixture(core); auto first = append_to(election, 2); if (!first) { throw std::runtime_error("snapshot retry fixture flight"); }
 	auto needed = core.step(Receive{2, AppendResponse{2, first->rpc, false, 0, 1, 0}}); check(find<SnapshotNeeded>(needed), "snapshot timeout fixture requests missing history");
 	core.step(Tick{60100, 100}); auto retry = core.step(Tick{60140, 100}); auto probe = append_to(retry, 2);
 	check(probe && probe->previous == 2, "expired snapshot request retries through a fresh ordinary prefix probe");
@@ -1123,7 +1187,7 @@ struct SnapshotSenderFixture {
 		auto result = empty(1); result.hard = {1, 1, 2}; result.base_index = result.applied_index = 2; result.base_term = 1; result.entries = {{3, 1, EntryKind::Command, "tail"}}; return result;
 	}
 	Core core; SnapshotKey key{}; Actions requested, election;
-	explicit SnapshotSenderFixture(Timing timing = {}) : core(config(1), state(), {}, timing) {
+	explicit SnapshotSenderFixture(Timing timing = patient()) : core(config(1), state(), {}, timing) {
 		election = elect_checkpoint_fixture(core); auto first = append_to(election, 2); if (!first) { throw std::runtime_error("sender fixture initial data flight"); }
 		requested = core.step(Receive{2, AppendResponse{2, first->rpc, false, 0, 1, 0}}); auto needed = find<SnapshotNeeded>(requested); if (!needed) { throw std::runtime_error("sender fixture snapshot request"); } key = needed->key;
 	}
@@ -1161,7 +1225,7 @@ void snapshot_sender_correlation() {
 	if (probe) { auto through = probe->previous + probe->entries.size(); auto result = reader.step(Receive{2, AppendResponse{2, probe->rpc, true, through, through + 1, probe->read_probe}}); check(find<ReadReady>(result), "fresh ordinary prefix verification can complete the pending quorum read"); }
 }
 void snapshot_sender_keepalive_pacing() {
-	Timing timing; timing.rpc_timeout = 10; SnapshotSenderFixture fixture(timing); fixture.commit_healthy_peer(); auto& core = fixture.core; auto request = append_to(fixture.requested, 2);
+	Timing timing = patient(); timing.rpc_timeout = 10; SnapshotSenderFixture fixture(timing); fixture.commit_healthy_peer(); auto& core = fixture.core; auto request = append_to(fixture.requested, 2);
 	check(request && request->previous == 0 && request->previous_term == 0 && request->commit == 0 && request->read_probe == 0 && request->entries.empty(), "snapshot contact uses an empty independent genesis keepalive");
 	if (!request) { return; } auto rpc = request->rpc;
 	core.step(Receive{2, AppendResponse{2, rpc, true, 4, 5, 0}});
@@ -1176,7 +1240,7 @@ void snapshot_sender_keepalive_pacing() {
 	for (std::uint64_t now = 140; now <= 400; now += 20) { auto actions = core.step(Tick{now, 100}); auto keepalive = append_to(actions, 2); check(keepalive && keepalive->previous == 0 && !keepalive->read_probe && !find<SnapshotNeeded>(actions), "source and transfer delays keep periodic contact even when replies are dropped"); }
 }
 void snapshot_sender_retries_and_retention() {
-	Timing timing; timing.snapshot_timeout = 300;
+	Timing timing = patient(); timing.snapshot_timeout = 300;
 	for (SnapshotReply result : {SnapshotReply::CaughtUp, SnapshotReply::Rejected}) {
 		SnapshotSenderFixture fixture(timing); fixture.ready(); auto released = fixture.reply(result);
 		check(find<SnapshotReleased>(released) && !find<Persist>(released) && fixture.core.committed() == 2, "caught-up or rejected snapshots release without fabricated progress");
@@ -1265,7 +1329,7 @@ void snapshot_sender_restart_clock_and_admission() {
 void snapshot_sender_maximum_fanout() {
 	auto cfg = config(1); cfg.voters.clear(); for (NodeId peer = 1; peer <= 31; ++peer) { cfg.voters.push_back(peer); }
 	auto state = SnapshotSenderFixture::state(); state.configuration = cfg; Limits capacity; capacity.voters = 31;
-	Core core(cfg, state, capacity); core.step(Start{}); auto campaign = core.step(Tick{100, 100}); auto ballot = find<Persist>(campaign); if (!ballot) { throw std::runtime_error("fanout ballot"); } core.step(Persisted{ballot->token});
+	Core core(cfg, state, capacity); core.step(Start{}); auto ballot_actions = campaign(core, Tick{100, 100}); auto ballot = find<Persist>(ballot_actions); if (!ballot) { throw std::runtime_error("fanout ballot"); } core.step(Persisted{ballot->token});
 	Actions traffic;
 	for (NodeId voter = 2; voter <= 16; ++voter) { auto actions = core.step(Receive{voter, VoteResponse{2, true}}); if (auto noop = find<Persist>(actions)) { traffic = core.step(Persisted{noop->token}); } }
 	std::map<NodeId, SnapshotKey> keys;
@@ -1315,7 +1379,7 @@ void terminal_retirement() {
 }
 
 int main() {
-	try { terminal_retirement(); snapshot_sender_maximum_fanout(); snapshot_sender_lost_ack_and_terms(); snapshot_sender_receiver_contact(); snapshot_sender_restart_clock_and_admission(); snapshot_sender_correlation(); snapshot_sender_keepalive_pacing(); snapshot_sender_retries_and_retention(); snapshot_timeout_retries(); portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); repair_at_or_below_commit(); }
+	try { terminal_retirement(); snapshot_sender_maximum_fanout(); snapshot_sender_lost_ack_and_terms(); snapshot_sender_receiver_contact(); snapshot_sender_restart_clock_and_admission(); snapshot_sender_correlation(); snapshot_sender_keepalive_pacing(); snapshot_sender_retries_and_retention(); snapshot_timeout_retries(); portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); repair_at_or_below_commit(); prevote_guard_checkquorum(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " consensus checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

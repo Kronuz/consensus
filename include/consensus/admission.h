@@ -76,6 +76,11 @@ inline EventAdmissionPlan plan_event(const Event& event, bool busy, Limits limit
 						payload += entry.payload.size(); command |= entry.kind == EntryKind::Command;
 					}
 					if (!busy) { add(command ? AdmissionClass::Normal : AdmissionClass::Control, storage_batch_size(true, true, message.entries.size(), payload)); }
+				} else if constexpr (std::is_same_v<M, PreVoteResponse>) {
+					// A pre-vote quorum starts the campaign: ballot, no-op, and commit continuation.
+					if (!busy) { add(AdmissionClass::Control, hard); add(AdmissionClass::Control, noop); add(AdmissionClass::Control, hard); }
+				} else if constexpr (std::is_same_v<M, PreVoteRequest>) {
+					// Answered without persistence.
 				} else if constexpr (std::is_same_v<M, VoteResponse>) {
 					if (!busy) { add(AdmissionClass::Control, noop); add(AdmissionClass::Control, hard); }
 				} else if constexpr (std::is_same_v<M, VoteRequest> || std::is_same_v<M, AppendResponse> || std::is_same_v<M, SnapshotResponse>) {

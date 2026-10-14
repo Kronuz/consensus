@@ -239,7 +239,7 @@ private:
 	void follower(NodeId leader, Actions& deferred) {
 		if (role_ != Role::Follower || leader_ != leader) { deferred.emplace_back(RoleChanged{Role::Follower, hard_.term, leader}); }
 		release_snapshots(SnapshotReleaseReason::LeadershipLost, deferred);
-		role_ = Role::Follower; leader_ = leader; peers_.clear(); grants_.clear();
+		role_ = Role::Follower; leader_ = leader; peers_.clear(); grants_.clear(); prevote_.reset(); prevotes_.clear(); answered_.clear();
 		for (const auto& read : reads_) { deferred.emplace_back(Reject{read.request, RejectReason::NotLeader}); }
 		reads_.clear(); reset_election();
 	}
@@ -301,7 +301,7 @@ private:
 		auto next_hard = durable_;
 		if (request.leader_term > next_hard.term) { next_hard.term = request.leader_term; next_hard.voted_for.reset(); }
 		if (request.boundary.index <= durable_.commit_index) {
-			Actions deferred; hard_ = next_hard; follower(request.authenticated_peer, deferred);
+			Actions deferred; hard_ = next_hard; follower(request.authenticated_peer, deferred); leader_contact_ = now_;
 			deferred.emplace_back(InstallRejected{request.request, request.prepared, InstallRejectReason::CaughtUp});
 			if (hard_ != durable_) { persist(StorageBatch{hard_, std::nullopt}, std::move(deferred), output); }
 			else { output = std::move(deferred); }
@@ -317,7 +317,7 @@ private:
 			for (std::size_t i = first; i < entries_.size(); ++i) { state.entries.push_back(entries_[i]); }
 		}
 		}
-		Actions deferred; hard_ = next_hard; follower(request.authenticated_peer, deferred);
+		Actions deferred; hard_ = next_hard; follower(request.authenticated_peer, deferred); leader_contact_ = now_;
 		auto id = token(); install_.emplace(PendingInstall{id, request.prepared, request.request, request.boundary, next_hard, std::move(deferred), retain});
 		if (capture_mode_) { captured_ = FrozenCheckpoint(*this, id, state, retain ? entries_.size() - static_cast<std::size_t>(request.boundary.index - base_index_) : 0); }
 		output.emplace_back(PersistInstall{id, request.prepared, std::move(state)});
@@ -442,6 +442,15 @@ private:
 	void handle(Receive receive, Actions& output) {
 		if (!started_ || busy() || receive.authenticated_peer == configuration_.local || !member(receive.authenticated_peer)) { return; }
 		if (!std::visit([&](const auto& message) { return valid(message); }, receive.message)) { return; }
+		// A pre-vote request names the term its sender would campaign at: answered without
+		// changing this node's term or ballot (Track C, D7).
+		if (auto request = std::get_if<PreVoteRequest>(&receive.message)) {
+			bool grant = request->term > hard_.term && !heard_from_leader() && log_up_to_date(request->last_index, request->last_term);
+			output.emplace_back(Send{receive.authenticated_peer, PreVoteResponse{hard_.term, request->term, grant}}); return;
+		}
+		// The leader-contact guard: a voter that heard from a current leader within
+		// election_min ignores a vote request unless it comes from a leadership transfer.
+		if (auto request = std::get_if<VoteRequest>(&receive.message); request && !request->transfer && heard_from_leader()) { return; }
 		auto incoming_term = std::visit([](const auto& message) { return message.term; }, receive.message);
 		bool changed = incoming_term > hard_.term;
 		Actions deferred;
@@ -456,8 +465,15 @@ private:
 			output = std::move(deferred); advance_commit(output);
 			if (!pending_) { deliver(output); ready_reads(output); }
 		}
+		if (prevote_ && prevotes_.size() >= quorum() && role_ != Role::Leader && !busy()) { campaign(output); }
 	}
 	bool valid(const VoteRequest& request) const { return request.term > 0 && request.last_index < maximum && request.last_term <= request.term && ((request.last_index == 0) == (request.last_term == 0)); }
+	bool valid(const PreVoteRequest& request) const { return valid(VoteRequest{request.term, request.last_index, request.last_term}); }
+	bool valid(const PreVoteResponse& response) const { return response.request_term > 0; }
+	bool log_up_to_date(Index index, Term term) const {
+		return term > log_term(last_index()) || (term == log_term(last_index()) && index >= last_index());
+	}
+	bool heard_from_leader() const { return role_ == Role::Follower && leader_ != 0 && now_ - leader_contact_ < timing_.election_min; }
 	bool valid(const VoteResponse&) const { return true; }
 	bool valid(const SnapshotResponse& response) const { return valid_snapshot_response(response); }
 	bool valid(const AppendResponse& response) const {
@@ -478,10 +494,14 @@ private:
 		return true;
 	}
 	void receive_message(NodeId source, VoteRequest request, StorageBatch&, Actions& output) {
-		bool grant = request.term == hard_.term && (!hard_.voted_for || *hard_.voted_for == source) &&
-			(request.last_term > log_term(last_index()) || (request.last_term == log_term(last_index()) && request.last_index >= last_index()));
+		bool grant = request.term == hard_.term && (!hard_.voted_for || *hard_.voted_for == source) && log_up_to_date(request.last_index, request.last_term);
 		if (grant) { hard_.voted_for = source; reset_election(); }
 		output.emplace_back(Send{source, VoteResponse{hard_.term, grant}});
+	}
+	void receive_message(NodeId, PreVoteRequest, StorageBatch&, Actions&) {}  // answered in handle(Receive)
+	void receive_message(NodeId source, PreVoteResponse response, StorageBatch&, Actions& output) {
+		if (!prevote_ || response.request_term != *prevote_ || !response.granted || role_ == Role::Leader) { return; }
+		prevotes_.insert(source);  // handle(Receive) campaigns once the quorum is in and nothing persists
 	}
 	void receive_message(NodeId source, VoteResponse response, StorageBatch&, Actions& output) {
 		if (response.term != hard_.term || role_ != Role::Candidate || !response.granted) { return; }
@@ -492,7 +512,7 @@ private:
 		if (request.term < hard_.term) {
 			output.emplace_back(Send{source, AppendResponse{hard_.term, request.rpc, false, 0, last_index() + 1, request.read_probe}}); return;
 		}
-		follower(source, output);
+		follower(source, output); leader_contact_ = now_;
 		if (base_index_ && (request.previous < base_index_ || (request.previous == base_index_ && request.previous_term != base_term_))) {
 			output.emplace_back(Send{source, AppendResponse{hard_.term, request.rpc, false, 0, base_index_ + 1, request.read_probe, LogBoundary{base_index_, base_term_}}}); return;
 		}
@@ -543,6 +563,7 @@ private:
 	}
 	void receive_message(NodeId source, AppendResponse response, StorageBatch&, Actions& output) {
 		if (role_ != Role::Leader || response.term != hard_.term) { return; }
+		answered_[source] = now_;
 		auto& peer = peers_.at(source);
 		if (!peer.flight || peer.flight->rpc != response.rpc) { return; }
 		auto flight = *peer.flight;
@@ -582,6 +603,7 @@ private:
 	}
 	void receive_message(NodeId source, SnapshotResponse response, StorageBatch&, Actions& output) {
 		if (role_ != Role::Leader || response.term != hard_.term || response.key.leader_term != durable_.term) { return; }
+		answered_[source] = now_;
 		auto& peer = peers_.at(source);
 		if (!peer.snapshot || peer.snapshot->phase != SnapshotPhase::Sending || peer.snapshot->key != response.key) { return; }
 		if (response.result == SnapshotReply::Installed) {
@@ -599,14 +621,20 @@ private:
 			// Campaigns require a separately admitted Tick. Slow persistence
 			// must not start another election from its completion callback.
 			if (!allow_campaign || now_ < election_deadline_ || hard_.term == maximum) { return; }
-			++hard_.term; hard_.voted_for = configuration_.local;
-			role_ = Role::Candidate; leader_ = 0; grants_ = {configuration_.local}; reset_election();
-			Actions deferred; deferred.emplace_back(RoleChanged{role_, hard_.term, 0});
+			if (quorum() == 1) { campaign(output); return; }
+			// Pre-vote first (Track C, D7): only a quorum of grants starts a campaign, so a
+			// node that cannot win never raises the group's term.
+			prevote_ = hard_.term + 1; prevotes_ = {configuration_.local}; reset_election();
 			for (NodeId voter : configuration_.voters) {
-				if (voter != configuration_.local) { deferred.emplace_back(Send{voter, VoteRequest{hard_.term, last_index(), log_term(last_index())}}); }
+				if (voter != configuration_.local) { output.emplace_back(Send{voter, PreVoteRequest{*prevote_, last_index(), log_term(last_index())}}); }
 			}
-			persist(StorageBatch{hard_, std::nullopt}, std::move(deferred), output, quorum() == 1); return;
+			return;
 		}
+		// CheckQuorum (Track C, D7): a leader whose voters have not answered within an
+		// election timeout steps down.
+		std::size_t answering = 1;
+		for (const auto& [id, at] : answered_) { answering += now_ - at < timing_.election_max; }
+		if (answering < quorum()) { follower(0, output); return; }
 		bool heartbeat = now_ >= heartbeat_deadline_;
 		for (auto& [id, peer] : peers_) {
 			if (peer.snapshot && peer.snapshot->phase == SnapshotPhase::AwaitSource && peer.snapshot->key.boundary != LogBoundary{base_index_, base_term_}) { release_snapshot(id, peer, SnapshotReleaseReason::Stale, output); }
@@ -619,13 +647,24 @@ private:
 		}
 		if (heartbeat) { heartbeat_deadline_ = deadline(timing_.heartbeat); }
 	}
+	void campaign(Actions& output) {
+		++hard_.term; hard_.voted_for = configuration_.local; prevote_.reset(); prevotes_.clear();
+		role_ = Role::Candidate; leader_ = 0; grants_ = {configuration_.local}; reset_election();
+		Actions deferred; deferred.emplace_back(RoleChanged{role_, hard_.term, 0});
+		for (NodeId voter : configuration_.voters) {
+			if (voter != configuration_.local) { deferred.emplace_back(Send{voter, VoteRequest{hard_.term, last_index(), log_term(last_index())}}); }
+		}
+		persist(StorageBatch{hard_, std::nullopt}, std::move(deferred), output, quorum() == 1);
+	}
 	void become_leader(Actions& output) {
 		if (busy()) { throw std::logic_error("leader election before vote persistence"); }
 		if (last_index() >= maximum - 1 || entries_.charged_entries() >= limits_.log_entries) {
 			follower(0, output); return; // Control reserve exhausted: fail closed.
 		}
-		role_ = Role::Leader; leader_ = configuration_.local; peers_.clear(); grants_.clear();
-		for (NodeId voter : configuration_.voters) { if (voter != configuration_.local) { peers_.emplace(voter, Peer{last_index() + 1, 0, {}}); } }
+		role_ = Role::Leader; leader_ = configuration_.local; peers_.clear(); grants_.clear(); answered_.clear();
+		for (NodeId voter : configuration_.voters) {
+			if (voter != configuration_.local) { peers_.emplace(voter, Peer{last_index() + 1, 0, {}}); answered_[voter] = now_; }
+		}
 		Entry noop{last_index() + 1, hard_.term, EntryKind::NoOp, {}}; entries_.push_back(noop);
 		Actions deferred; deferred.emplace_back(RoleChanged{role_, hard_.term, leader_});
 		persist(StorageBatch{std::nullopt, LogMutation{noop.index, {noop}}}, std::move(deferred), output);
@@ -707,6 +746,10 @@ private:
 	std::optional<PendingInstall> install_;
 	std::map<NodeId, Peer> peers_;
 	std::set<NodeId> grants_;
+	std::optional<Term> prevote_;  // the term a pre-vote in progress asks for
+	std::set<NodeId> prevotes_;
+	std::map<NodeId, std::uint64_t> answered_;  // a leader's last answer from each voter
+	std::uint64_t leader_contact_ = 0;
 	std::vector<PendingRead> reads_;
 };
 

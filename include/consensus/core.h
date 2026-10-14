@@ -492,7 +492,7 @@ private:
 	void handle(ChangeMembership change, Actions& output) {
 		auto reject = [&](RejectReason reason) { output.emplace_back(Reject{change.request, reason}); };
 		if (busy()) { reject(RejectReason::Busy); return; }
-		if (!started_ || role_ != Role::Leader) { reject(RejectReason::NotLeader); return; }
+		if (!started_ || role_ != Role::Leader || witness_self()) { reject(RejectReason::NotLeader); return; }
 		if (transfer_) { reject(RejectReason::Busy); return; }
 		const auto& current = membership();
 		// D3: (a) the leader committed an entry of its term; (b) no configuration above the
@@ -536,10 +536,17 @@ private:
 		if (request.target == configuration_.local || !target || target->role != MemberRole::Voter || !peers_.contains(request.target)) {
 			reject(RejectReason::InvalidTarget); return;
 		}
-		transfer_ = Transfer{request.target, token(), deadline(timing_.election_max)};
-		auto& peer = peers_.at(request.target);
-		if (peer.next <= last_index()) { replicate(request.target, peer, output, needed_probe(request.target)); }
+		start_transfer(request.target, output);
+	}
+	void start_transfer(NodeId target, Actions& output) {
+		transfer_ = Transfer{target, token(), deadline(timing_.election_max)};
+		auto& peer = peers_.at(target);
+		if (peer.next <= last_index()) { replicate(target, peer, output, needed_probe(target)); }
 		timeout_now(output);
+	}
+	bool witness_self() const {
+		auto self = find_member(membership(), configuration_.local);
+		return self && self->role == MemberRole::Witness;
 	}
 	// Sends TimeoutNow once the target has matched the leader's last index.
 	void timeout_now(Actions& output) {
@@ -552,6 +559,7 @@ private:
 	void handle(Propose proposal, Actions& output) {
 		if (busy()) { output.emplace_back(Reject{proposal.request, RejectReason::Busy}); return; }
 		if (!started_ || role_ != Role::Leader) { output.emplace_back(Reject{proposal.request, RejectReason::NotLeader}); return; }
+		if (witness_self()) { output.emplace_back(Reject{proposal.request, RejectReason::NotLeader}); return; }  // D9
 		if (transfer_) { output.emplace_back(Reject{proposal.request, RejectReason::Busy}); return; }
 		if (proposal.command.size() > limits_.command_bytes) { output.emplace_back(Reject{proposal.request, RejectReason::TooLarge}); return; }
 		if (last_index() - durable_.commit_index >= limits_.uncommitted_entries) {
@@ -567,7 +575,7 @@ private:
 	}
 	void handle(Read read, Actions& output) {
 		if (busy()) { output.emplace_back(Reject{read.request, RejectReason::Busy}); return; }
-		if (!started_ || role_ != Role::Leader) { output.emplace_back(Reject{read.request, RejectReason::NotLeader}); return; }
+		if (!started_ || role_ != Role::Leader || witness_self()) { output.emplace_back(Reject{read.request, RejectReason::NotLeader}); return; }
 		if (durable_.commit_index == 0 || log_term(durable_.commit_index) != hard_.term) {
 			output.emplace_back(Reject{read.request, RejectReason::NotReady}); return;
 		}
@@ -801,6 +809,15 @@ private:
 		if (answering < quorum()) { follower(0, output); return; }
 		// D6: a transfer that has not ended in one election timeout aborts; proposals resume.
 		if (transfer_ && now_ >= transfer_->until) { transfer_.reset(); }
+		// D9: a witness that leads hands leadership to its most caught-up data voter.
+		if (!transfer_ && witness_self()) {
+			NodeId best = 0; Index matched = 0;
+			for (const auto& [id, peer] : peers_) {
+				auto member = find_member(membership(), id);
+				if (member && member->role == MemberRole::Voter && (!best || peer.matched > matched)) { best = id; matched = peer.matched; }
+			}
+			if (best) { start_transfer(best, output); }
+		}
 		// D4: a leader whose own removal committed steps down, transfer or not. D3: a
 		// committed replacement's leaving voter is removed next, by whichever leader holds
 		// the committed membership, so the replacement completes across leader changes.

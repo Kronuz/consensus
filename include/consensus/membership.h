@@ -71,8 +71,14 @@ inline void validate_membership(const Membership& m, const Limits& limits) {
 	const auto voters = voter_count(m);
 	if (voters == 0 || voters > limits.voters || voters > 31) { throw std::invalid_argument("membership voters"); }
 	if (m.leaving && !votes_in(m, m.leaving)) { throw std::invalid_argument("membership leaving"); }
-	// Outside a replacement's window a group has at most one witness (D9); inside it, two.
-	if (witnesses > 2) { throw std::invalid_argument("membership witnesses"); }
+	// D9: a witness only in rf = 2 + witness; inside a replacement's window, 3 + 1 while a
+	// data voter leaves, or 2 + 2 while the witness does.
+	if (witnesses) {
+		const auto data = voters - witnesses;
+		const bool steady = data == 2 && witnesses == 1;
+		const bool window = m.leaving && ((data == 3 && witnesses == 1) || (data == 2 && witnesses == 2));
+		if (!steady && !window) { throw std::invalid_argument("membership witnesses"); }
+	}
 }
 
 // The single-step rule (D3): at most one voter or witness added or removed, any learners;

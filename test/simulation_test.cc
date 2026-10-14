@@ -104,7 +104,9 @@ struct Envelope {
 
 class Simulation {
 public:
-	Simulation(std::uint64_t seed, std::size_t voters, bool membership) : random_(seed), voters_(voters), membership_changes_(membership) {
+	Simulation(std::uint64_t seed, std::size_t voters, bool membership, bool witness = false) : random_(seed), voters_(voters), membership_changes_(membership) {
+		// D9: a 2 + witness group, founded with its roles.
+		if (witness && voters == 3) { founding_.members.back().role = MemberRole::Witness; witness_ = true; }
 		// Small RPC batches leave replication partial across leader changes.
 		limits_.rpc_entries = 1 + random_() % 4;
 		for (NodeId id = 1; id <= voters; ++id) {
@@ -228,6 +230,7 @@ private:
 		state.hard = n.durable.hard;
 		state.entries = n.durable.log;
 		if (n.joiner) { state.membership = Membership{}; }  // the join record: no membership yet
+		else if (witness_) { state.membership = founding_; }
 		n.core = std::make_unique<Core>(node_config(n), std::move(state), limits_, timing_);
 		n.pending.reset();
 		n.applying.reset();
@@ -518,6 +521,7 @@ private:
 	std::size_t voters_;
 	bool membership_changes_;
 	Membership founding_ = fixed_membership(config(1, voters_));
+	bool witness_ = false;
 	std::map<Index, Membership> memberships_;
 	Limits limits_;
 	Timing timing_{60, 300, 600, 1200, 60000};
@@ -540,7 +544,7 @@ int main(int argc, char** argv) {
 	std::uint64_t restarts = 0, kept = 0, lost = 0, elections = 0, repairs = 0, transfers = 0, changes = 0, committed_changes = 0;
 	for (std::uint64_t seed = first; seed < first + seeds && !failures; ++seed) {
 		current_seed = seed;
-		Simulation sim(seed, 3 + 2 * (seed % 3 == 0), seed % 2 == 0);  // even seeds change membership
+		Simulation sim(seed, 3 + 2 * (seed % 3 == 0), seed % 2 == 0, seed % 5 == 1);  // even seeds change membership
 		sim.run(steps);
 		if (std::getenv("SIM_DEBUG")) {
 			for (auto [r, n] : sim.reject_reasons) { std::fprintf(stderr, "  reject %d: %llu\n", r, (unsigned long long)n); } std::fprintf(stderr, "seed %llu: elections %llu led %llu of %llu steps, max term %llu\n", (unsigned long long)seed, (unsigned long long)sim.elections, (unsigned long long)sim.led_steps, (unsigned long long)steps, (unsigned long long)sim.max_term()); }

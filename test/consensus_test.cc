@@ -1621,8 +1621,50 @@ void leadership_transfer() {
 	check(later.role() == Role::Follower && later.term() == before + 1, "TimeoutNow from another term never starts a campaign");
 }
 
+void witnesses() {
+	using R = MemberRole;
+	// D9's mixes: 2 + witness, and inside a replacement's window 3 + 1 or 2 + 2.
+	auto valid = [](Membership m) { return !throws([&] { validate_membership(m, Limits{}); }); };
+	check(valid({{{1, 1, R::Voter}, {2, 2, R::Voter}, {3, 3, R::Witness}}, 4, 0}), "2 + witness is a valid group");
+	check(!valid({{{1, 1, R::Voter}, {2, 2, R::Voter}, {3, 3, R::Voter}, {4, 4, R::Witness}}, 5, 0}), "3 + witness outside a window is refused");
+	check(valid({{{1, 1, R::Voter}, {2, 2, R::Voter}, {3, 3, R::Voter}, {4, 4, R::Witness}}, 5, 1}), "3 + witness while a data voter leaves");
+	check(valid({{{1, 1, R::Voter}, {2, 2, R::Voter}, {3, 3, R::Witness}, {4, 4, R::Witness}}, 5, 3}), "2 + 2 witnesses while the witness leaves");
+	check(!valid({{{1, 1, R::Voter}, {2, 2, R::Voter}, {3, 3, R::Witness}, {4, 4, R::Witness}}, 5, 0}), "two witnesses outside a window are refused");
+	check(!valid({{{1, 1, R::Voter}, {3, 3, R::Witness}}, 4, 0}), "1 + witness is refused");
+
+	// A witness that wins an election refuses work and hands leadership to a data voter.
+	Network cluster;
+	Membership founding{{{1, 1, R::Voter}, {2, 2, R::Voter}, {3, 3, R::Witness}}, 4, 0};
+	for (NodeId id : {1u, 2u, 3u}) {
+		auto state = empty(id); state.membership = founding;
+		cluster.host(id).core = std::make_unique<Core>(config(id), std::move(state));
+	}
+	// Alone: a witness that wins refuses proposals and reads.
+	auto lone_state = empty(3); lone_state.membership = founding;
+	Core lone(config(3), std::move(lone_state)); lone.step(Start{});
+	auto ballot = campaign(lone, Tick{100, 100});
+	lone.step(Persisted{find<Persist>(ballot)->token});
+	auto noop = lone.step(Receive{1, VoteResponse{lone.term(), true}});
+	check(lone.role() == Role::Leader, "a witness can win an election");
+	lone.step(Persisted{find<Persist>(noop)->token});
+	auto refused = lone.step(Propose{70, "x"});
+	check(find<Reject>(refused) && find<Reject>(refused)->reason == RejectReason::NotLeader, "a witness leader refuses proposals");
+	auto unread = lone.step(Read{71});
+	check(find<Reject>(unread) && find<Reject>(unread)->reason == RejectReason::NotLeader, "a witness leader refuses reads");
+	// In a group: the witness wins, then hands leadership to a data voter.
+	cluster.start();
+	cluster.now = 200;
+	auto& witness = *cluster.host(3).core;
+	cluster.consume(3, campaign(witness, Tick{200, 100}));
+	const Term led = witness.term();
+	cluster.pump();
+	for (std::uint64_t from = cluster.now, t = from + 10; t <= from + 400 && witness.role() == Role::Leader; t += 10) { cluster.tick(t); cluster.pump(); }
+	const bool handed = cluster.host(1).core->role() == Role::Leader || cluster.host(2).core->role() == Role::Leader;
+	check(handed && witness.role() == Role::Follower && witness.term() == led + 1, "the witness transfers leadership to a data voter");
+}
+
 int main() {
-	try { terminal_retirement(); snapshot_sender_maximum_fanout(); snapshot_sender_lost_ack_and_terms(); snapshot_sender_receiver_contact(); snapshot_sender_restart_clock_and_admission(); snapshot_sender_correlation(); snapshot_sender_keepalive_pacing(); snapshot_sender_retries_and_retention(); snapshot_timeout_retries(); portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); repair_at_or_below_commit(); prevote_guard_checkquorum(); membership_scripts(); membership_formats(); leadership_transfer(); }
+	try { terminal_retirement(); snapshot_sender_maximum_fanout(); snapshot_sender_lost_ack_and_terms(); snapshot_sender_receiver_contact(); snapshot_sender_restart_clock_and_admission(); snapshot_sender_correlation(); snapshot_sender_keepalive_pacing(); snapshot_sender_retries_and_retention(); snapshot_timeout_retries(); portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); repair_at_or_below_commit(); prevote_guard_checkquorum(); membership_scripts(); membership_formats(); leadership_transfer(); witnesses(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " consensus checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

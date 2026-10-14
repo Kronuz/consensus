@@ -26,7 +26,7 @@
 #include <algorithm>
 #include <type_traits>
 
-namespace cluster::consensus::detail {
+namespace kronuz::consensus::detail {
 // One maximum legal payload fits a fresh budget. Counts bound empty entries
 // and actions too; callers retain unfinished containers between owner turns.
 struct RetirementBudget {
@@ -84,4 +84,4 @@ inline bool retire_actions(Actions &actions, RetirementBudget &budget) noexcept 
 	}
 	return true;
 }
-} // namespace cluster::consensus::detail
+} // namespace kronuz::consensus::detail

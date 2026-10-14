@@ -20,10 +20,10 @@
  * THE SOFTWARE.
  */
 
-#include "core.h"
-#include "storage.h"
-#include "../journal/journal.h"
-#include "../journal/posix.h"
+#include "consensus/core.h"
+#include "consensus/storage.h"
+#include "journal/journal.h"
+#include "completion/posix.h"
 #include <deque>
 #include <iostream>
 
@@ -35,7 +35,7 @@ int main(int argc, char** argv) {
 		return 2;
 	}
 	try {
-		using namespace cluster::consensus;
+		using namespace kronuz::consensus;
 		FixedConfiguration configuration; configuration.cluster[0] = 'D'; configuration.configuration[0] = 'E';
 		configuration.local = 1; configuration.voters = {1};
 		kronuz::journal::PosixIO io(argv[1]); kronuz::journal::Journal journal(io, 4 * 1024 * 1024);

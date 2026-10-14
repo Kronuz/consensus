@@ -25,7 +25,7 @@
 #include "worker.h"
 #include "snapshot_transfer.h"
 
-namespace cluster::consensus {
+namespace kronuz::consensus {
 
 // Supplied by an authenticated, reliable, ordered transport. Identities must
 // be fresh on every connection; frame fields alone authenticate nothing.
@@ -247,4 +247,4 @@ private:
 	std::vector<Channel> channels_; std::optional<Output> data_; std::optional<Sending> sending_; std::optional<Receiving> receiving_;
 };
 
-} // namespace cluster::consensus
+} // namespace kronuz::consensus

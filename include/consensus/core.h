@@ -32,7 +32,7 @@
 #include <stdexcept>
 #include <type_traits>
 
-namespace cluster::consensus {
+namespace kronuz::consensus {
 
 // One owning executor. No I/O, clock reads, entropy, or application callbacks.
 // Persist changes are staged internally; all dependent actions are deferred.
@@ -693,4 +693,4 @@ private:
 	std::vector<PendingRead> reads_;
 };
 
-} // namespace cluster::consensus
+} // namespace kronuz::consensus

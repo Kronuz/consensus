@@ -26,12 +26,12 @@
 #include <chrono>
 #include <fstream>
 #include <sys/resource.h>
-#include "journal/posix.h"
+#include "completion/posix.h"
 #include <iostream>
 #include <map>
 #include <ctime>
 
-using namespace cluster::consensus;
+using namespace kronuz::consensus;
 namespace {
 int checks = 0, failures = 0;
 bool admission_benchmark = false;

@@ -25,7 +25,7 @@
 #include "checkpoint_format.h"
 #include <span>
 
-namespace cluster::consensus {
+namespace kronuz::consensus {
 
 // Borrowed sources must remain immutable until encoding finishes. Accessors
 // validate their own capability on every access; no Entry reference escapes
@@ -162,4 +162,4 @@ template <class Source> class IncrementalCheckpointEncoder {
 	bool active_ = false, failed_ = false;
 };
 
-} // namespace cluster::consensus
+} // namespace kronuz::consensus

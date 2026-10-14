@@ -24,7 +24,7 @@
 
 #include "checkpoint_encoder.h"
 
-namespace cluster::consensus {
+namespace kronuz::consensus {
 struct CheckpointBundle {
 	std::uint64_t storage_sequence;
 	kronuz::journal::ArtifactDescriptor application;
@@ -95,4 +95,4 @@ inline CheckpointBundle decode_checkpoint(std::string_view bytes, const FixedCon
 	Recovery validator(expected, limits); validator.validate_checkpoint_state(bundle.state);
 	return bundle;
 }
-} // namespace cluster::consensus
+} // namespace kronuz::consensus

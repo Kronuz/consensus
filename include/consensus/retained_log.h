@@ -27,7 +27,7 @@
 #include <memory>
 #include <stdexcept>
 
-namespace cluster::consensus::detail {
+namespace kronuz::consensus::detail {
 
 // Indexed AVL log with cached subtree accounting. Removing a range only
 // detaches roots; bounded retire() turns reclaim their payloads separately.
@@ -245,4 +245,4 @@ class RetainedLog {
 	std::size_t retired_count_ = 0, retired_bytes_ = 0;
 };
 
-} // namespace cluster::consensus::detail
+} // namespace kronuz::consensus::detail

@@ -31,7 +31,7 @@
 #include <variant>
 #include <vector>
 
-namespace cluster::consensus {
+namespace kronuz::consensus {
 
 using NodeId = std::uint64_t;
 using Term = std::uint64_t;
@@ -175,4 +175,4 @@ struct Fenced { std::string reason; };
 using Action = std::variant<Persist, Send, ProposalPlaced, Committed, ReadReady, RoleChanged, Reject, Fenced, PersistCheckpoint, CheckpointPublished, SnapshotNeeded, PersistInstall, ActivateInstall, InstallRejected, InstallCompleted, SnapshotTransmit, SnapshotReleased>;
 using Actions = std::vector<Action>;
 
-} // namespace cluster::consensus
+} // namespace kronuz::consensus

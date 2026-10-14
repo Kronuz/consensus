@@ -26,7 +26,7 @@
 #include <array>
 #include <iostream>
 
-using namespace cluster::consensus;
+using namespace kronuz::consensus;
 namespace {
 std::string original_encoding(const RecoveredState &state, std::uint64_t storage_sequence,
 							  const kronuz::journal::ArtifactDescriptor &application, Limits limits = {},

@@ -20,10 +20,10 @@
  * THE SOFTWARE.
  */
 
-#include "core.h"
-#include "checkpoint.h"
-#include "../journal/journal.h"
-#include "../journal/posix.h"
+#include "consensus/core.h"
+#include "consensus/checkpoint.h"
+#include "journal/journal.h"
+#include "completion/posix.h"
 #include <chrono>
 #include <filesystem>
 #include <iomanip>
@@ -36,7 +36,7 @@ static double cpu_seconds() {
 	return usage.ru_utime.tv_sec + usage.ru_stime.tv_sec + (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1e6;
 }
 int main() {
-	using namespace cluster::consensus;
+	using namespace kronuz::consensus;
 	try {
 		auto root = std::filesystem::current_path() / ".scratch"; std::filesystem::create_directories(root);
 		std::cout << "retained_entries,payload_bytes,bundle_bytes,capture_wall_s,capture_cpu_s,encode_write_publish_wall_s,encode_write_publish_cpu_s,total_frozen_wall_s,peak_process_rss_bytes\n";

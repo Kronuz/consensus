@@ -24,7 +24,7 @@
 
 #include "snapshot.h"
 
-namespace cluster::consensus {
+namespace kronuz::consensus {
 
 enum class TransferKind : std::uint8_t { Begin = 1, Accepted, Chunk, Credit, Result, Cancel };
 enum class TransferOutcome : std::uint8_t { Installed = 1, CaughtUp, Rejected, Failed };
@@ -86,4 +86,4 @@ inline std::string transfer_chunk_body(Token token, std::uint64_t offset, std::s
 	if (!credit) { bytes.append(payload); } return bytes;
 }
 
-} // namespace cluster::consensus
+} // namespace kronuz::consensus

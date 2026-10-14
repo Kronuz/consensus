@@ -23,13 +23,13 @@
 #pragma once
 
 #include "types.h"
-#include "../journal/codec.h"
+#include "journal/codec.h"
 #include <algorithm>
 #include <limits>
 #include <set>
 #include <stdexcept>
 
-namespace cluster::consensus {
+namespace kronuz::consensus {
 
 namespace storage_detail {
 using kronuz::journal::Corruption;
@@ -259,4 +259,4 @@ private:
 	bool failed_ = false, finished_ = false;
 };
 
-} // namespace cluster::consensus
+} // namespace kronuz::consensus

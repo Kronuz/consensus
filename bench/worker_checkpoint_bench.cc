@@ -20,13 +20,13 @@
  * THE SOFTWARE.
  */
 
-#include "worker.h"
-#include "../journal/posix.h"
+#include "consensus/worker.h"
+#include "completion/posix.h"
 #include <chrono>
 #include <iostream>
 #include <sys/resource.h>
 
-using namespace cluster::consensus;
+using namespace kronuz::consensus;
 namespace {
 using Clock = std::chrono::steady_clock;
 double cpu() {

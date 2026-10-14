@@ -22,17 +22,18 @@
 
 // Native completion checkpoint qualification. Seed IO and recovery are excluded
 // from the measured interval; all live Worker and driver callbacks are observed.
-#include "../journal/asio_completion.h"
-#include "../journal/native_completion.h"
-#include "../journal/posix.h"
-#include "worker.h"
+#include "journal/mutation.h"
+#include "completion/asio_completion.h"
+#include "completion/native_completion.h"
+#include "completion/posix.h"
+#include "consensus/worker.h"
 #include <charconv>
 #include <ctime>
 #include <iostream>
 #include <sys/resource.h>
 #include <thread>
 
-using namespace cluster::consensus;
+using namespace kronuz::consensus;
 namespace {
 using Clock = std::chrono::steady_clock;
 void require(bool condition, const char *message) {

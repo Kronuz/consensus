@@ -23,11 +23,11 @@
 #pragma once
 
 #include "storage.h"
-#include "../journal/admission.h"
+#include "journal/admission.h"
 #include <array>
 #include <type_traits>
 
-namespace cluster::consensus {
+namespace kronuz::consensus {
 
 struct AppendBudget {
 	kronuz::journal::AdmissionClass kind = kronuz::journal::AdmissionClass::Control;
@@ -94,4 +94,4 @@ inline EventAdmissionPlan plan_event(const Event& event, bool busy, Limits limit
 	return plan;
 }
 
-} // namespace cluster::consensus
+} // namespace kronuz::consensus

@@ -27,9 +27,9 @@
 #include "checkpoint.h"
 #include "checkpoint_encoder.h"
 #include "snapshot.h"
-#include "../journal/store.h"
+#include "journal/store.h"
 
-namespace cluster::consensus {
+namespace kronuz::consensus {
 
 enum class SubmitResult { Accepted, Busy, Pressure, Fenced };
 enum class TurnResult { Idle, Blocked, Pressure, Inventory, Stored, Completed, Maintenance, Fenced, IOPending };
@@ -1024,4 +1024,4 @@ private:
 	bool failed_ = false, cutover_debt_ = false, timer_due_ = true, timer_blocked_ = false, closing_ = false;
 };
 
-} // namespace cluster::consensus
+} // namespace kronuz::consensus

@@ -26,7 +26,7 @@
 #include "consensus/checkpoint.h"
 #include "consensus/snapshot.h"
 #include "journal/journal.h"
-#include "journal/posix.h"
+#include "completion/posix.h"
 #include "journal/store.h"
 #include <deque>
 #include <functional>
@@ -34,7 +34,7 @@
 #include <memory>
 #include <random>
 
-using namespace cluster::consensus;
+using namespace kronuz::consensus;
 namespace {
 int checks = 0, failures = 0;
 void check(bool value, std::string_view message) {
@@ -816,7 +816,7 @@ void event_admission_plans() {
 }
 
 void storage_footprint_plans() {
-	using namespace cluster::consensus;
+	using namespace kronuz::consensus;
 	for (bool hard : {false, true}) {
 		for (bool log : {false, true}) {
 			for (unsigned count : {0u, 1u, 256u}) {

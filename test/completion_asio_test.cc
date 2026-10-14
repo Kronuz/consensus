@@ -21,9 +21,10 @@
  */
 
 #include "consensus/worker.h"
-#include "journal/asio_completion.h"
+#include "journal/mutation.h"
+#include "completion/asio_completion.h"
 #include "journal/journal.h"
-#include "journal/native_completion.h"
+#include "completion/native_completion.h"
 #include <filesystem>
 #include <iostream>
 
@@ -98,10 +99,10 @@ asio::awaitable<void> observe(Journal &journal, bool &done, std::size_t &ticks) 
 		}
 	}
 }
-asio::awaitable<void> worker_exercise(cluster::consensus::Worker &worker,
+asio::awaitable<void> worker_exercise(kronuz::consensus::Worker &worker,
 									  const std::shared_ptr<AsioCompletionDriver<DelayedQueue>> &driver,
 									  const std::shared_ptr<DelayedQueue> &queue) {
-	using namespace cluster::consensus;
+	using namespace kronuz::consensus;
 	auto executor = co_await asio::this_coro::executor;
 	asio::steady_timer timer(executor);
 	asio::ip::udp::socket socket(executor, asio::ip::udp::endpoint(asio::ip::address_v4::loopback(), 0));
@@ -197,19 +198,19 @@ void native_worker(const std::filesystem::path &directory) {
 	std::filesystem::create_directory(directory);
 	::chmod(directory.c_str(), 0700);
 	auto io = std::make_shared<PosixIO>(directory);
-	cluster::consensus::FixedConfiguration fixed;
+	kronuz::consensus::FixedConfiguration fixed;
 	fixed.local = 1;
 	fixed.voters = {1};
 	fixed.cluster[0] = 'W';
 	fixed.configuration[0] = 'V';
-	cluster::consensus::Limits limits;
+	kronuz::consensus::Limits limits;
 	limits.command_bytes = 1024;
 	limits.rpc_bytes = 2048;
 	limits.log_bytes = 4096;
 	limits.log_entries = 32;
 	limits.control_entries = 4;
 	limits.rpc_entries = 4;
-	cluster::consensus::Worker worker(io, fixed, {{1024 * 1024, 1024}, {65536, 3}, {512 * 1024, 4}, 8, 3},
+	kronuz::consensus::Worker worker(io, fixed, {{1024 * 1024, 1024}, {65536, 3}, {512 * 1024, 4}, 8, 3},
 									  limits, {}, {16, 128, false, true});
 	Identity identity{};
 	identity[0] = 'W';

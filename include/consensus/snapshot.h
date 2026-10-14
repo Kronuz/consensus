@@ -23,11 +23,11 @@
 #pragma once
 
 #include "types.h"
-#include "../journal/codec.h"
+#include "journal/codec.h"
 #include <algorithm>
 #include <limits>
 
-namespace cluster::consensus {
+namespace kronuz::consensus {
 
 // Portable application metadata. Ballots, local identities, storage sequences
 // and retained suffixes belong to the receiver's local checkpoint bundle.
@@ -79,4 +79,4 @@ inline SnapshotDescriptor decode_snapshot(std::string_view bytes, const Snapshot
 	validate_snapshot(result, policy); return result;
 }
 
-} // namespace cluster::consensus
+} // namespace kronuz::consensus

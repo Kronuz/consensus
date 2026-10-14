@@ -61,7 +61,9 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
 	if (size == 0) { return 0; }
 	const std::string_view input(reinterpret_cast<const char*>(data) + 1, size - 1);
 	try {
-		switch (data[0] % 7) {
+		// FUZZ_DECODER pins every input to one decoder, so each gets measured hours of its own.
+		static const int pinned = std::getenv("FUZZ_DECODER") ? std::atoi(std::getenv("FUZZ_DECODER")) : -1;
+		switch (pinned >= 0 ? pinned : data[0] % 7) {
 		case 0: {
 			auto message = transport::decode(input);
 			require(transport::encode(message) == input);

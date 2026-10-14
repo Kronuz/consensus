@@ -544,6 +544,22 @@ void joiner_retained_install() {
 	check(joiner.base_index() == 3 && joiner.membership() == with4, "its membership in force is the one entry 5 names");
 }
 
+
+// A node whose own limits were lowered across a restart still reopens what it accepted.
+void lowered_node_limits_reopen() {
+	Limits wide; wide.command_bytes = 1024;
+	RecoveredState state; state.configuration = founding_config(2);
+	Core follower(founding_config(2), state, wide, compact); follower.step(Start{});
+	auto appended = follower.step(Receive{1, AppendRequest{1, 9, 0, 0, 0, 0, {{1, 1, EntryKind::NoOp, {}}, {2, 1, EntryKind::Command, std::string(500, 'x')}}, 0}});
+	check(first<Persist>(appended) && follower.last_index() == 2, "a follower accepts a 500-byte command under its node's 1 KiB limit");
+	RecoveredState after; after.configuration = founding_config(2); after.hard = HardState{1, std::nullopt, 0};
+	after.entries = {{1, 1, EntryKind::NoOp, {}}, {2, 1, EntryKind::Command, std::string(500, 'x')}};
+	Limits narrow; narrow.command_bytes = 100;
+	bool reopened = true;
+	try { Core again(founding_config(2), after, narrow, compact); } catch (const std::exception&) { reopened = false; }
+	check(reopened, "with its node limit lowered to 100 bytes, it still reopens its log");
+}
+
 }  // namespace
 
 int main() {
@@ -562,6 +578,7 @@ int main() {
 		unequal_node_limits();
 		founding_limits();
 		joiner_retained_install();
+		lowered_node_limits_reopen();
 	} catch (const std::exception& error) {
 		check(false, error.what());
 	}

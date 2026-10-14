@@ -297,7 +297,15 @@ private:
 		if (n.durable.base) { state.membership = n.durable.membership; }
 		else if (n.joiner) { state.membership = Membership{}; }  // the join record: no membership yet
 		else if (witness_) { state.membership = founding_; }
-		n.core = std::make_unique<Core>(node_config(n), std::move(state), n.limits, timing_);
+		try {
+			n.core = std::make_unique<Core>(node_config(n), state, n.limits, timing_);
+		} catch (const std::exception& error) {
+			std::string detail = "node " + std::to_string(n.id) + " cannot reopen: " + error.what() + "; hard term " + std::to_string(state.hard.term) + " base " +
+				std::to_string(state.base_index) + " command limit " + std::to_string(n.limits.command_bytes) + "; entries";
+			for (const auto& e : state.entries) { detail += " " + std::to_string(e.index) + "/" + std::to_string(e.term) + "/" + std::to_string(int(e.kind)) + ":" + std::to_string(e.payload.size()); }
+			fail(detail);
+			throw;
+		}
 		n.pending.reset();
 		n.checkpointing.reset();
 		n.installing.reset();
@@ -461,7 +469,7 @@ private:
 			const NodeId incarnation = next.next_incarnation++;
 			next.members.push_back({incarnation, incarnation, MemberRole::Learner});
 			auto& joiner = nodes_[incarnation];
-			if (!joiner.core) {
+			if (!joiner.id) {  // a new node, not a crashed one
 				joiner.id = incarnation;
 				joiner.joiner = true;
 				joiner.rate = 0.5 + double(random_() % 1501) / 1000.0;
@@ -592,7 +600,7 @@ private:
 		const NodeId incarnation = next.next_incarnation++;
 		next.members.push_back({incarnation, incarnation, MemberRole::Learner});
 		auto& joiner = nodes_[incarnation];
-		if (!joiner.core) {
+		if (!joiner.id) {  // a new node, not a crashed one
 			joiner.id = incarnation; joiner.joiner = true; joiner.rate = 1.0; joiner.local = leader->local; joiner.limits = node_limits();
 			restart(joiner);
 		}

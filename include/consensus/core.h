@@ -75,7 +75,7 @@ public:
 		for (std::size_t i = 0; i < entries_.size(); ++i) {
 			const auto& entry = entries_[i];
 			if (entry.index != base_index_ + i + 1 || !valid_entry(entry) || entry.term > hard_.term || entry.term < previous_term ||
-				!fits(entry, limits_at(entry.index)) || entry.payload.size() > ceilings.log_bytes - log_bytes_) { throw std::invalid_argument("invalid recovered entry"); }
+				!fits(entry, recovered_limits(entry.index)) || entry.payload.size() > ceilings.log_bytes - log_bytes_) { throw std::invalid_argument("invalid recovered entry"); }
 			log_bytes_ += entry.payload.size(); previous_term = entry.term;
 			note_append(entry);
 		}
@@ -317,6 +317,13 @@ private:
 	// encoding (maximum_membership_bytes), so lowering the limit cannot wedge a group (R16).
 	static bool fits(const Entry& entry, const Limits& limits) {
 		return entry.kind == EntryKind::Command ? entry.payload.size() <= limits.command_bytes : entry.payload.size() <= maximum_membership_bytes;
+	}
+	// What a recovered entry is checked against: the group's limits at its position, or the
+	// ceilings where the group set none. A node's own limits govern what it admits from now
+	// on, not what it already holds, so lowering them never stops it reopening.
+	const Limits& recovered_limits(Index index) const {
+		const auto& m = membership_at(index - 1);
+		return m.limits ? *m.limits : ceilings;
 	}
 	// The limits an entry at `index` is checked against: those in force just before it.
 	const Limits& limits_at(Index index) const { return limits_of(membership_at(index - 1)); }

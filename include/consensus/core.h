@@ -388,7 +388,7 @@ private:
 		if (!started_ || busy() || delivered_through_) { reject(RejectReason::Busy); return; }
 		if (role_ == Role::Leader && configuration_.voters.size() > 1) { reject(RejectReason::LeaderMustTransfer); return; }
 		const auto b = request.boundary;
-		if (b.index < base_index_ || b.index > applied_ || (b.index == base_index_ ? b.term != base_term_ : log_term(b.index) != b.term)) {
+		if (b.index < base_index_ || b.index > durable_.commit_index || (b.index == base_index_ ? b.term != base_term_ : log_term(b.index) != b.term)) {
 			reject(RejectReason::InvalidRepair);
 			return;
 		}

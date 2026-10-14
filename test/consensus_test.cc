@@ -790,6 +790,63 @@ void repair_at_or_below_commit() {
 		for (unsigned round = 0; round < 4; ++round) { cluster.tick(cluster.now + 10); cluster.pump(); }
 		check(follower.applied_commands.back() == "c8" && cluster.host(3).applied_commands == follower.applied_commands, "after repair the voter applies what the group commits");
 	}
+	// The core refuses a repair while busy (a storage batch pending).
+	{
+		Network busy(3); busy.start(); busy.elect(1);
+		auto& h = busy.host(2); h.auto_persist = false;
+		busy.consume(1, busy.host(1).core->step(Propose{300, "b"})); busy.pump();
+		check(h.pending.has_value() && reason(h.core->step(Repair{301, {0, 0}})) == RejectReason::Busy, "a busy core refuses a repair");
+	}
+	// Detection to repair (R22): a host whose application is damaged acknowledges what it
+	// is delivered without applying it, then restores a member's image at the commit index.
+	{
+		Network d(3); d.start(); d.elect(1);
+		for (RequestId r = 400; r < 404; ++r) { d.consume(1, d.host(1).core->step(Propose{r, "d" + std::to_string(r)})); d.pump(); }
+		for (unsigned round = 0; round < 4; ++round) { d.tick(d.now + 10); d.pump(); }
+		auto& damaged = d.host(3);
+		damaged.applied_commands.resize(1);  // damaged after its first command; it applies nothing more
+		damaged.auto_apply = false;
+		d.consume(1, d.host(1).core->step(Propose{404, "d404"})); d.pump();
+		for (unsigned round = 0; round < 4; ++round) { d.tick(d.now + 10); d.pump(); }
+		while (damaged.applying) {  // acknowledged, not applied
+			auto batch = std::move(*damaged.applying); damaged.applying.reset();
+			d.consume(3, damaged.core->step(Applied{batch.entries.back().index}));
+		}
+		const Index commit = damaged.core->committed();
+		damaged.applied_commands = d.host(1).applied_commands;  // a member's image at the commit index
+		auto done = damaged.core->step(Repair{405, {commit, damaged.core->term()}});
+		check(find<RepairCompleted>(done) != nullptr && damaged.core->applied() == commit, "a member's image at the commit index repairs a stalled voter");
+		d.consume(3, std::move(done)); damaged.auto_apply = true;
+		d.consume(1, d.host(1).core->step(Propose{406, "d406"})); d.pump();
+		for (unsigned round = 0; round < 4; ++round) { d.tick(d.now + 10); d.pump(); }
+		check(damaged.applied_commands == d.host(1).applied_commands, "the repaired voter applies what follows");
+	}
+	// Exactly at a nonzero base, and voting while the redelivery is outstanding, on whichever
+	// of nodes 2 and 3 now follows.
+	{
+		const NodeId f = cluster.host(2).core->role() == Role::Leader ? 3 : 2, other = f == 2 ? 3 : 2;
+		auto& v = cluster.host(f);
+		auto term_of = [&](Index i) { return i == 0 ? Term{0} : v.applied_entries.at(i - 1).term; };
+		const Index through = v.core->applied() - 1;
+		if (through > v.core->base_index()) {
+			auto cp = v.core->step(LocalCheckpoint{499, 9, through, term_of(through), config(f).cluster, config(f).configuration, v.core->epoch()});
+			if (auto p = find<PersistCheckpoint>(cp)) { cluster.consume(f, v.core->step(Persisted{p->token})); }
+		}
+		const Index base = v.core->base_index();
+		v.auto_apply = false;
+		auto at_base = v.core->step(Repair{500, {base, term_of(base)}});
+		check(base > 0 && find<RepairCompleted>(at_base) != nullptr, "a repair exactly at a nonzero base");
+		cluster.consume(f, std::move(at_base));
+		check(v.applying.has_value(), "the redelivery is outstanding");
+		const Term t = std::max(v.core->term(), cluster.host(other).core->term()) + 1;
+		cluster.consume(f, v.core->step(Receive{other, VoteRequest{t, cluster.host(other).core->last_index(), cluster.host(other).core->term()}}));
+		if (v.pending) { cluster.complete_disk(f); }
+		const auto& hard = v.core->durable_hard_state();
+		check(hard.term == t && hard.voted_for == other, "a voter votes while its redelivery is outstanding");
+		cluster.network.clear();
+		while (v.applying) { cluster.complete_apply(f); }
+		v.auto_apply = true;
+	}
 	std::cout << "repair: " << repaired << " boundaries\n";
 }
 

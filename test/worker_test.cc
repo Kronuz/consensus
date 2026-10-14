@@ -718,6 +718,59 @@ void checkpoint_cancellation_and_completion() {
 	}
 	check(proposal == SubmitResult::Accepted && committed && worker.committed() == 2 && worker.applied_index() == 2 && !worker.fenced(), "first proposal in the replacement generation persists, commits, and applies");
 }
+// Track C, D10 through the Worker: a repair rewinds and redelivers; a capture taken before
+// it is rejected even when attached after it (R21); a repair waits for a checkpoint in flight.
+void worker_repair() {
+	auto directory = std::filesystem::current_path() / ".scratch" / ("worker-repair-" + std::to_string(::getpid()));
+	std::filesystem::create_directories(directory); ::chmod(directory.c_str(), 0700);
+	struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
+	FaultIO io(directory); Worker worker(io, configuration(), {{256 * 1024, 512}, {16 * 1024, 3}, {64 * 1024, 4}, 8, 3}, limits());
+	start_single(worker, 'R');
+	std::vector<std::string> applied;
+	std::vector<RepairCompleted> repaired;
+	std::vector<Reject> rejected;
+	unsigned published = 0;
+	auto pump = [&] {
+		worker.run_one({100, 100});
+		for (const auto& action : worker.take_actions()) {
+			if (auto batch = std::get_if<Committed>(&action)) {
+				for (const auto& e : batch->entries) { if (e.kind == EntryKind::Command) { applied.push_back(e.payload); } }
+				worker.applied({batch->entries.back().index});
+			} else if (auto r = std::get_if<RepairCompleted>(&action)) { repaired.push_back(*r);
+			} else if (auto r = std::get_if<Reject>(&action)) { rejected.push_back(*r);
+			} else { published += std::holds_alternative<CheckpointPublished>(action); }
+		}
+	};
+	auto submit = [&](Event event) {
+		SubmitResult result = SubmitResult::Busy;
+		for (unsigned turn = 0; turn < 100 && result == SubmitResult::Busy; ++turn) { result = worker.try_submit(event); if (result == SubmitResult::Busy) { pump(); } }
+		return result;
+	};
+	for (RequestId r = 1; r <= 3; ++r) { check(submit(Propose{r, "w" + std::to_string(r)}) == SubmitResult::Accepted, "repair fixture proposes"); }
+	for (unsigned turn = 0; turn < 100 && worker.applied_index() < 4; ++turn) { pump(); }
+	const auto reference = applied;
+	check(reference == std::vector<std::string>{"w1", "w2", "w3"} && worker.applied_index() == 4 && worker.epoch() == 0, "repair fixture applies three commands");
+	const std::uint64_t before = worker.epoch();  // a capture of the state before the repair
+	applied = {"w1"};  // the host restored its image at index 2: the no-op and w1
+	check(submit(Repair{40, {2, worker.term()}}) == SubmitResult::Accepted, "a single voter accepts a repair");
+	for (unsigned turn = 0; turn < 100 && (repaired.empty() || worker.applied_index() < 4); ++turn) { pump(); }
+	check(repaired.size() == 1 && repaired[0].boundary.index == 2 && worker.epoch() == 1 && applied == reference, "the Worker redelivers after a repair and advances the epoch");
+	auto id = worker.reserve_checkpoint(16);
+	check(bool(id) && submit(Repair{41, {2, worker.term()}}) == SubmitResult::Busy, "a repair waits for a checkpoint in flight");
+	if (id) {
+		worker.attach_capture(*id, {42, 3, worker.term(), before}); worker.offer_application_chunk(*id, "stale", true);
+		for (unsigned turn = 0; turn < 100 && worker.checkpoint_active(*id); ++turn) { pump(); }
+		bool stale = false;
+		for (const auto& r : rejected) { stale |= r.request == 42 && r.reason == RejectReason::InvalidCheckpoint; }
+		check(stale && published == 0, "a capture from before the repair is rejected though attached after it (R21)");
+	}
+	id = worker.reserve_checkpoint(16);
+	if (id) {
+		worker.attach_capture(*id, {43, 3, worker.term(), worker.epoch()}); worker.offer_application_chunk(*id, "fresh", true);
+		for (unsigned turn = 0; turn < 100 && !published; ++turn) { pump(); }
+		check(published == 1 && worker.base_index() == 3 && !worker.fenced(), "a capture under the current epoch publishes");
+	}
+}
 void checkpoint_faults() {
 	for (bool publication : {false, true}) {
 		auto directory = std::filesystem::current_path() / ".scratch" / ("worker-cp-fault-" + std::to_string(::getpid()) + "-" + std::to_string(publication));
@@ -1695,6 +1748,6 @@ int main(int argc, char** argv) {
 		if (argc == 2 && std::string_view(argv[1]) == "--transfer-benchmark") { std::ofstream(std::filesystem::current_path() / ".scratch" / "snapshot-transfer-benchmark.csv") << "image_bytes,wall_s,cpu_s,wire_bytes,retained_frame_bytes,payload_buffer_capacity,process_maxrss_native,sender_payload_reads,receiver_payload_reads\n"; binary_transfer_integration(1048576, 0, true); binary_transfer_integration(67108864, 0, true); std::cout << checks << " benchmark checks, " << failures << " failures\n"; return failures ? 1 : 0; }
 		completion_appends(); completion_storage(); completion_channel_cancellation(); completion_snapshot_readback(); retired_completion_worker(); for (unsigned mode : {0u, 1u, 3u}) { binary_transfer_integration(65553, mode, false, true); } checkpoint_format_recovery(); legacy_source_export_rejection(); binary_channel_validation(); channel_dispatch_and_unstarted_result(); binary_transfer_codec(); for (std::size_t length : {std::size_t{0}, std::size_t{9}, std::size_t{65553}, std::size_t{1048576}}) { binary_transfer_integration(length); }
 		for (unsigned mode : {1u, 2u, 3u, 5u}) { binary_transfer_integration(65553, mode); }
-		owned_snapshot_sources(); snapshot_reception_and_validation(); snapshot_policy_and_rejection(); snapshot_cancellation_phases(); snapshot_read_faults(); snapshot_restart_cleanup(); snapshot_protocol_progress(); snapshot_installation(); snapshot_rejection_branches(); snapshot_old_application(); snapshot_install_reopening(); snapshot_install_admission(); snapshot_publication_faults(); maintenance_preserves_protocol_timers(); real_worker(); partial_control_pack(); failures_and_multi_action_output(); interrupted_initialization(); checkpoint_crash_and_progress(); preparation_preserves_protocol_timers(); checkpoint_cancellation_and_completion(); checkpoint_faults(); } catch (const std::exception& error) { check(false, error.what()); }
+		owned_snapshot_sources(); snapshot_reception_and_validation(); snapshot_policy_and_rejection(); snapshot_cancellation_phases(); snapshot_read_faults(); snapshot_restart_cleanup(); snapshot_protocol_progress(); snapshot_installation(); snapshot_rejection_branches(); snapshot_old_application(); snapshot_install_reopening(); snapshot_install_admission(); snapshot_publication_faults(); maintenance_preserves_protocol_timers(); real_worker(); partial_control_pack(); failures_and_multi_action_output(); interrupted_initialization(); checkpoint_crash_and_progress(); preparation_preserves_protocol_timers(); checkpoint_cancellation_and_completion(); checkpoint_faults(); worker_repair(); } catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " worker checks, " << failures << " failures\n"; return failures ? 1 : 0;
 }

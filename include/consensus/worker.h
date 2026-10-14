@@ -34,7 +34,9 @@ namespace kronuz::consensus {
 enum class SubmitResult { Accepted, Busy, Pressure, Fenced };
 enum class TurnResult { Idle, Blocked, Pressure, Inventory, Stored, Completed, Maintenance, Fenced, IOPending };
 struct WorkerLimits { std::size_t foreground_burst = 16, scan_entries = 128; bool async_appends = false, async_storage = false; };
-struct CaptureMetadata { RequestId request; Index through; Term term; };
+// epoch: Worker::epoch() when the application state was captured; a repair since then makes
+// the capture stale, and the core rejects it.
+struct CaptureMetadata { RequestId request; Index through; Term term; std::uint64_t epoch = 0; };
 struct SnapshotLimits { std::uint32_t application_format; std::uint64_t application_bytes; };
 struct SnapshotContext { NodeId authenticated_peer; Term leader_term; RequestId request; Token transfer; SnapshotDescriptor descriptor; };
 enum class ValidationAck { Accepted, Stale, NotReady, Fenced };
@@ -199,6 +201,8 @@ public:
 		if (core_->busy()) { ingest(core_->step(completion)); }
 		else { application_ = completion; }
 	}
+	// The application epoch, which a repair advances; a capture records it (CaptureMetadata).
+	std::uint64_t epoch() const noexcept { return core_ ? core_->epoch() : 0; }
 	void application_failed(Index through, std::string reason) {
 		// A stale/duplicate report cannot fence unrelated application work.
 		if (!closing_ && !fenced() && core_ && through != 0 && through == delivered_) { fail(std::move(reason)); }
@@ -850,7 +854,7 @@ private:
 				break;
 			}
 			auto capture = *std::get<Local>(operation.mode).capture;
-			ingest_capture(core_->step_capture(LocalCheckpoint{capture.request, operation.token, capture.through, capture.term, configuration_.cluster, configuration_.configuration, core_->epoch()}));
+			ingest_capture(core_->step_capture(LocalCheckpoint{capture.request, operation.token, capture.through, capture.term, configuration_.cluster, configuration_.configuration, capture.epoch}));
 			if (fenced()) { break; }
 			if (!core_->busy()) { store_.cancel_replacement(operation.replacement); checkpoint_.reset(); cutover_debt_ = false; }
 			break;

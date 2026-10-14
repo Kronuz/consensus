@@ -150,10 +150,11 @@ struct SnapshotTransferFailed { NodeId peer; SnapshotKey key; };
 struct StorageFault { std::string error; };
 enum class FailureSource { Storage, Application };
 struct Failed { FailureSource source; Token token; std::string error; };
-// The host restored its application image at `boundary` (base_index <= index <= applied),
-// verified whole: the core rewinds its applied cursor there and delivers the committed
-// entries after it again from its own log. Hard state, role, leader, and commit index
-// stay as they are.
+// The host restored its application image at `boundary` (base_index <= index <= commit),
+// verified whole: from a local checkpoint, or from a member's image when its own state
+// stalled behind. The core moves its applied cursor there and delivers the committed
+// entries after it from its own log. Hard state, role, leader, and commit index stay as
+// they are. A host reports damage this way, never as Failed{Application}, which fences.
 struct Repair { RequestId request; LogBoundary boundary; };
 using Event = std::variant<Start, Tick, Receive, Propose, Read, Persisted, Applied, Failed, LocalCheckpoint, StorageFault, InstallPrepared, InstallActivated, InstallActivationFailed, SnapshotSourceReady, SnapshotTransferFailed, Repair>;
 

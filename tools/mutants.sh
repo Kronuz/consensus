@@ -33,6 +33,15 @@ mutants=(
 	$'a leader ignores members\' node limits\t\t\tif (auto found = peer_limits_.find(member); found != peer_limits_.end()) { cap(found->second); }\t\t\t(void)member;'
 	$'commit of an earlier term by counting\tif (candidate <= durable_.commit_index || log_term(candidate) != hard_.term) { return; }\tif (candidate <= durable_.commit_index) { return; }'
 )
+# Runs a suite for at most $1 seconds; a mutant that hangs a suite fails it.
+bounded() {
+	local limit=$1; shift
+	"$@" & local pid=$!
+	(for ((i = 0; i < limit; ++i)); do kill -0 "$pid" 2>/dev/null || exit 0; sleep 1; done; kill -9 "$pid") &
+	local rc=0; wait "$pid" || rc=$?
+	wait
+	return "$rc"
+}
 status=0
 for m in "${mutants[@]}"; do
 	IFS=$'\t' read -r name search replace <<<"$m"
@@ -52,9 +61,9 @@ PY
 	# Each suite on its own, so the report shows whether the randomized harness catches the
 	# fault, not only the first suite that does.
 	unit=no; membership=no; simulation=no
-	"$dir/unit" >"$dir/unit.log" 2>&1 || unit=yes
-	"$dir/membership" >"$dir/membership.log" 2>&1 || membership=yes
-	"$dir/simulation" "$seeds" "$steps" >"$dir/simulation.log" 2>&1 || simulation=yes
+	bounded 600 "$dir/unit" >"$dir/unit.log" 2>&1 || unit=yes
+	bounded 600 "$dir/membership" >"$dir/membership.log" 2>&1 || membership=yes
+	bounded 3600 "$dir/simulation" "$seeds" "$steps" >"$dir/simulation.log" 2>&1 || simulation=yes
 	first=""
 	[[ $simulation == yes ]] && first=", first at $(grep -m1 -o '^seed [0-9]*' "$dir/simulation.log" || echo 'the heal')"
 	echo "$name: unit $unit, membership $membership, simulation $simulation ($seeds seeds$first)"

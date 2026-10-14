@@ -1704,6 +1704,13 @@ void founding_records() {
 	}
 	Membership stranger{{{1, 1, R::Voter}, {2, 2, R::Voter}, {4, 4, R::Witness}}, 5, 0};
 	check(throws([&] { Recovery r(config(1)); r.replay(1, encode_initialization(config(1), stranger)); }), "founding roles must name the founding voters");
+	{
+		auto all_voters = encode_initialization(config(1), witness);
+		Membership voters_only = witness; voters_only.members.back().role = R::Voter;
+		auto bytes = encode_membership(voters_only);  // RFTINIT2 framing around an all-voter membership
+		auto forged = all_voters.substr(0, all_voters.size() - encode_membership(witness).size()) + bytes;
+		check(throws([&] { Recovery r(config(1)); r.replay(1, forged); }), "RFTINIT2 without a non-voter is not canonical");
+	}
 	for (std::size_t size = 0; size < v2.size(); ++size) {
 		check(throws([&] { Recovery r(config(1)); r.replay(1, std::string_view(v2).substr(0, size)); }), "a truncated RFTINIT2 is corruption");
 	}

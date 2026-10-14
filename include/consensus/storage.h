@@ -227,6 +227,8 @@ private:
 				voting.insert(x.incarnation);
 			}
 			if (voting != founding || m.leaving) { throw Corruption("founding membership does not match its voters"); }
+			// RFTINIT2 is written only for a non-voter, so each founding has one encoding.
+			if (std::all_of(m.members.begin(), m.members.end(), [](const Member& x) { return x.role == MemberRole::Voter; })) { throw Corruption("founding roles without a non-voter"); }
 			state_.membership = std::move(m);
 		}
 		end(bytes);

@@ -2,8 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 project(consensus LANGUAGES CXX)
 
 # Strict durable Raft: a deterministic Core, a Worker over journal storage, checkpoints,
-# and snapshot transfer. Header-only. Asio and reactor are needed only by the Asio
-# completion test and benchmark, when CONSENSUS_ASIO_TESTS is on.
+# and snapshot transfer, plus an optional authenticated peer transport. Header-only.
 include(FetchContent)
 FetchContent_Declare(journal GIT_REPOSITORY https://github.com/Kronuz/journal.git GIT_TAG 2c18fcb036fc128b508f2b8597c669ac0921906c)
 FetchContent_MakeAvailable(journal)
@@ -13,6 +12,23 @@ target_include_directories(consensus INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/incl
 target_compile_features(consensus INTERFACE cxx_std_20)
 target_link_libraries(consensus INTERFACE journal::journal)
 add_library(consensus::consensus ALIAS consensus)
+
+# The authenticated peer transport (TLS over TCP, a control and a bulk lane per peer):
+# optional, since it brings Asio, reactor, and OpenSSL 3.
+option(CONSENSUS_TRANSPORT "Build the peer transport target consensus::transport" OFF)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+	set(CONSENSUS_TRANSPORT ON)
+endif()
+if(CONSENSUS_TRANSPORT)
+	FetchContent_Declare(reactor GIT_REPOSITORY https://github.com/Kronuz/reactor.git GIT_TAG d5bd39bbf3c96a204d2b6dc379c4afdd5ce697f5)
+	FetchContent_MakeAvailable(reactor)
+	if(NOT TARGET reactor::tls)
+		message(FATAL_ERROR "consensus::transport needs OpenSSL 3 (reactor::tls)")
+	endif()
+	add_library(consensus_transport INTERFACE)
+	target_link_libraries(consensus_transport INTERFACE consensus::consensus reactor::tls)
+	add_library(consensus::transport ALIAS consensus_transport)
+endif()
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	enable_testing()
@@ -36,10 +52,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	add_executable(consensus_demo examples/demo.cc)
 	target_link_libraries(consensus_demo PRIVATE consensus::consensus)
 
-	option(CONSENSUS_ASIO_TESTS "Build the Asio completion test and benchmark (fetches reactor)" ON)
-	if(CONSENSUS_ASIO_TESTS AND (APPLE OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD" OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
-		FetchContent_Declare(reactor GIT_REPOSITORY https://github.com/Kronuz/reactor.git GIT_TAG a0bc26cb81d92d4d0867376e5fc3690454597a2b)
-		FetchContent_MakeAvailable(reactor)
+	if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD" OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
 		add_executable(consensus_completion_asio_test test/completion_asio_test.cc)
 		target_link_libraries(consensus_completion_asio_test PRIVATE consensus::consensus reactor::reactor)
 		add_test(NAME consensus_completion_asio COMMAND consensus_completion_asio_test)
@@ -47,4 +60,24 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 		add_executable(consensus_worker_completion_bench EXCLUDE_FROM_ALL bench/worker_completion_bench.cc)
 		target_link_libraries(consensus_worker_completion_bench PRIVATE consensus::consensus reactor::reactor)
 	endif()
+
+	# Transport tests; they check with assert, so NDEBUG stays off.
+	find_program(CONSENSUS_TEST_OPENSSL openssl REQUIRED)
+	add_test(NAME consensus_tls_certificates COMMAND ${CMAKE_COMMAND} -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/tls-fixture
+		-DOPENSSL=${CONSENSUS_TEST_OPENSSL} -P ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/tls_certificates.cmake)
+	set_tests_properties(consensus_tls_certificates PROPERTIES FIXTURES_SETUP consensus_tls TIMEOUT 30)
+	foreach(t codec rpc_observation ownership tls authentication peers)
+		add_executable(consensus_transport_${t}_test test/transport/${t}_test.cc)
+		target_link_libraries(consensus_transport_${t}_test PRIVATE consensus::transport)
+		target_compile_options(consensus_transport_${t}_test PRIVATE -UNDEBUG)
+	endforeach()
+	foreach(t codec rpc_observation ownership peers)
+		add_test(NAME consensus_transport_${t} COMMAND consensus_transport_${t}_test)
+		set_tests_properties(consensus_transport_${t} PROPERTIES TIMEOUT 30)
+	endforeach()
+	add_test(NAME consensus_transport_tls COMMAND consensus_transport_tls_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture)
+	add_test(NAME consensus_transport_pipe COMMAND consensus_transport_tls_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture --pipes)
+	add_test(NAME consensus_transport_authentication COMMAND consensus_transport_authentication_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture)
+	set_tests_properties(consensus_transport_tls consensus_transport_pipe consensus_transport_authentication
+		PROPERTIES FIXTURES_REQUIRED consensus_tls TIMEOUT 30)
 endif()

@@ -244,3 +244,19 @@ Worker's private staging Chunk uses an explicit zero-initializing constructor to
 After accepted originals settle, Worker incrementally releases retained actions and calls Core's terminal retirement API. `Core::begin_retirement()` invalidates checkpoint capabilities and detaches live log roots; `retirement_step(budget)` retires pending actions and physical log entries. The byte budget must fit one maximum legal command, while the unit budget separately bounds empty entries and actions. `retirement_drained()` includes pending protocol containers and retired payloads. Existing synchronous destructors remain fallback behavior for callers that do not use this additive lifecycle; legacy Raft and storage formats are unchanged. Application and transport owners must separately retire their roots and original callbacks before destruction.
 
 Source verification completion always observes the authentic typed IO result before resuming its consumer. A peer failure or terminal close suppresses obsolete source continuation, so a disconnected verifier can be released without dereferencing it when the held original settles. Terminal snapshot validation and activation callbacks return `NotReady`; they neither advance the application nor fence successfully published storage.
+
+## Peer transport
+
+The optional target `consensus::transport` (`include/consensus/transport/`, on with
+`CONSENSUS_TRANSPORT`, always on when this repository builds itself) carries the core's
+messages between voters: TLS 1.2 or later over TCP through `reactor::tls`, a control lane
+and a bulk lane per peer, each voter's leaf certificate pinned by SHA-256, the `DTHL0001`
+hello (cluster, group, epoch, connection identity, and a profile fingerprint both ends
+must share), the `DTC1` message codec, bounded byte credit in both directions, snapshot
+writes, and RPC timing. It needs Asio (through `reactor`) and OpenSSL 3.
+
+`Peers<Host>` runs it on one executor for any host with `worker()` and `channel()` (the
+`PeerHost` concept), configured by a `PeerConfiguration`: the voters, the consensus
+limits, the group's identities, and the fingerprint from `profile_fingerprint`, which
+hashes the application's own profile bytes with the membership and limits.
+

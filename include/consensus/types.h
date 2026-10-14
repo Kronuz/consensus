@@ -117,6 +117,8 @@ struct VoteResponse { Term term; bool granted; };
 // changes its term or ballot. A response carries the responder's own term.
 struct PreVoteRequest { Term term; Index last_index; Term last_term; };
 struct PreVoteResponse { Term term; Term request_term; bool granted; };
+// A transferring leader tells a caught-up voter to campaign now (Track C, D6).
+struct TimeoutNow { Term term; Index last_index; Token token; };
 struct AppendRequest {
 	Term term;
 	Token rpc;
@@ -149,7 +151,7 @@ struct AppendResponse {
 	Token read_probe;
 	std::optional<LogBoundary> compacted{};
 };
-using Message = std::variant<VoteRequest, VoteResponse, AppendRequest, AppendResponse, SnapshotResponse, PreVoteRequest, PreVoteResponse>;
+using Message = std::variant<VoteRequest, VoteResponse, AppendRequest, AppendResponse, SnapshotResponse, PreVoteRequest, PreVoteResponse, TimeoutNow>;
 
 struct Start {};
 // The host supplies absolute monotonic time and a fresh randomized election
@@ -186,10 +188,13 @@ struct Repair { RequestId request; LogBoundary boundary; };
 // voter or witness added or removed, any learners; a learner's promotion beside a voter
 // it replaces names that voter as `leaving`, and the core removes it once that commits.
 struct ChangeMembership { RequestId request; Membership next; };
-using Event = std::variant<Start, Tick, Receive, Propose, Read, Persisted, Applied, Failed, LocalCheckpoint, StorageFault, InstallPrepared, InstallActivated, InstallActivationFailed, SnapshotSourceReady, SnapshotTransferFailed, Repair, ChangeMembership>;
+// A leader hands leadership to a voter of its membership in force (D6). Proposals are
+// refused until the target wins or one election timeout passes.
+struct TransferLeadership { RequestId request; NodeId target; };
+using Event = std::variant<Start, Tick, Receive, Propose, Read, Persisted, Applied, Failed, LocalCheckpoint, StorageFault, InstallPrepared, InstallActivated, InstallActivationFailed, SnapshotSourceReady, SnapshotTransferFailed, Repair, ChangeMembership, TransferLeadership>;
 
 enum class Role { Follower, Candidate, Leader, Fenced };
-enum class RejectReason { Busy, NotLeader, NotReady, LogFull, TooLarge, DuplicateRequest, InvalidCheckpoint, InvalidRepair, LeaderMustTransfer, InvalidMembership };
+enum class RejectReason { Busy, NotLeader, NotReady, LogFull, TooLarge, DuplicateRequest, InvalidCheckpoint, InvalidRepair, LeaderMustTransfer, InvalidMembership, InvalidTarget };
 struct Persist { Token token; StorageBatch batch; };
 struct PersistCheckpoint { Token token; Token capture; RecoveredState state; };
 struct PersistInstall { Token token, prepared; RecoveredState state; };

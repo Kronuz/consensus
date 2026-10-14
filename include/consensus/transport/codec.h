@@ -44,6 +44,8 @@ inline std::string encode(const kronuz::consensus::Message &message,
 				number(6);
 			else if constexpr (std::is_same_v<T, PreVoteResponse>)
 				number(7);
+			else if constexpr (std::is_same_v<T, TimeoutNow>)
+				number(8);
 			else
 				static_assert(!sizeof(T), "missing control wire tag");
 			number(value.term);
@@ -54,6 +56,9 @@ inline std::string encode(const kronuz::consensus::Message &message,
 			} else if constexpr (std::is_same_v<T, PreVoteRequest>) {
 				number(value.last_index);
 				number(value.last_term);
+			} else if constexpr (std::is_same_v<T, TimeoutNow>) {
+				number(value.last_index);
+				number(value.token);
 			} else if constexpr (std::is_same_v<T, PreVoteResponse>) {
 				number(value.request_term);
 				number(value.granted);
@@ -140,6 +145,11 @@ inline kronuz::consensus::Message decode(std::string_view bytes, kronuz::consens
 	case 7: {
 		auto request_term = get64(bytes);
 		result = PreVoteResponse{term, request_term, boolean()};
+		break;
+	}
+	case 8: {
+		auto index = get64(bytes);
+		result = TimeoutNow{term, index, get64(bytes)};
 		break;
 	}
 	case 2:

@@ -80,6 +80,9 @@ inline EventAdmissionPlan plan_event(const Event& event, bool busy, Limits limit
 				} else if constexpr (std::is_same_v<M, PreVoteResponse>) {
 					// A pre-vote quorum starts the campaign: ballot, no-op, and commit continuation.
 					if (!busy) { add(AdmissionClass::Control, hard); add(AdmissionClass::Control, noop); add(AdmissionClass::Control, hard); }
+				} else if constexpr (std::is_same_v<M, TimeoutNow>) {
+					// The target campaigns at once: its ballot.
+					if (!busy) { add(AdmissionClass::Control, hard); }
 				} else if constexpr (std::is_same_v<M, PreVoteRequest>) {
 					// Answered without persistence.
 				} else if constexpr (std::is_same_v<M, VoteResponse>) {
@@ -96,7 +99,7 @@ inline EventAdmissionPlan plan_event(const Event& event, bool busy, Limits limit
 				add(AdmissionClass::Control, storage_batch_size(false, true, 1, encode_membership(value.next).size()));
 				add(AdmissionClass::Control, hard);
 			}
-		} else if constexpr (std::is_same_v<T, Start> || std::is_same_v<T, Read> || std::is_same_v<T, Repair>) {
+		} else if constexpr (std::is_same_v<T, Start> || std::is_same_v<T, Read> || std::is_same_v<T, Repair> || std::is_same_v<T, TransferLeadership>) {
 			// These events emit no persistence action.
 		} else {
 			static_assert(std::is_same_v<T, void>, "new consensus event requires an admission plan");

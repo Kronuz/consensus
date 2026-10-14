@@ -140,6 +140,8 @@ public:
 				crash(random_() % 2 ? leader_or(n) : n);
 			} else if (pick < 706) {
 				toggle_partition(random_() % 2 ? leader_or(n).id : id);
+			} else if (pick >= 712 && pick < 716) {
+				transfer();
 			} else {
 				for (auto& [i, m] : nodes_) { tick(m); }
 			}
@@ -184,7 +186,7 @@ public:
 		check_logs();
 	}
 
-	std::uint64_t restarts = 0, kept = 0, lost = 0, elections = 0, led_steps = 0, repairs = 0, changes_proposed = 0, memberships_committed = 0;
+	std::uint64_t restarts = 0, kept = 0, lost = 0, elections = 0, led_steps = 0, repairs = 0, transfers = 0, changes_proposed = 0, memberships_committed = 0;
 	std::map<int, std::uint64_t> reject_reasons;
 	Term max_term() const {
 		Term t = 0;
@@ -335,6 +337,21 @@ private:
 			if (auto r = std::get_if<Reject>(&a); r && r->request == request_ && std::getenv("SIM_DEBUG")) { ++reject_reasons[int(r->reason)]; }
 		}
 		act(*leader, std::move(actions));
+	}
+	// Track C, D6: a leader hands leadership to a random voter of its membership in force.
+	void transfer() {
+		for (auto& [id, m] : nodes_) {
+			if (!m.up || m.core->role() != Role::Leader) { continue; }
+			std::vector<NodeId> targets;
+			for (const auto& x : m.core->membership().members) {
+				if (x.role == MemberRole::Voter && x.incarnation != id) { targets.push_back(x.incarnation); }
+			}
+			if (targets.empty()) { return; }
+			auto actions = m.core->step(TransferLeadership{++request_, targets[random_() % targets.size()]});
+			transfers += !std::any_of(actions.begin(), actions.end(), [](const Action& a) { return std::holds_alternative<Reject>(a); });
+			act(m, std::move(actions));
+			return;
+		}
 	}
 	// Track C, D10: the node restores its application at a boundary in [0, applied] and
 	// replays from its own log; a leader of more than one voter or a busy node is refused.
@@ -520,7 +537,7 @@ int main(int argc, char** argv) {
 	const std::uint64_t seeds = argc > 1 ? std::strtoull(argv[1], nullptr, 10) : 200;
 	const std::uint64_t steps = argc > 2 ? std::strtoull(argv[2], nullptr, 10) : 10000;
 	const std::uint64_t first = argc > 3 ? std::strtoull(argv[3], nullptr, 10) : 1;
-	std::uint64_t restarts = 0, kept = 0, lost = 0, elections = 0, repairs = 0, changes = 0, committed_changes = 0;
+	std::uint64_t restarts = 0, kept = 0, lost = 0, elections = 0, repairs = 0, transfers = 0, changes = 0, committed_changes = 0;
 	for (std::uint64_t seed = first; seed < first + seeds && !failures; ++seed) {
 		current_seed = seed;
 		Simulation sim(seed, 3 + 2 * (seed % 3 == 0), seed % 2 == 0);  // even seeds change membership
@@ -533,11 +550,12 @@ int main(int argc, char** argv) {
 		lost += sim.lost;
 		elections += sim.elections;
 		repairs += sim.repairs;
+		transfers += sim.transfers;
 		changes += sim.changes_proposed;
 		committed_changes += sim.memberships_committed;
 	}
-	std::printf("simulation: %llu seeds x %llu steps, %llu elections, %llu restarts (%llu kept a pending batch, %llu lost one), %llu repairs, %llu membership changes proposed, %llu committed memberships applied: %s\n",
+	std::printf("simulation: %llu seeds x %llu steps, %llu elections, %llu restarts (%llu kept a pending batch, %llu lost one), %llu repairs, %llu transfers, %llu membership changes proposed, %llu committed memberships applied: %s\n",
 		(unsigned long long)seeds, (unsigned long long)steps, (unsigned long long)elections, (unsigned long long)restarts, (unsigned long long)kept,
-		(unsigned long long)lost, (unsigned long long)repairs, (unsigned long long)changes, (unsigned long long)committed_changes, failures ? "FAILED" : "ok");
+		(unsigned long long)lost, (unsigned long long)repairs, (unsigned long long)transfers, (unsigned long long)changes, (unsigned long long)committed_changes, failures ? "FAILED" : "ok");
 	return failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }

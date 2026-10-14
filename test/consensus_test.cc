@@ -1543,8 +1543,86 @@ void terminal_retirement() {
  check(core.retirement_step(budget), "terminal drain is idempotent");
 }
 
+void leadership_transfer() {
+	// A caught-up target receives TimeoutNow at once, campaigns with the transfer flag, and
+	// wins; the old leader refuses proposals until then.
+	Network cluster; cluster.start(); cluster.elect();
+	auto& leader = *cluster.host(1).core;
+	const Term term = leader.term();
+	auto started = leader.step(TransferLeadership{40, 2});
+	check(leader.transferring() && !find<Reject>(started), "a leader starts a transfer to a voter");
+	auto send = find<Send>(started);
+	auto now = send ? std::get_if<TimeoutNow>(&send->message) : nullptr;
+	check(now && send->peer == 2 && now->term == term && now->last_index == leader.last_index(), "a caught-up target gets TimeoutNow at once");
+	auto refused = leader.step(Propose{41, "late"});
+	check(find<Reject>(refused) && find<Reject>(refused)->reason == RejectReason::Busy, "a transferring leader refuses proposals");
+	auto second = leader.step(TransferLeadership{42, 3});
+	check(find<Reject>(second) && find<Reject>(second)->reason == RejectReason::Busy, "one transfer at a time");
+	cluster.consume(1, std::move(started)); cluster.pump();
+	check(cluster.host(2).core->role() == Role::Leader && cluster.host(2).core->term() == term + 1 && leader.role() == Role::Follower && !leader.transferring(),
+		"the target wins at the next term and the old leader follows");
+
+	// Invalid targets: itself, a stranger, and any request to a follower.
+	auto& next = *cluster.host(2).core;
+	auto self = next.step(TransferLeadership{43, 2});
+	check(find<Reject>(self) && find<Reject>(self)->reason == RejectReason::InvalidTarget, "a leader cannot transfer to itself");
+	auto stranger = next.step(TransferLeadership{44, 9});
+	check(find<Reject>(stranger) && find<Reject>(stranger)->reason == RejectReason::InvalidTarget, "a transfer target must be a member");
+	auto follower = leader.step(TransferLeadership{45, 3});
+	check(find<Reject>(follower) && find<Reject>(follower)->reason == RejectReason::NotLeader, "only a leader transfers");
+
+	// A lagging target is caught up first; TimeoutNow follows its match.
+	Network lag; lag.start(); lag.elect();
+	lag.isolated = {3};
+	lag.consume(1, lag.host(1).core->step(Propose{50, "missed"})); lag.pump();
+	lag.isolated.clear();
+	auto behind = lag.host(1).core->step(TransferLeadership{51, 3});
+	bool early = false;
+	for (const auto& action : behind) { if (auto s = std::get_if<Send>(&action)) { early |= std::holds_alternative<TimeoutNow>(s->message); } }
+	check(!early, "a lagging target gets no TimeoutNow before it matches");
+	lag.consume(1, std::move(behind)); lag.pump();
+	// The append lost during isolation is retried after rpc_timeout, within the transfer.
+	for (std::uint64_t from = lag.now, t = from + 10; t <= from + 150 && lag.host(3).core->role() != Role::Leader; t += 10) { lag.tick(t); lag.pump(); }
+	check(lag.host(3).core->role() == Role::Leader && lag.host(3).core->last_index() >= 3, "the caught-up target wins");
+
+	// A transfer to an unreachable target aborts after one election timeout.
+	Network gone; gone.start(); gone.elect();
+	gone.isolated = {2};
+	auto& stuck = *gone.host(1).core;
+	gone.consume(1, stuck.step(TransferLeadership{60, 2})); gone.pump();
+	for (std::uint64_t from = gone.now, t = from + 10; t <= from + 220; t += 10) { gone.tick(t); gone.pump(); }
+	check(stuck.role() == Role::Leader && !stuck.transferring(), "an unfinished transfer aborts after an election timeout");
+	auto resumed = stuck.step(Propose{61, "after"});
+	check(find<ProposalPlaced>(resumed) || find<Persist>(resumed), "proposals resume after an abort");
+
+	// The target acts only as the sender's follower in its term, and once per token.
+	Network rules; rules.start(); rules.elect();
+	auto& target = *rules.host(2).core;
+	const Term current = target.term();
+	auto wrong_sender = target.step(Receive{3, TimeoutNow{current, target.last_index(), 7}});
+	check(target.role() == Role::Follower && target.term() == current && wrong_sender.empty(), "TimeoutNow from a non-leader is ignored");
+	auto wrong_index = target.step(Receive{1, TimeoutNow{current, target.last_index() + 1, 7}});
+	check(target.role() == Role::Follower && wrong_index.empty(), "TimeoutNow naming another last index is ignored");
+	auto acted = target.step(Receive{1, TimeoutNow{current, target.last_index(), 7}});
+	auto ballot = find<Persist>(acted);
+	bool flagged = false;
+	for (const auto& action : acted) {
+		if (auto s = std::get_if<Send>(&action); s) { if (auto v = std::get_if<VoteRequest>(&s->message)) { flagged = v->transfer; } }
+	}
+	check(ballot && target.role() == Role::Candidate && target.term() == current + 1, "TimeoutNow starts a campaign without pre-vote");
+	rules.consume(2, std::move(acted));
+	for (const auto& envelope : rules.network) { if (auto v = std::get_if<VoteRequest>(&envelope.message)) { flagged = v->transfer; } }
+	check(flagged, "a transfer's vote requests carry the transfer flag");
+	// A higher term is adopted, as from any message, but does not start a campaign.
+	Network ahead; ahead.start(); ahead.elect();
+	auto& later = *ahead.host(2).core;
+	const Term before = later.term();
+	later.step(Receive{1, TimeoutNow{before + 1, later.last_index(), 7}});
+	check(later.role() == Role::Follower && later.term() == before + 1, "TimeoutNow from another term never starts a campaign");
+}
+
 int main() {
-	try { terminal_retirement(); snapshot_sender_maximum_fanout(); snapshot_sender_lost_ack_and_terms(); snapshot_sender_receiver_contact(); snapshot_sender_restart_clock_and_admission(); snapshot_sender_correlation(); snapshot_sender_keepalive_pacing(); snapshot_sender_retries_and_retention(); snapshot_timeout_retries(); portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); repair_at_or_below_commit(); prevote_guard_checkquorum(); membership_scripts(); membership_formats(); }
+	try { terminal_retirement(); snapshot_sender_maximum_fanout(); snapshot_sender_lost_ack_and_terms(); snapshot_sender_receiver_contact(); snapshot_sender_restart_clock_and_admission(); snapshot_sender_correlation(); snapshot_sender_keepalive_pacing(); snapshot_sender_retries_and_retention(); snapshot_timeout_retries(); portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); repair_at_or_below_commit(); prevote_guard_checkquorum(); membership_scripts(); membership_formats(); leadership_transfer(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " consensus checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

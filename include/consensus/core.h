@@ -32,6 +32,7 @@
 #include <set>
 #include <stdexcept>
 #include <type_traits>
+#include <utility>
 
 namespace kronuz::consensus {
 
@@ -152,6 +153,7 @@ public:
 		return snapshot_active(peer, key) && found->second.snapshot->phase == SnapshotPhase::Sending;
 	}
 	bool busy() const noexcept { return pending_.has_value() || install_.has_value(); }
+	bool transferring() const noexcept { return transfer_.has_value(); }
 	const HardState& durable_hard_state() const noexcept { return durable_; }
 	const FixedConfiguration& configuration() const noexcept { return configuration_; }
 	// The membership in force (the newest Configuration entry in the log, committed or not)
@@ -235,6 +237,7 @@ private:
 	struct SnapshotFlight { SnapshotKey key; SnapshotPhase phase; std::uint64_t started; };
 	struct Peer { Index next = 1, matched = 0; std::optional<Flight> flight; std::uint64_t retry_after = 0; std::optional<SnapshotFlight> snapshot{}; std::optional<std::uint64_t> snapshot_retry_clock{}; };
 	struct PendingRead { RequestId request; Token probe; Term term; Index index; std::set<NodeId> acknowledgements; };
+	struct Transfer { NodeId target; Token token; std::uint64_t until; bool sent = false; };
 	static constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
 	const Membership& membership_at(Index index) const {
 		auto it = configs_.upper_bound(index);
@@ -313,7 +316,7 @@ private:
 	void follower(NodeId leader, Actions& deferred) {
 		if (role_ != Role::Follower || leader_ != leader) { deferred.emplace_back(RoleChanged{Role::Follower, hard_.term, leader}); }
 		release_snapshots(SnapshotReleaseReason::LeadershipLost, deferred);
-		role_ = Role::Follower; leader_ = leader; peers_.clear(); grants_.clear(); prevote_.reset(); prevotes_.clear(); answered_.clear();
+		role_ = Role::Follower; leader_ = leader; peers_.clear(); grants_.clear(); prevote_.reset(); prevotes_.clear(); answered_.clear(); transfer_.reset();
 		for (const auto& read : reads_) { deferred.emplace_back(Reject{read.request, RejectReason::NotLeader}); }
 		reads_.clear(); reset_election();
 	}
@@ -490,6 +493,7 @@ private:
 		auto reject = [&](RejectReason reason) { output.emplace_back(Reject{change.request, reason}); };
 		if (busy()) { reject(RejectReason::Busy); return; }
 		if (!started_ || role_ != Role::Leader) { reject(RejectReason::NotLeader); return; }
+		if (transfer_) { reject(RejectReason::Busy); return; }
 		const auto& current = membership();
 		// D3: (a) the leader committed an entry of its term; (b) no configuration above the
 		// commit index; (c) a promoted learner has matched the commit index.
@@ -523,9 +527,32 @@ private:
 		if (request) { deferred.emplace_back(ProposalPlaced{request, hard_.term, entry.index}); }
 		persist(StorageBatch{std::nullopt, LogMutation{entry.index, {std::move(entry)}}}, std::move(deferred), output);
 	}
+	// D6: the target must be a voter, not a witness or learner, of the membership in force.
+	void handle(TransferLeadership request, Actions& output) {
+		auto reject = [&](RejectReason reason) { output.emplace_back(Reject{request.request, reason}); };
+		if (busy() || transfer_) { reject(RejectReason::Busy); return; }
+		if (!started_ || role_ != Role::Leader) { reject(RejectReason::NotLeader); return; }
+		auto target = find_member(membership(), request.target);
+		if (request.target == configuration_.local || !target || target->role != MemberRole::Voter || !peers_.contains(request.target)) {
+			reject(RejectReason::InvalidTarget); return;
+		}
+		transfer_ = Transfer{request.target, token(), deadline(timing_.election_max)};
+		auto& peer = peers_.at(request.target);
+		if (peer.next <= last_index()) { replicate(request.target, peer, output, needed_probe(request.target)); }
+		timeout_now(output);
+	}
+	// Sends TimeoutNow once the target has matched the leader's last index.
+	void timeout_now(Actions& output) {
+		if (!transfer_ || transfer_->sent || role_ != Role::Leader) { return; }
+		auto found = peers_.find(transfer_->target);
+		if (found == peers_.end() || found->second.matched != last_index()) { return; }
+		transfer_->sent = true;
+		output.emplace_back(Send{transfer_->target, TimeoutNow{hard_.term, last_index(), transfer_->token}});
+	}
 	void handle(Propose proposal, Actions& output) {
 		if (busy()) { output.emplace_back(Reject{proposal.request, RejectReason::Busy}); return; }
 		if (!started_ || role_ != Role::Leader) { output.emplace_back(Reject{proposal.request, RejectReason::NotLeader}); return; }
+		if (transfer_) { output.emplace_back(Reject{proposal.request, RejectReason::Busy}); return; }
 		if (proposal.command.size() > limits_.command_bytes) { output.emplace_back(Reject{proposal.request, RejectReason::TooLarge}); return; }
 		if (last_index() - durable_.commit_index >= limits_.uncommitted_entries) {
 			output.emplace_back(Reject{proposal.request, RejectReason::Busy}); return;
@@ -587,10 +614,12 @@ private:
 			if (!pending_) { deliver(output); ready_reads(output); }
 		}
 		if (prevote_ && prevotes_.size() >= quorum() && role_ != Role::Leader && !busy()) { campaign(output); }
+		if (std::exchange(timed_out_, false) && role_ == Role::Follower && !busy()) { campaign(output, true); }
 	}
 	bool valid(const VoteRequest& request) const { return request.term > 0 && request.last_index < maximum && request.last_term <= request.term && ((request.last_index == 0) == (request.last_term == 0)); }
 	bool valid(const PreVoteRequest& request) const { return valid(VoteRequest{request.term, request.last_index, request.last_term}); }
 	bool valid(const PreVoteResponse& response) const { return response.request_term > 0; }
+	bool valid(const TimeoutNow& request) const { return request.term > 0 && request.token > 0 && request.last_index < maximum; }
 	bool log_up_to_date(Index index, Term term) const {
 		return term > log_term(last_index()) || (term == log_term(last_index()) && index >= last_index());
 	}
@@ -620,6 +649,14 @@ private:
 		output.emplace_back(Send{source, VoteResponse{hard_.term, grant}});
 	}
 	void receive_message(NodeId, PreVoteRequest, StorageBatch&, Actions&) {}  // answered in handle(Receive)
+	// D6: act once per token, only as the sender's caught-up follower in its term, and only
+	// as a voter (never a witness or learner); handle(Receive) campaigns after settling.
+	void receive_message(NodeId source, TimeoutNow request, StorageBatch&, Actions&) {
+		auto self = find_member(membership(), configuration_.local);
+		if (request.term != hard_.term || role_ != Role::Follower || leader_ != source || request.last_index != last_index() ||
+			!self || self->role != MemberRole::Voter || acted_timeout_ == std::pair{source, request.token}) { return; }
+		acted_timeout_ = {source, request.token}; timed_out_ = true;
+	}
 	void receive_message(NodeId source, PreVoteResponse response, StorageBatch&, Actions& output) {
 		if (!prevote_ || response.request_term != *prevote_ || !response.granted || role_ == Role::Leader || !is_voter(source)) { return; }
 		prevotes_.insert(source);  // handle(Receive) campaigns once the quorum is in and nothing persists
@@ -697,6 +734,7 @@ private:
 		if (response.success) {
 			if (response.matched != flight.through) { return; }
 			peer.matched = std::max(peer.matched, response.matched); peer.next = peer.matched + 1; peer.retry_after = 0;
+			if (transfer_ && transfer_->target == source) { timeout_now(output); }
 			if (flight.read_probe) {
 				for (auto& read : reads_) { if (read.probe == flight.read_probe && read.term == hard_.term) { read.acknowledgements.insert(source); } }
 			}
@@ -761,6 +799,8 @@ private:
 		std::size_t answering = is_voter(configuration_.local);
 		for (const auto& [id, at] : answered_) { answering += is_voter(id) && now_ - at < timing_.election_max; }
 		if (answering < quorum()) { follower(0, output); return; }
+		// D6: a transfer that has not ended in one election timeout aborts; proposals resume.
+		if (transfer_ && now_ >= transfer_->until) { transfer_.reset(); }
 		// D4: a leader whose own removal committed steps down, transfer or not. D3: a
 		// committed replacement's leaving voter is removed next, by whichever leader holds
 		// the committed membership, so the replacement completes across leader changes.
@@ -785,12 +825,12 @@ private:
 		}
 		if (heartbeat) { heartbeat_deadline_ = deadline(timing_.heartbeat); }
 	}
-	void campaign(Actions& output) {
+	void campaign(Actions& output, bool transfer = false) {
 		++hard_.term; hard_.voted_for = configuration_.local; prevote_.reset(); prevotes_.clear();
 		role_ = Role::Candidate; leader_ = 0; grants_ = {configuration_.local}; reset_election();
 		Actions deferred; deferred.emplace_back(RoleChanged{role_, hard_.term, 0});
 		for (NodeId voter : voters()) {
-			if (voter != configuration_.local) { deferred.emplace_back(Send{voter, VoteRequest{hard_.term, last_index(), log_term(last_index())}}); }
+			if (voter != configuration_.local) { deferred.emplace_back(Send{voter, VoteRequest{hard_.term, last_index(), log_term(last_index()), transfer}}); }
 		}
 		persist(StorageBatch{hard_, std::nullopt}, std::move(deferred), output, quorum() == 1);
 	}
@@ -799,7 +839,7 @@ private:
 		if (last_index() >= maximum - 1 || entries_.charged_entries() >= limits_.log_entries) {
 			follower(0, output); return; // Control reserve exhausted: fail closed.
 		}
-		role_ = Role::Leader; leader_ = configuration_.local; peers_.clear(); grants_.clear(); answered_.clear();
+		role_ = Role::Leader; leader_ = configuration_.local; peers_.clear(); grants_.clear(); answered_.clear(); transfer_.reset();
 		for (NodeId replica : replicas()) {
 			peers_.emplace(replica, Peer{last_index() + 1, 0, {}});
 			if (is_voter(replica)) { answered_[replica] = now_; }
@@ -898,6 +938,9 @@ private:
 	std::map<NodeId, std::uint64_t> answered_;  // a leader's last answer from each voter
 	std::uint64_t leader_contact_ = 0;
 	std::vector<PendingRead> reads_;
+	std::optional<Transfer> transfer_;  // a leader's transfer in progress (D6)
+	std::pair<NodeId, Token> acted_timeout_{};  // the last TimeoutNow this node acted on
+	bool timed_out_ = false;
 };
 
 } // namespace kronuz::consensus

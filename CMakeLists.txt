@@ -39,6 +39,10 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 		add_test(NAME consensus_${t} COMMAND consensus_${t}_test)
 		set_tests_properties(consensus_${t} PROPERTIES TIMEOUT 30)
 	endforeach()
+	# T1: stores written at b7073bb recover unchanged.
+	add_executable(consensus_compat_test test/compat_test.cc)
+	target_link_libraries(consensus_compat_test PRIVATE consensus::consensus)
+	add_test(NAME consensus_compat COMMAND consensus_compat_test ${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/b7073bb)
 	# T3 in simulated time, under the default and per-platform profiles.
 	add_executable(consensus_liveness_test test/liveness_test.cc)
 	target_link_libraries(consensus_liveness_test PRIVATE consensus::consensus)

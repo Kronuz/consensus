@@ -1,0 +1,26 @@
+// Built against consensus b7073bb: writes the formats Detent's pin writes, for T1.
+#include "consensus/checkpoint.h"
+#include "consensus/snapshot.h"
+#include "consensus/storage.h"
+#include <cstdio>
+#include <fstream>
+#include <string>
+using namespace kronuz::consensus;
+static void write(const std::string& dir, const char* name, const std::string& bytes) { std::ofstream(dir + "/" + name, std::ios::binary) << bytes; }
+int main(int argc, char** argv) {
+	std::string dir = argv[1];
+	FixedConfiguration c; c.cluster[0] = 'T'; c.cluster[1] = '1'; c.configuration[0] = 'O'; c.local = 1; c.voters = {1, 2, 3};
+	write(dir, "init", encode_initialization(c));
+	write(dir, "batch-2", encode_storage_batch(StorageBatch{HardState{1, 1, 0}, std::nullopt}));
+	write(dir, "batch-3", encode_storage_batch(StorageBatch{std::nullopt, LogMutation{1, {{1, 1, EntryKind::NoOp, {}}, {2, 1, EntryKind::Command, "alpha"}}}}));
+	write(dir, "batch-4", encode_storage_batch(StorageBatch{HardState{2, 2, 2}, LogMutation{3, {{3, 2, EntryKind::Command, std::string("b\0c", 3)}}}}));
+	RecoveredState state; state.configuration = c; state.hard = HardState{2, 2, 3}; state.base_index = 2; state.base_term = 1; state.applied_index = 2;
+	state.entries = {{3, 2, EntryKind::Command, std::string("b\0c", 3)}};
+	kronuz::journal::ArtifactDescriptor application{{'A', 'P'}, 5, kronuz::journal::crc32c("image")};
+	write(dir, "checkpoint-v1", encode_checkpoint(state, 4, application));
+	write(dir, "checkpoint-v2", encode_checkpoint(state, 4, application, {}, 7));
+	SnapshotPolicy policy{c.cluster, c.configuration, 7, 1 << 20};
+	write(dir, "snapshot-v1", encode_snapshot(SnapshotDescriptor{c.cluster, c.configuration, 7, 2, 1, 5, kronuz::journal::crc32c("image")}, policy));
+	std::printf("wrote b7073bb fixtures to %s\n", dir.c_str());
+	return 0;
+}

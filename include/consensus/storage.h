@@ -151,7 +151,7 @@ public:
 		if (state.configuration != expected_ || state.base_index == 0 ||
 			state.base_index >= std::numeric_limits<Index>::max() || state.base_term == 0 || state.base_term > state.hard.term ||
 			state.applied_index != state.base_index || state.hard.commit_index < state.base_index ||
-			entry_count > limits_.log_entries || entry_count >= std::numeric_limits<Index>::max() - state.base_index ||
+			entry_count > ceilings.log_entries || entry_count >= std::numeric_limits<Index>::max() - state.base_index ||
 			state.hard.commit_index > state.base_index + entry_count ||
 			(state.hard.voted_for && *state.hard.voted_for == 0)) {
 			throw storage_detail::Corruption("invalid consensus checkpoint state");
@@ -163,11 +163,11 @@ public:
 		for (std::size_t i = 0; i < state.entries.size(); ++i) {
 			const auto& entry = state.entries[i];
 			if (entry.index != state.base_index + i + 1 || entry.term == 0 || entry.term < previous || entry.term > state.hard.term ||
-				entry.payload.size() > limits_.command_bytes || entry.payload.size() > limits_.log_bytes - bytes ||
+				entry.payload.size() > ceilings.command_bytes || entry.payload.size() > ceilings.log_bytes - bytes ||
 				static_cast<unsigned>(entry.kind) > static_cast<unsigned>(EntryKind::Configuration) || (entry.kind == EntryKind::NoOp && !entry.payload.empty())) {
 				throw storage_detail::Corruption("invalid consensus checkpoint suffix");
 			}
-			if (entry.kind == EntryKind::Configuration) { (void)decode_membership(entry.payload, limits_); }  // throws Corruption
+			if (entry.kind == EntryKind::Configuration) { (void)decode_membership(entry.payload); }  // throws Corruption
 			previous = entry.term; bytes += entry.payload.size();
 		}
 		return bytes;
@@ -200,7 +200,7 @@ public:
 private:
 	void initialization(std::string_view bytes) {
 		using namespace storage_detail;
-		const auto bound = 52 + 31 * 8 + 4 + 36 + 24 * std::size_t(limits_.members);  // RFTINIT2 with its largest membership
+		const auto bound = 52 + 31 * 8 + 4 + 36 + 24 * std::size_t(ceilings.members);  // RFTINIT2 with its largest membership
 		if (bytes.size() > bound) { throw Corruption("invalid consensus initialization"); }
 		const auto magic = get64(bytes);
 		if (magic != initial_magic && magic != initial_magic_v2 && magic != join_magic) { throw Corruption("invalid consensus initialization"); }
@@ -219,7 +219,7 @@ private:
 		if (magic == initial_magic_v2) {
 			auto size = get32(bytes);
 			if (size > bytes.size()) { throw Corruption("truncated founding membership"); }
-			auto m = decode_membership(bytes.substr(0, size), limits_); bytes.remove_prefix(size);
+			auto m = decode_membership(bytes.substr(0, size)); bytes.remove_prefix(size);
 			// The roles name exactly the founding voters, each its own node.
 			std::set<NodeId> voting, founding(configuration.voters.begin(), configuration.voters.end());
 			for (const auto& x : m.members) {
@@ -232,12 +232,13 @@ private:
 		end(bytes);
 		if (configuration != expected_) { throw Corruption("stored fixed configuration does not match"); }
 	}
+	// Bounded by the ceilings (R16); the core checks each entry by position.
 	StorageBatch decode(std::string_view bytes) {
 		using namespace storage_detail;
 		// Metadata has its own bound; payload accounting below is independent.
-		if (limits_.rpc_entries > (std::numeric_limits<std::size_t>::max() - 46) / 21 ||
-			limits_.rpc_bytes > std::numeric_limits<std::size_t>::max() - 46 - limits_.rpc_entries * 21 ||
-			bytes.size() > 46 + limits_.rpc_entries * 21 + limits_.rpc_bytes) {
+		if (ceilings.rpc_entries > (std::numeric_limits<std::size_t>::max() - 46) / 21 ||
+			ceilings.rpc_bytes > std::numeric_limits<std::size_t>::max() - 46 - ceilings.rpc_entries * 21 ||
+			bytes.size() > 46 + ceilings.rpc_entries * 21 + ceilings.rpc_bytes) {
 			throw Corruption("invalid consensus storage batch size or version");
 		}
 		const auto magic = get64(bytes);
@@ -250,16 +251,16 @@ private:
 		}
 		if (flag(bytes)) {
 			LogMutation mutation; mutation.replace_from = get64(bytes); auto count = get32(bytes);
-			if (count > limits_.rpc_entries || count > bytes.size() / 21) { throw Corruption("storage entry count exceeds bound"); }
+			if (count > ceilings.rpc_entries || count > bytes.size() / 21) { throw Corruption("storage entry count exceeds bound"); }
 			std::size_t total = 0;
 			for (std::uint32_t i = 0; i < count; ++i) {
 				Entry entry; entry.index = get64(bytes); entry.term = get64(bytes);
 				if (bytes.empty() || static_cast<unsigned char>(bytes[0]) > static_cast<unsigned char>(highest_kind)) { throw Corruption("invalid storage entry kind"); }
 				entry.kind = static_cast<EntryKind>(bytes[0]); bytes.remove_prefix(1);
 				auto length = get32(bytes);
-				if (length > limits_.command_bytes || length > limits_.rpc_bytes - total || length > bytes.size()) { throw Corruption("storage payload exceeds bound"); }
+				if (length > ceilings.command_bytes || length > ceilings.rpc_bytes - total || length > bytes.size()) { throw Corruption("storage payload exceeds bound"); }
 				entry.payload.assign(bytes.substr(0, length)); bytes.remove_prefix(length); total += length;
-				if (entry.kind == EntryKind::Configuration) { (void)decode_membership(entry.payload, limits_); }
+				if (entry.kind == EntryKind::Configuration) { (void)decode_membership(entry.payload); }
 				mutation.entries.push_back(std::move(entry));
 			}
 			batch.log = std::move(mutation);
@@ -281,7 +282,7 @@ private:
 		if (batch.log) {
 			auto from = batch.log->replace_from;
 			if (from == 0 || from <= state_.hard.commit_index || from <= state_.base_index || from - state_.base_index - 1 > state_.entries.size() ||
-				batch.log->entries.size() > limits_.log_entries - static_cast<std::size_t>(from - state_.base_index - 1)) { throw Corruption("invalid logical log replacement"); }
+				batch.log->entries.size() > ceilings.log_entries - static_cast<std::size_t>(from - state_.base_index - 1)) { throw Corruption("invalid logical log replacement"); }
 			new_count = static_cast<std::size_t>(from - state_.base_index - 1) + batch.log->entries.size();
 			for (std::size_t i = static_cast<std::size_t>(from - state_.base_index - 1); i < state_.entries.size(); ++i) { new_bytes -= state_.entries[i].payload.size(); }
 			Term term = from == state_.base_index + 1 ? state_.base_term : state_.entries[from - state_.base_index - 2].term;
@@ -289,7 +290,7 @@ private:
 			for (const auto& entry : batch.log->entries) {
 				if (entry.index != index++ || entry.index >= std::numeric_limits<Index>::max() || entry.term == 0 || entry.term < term ||
 					entry.term > hard.term || (entry.kind == EntryKind::NoOp && !entry.payload.empty()) ||
-					entry.payload.size() > limits_.log_bytes - new_bytes) { throw Corruption("invalid logical replacement entry"); }
+					entry.payload.size() > ceilings.log_bytes - new_bytes) { throw Corruption("invalid logical replacement entry"); }
 				if (entry.index <= state_.base_index + state_.entries.size() && state_.entries[entry.index - state_.base_index - 1].term == entry.term && state_.entries[entry.index - state_.base_index - 1] != entry) {
 					throw Corruption("same-index same-term storage content conflict");
 				}

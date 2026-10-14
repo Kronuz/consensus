@@ -70,14 +70,14 @@ public:
 		}
 		if (hard_.voted_for && *hard_.voted_for == 0) { throw std::invalid_argument("recovered ballot names no incarnation"); }
 		if (hard_.term == 0 && hard_.voted_for) { throw std::invalid_argument("term zero cannot contain a ballot"); }
-		if (entries_.size() > limits_.log_entries || hard_.commit_index > last_index()) { throw std::invalid_argument("invalid recovered log bounds"); }
+		if (entries_.size() > ceilings.log_entries || hard_.commit_index > last_index()) { throw std::invalid_argument("invalid recovered log bounds"); }
 		Term previous_term = base_term_;
 		for (std::size_t i = 0; i < entries_.size(); ++i) {
 			const auto& entry = entries_[i];
 			if (entry.index != base_index_ + i + 1 || !valid_entry(entry) || entry.term > hard_.term || entry.term < previous_term ||
-				entry.payload.size() > limits_.log_bytes - log_bytes_) { throw std::invalid_argument("invalid recovered entry"); }
+				entry.payload.size() > limits_at(entry.index).command_bytes || entry.payload.size() > ceilings.log_bytes - log_bytes_) { throw std::invalid_argument("invalid recovered entry"); }
 			log_bytes_ += entry.payload.size(); previous_term = entry.term;
-			if (entry.kind == EntryKind::Configuration) { configs_.emplace(entry.index, decode_membership(entry.payload, limits_)); }
+			note_append(entry);
 		}
 	}
 	~Core() { capture_owner_->core = nullptr; }
@@ -154,6 +154,8 @@ public:
 	}
 	bool busy() const noexcept { return pending_.has_value() || install_.has_value(); }
 	bool transferring() const noexcept { return transfer_.has_value(); }
+	// The limits the group applies to its next entry (R16).
+	const Limits& group_limits() const { return limits_in_force(); }
 	Index witness_bound() const noexcept { return witness_bound_; }
 	const HardState& durable_hard_state() const noexcept { return durable_; }
 	const FixedConfiguration& configuration() const noexcept { return configuration_; }
@@ -266,9 +268,18 @@ private:
 		if (!m || *m == fixed_membership(configuration_)) { return std::nullopt; }
 		return m;
 	}
+	// A Configuration entry without limits keeps those before it (R16).
 	void note_append(const Entry& entry) {
-		if (entry.kind == EntryKind::Configuration) { configs_[entry.index] = decode_membership(entry.payload, limits_); }
+		if (entry.kind != EntryKind::Configuration) { return; }
+		auto m = decode_membership(entry.payload);
+		if (!m.limits) { m.limits = membership_at(entry.index - 1).limits; }
+		configs_[entry.index] = std::move(m);
 	}
+	// The limits a group applies: its newest configuration's, else the node's (R16).
+	const Limits& limits_of(const Membership& m) const { return m.limits ? *m.limits : limits_; }
+	const Limits& limits_in_force() const { return limits_of(membership()); }
+	// The limits an entry at `index` is checked against: those in force just before it.
+	const Limits& limits_at(Index index) const { return limits_of(membership_at(index - 1)); }
 	void note_truncate(Index from) { configs_.erase(configs_.lower_bound(from), configs_.end()); }
 	void note_base(Index through) {
 		base_membership_ = membership_at(through);
@@ -291,11 +302,11 @@ private:
 	const Entry& log_entry(Index index) const { return entries_.at(log_offset(index)); }
 	Term log_term(Index index) const { return index == base_index_ ? base_term_ : log_entry(index).term; }
 	bool valid_entry(const Entry& entry) const {
-		if (entry.index == 0 || entry.index == maximum || entry.term == 0 || entry.payload.size() > limits_.command_bytes) { return false; }
+		if (entry.index == 0 || entry.index == maximum || entry.term == 0 || entry.payload.size() > ceilings.command_bytes) { return false; }
 		if (entry.kind == EntryKind::NoOp) { return entry.payload.empty(); }
 		if (entry.kind == EntryKind::Configuration) {
 			try {
-				(void)decode_membership(entry.payload, limits_);
+				(void)decode_membership(entry.payload);
 			} catch (const std::exception&) {
 				return false;
 			}
@@ -502,10 +513,13 @@ private:
 		if (durable_.commit_index == 0 || log_term(durable_.commit_index) != hard_.term ||
 			(!configs_.empty() && configs_.rbegin()->first > durable_.commit_index)) { reject(RejectReason::NotReady); return; }
 		try {
-			validate_change(current, change.next, limits_);
+			validate_change(current, change.next, limits_in_force());
 		} catch (const std::invalid_argument&) {
 			reject(RejectReason::InvalidMembership); return;
 		}
+		// A group's RPC limits stay within what this node's transport carries.
+		if (change.next.limits && (change.next.limits->command_bytes > limits_.rpc_bytes || change.next.limits->rpc_bytes > limits_.rpc_bytes ||
+			change.next.limits->rpc_entries > limits_.rpc_entries)) { reject(RejectReason::InvalidMembership); return; }
 		for (const auto& x : change.next.members) {
 			auto old = find_member(current, x.incarnation);
 			if (old && !voting(old->role) && voting(x.role)) {
@@ -516,7 +530,7 @@ private:
 		propose_membership(change.request, change.next, output);
 	}
 	void propose_membership(RequestId request, const Membership& next, Actions& output) {
-		if (last_index() >= maximum - 1 || entries_.charged_entries() >= limits_.log_entries) {
+		if (last_index() >= maximum - 1 || entries_.charged_entries() >= limits_in_force().log_entries) {
 			if (request) { output.emplace_back(Reject{request, RejectReason::LogFull}); }
 			return;
 		}
@@ -563,11 +577,13 @@ private:
 		if (!started_ || role_ != Role::Leader) { output.emplace_back(Reject{proposal.request, RejectReason::NotLeader}); return; }
 		if (witness_self()) { output.emplace_back(Reject{proposal.request, RejectReason::NotLeader}); return; }  // D9
 		if (transfer_) { output.emplace_back(Reject{proposal.request, RejectReason::Busy}); return; }
-		if (proposal.command.size() > limits_.command_bytes) { output.emplace_back(Reject{proposal.request, RejectReason::TooLarge}); return; }
-		if (last_index() - durable_.commit_index >= limits_.uncommitted_entries) {
+		const auto& limits = limits_in_force();
+		if (proposal.command.size() > limits.command_bytes) { output.emplace_back(Reject{proposal.request, RejectReason::TooLarge}); return; }
+		if (last_index() - durable_.commit_index >= limits.uncommitted_entries) {
 			output.emplace_back(Reject{proposal.request, RejectReason::Busy}); return;
 		}
-		if (last_index() >= maximum - 1 || entries_.charged_entries() >= limits_.log_entries - limits_.control_entries || entries_.charged_bytes() > limits_.log_bytes || proposal.command.size() > limits_.log_bytes - entries_.charged_bytes()) {
+		// A lowered retained-log limit blocks proposals until checkpoints bring usage under it.
+		if (last_index() >= maximum - 1 || entries_.charged_entries() >= limits.log_entries - limits.control_entries || entries_.charged_bytes() > limits.log_bytes || proposal.command.size() > limits.log_bytes - entries_.charged_bytes()) {
 			output.emplace_back(Reject{proposal.request, RejectReason::LogFull}); return;
 		}
 		Entry entry{last_index() + 1, hard_.term, EntryKind::Command, std::move(proposal.command)};
@@ -581,7 +597,7 @@ private:
 		if (durable_.commit_index == 0 || log_term(durable_.commit_index) != hard_.term) {
 			output.emplace_back(Reject{read.request, RejectReason::NotReady}); return;
 		}
-		if (reads_.size() >= limits_.reads) { output.emplace_back(Reject{read.request, RejectReason::Busy}); return; }
+		if (reads_.size() >= limits_in_force().reads) { output.emplace_back(Reject{read.request, RejectReason::Busy}); return; }
 		for (const auto& pending : reads_) {
 			if (pending.request == read.request) { output.emplace_back(Reject{read.request, RejectReason::DuplicateRequest}); return; }
 		}
@@ -643,12 +659,12 @@ private:
 	}
 	bool valid(const AppendRequest& request) const {
 		if (request.term == 0 || request.rpc == 0 || request.previous >= maximum || request.previous_term > request.term ||
-			((request.previous == 0) != (request.previous_term == 0)) || request.entries.size() > limits_.rpc_entries ||
+			((request.previous == 0) != (request.previous_term == 0)) || request.entries.size() > ceilings.rpc_entries ||
 			request.entries.size() >= maximum - request.previous) { return false; }
 		Index index = request.previous; Term term = request.previous_term; std::size_t bytes = 0;
 		for (const auto& entry : request.entries) {
 			if (!valid_entry(entry) || entry.index != ++index || entry.term < term || entry.term > request.term ||
-				entry.payload.size() > limits_.rpc_bytes - bytes) { return false; }
+				entry.payload.size() > ceilings.rpc_bytes - bytes) { return false; }
 			bytes += entry.payload.size(); term = entry.term;
 		}
 		return true;
@@ -704,11 +720,24 @@ private:
 			}
 			auto retained_bytes = log_bytes_ - entries_.suffix_bytes(static_cast<std::size_t>(replace_from - base_index_ - 1));
 			auto additional = request.entries.size() - first;
-			if (replace_from - base_index_ - 1 > limits_.log_entries || additional > limits_.log_entries - (replace_from - base_index_ - 1)) {
+			// R16: each entry against the limits in force at its position; retention against
+			// the wider of those before and after the request's configurations.
+			Limits running = limits_at(replace_from), widest = running;
+			for (std::size_t i = first; i < request.entries.size(); ++i) {
+				const auto& entry = request.entries[i];
+				if (entry.payload.size() > running.command_bytes) {
+					output.emplace_back(Send{source, AppendResponse{hard_.term, request.rpc, false, 0, replace_from, request.read_probe}}); return;
+				}
+				if (entry.kind == EntryKind::Configuration) {
+					if (auto m = decode_membership(entry.payload); m.limits) { running = *m.limits; }
+					widest.log_entries = std::max(widest.log_entries, running.log_entries); widest.log_bytes = std::max(widest.log_bytes, running.log_bytes);
+				}
+			}
+			if (replace_from - base_index_ - 1 > widest.log_entries || additional > widest.log_entries - (replace_from - base_index_ - 1)) {
 				output.emplace_back(Send{source, AppendResponse{hard_.term, request.rpc, false, 0, replace_from, request.read_probe}}); return;
 			}
 			for (std::size_t i = first; i < request.entries.size(); ++i) {
-				if (request.entries[i].payload.size() > limits_.log_bytes - retained_bytes) {
+				if (request.entries[i].payload.size() > widest.log_bytes - retained_bytes) {
 					output.emplace_back(Send{source, AppendResponse{hard_.term, request.rpc, false, 0, replace_from, request.read_probe}}); return;
 				}
 				retained_bytes += request.entries[i].payload.size();
@@ -716,8 +745,8 @@ private:
 			std::size_t incoming_bytes = 0;
 			for (std::size_t i = first; i < request.entries.size(); ++i) { incoming_bytes += request.entries[i].payload.size(); }
 			// Overflow-free charged bounds include one reserved replacement RPC.
-			if (entries_.charged_entries() > limits_.log_entries || additional > limits_.rpc_entries ||
-				entries_.charged_bytes() > limits_.log_bytes || incoming_bytes > limits_.rpc_bytes) {
+			if (entries_.charged_entries() > widest.log_entries || additional > ceilings.rpc_entries ||
+				entries_.charged_bytes() > widest.log_bytes || incoming_bytes > ceilings.rpc_bytes) {
 				output.emplace_back(Send{source, AppendResponse{hard_.term, request.rpc, false, 0, replace_from, request.read_probe}}); return;
 			}
 			std::vector<Entry> suffix(request.entries.begin() + static_cast<std::ptrdiff_t>(first), request.entries.end());
@@ -856,7 +885,7 @@ private:
 	}
 	void become_leader(Actions& output) {
 		if (busy()) { throw std::logic_error("leader election before vote persistence"); }
-		if (last_index() >= maximum - 1 || entries_.charged_entries() >= limits_.log_entries) {
+		if (last_index() >= maximum - 1 || entries_.charged_entries() >= limits_in_force().log_entries) {
 			follower(0, output); return; // Control reserve exhausted: fail closed.
 		}
 		role_ = Role::Leader; leader_ = configuration_.local; peers_.clear(); grants_.clear(); answered_.clear(); transfer_.reset();
@@ -885,9 +914,10 @@ private:
 		}
 		Index previous = peer.next - 1;
 		std::vector<Entry> batch; std::size_t bytes = 0;
-		for (Index index = peer.next; index <= last_index() && batch.size() < limits_.rpc_entries; ++index) {
+		const auto rpc_entries = std::min(limits_in_force().rpc_entries, limits_.rpc_entries), rpc_bytes = std::min(limits_in_force().rpc_bytes, limits_.rpc_bytes);
+		for (Index index = peer.next; index <= last_index() && batch.size() < rpc_entries; ++index) {
 			const auto& entry = log_entry(index);
-			if (entry.payload.size() > limits_.rpc_bytes - bytes) { break; }
+			if (entry.payload.size() > rpc_bytes - bytes) { break; }
 			bytes += entry.payload.size(); batch.push_back(entry);
 		}
 		auto rpc = token();
@@ -926,7 +956,7 @@ private:
 		std::vector<Entry> batch; std::size_t bytes = 0;
 		for (Index index = applied_ + 1; index <= durable_.commit_index && batch.size() < limits_.rpc_entries; ++index) {
 			const auto& entry = log_entry(index);
-			if (entry.payload.size() > limits_.rpc_bytes - bytes) { break; }
+			if (!batch.empty() && entry.payload.size() > limits_.rpc_bytes - bytes) { break; }  // one entry always fits
 			bytes += entry.payload.size(); batch.push_back(entry);
 		}
 		delivered_through_ = batch.back().index;

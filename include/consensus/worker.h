@@ -131,7 +131,7 @@ public:
 			Recovery recovery(configuration_, limits_);
 			auto frontier = store_.recover([&](auto sequence, auto bytes) { recovery.replay(sequence, bytes); },
 				[&](const auto& selected, auto& bundle, auto dependencies) {
-					if (dependencies.size() != 1 || selected.dependencies.size() != 1 || bundle.descriptor().length > checkpoint_detail::maximum_size(limits_)) {
+					if (dependencies.size() != 1 || selected.dependencies.size() != 1 || bundle.descriptor().length > checkpoint_detail::maximum_size()) {
 						throw kronuz::journal::Corruption("invalid worker checkpoint dependencies or bundle bound");
 					}
 					std::string bytes(static_cast<std::size_t>(bundle.descriptor().length), '\0');
@@ -224,7 +224,7 @@ public:
 	std::optional<CheckpointId> reserve_checkpoint(std::uint64_t application_cap) {
 		if (!ready() || checkpoint_ || snapshot_result_) { return std::nullopt; }
 		if (next_checkpoint_ == std::numeric_limits<Token>::max()) { throw std::length_error("checkpoint identity exhausted"); }
-		auto replacement = store_.reserve_replacement(application_cap, checkpoint_detail::maximum_size(limits_));
+		auto replacement = store_.reserve_replacement(application_cap, checkpoint_detail::maximum_size(bundle_limits()));
 		if (!replacement) { return std::nullopt; }
 		auto token = ++next_checkpoint_;
 		try { checkpoint_ = std::make_unique<Checkpoint>(*replacement, token, application_cap); }
@@ -270,7 +270,7 @@ public:
 			(core_ && context.leader_term < core_->term())) { throw std::invalid_argument("invalid snapshot sender context"); }
 		if (!ready() || checkpoint_ || snapshot_result_) { return std::nullopt; }
 		if (next_checkpoint_ == std::numeric_limits<Token>::max()) { throw std::length_error("snapshot identity exhausted"); }
-		auto replacement = store_.reserve_replacement(context.descriptor.application_bytes, checkpoint_detail::maximum_size(limits_));
+		auto replacement = store_.reserve_replacement(context.descriptor.application_bytes, checkpoint_detail::maximum_size(bundle_limits()));
 		if (!replacement) { return std::nullopt; }
 		auto token = ++next_checkpoint_;
 		try {
@@ -552,6 +552,15 @@ private:
 		}
 	}
 	enum class MaintenanceKind { Reclaim, BeginApplication, Application, SealApplication, OpenVerification, Readback, BeginBundle, Bundle, SealBundle, Publish, SourceOpen, SourceVerify, SourceRead };
+	// A bundle holds at most the retained log: the node's limits, widened by the group's (R16).
+	Limits bundle_limits() const {
+		Limits limits = limits_;
+		if (core_) {
+			limits.log_entries = std::max(limits.log_entries, core_->group_limits().log_entries);
+			limits.log_bytes = std::max(limits.log_bytes, core_->group_limits().log_bytes);
+		}
+		return limits;
+	}
 	std::string initial_record() const { return configuration_.voters.empty() ? encode_join(configuration_) : encode_initialization(configuration_, founding_); }
 	RecoveredState initial_state() const {
 		RecoveredState state{configuration_, {}, 0, 0, {}, 0};

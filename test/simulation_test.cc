@@ -444,7 +444,7 @@ private:
 		// The membership its durable log puts in force, not the core's own view of it.
 		Membership m = founding_;  // every log here starts at index 1, over the founding membership
 		for (const auto& e : leader.durable.log) {
-			if (e.kind == EntryKind::Configuration) { m = decode_membership(e.payload, limits_); }
+			if (e.kind == EntryKind::Configuration) { m = decode_membership(e.payload); }
 		}
 		if (m.members.empty()) { return; }
 		const Entry& entry = leader.durable.log.at(index - 1);
@@ -463,7 +463,7 @@ private:
 	}
 	// Every committed membership is a single-voter step from the one before (D3).
 	void record_membership(const Entry& e) {
-		auto [it, fresh] = memberships_.emplace(e.index, decode_membership(e.payload, limits_));
+		auto [it, fresh] = memberships_.emplace(e.index, decode_membership(e.payload));
 		if (!fresh) { return; }
 		if (it != memberships_.begin()) {
 			const auto& before = std::prev(it)->second;

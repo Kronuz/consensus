@@ -42,7 +42,7 @@ template <class Source> class IncrementalCheckpointEncoder {
 	IncrementalCheckpointEncoder(Source source, std::uint64_t sequence,
 								 const kronuz::journal::ArtifactDescriptor &application, Limits limits = {},
 								 std::optional<std::uint32_t> format = {})
-		: source_(std::move(source)), limits_(limits), maximum_(checkpoint_detail::maximum_size(limits)) {
+		: source_(std::move(source)), limits_(limits), maximum_(checkpoint_detail::maximum_size()) {
 		using namespace storage_detail;
 		if (!sequence) {
 			throw Corruption("invalid checkpoint storage sequence");

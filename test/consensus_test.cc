@@ -244,8 +244,8 @@ void membership_formats() {
 	Limits limits;
 	Membership m{{{1, 1, MemberRole::Voter}, {2, 2, MemberRole::Voter}, {5, 9, MemberRole::Learner}, {6, 6, MemberRole::Witness}}, 7, 2};
 	auto bytes = encode_membership(m);
-	check(decode_membership(bytes, limits) == m, "a membership round-trips");
-	auto rejects = [&](std::string b) { return throws([&] { (void)decode_membership(b, limits); }); };
+	check(decode_membership(bytes) == m, "a membership round-trips");
+	auto rejects = [&](std::string b) { return throws([&] { (void)decode_membership(b); }); };
 	auto damaged = [&](auto change) { Membership x = m; change(x); return encode_membership(x); };
 	check(rejects("XXXX" + bytes.substr(4)), "a membership with another magic is refused");
 	check(rejects(bytes.substr(0, bytes.size() - 1)) && rejects(bytes + "x"), "a truncated or extended membership is refused");
@@ -1728,8 +1728,62 @@ void founding_records() {
 	}
 }
 
+void limits_by_position() {
+	// RFTM v2 carries limits; without them the bytes stay version 1.
+	Membership plain = fixed_membership(config(1));
+	Membership limited = plain; limited.limits = Limits{};
+	check(encode_membership(plain).size() + 80 == encode_membership(limited).size() && decode_membership(encode_membership(limited)) == limited,
+		"limits round-trip in a version 2 membership");
+	Limits above; above.rpc_bytes = ceilings.rpc_bytes + 1;
+	Membership too_big = plain; too_big.limits = above;
+	check(throws([&] { (void)decode_membership(encode_membership(too_big)); }), "limits above the ceilings are corruption");
+	Limits inconsistent; inconsistent.command_bytes = inconsistent.rpc_bytes + 1;
+	Membership odd = plain; odd.limits = inconsistent;
+	check(throws([&] { (void)decode_membership(encode_membership(odd)); }), "inconsistent limits are corruption");
+
+	Network cluster; cluster.start(); cluster.elect();
+	auto& leader = *cluster.host(1).core;
+	auto change = [&](Limits limits) {
+		Membership next = leader.membership(); next.limits = limits;
+		auto actions = leader.step(ChangeMembership{90, next});
+		bool rejected = find<Reject>(actions) != nullptr;
+		cluster.consume(1, std::move(actions)); cluster.pump(); cluster.tick(cluster.now + 30); cluster.pump();
+		return !rejected;
+	};
+	const std::string big(1536 * 1024, 'b');
+	auto early = leader.step(Propose{91, big});
+	check(find<Reject>(early) && find<Reject>(early)->reason == RejectReason::TooLarge, "a command above the node's default is refused");
+	// Raise: followers whose node default is lower accept it by position.
+	Limits raised; raised.command_bytes = 2 * 1024 * 1024;
+	check(change(raised), "a leader raises the group's command limit");
+	cluster.consume(1, leader.step(Propose{92, big})); cluster.pump(); cluster.tick(cluster.now + 30); cluster.pump();
+	for (NodeId id : {1u, 2u, 3u}) {
+		auto& applied = cluster.host(id).applied_commands;
+		check(!applied.empty() && applied.back().size() == big.size(), "every member applies a command admitted under raised limits");
+	}
+	// Lower: earlier entries stay valid, in the log and after a restart; new ones are refused.
+	Limits lowered; lowered.command_bytes = 512 * 1024;
+	check(change(lowered), "a leader lowers the group's command limit");
+	auto late = leader.step(Propose{93, std::string(700 * 1024, 'c')});
+	check(find<Reject>(late) && find<Reject>(late)->reason == RejectReason::TooLarge, "a command above a lowered limit is refused");
+	for (NodeId id : {2u, 3u}) {
+		auto& host = cluster.host(id);
+		check(!throws([&] { host.restart(); }), "a member recovers entries written before a lowering");
+		cluster.consume(id, host.core->step(Start{}));
+		check(!host.applied_commands.empty() && host.applied_commands.back().size() == big.size(), "the large command replays after a lowering");
+	}
+	// A group's RPC limits stay within the node's transport.
+	Limits wide; wide.rpc_bytes = 4 * 1024 * 1024; wide.log_bytes = 128 * 1024 * 1024;
+	check(!change(wide), "RPC limits above the node's transport are refused");
+	// A retained-log limit below usage blocks proposals.
+	Limits tight; tight.command_bytes = 1024; tight.rpc_bytes = 1024; tight.log_bytes = 1024;
+	check(change(tight), "a leader lowers the retained-log limit below usage");
+	auto blocked = leader.step(Propose{94, "x"});
+	check(find<Reject>(blocked) && find<Reject>(blocked)->reason == RejectReason::LogFull, "a retained log above its lowered limit blocks proposals");
+}
+
 int main() {
-	try { terminal_retirement(); snapshot_sender_maximum_fanout(); snapshot_sender_lost_ack_and_terms(); snapshot_sender_receiver_contact(); snapshot_sender_restart_clock_and_admission(); snapshot_sender_correlation(); snapshot_sender_keepalive_pacing(); snapshot_sender_retries_and_retention(); snapshot_timeout_retries(); portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); repair_at_or_below_commit(); prevote_guard_checkquorum(); membership_scripts(); membership_formats(); leadership_transfer(); witnesses(); checkpoint_with_configuration_suffix(); founding_records(); }
+	try { terminal_retirement(); snapshot_sender_maximum_fanout(); snapshot_sender_lost_ack_and_terms(); snapshot_sender_receiver_contact(); snapshot_sender_restart_clock_and_admission(); snapshot_sender_correlation(); snapshot_sender_keepalive_pacing(); snapshot_sender_retries_and_retention(); snapshot_timeout_retries(); portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); repair_at_or_below_commit(); prevote_guard_checkquorum(); membership_scripts(); membership_formats(); leadership_transfer(); witnesses(); checkpoint_with_configuration_suffix(); founding_records(); limits_by_position(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " consensus checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

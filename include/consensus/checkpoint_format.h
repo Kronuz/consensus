@@ -34,13 +34,16 @@ constexpr std::uint64_t magic_v2 = 0x32504b4342544652ull;
 // application format follows), the version 1 fields, and after the initialization record a
 // membership length and its bytes.
 constexpr std::uint64_t magic_v3 = 0x33504b4342544652ull;
+// A bundle's encoded size under limits: what a reservation needs.
 inline std::size_t maximum_size(Limits limits) {
-	constexpr std::size_t fixed = 400 + 8 + 24 * 64 + 16;  // with a version 3 membership
+	constexpr std::size_t fixed = 400 + 8 + 36 + 24 * ceilings.members + 80;  // with a version 3 membership and its limits
 	if (limits.log_entries > (std::numeric_limits<std::size_t>::max() - fixed) / 21 ||
 		limits.log_bytes > std::numeric_limits<std::size_t>::max() - fixed - limits.log_entries * 21) {
 		throw std::length_error("checkpoint encoded bound overflow");
 	}
 	return fixed + limits.log_entries * 21 + limits.log_bytes;
 }
+// Decoders bound a bundle by the ceilings (R16), so one written under raised limits decodes.
+inline std::size_t maximum_size() { return maximum_size(ceilings); }
 } // namespace checkpoint_detail
 } // namespace kronuz::consensus

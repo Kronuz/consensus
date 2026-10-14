@@ -32,6 +32,23 @@
 
 namespace kronuz::consensus {
 
+// Node-level ceilings no group limit may exceed (R16). Decoders bound their input by
+// these, never by a group's limits, so a follower under old limits decodes a raise.
+inline constexpr Limits ceilings{31, std::size_t{64} << 20, std::size_t{16} << 30, std::size_t{8} << 20, 4096,
+	std::size_t{256} << 20, 65536, 65536, std::size_t{8} << 20, 255};
+
+// Throws std::invalid_argument when a group's limits are inconsistent or above the ceilings.
+inline void validate_limits(const Limits& l) {
+	if (l.voters == 0 || l.command_bytes == 0 || l.rpc_entries == 0 || l.log_entries == 0 || l.reads == 0 || l.uncommitted_entries == 0 ||
+		l.members == 0 || l.control_entries == 0 || l.control_entries > l.log_entries || l.command_bytes > l.rpc_bytes || l.rpc_bytes > l.log_bytes ||
+		l.voters > ceilings.voters || l.command_bytes > ceilings.command_bytes || l.log_bytes > ceilings.log_bytes ||
+		l.log_entries > ceilings.log_entries || l.control_entries > ceilings.control_entries || l.rpc_bytes > ceilings.rpc_bytes ||
+		l.rpc_entries > ceilings.rpc_entries || l.reads > ceilings.reads || l.uncommitted_entries > ceilings.uncommitted_entries ||
+		l.members > ceilings.members) {
+		throw std::invalid_argument("membership limits");
+	}
+}
+
 inline bool voting(MemberRole role) noexcept { return role == MemberRole::Voter || role == MemberRole::Witness; }
 
 // The founding membership of a fixed configuration: every voter its own node and incarnation.
@@ -71,6 +88,10 @@ inline void validate_membership(const Membership& m, const Limits& limits) {
 	const auto voters = voter_count(m);
 	if (voters == 0 || voters > limits.voters || voters > 31) { throw std::invalid_argument("membership voters"); }
 	if (m.leaving && !votes_in(m, m.leaving)) { throw std::invalid_argument("membership leaving"); }
+	if (m.limits) {
+		validate_limits(*m.limits);
+		if (m.members.size() > m.limits->members || voters > m.limits->voters) { throw std::invalid_argument("membership exceeds its limits"); }
+	}
 	// D9: a witness only in rf = 2 + witness; inside a replacement's window, 3 + 1 while a
 	// data voter leaves, or 2 + 2 while the witness does.
 	if (witnesses) {
@@ -107,7 +128,7 @@ inline void validate_change(const Membership& current, const Membership& next, c
 inline std::string encode_membership(const Membership& m) {
 	using kronuz::journal::put64;
 	std::string bytes("RFTM", 4);
-	put64(bytes, 1);  // version
+	put64(bytes, m.limits ? 2 : 1);  // version 2 carries limits (R16)
 	put64(bytes, m.members.size());
 	for (const auto& x : m.members) {
 		put64(bytes, x.incarnation);
@@ -116,16 +137,22 @@ inline std::string encode_membership(const Membership& m) {
 	}
 	put64(bytes, m.next_incarnation);
 	put64(bytes, m.leaving);
+	if (m.limits) {
+		const auto& l = *m.limits;
+		for (auto v : {l.voters, l.command_bytes, l.log_bytes, l.log_entries, l.control_entries, l.rpc_bytes, l.rpc_entries, l.reads, l.uncommitted_entries, l.members}) { put64(bytes, v); }
+	}
 	return bytes;
 }
-inline Membership decode_membership(std::string_view bytes, const Limits& limits) {
+// Structural: bounded by the ceilings; the core checks a membership against the limits in force.
+inline Membership decode_membership(std::string_view bytes) {
 	using kronuz::journal::Corruption;
 	using kronuz::journal::get64;
 	if (!bytes.starts_with("RFTM")) { throw Corruption("membership magic"); }
 	bytes.remove_prefix(4);
-	if (get64(bytes) != 1) { throw Corruption("membership version"); }
+	const auto version = get64(bytes);
+	if (version != 1 && version != 2) { throw Corruption("membership version"); }
 	const auto count = get64(bytes);
-	if (count > limits.members || count > bytes.size() / 24) { throw Corruption("membership count"); }
+	if (count > ceilings.members || count > bytes.size() / 24) { throw Corruption("membership count"); }
 	Membership m;
 	for (std::uint64_t i = 0; i < count; ++i) {
 		const auto incarnation = get64(bytes), node = get64(bytes), role = get64(bytes);
@@ -134,9 +161,18 @@ inline Membership decode_membership(std::string_view bytes, const Limits& limits
 	}
 	m.next_incarnation = get64(bytes);
 	m.leaving = get64(bytes);
+	if (version == 2) {
+		Limits l;
+		for (auto* v : {&l.voters, &l.command_bytes, &l.log_bytes, &l.log_entries, &l.control_entries, &l.rpc_bytes, &l.rpc_entries, &l.reads, &l.uncommitted_entries, &l.members}) {
+			const auto value = get64(bytes);
+			if (value > std::numeric_limits<std::size_t>::max()) { throw Corruption("membership limit"); }
+			*v = static_cast<std::size_t>(value);
+		}
+		m.limits = l;
+	}
 	if (!bytes.empty()) { throw Corruption("trailing membership bytes"); }
 	try {
-		validate_membership(m, limits);
+		validate_membership(m, ceilings);
 	} catch (const std::invalid_argument& error) {
 		throw Corruption(error.what());
 	}

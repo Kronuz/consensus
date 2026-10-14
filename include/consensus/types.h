@@ -52,6 +52,19 @@ struct HardState {
 	Index commit_index = 0;
 	bool operator==(const HardState&) const = default;
 };
+struct Limits {
+	std::size_t voters = 7;
+	std::size_t command_bytes = 1024 * 1024;
+	std::size_t log_bytes = 64 * 1024 * 1024;
+	std::size_t log_entries = 65536;
+	std::size_t control_entries = 16;
+	std::size_t rpc_bytes = 2 * 1024 * 1024;
+	std::size_t rpc_entries = 256;
+	std::size_t reads = 64;
+	std::size_t uncommitted_entries = 1024;
+	std::size_t members = 64;
+	bool operator==(const Limits&) const = default;
+};
 // Configuration entries carry an encoded Membership (membership.h; Track C, D1).
 enum class EntryKind : std::uint8_t { Command, NoOp, Configuration };
 // A member of a group (Track C, D1, D5): a per-group incarnation id, never reused, on a
@@ -68,6 +81,8 @@ struct Membership {
 	std::vector<Member> members;  // sorted by incarnation
 	NodeId next_incarnation = 1;  // above every incarnation the group has used
 	NodeId leaving = 0;           // a voter a replacement promoted beside; removed next
+	// The group's limits from this entry on (R16); absent, those before it, else the node's.
+	std::optional<Limits> limits{};
 	bool operator==(const Membership&) const = default;
 };
 struct Entry {
@@ -91,18 +106,6 @@ struct LogMutation { Index replace_from; std::vector<Entry> entries; };
 struct StorageBatch {
 	std::optional<HardState> hard;
 	std::optional<LogMutation> log;
-};
-struct Limits {
-	std::size_t voters = 7;
-	std::size_t command_bytes = 1024 * 1024;
-	std::size_t log_bytes = 64 * 1024 * 1024;
-	std::size_t log_entries = 65536;
-	std::size_t control_entries = 16;
-	std::size_t rpc_bytes = 2 * 1024 * 1024;
-	std::size_t rpc_entries = 256;
-	std::size_t reads = 64;
-	std::size_t uncommitted_entries = 1024;
-	std::size_t members = 64;
 };
 struct Timing {
 	std::uint64_t heartbeat = 20, rpc_timeout = 40;

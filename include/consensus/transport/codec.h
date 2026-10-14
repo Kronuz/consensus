@@ -174,7 +174,7 @@ inline kronuz::consensus::Message decode(std::string_view bytes, kronuz::consens
 			payload_bytes += payload.size();
 			bytes.remove_prefix(payload.size());
 			if (entry_kind == static_cast<unsigned>(EntryKind::Configuration))
-				(void)decode_membership(payload, limits);  // throws Corruption
+				(void)decode_membership(payload);  // throws Corruption
 			value.entries.push_back(
 				{index, entry_term, static_cast<EntryKind>(entry_kind), std::string(payload)});
 		}

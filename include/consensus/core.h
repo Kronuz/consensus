@@ -848,12 +848,15 @@ private:
 		if (transfer_ && now_ >= transfer_->until) { transfer_.reset(); }
 		// A lost TimeoutNow is resent each heartbeat; the target acts once per token.
 		if (transfer_ && now_ >= heartbeat_deadline_) { transfer_->sent = false; }
-		// D9: a witness that leads hands leadership to its most caught-up data voter.
+		// D9: a witness that leads hands leadership to its most caught-up data voter among
+		// those that answered within the election timeout.
 		if (!transfer_ && witness_self()) {
 			NodeId best = 0; Index matched = 0;
 			for (const auto& [id, peer] : peers_) {
 				auto member = find_member(membership(), id);
-				if (member && member->role == MemberRole::Voter && (!best || peer.matched > matched)) { best = id; matched = peer.matched; }
+				auto answer = answered_.find(id);
+				const bool live = answer != answered_.end() && now_ - answer->second < timing_.election_max && answer->second > leadership_start_;
+				if (member && member->role == MemberRole::Voter && live && (!best || peer.matched > matched)) { best = id; matched = peer.matched; }
 			}
 			if (best) { start_transfer(best, output); }
 		}
@@ -897,6 +900,7 @@ private:
 			follower(0, output); return; // Control reserve exhausted: fail closed.
 		}
 		role_ = Role::Leader; leader_ = configuration_.local; peers_.clear(); grants_.clear(); answered_.clear(); transfer_.reset();
+		leadership_start_ = now_;
 		for (NodeId replica : replicas()) {
 			peers_.emplace(replica, Peer{last_index() + 1, 0, {}});
 			if (is_voter(replica)) { answered_[replica] = now_; }
@@ -1010,6 +1014,7 @@ private:
 	std::optional<Transfer> transfer_;  // a leader's transfer in progress (D6)
 	std::pair<NodeId, Token> acted_timeout_{};  // the last TimeoutNow this node acted on
 	bool timed_out_ = false;
+	std::uint64_t leadership_start_ = 0;  // when this node last became leader
 	Index witness_bound_ = 0;  // a witness truncates only through this (D9)
 };
 

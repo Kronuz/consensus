@@ -1692,6 +1692,19 @@ void witnesses() {
 	for (std::uint64_t from = cluster.now, t = from + 10; t <= from + 400 && witness.role() == Role::Leader; t += 10) { cluster.tick(t); cluster.pump(); }
 	const bool handed = cluster.host(1).core->role() == Role::Leader || cluster.host(2).core->role() == Role::Leader;
 	check(handed && witness.role() == Role::Follower && witness.term() == led + 1, "the witness transfers leadership to a data voter");
+	// With a data voter cut off, the witness hands off to the one that answers.
+	{
+		Network cut;
+		for (NodeId id : {1u, 2u, 3u}) {
+			auto state = empty(id); state.membership = founding;
+			cut.host(id).core = std::make_unique<Core>(config(id), std::move(state));
+		}
+		cut.start(); cut.now = 200; cut.isolated = {1};
+		auto& w3 = *cut.host(3).core;
+		cut.consume(3, campaign(w3, Tick{200, 100})); cut.pump();
+		for (std::uint64_t from = cut.now, t = from + 10; t <= from + 200 && cut.host(2).core->role() != Role::Leader; t += 10) { cut.tick(t); cut.pump(); }
+		check(cut.host(2).core->role() == Role::Leader, "a witness hands off while a data voter is cut off");
+	}
 	// A witness checkpoints only through what every data voter has matched.
 	auto bound_state = empty(3); bound_state.membership = founding;
 	Core w(config(3), std::move(bound_state)); w.step(Start{});

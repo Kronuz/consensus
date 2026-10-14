@@ -70,12 +70,17 @@ Profile derive(const char* name, double b, double r) {
 
 class Cluster {
 public:
-	Cluster(std::uint64_t seed, std::size_t voters, const Profile& profile) : random_(seed), profile_(profile) {
+	// witness: the last voter founds the group as a witness (2 + witness, D9).
+	Cluster(std::uint64_t seed, std::size_t voters, const Profile& profile, bool witness = false) : random_(seed), profile_(profile) {
 		tick_ = std::max<std::uint64_t>(1, profile.timing.heartbeat / 5);
 		for (NodeId id = 1; id <= voters; ++id) {
 			FixedConfiguration c; c.cluster[0] = 'L'; c.configuration[0] = 'T'; c.local = id;
 			for (NodeId v = 1; v <= voters; ++v) { c.voters.push_back(v); }
 			RecoveredState state; state.configuration = c;
+			if (witness) {
+				Membership m = fixed_membership(c); m.members.back().role = MemberRole::Witness;
+				state.membership = m;
+			}
 			nodes_[id].core = std::make_unique<Core>(c, std::move(state), Limits{}, profile.timing);
 			step(id, Tick{0, delay()});
 			step(id, Start{});
@@ -83,11 +88,13 @@ public:
 		for (auto& [id, n] : nodes_) { at(tick_ + random_() % tick_, [this, id] { tick(id); }); }
 	}
 	std::uint64_t now() const { return now_; }
+	std::function<void()> observe;  // called after every event
 	void run_until(std::uint64_t until, const std::function<bool()>& done = {}) {
 		while (!events_.empty() && events_.top().at <= until) {
 			auto event = events_.top(); events_.pop();
 			now_ = event.at;
 			event.run();
+			if (observe) { observe(); }
 			if (done && done()) { return; }
 		}
 		now_ = until;
@@ -222,8 +229,8 @@ double percentile(std::vector<double> v, double p) {
 }
 
 void run(const Profile& profile, std::uint64_t seeds) {
-	std::vector<double> heal, transfer, stepdown, recover;
-	std::uint64_t raised = 0, lone_raised = 0, unhealed = 0, untransferred = 0, unrecovered = 0;
+	std::vector<double> heal, transfer, stepdown, recover, handoff, survive;
+	std::uint64_t unsurvived = 0, unhanded = 0, raised = 0, lone_raised = 0, unhealed = 0, untransferred = 0, unrecovered = 0;
 	const auto& t = profile.timing;
 	for (std::uint64_t seed = 1; seed <= seeds; ++seed) {
 		std::mt19937_64 pick(seed * 7919);
@@ -283,6 +290,27 @@ void run(const Profile& profile, std::uint64_t seeds) {
 				if (std::getenv("LIVENESS_DEBUG")) { std::fprintf(stderr, "%s transfer failed: seed %llu voters %zu leader %llu target %llu, leader now %llu term %llu\n", profile.name, (unsigned long long)seed, voters, (unsigned long long)*l, (unsigned long long)target, (unsigned long long)c.leader().value_or(0), (unsigned long long)c.core(target).term()); }
 			}
 		}
+		// T4: a 2 + witness group survives any single failure, and a witness that leads hands
+		// off to a data voter within election_max.
+		{
+			const std::set<NodeId> three{1, 2, 3};
+			for (NodeId failed : {NodeId(1), NodeId(2), NodeId(3)}) {
+				Cluster c(seed + 4000000 + failed, 3, profile, true);
+				c.commit_one(three, 20000);
+				std::optional<std::uint64_t> led;
+				c.observe = [&] {
+					if (!led && c.core(3).role() == Role::Leader) { led = c.now(); }
+					if (led && c.core(3).role() != Role::Leader) { handoff.push_back(double(c.now() - *led)); led.reset(); }
+				};
+				c.isolate({failed});
+				const auto started = c.now();
+				std::set<NodeId> rest = three; rest.erase(failed);
+				// The witness refuses proposals, so a commit means a data voter leads.
+				if (c.commit_one(rest, started + 30000)) { survive.push_back(double(c.now() - started)); } else { ++unsurvived; }
+				c.run_until(c.now() + 5000);
+				if (led) { ++unhanded; }
+			}
+		}
 		// A leader that cannot receive steps down, and a new leader commits.
 		{
 			Cluster c(seed + 3000000, voters, profile);
@@ -309,6 +337,11 @@ void run(const Profile& profile, std::uint64_t seeds) {
 	check(!untransferred && transfer99 <= 500, std::string(profile.name) + ": a transfer completes within 500 ms at p99");
 	check(down_max <= double(t.election_max) + double(t.heartbeat), std::string(profile.name) + ": a deaf leader steps down within election_max");
 	check(!unrecovered && recover99 <= 5000, std::string(profile.name) + ": a new leader commits within 5 s of a deaf leader");
+	const auto survive99 = percentile(survive, 0.99), handoff_max = percentile(handoff, 1.0);
+	std::printf("%26s 2 + witness: single failure recovered p99 %6.0f (%zu, %llu failed); witness hand-offs %zu, max %5.0f, unfinished %llu\n", "",
+		survive99, survive.size(), (unsigned long long)unsurvived, handoff.size(), handoff_max, (unsigned long long)unhanded);
+	check(!unsurvived && survive99 <= 5000, std::string(profile.name) + ": 2 + witness survives any single failure");
+	check(!unhanded && handoff_max <= double(t.election_max), std::string(profile.name) + ": a witness leader hands off within election_max");
 }
 
 }  // namespace

@@ -1772,7 +1772,8 @@ void worker_api_guards() {
 		check(refused({0, 1}) && refused({1048577, 1}) && refused({4, 0}) && refused({4, 4097}) && refused({4, 1}, few_slots) && refused({4, 1}, few_tickets),
 			"a worker needs bounded scheduling, three control slots, and five tickets");
 		FaultIO borrowed(directory.path);
-		check(throws([&] { Worker bad(borrowed, SnapshotFixture::fixed(), SnapshotFixture::quota(), limits(), compact, {4, 1, true}); }), "borrowed IO cannot run asynchronous storage");
+		check(throws([&] { Worker bad(borrowed, SnapshotFixture::fixed(), SnapshotFixture::quota(), limits(), compact, {4, 1, true}); }) &&
+			throws([&] { Worker bad(borrowed, SnapshotFixture::fixed(), SnapshotFixture::quota(), limits(), compact, {4, 1, false, true}); }), "borrowed IO cannot run asynchronous storage");
 	}
 	SnapshotFixture owner("guards-owner"), other("guards-other");
 	auto id = owner.worker.reserve_snapshot(owner.context("data")); check(id.has_value(), "the owner reserves a snapshot");
@@ -1859,6 +1860,8 @@ void receiving_protocol() {
 		"a Chunk after the final one closes the session"); finish();
 	check(start() && send(b, begin(from_b)) == TransferReceive::Busy, "a Begin from another session waits while one transfer is in progress"); finish();
 	check(start() && send(a, begin(other_key)) == TransferReceive::Busy, "a Begin for another transfer waits while one is in progress"); finish();
+	auto conflicting = encode_transfer(TransferKind::Begin, envelope, encode_snapshot(fixture.context("datb").descriptor, *fixture.worker.snapshot_policy()));
+	check(start() && send(a, conflicting) == TransferReceive::Closed, "a repeated Begin with another descriptor closes the session"); finish();
 	SnapshotFixture disabled("reception-disabled", std::nullopt); SnapshotChannel refusing(disabled.worker); refusing.register_session(a);
 	auto bytes = encode_transfer(TransferKind::Begin, envelope, encode_snapshot(fixture.context("data").descriptor, *fixture.worker.snapshot_policy()));
 	check(refusing.receive(a, std::span<const char>(bytes.data(), bytes.size())).result == TransferReceive::Closed, "a worker without snapshot reception refuses a Begin");
@@ -1947,6 +1950,11 @@ void founding_and_join_records() {
  Membership greedy{{{1, 1, MemberRole::Voter}, {2, 2, MemberRole::Voter}, {3, 3, MemberRole::Witness}}, 4, 0};
  greedy.limits = limits(); greedy.limits->command_bytes = limits().command_bytes * 2; greedy.limits->rpc_bytes = limits().rpc_bytes * 2; greedy.limits->log_bytes = limits().log_bytes * 2;
  check(throws([&] { bad.found(greedy); }), "founding limits above the node's are refused");
+ Membership moved{{{1, 1, MemberRole::Voter}, {2, 2, MemberRole::Voter}, {3, 9, MemberRole::Witness}}, 10, 0};
+ Membership learner{{{1, 1, MemberRole::Voter}, {2, 2, MemberRole::Voter}, {3, 3, MemberRole::Learner}}, 4, 0};
+ Membership leaving{{{1, 1, MemberRole::Voter}, {2, 2, MemberRole::Voter}, {3, 3, MemberRole::Witness}}, 4, 3};
+ check(throws([&] { bad.found(moved); }) && throws([&] { bad.found(learner); }) && throws([&] { bad.found(leaving); }),
+  "founding members are first incarnations, none a learner, none leaving");
 }
 
 // Track C, D5 (review M3): any authenticated incarnation of the group may send a snapshot,

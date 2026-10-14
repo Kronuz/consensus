@@ -220,6 +220,10 @@ public:
 				std::fprintf(stderr, "  node %llu: up %d role %d term %llu committed %llu applied %llu last %llu durable log %zu pending %d applying %d\n", (unsigned long long)id, n.up,
 					int(n.core->role()), (unsigned long long)n.core->term(), (unsigned long long)n.core->committed(), (unsigned long long)n.core->applied(),
 					(unsigned long long)n.core->last_index(), n.durable.log.size(), n.pending.has_value(), n.applying.has_value());
+				std::fprintf(stderr, "    base %llu members:", (unsigned long long)n.durable.base);
+				for (const auto& x : n.core->membership().members) { std::fprintf(stderr, " %llu/%d", (unsigned long long)x.incarnation, int(x.role)); }
+				for (const auto& x : n.core->membership().members) { if (auto pr = n.core->progress(x.incarnation)) { std::fprintf(stderr, " p%llu=%llu", (unsigned long long)x.incarnation, (unsigned long long)*pr); } }
+				std::fprintf(stderr, " snapshots queued %zu\n", snapshot_requests_.size());
 			}
 		}
 		check_logs();
@@ -306,6 +310,11 @@ private:
 			} else {
 				++lost;
 			}
+		}
+		// The transport tells a sender its stream broke.
+		if (n.installing) {
+			auto& from = nodes_.at(n.installing->from);
+			if (from.up) { act(from, from.core->step(SnapshotTransferFailed{n.id, n.installing->key})); }
 		}
 		n.up = false;
 		n.core.reset();
@@ -512,7 +521,13 @@ private:
 		auto ready = l.core->step(SnapshotSourceReady{peer, key});
 		const bool transmit = std::any_of(ready.begin(), ready.end(), [](const Action& a) { return std::holds_alternative<SnapshotTransmit>(a); });
 		act(l, std::move(ready));
-		if (!transmit || !l.up) { return; }
+		if (!l.up) { return; }
+		if (!transmit) {
+			// A busy leader answers nothing; a host keeps the request until the core takes the
+			// source or drops the flight.
+			if (auto waiting = l.core->awaiting_snapshot(peer); waiting && *waiting == key) { snapshot_requests_.push_back({from, peer, key}); }
+			return;
+		}
 		auto it = nodes_.find(peer);
 		if (it == nodes_.end() || !it->second.up || isolated_.count(from) || isolated_.count(peer) || random_() % 10 == 0) {
 			act(l, l.core->step(SnapshotTransferFailed{peer, key}));
@@ -611,7 +626,14 @@ private:
 	void deliver(const Envelope& e) {
 		auto& n = nodes_.at(e.to);
 		if (!n.up || isolated_.count(e.from) || isolated_.count(e.to) || cut_.count({e.from, e.to})) { return; }
-		act(n, n.core->step(Receive{e.from, e.message}));
+		auto out = n.core->step(Receive{e.from, e.message});
+		if (std::getenv("SIM_TRACE") && n.id == NodeId(std::atoi(std::getenv("SIM_TRACE"))) && now_ > trace_after_) {
+			for (const auto& x : out) {
+				if (auto snd = std::get_if<Send>(&x)) { if (auto r = std::get_if<AppendResponse>(&snd->message)) { std::fprintf(stderr, "trace %llu -> %llu: success %d matched %llu hint %llu compacted %d term %llu\n", (unsigned long long)n.id, (unsigned long long)snd->peer, r->success, (unsigned long long)r->matched, (unsigned long long)r->next_hint, r->compacted.has_value(), (unsigned long long)r->term); } }
+			}
+			if (auto ar = std::get_if<AppendRequest>(&e.message)) { std::fprintf(stderr, "trace %llu <- %llu: append term %llu prev %llu/%llu n %zu commit %llu; out %zu actions\n", (unsigned long long)n.id, (unsigned long long)e.from, (unsigned long long)ar->term, (unsigned long long)ar->previous, (unsigned long long)ar->previous_term, ar->entries.size(), (unsigned long long)ar->commit, out.size()); }
+		}
+		act(n, std::move(out));
 	}
 
 	void act(Node& n, Actions actions) {
@@ -748,7 +770,7 @@ private:
 	bool witness_ = false;
 	std::map<Index, Membership> memberships_;
 	Limits limits_;
-	Timing timing_{60, 300, 600, 1200, 60000};
+	Timing timing_{60, 300, 600, 1200, 3000};  // a lost snapshot reply times out well inside the heal
 	std::map<NodeId, Node> nodes_;
 	std::deque<Envelope> network_;
 	std::set<NodeId> isolated_;
@@ -764,6 +786,7 @@ private:
 	std::size_t forced_at_ = 2000 + random_() % 4000;
 	std::set<std::pair<NodeId, NodeId>> cut_;  // (from, to) links down
 	std::optional<NodeId> forced_leader_;
+	std::uint64_t trace_after_ = std::getenv("SIM_TRACE_AFTER") ? std::strtoull(std::getenv("SIM_TRACE_AFTER"), nullptr, 10) : 0;
 };
 
 }  // namespace

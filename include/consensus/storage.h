@@ -39,6 +39,10 @@ using kronuz::journal::get64;
 using kronuz::journal::put32;
 using kronuz::journal::put64;
 constexpr std::uint64_t initial_magic = 0x3154494e49544652ull;
+// Track C, D1, D9: a founding membership with roles ("RFTINIT2"), and a joiner's record
+// ("RFTJOIN1": identities and its incarnation, no membership).
+constexpr std::uint64_t initial_magic_v2 = 0x3254494e49544652ull;
+constexpr std::uint64_t join_magic = 0x314e494f4a544652ull;
 constexpr std::uint64_t batch_magic = 0x3148435442544652ull;
 // A batch holding a Configuration entry (Track C, D1), so a reader before it refuses it.
 constexpr std::uint64_t membership_batch_magic = 0x3248435442544652ull;
@@ -55,13 +59,28 @@ inline bool flag(std::string_view& bytes) {
 inline void end(std::string_view bytes) { if (!bytes.empty()) { throw Corruption("trailing consensus storage bytes"); } }
 } // namespace storage_detail
 
-inline std::string encode_initialization(const FixedConfiguration& configuration) {
+// The founding record. Roles are written (RFTINIT2) only when a founding member is not a
+// voter, so an all-voter group's record stays the one older readers know.
+inline std::string encode_initialization(const FixedConfiguration& configuration, const std::optional<Membership>& founding = {}) {
 	using namespace storage_detail;
 	if (configuration.voters.size() > 31) { throw std::length_error("too many voters"); }
+	const bool roles = founding && std::any_of(founding->members.begin(), founding->members.end(), [](const Member& x) { return x.role != MemberRole::Voter; });
 	std::string result;
-	put64(result, initial_magic); identity(result, configuration.cluster); identity(result, configuration.configuration);
+	put64(result, roles ? initial_magic_v2 : initial_magic); identity(result, configuration.cluster); identity(result, configuration.configuration);
 	put64(result, configuration.local); put32(result, static_cast<std::uint32_t>(configuration.voters.size()));
 	for (auto voter : configuration.voters) { put64(result, voter); }
+	if (roles) {
+		auto bytes = encode_membership(*founding);
+		put32(result, static_cast<std::uint32_t>(bytes.size())); result += bytes;
+	}
+	return result;
+}
+inline std::string encode_join(const FixedConfiguration& configuration) {
+	using namespace storage_detail;
+	if (!configuration.voters.empty() || configuration.local == 0) { throw std::invalid_argument("a join record names only its own incarnation"); }
+	std::string result;
+	put64(result, join_magic); identity(result, configuration.cluster); identity(result, configuration.configuration);
+	put64(result, configuration.local);
 	return result;
 }
 
@@ -119,7 +138,8 @@ class Recovery {
 public:
 	Recovery(FixedConfiguration configuration, Limits limits = {}) : expected_(std::move(configuration)), limits_(limits) {
 		std::set<NodeId> voters(expected_.voters.begin(), expected_.voters.end());
-		if (expected_.local == 0 || expected_.voters.empty() || voters.contains(0) || !voters.contains(expected_.local) ||
+		// No voters: a joiner, recovered from its join record (D5).
+		if (expected_.local == 0 || voters.contains(0) || (!voters.empty() && !voters.contains(expected_.local)) ||
 			voters.size() != expected_.voters.size() || voters.size() > limits.voters || limits.voters > 31 ||
 			limits.command_bytes == 0 || limits.rpc_entries == 0 || limits.rpc_bytes < limits.command_bytes ||
 			limits.log_bytes < limits.rpc_bytes || limits.log_entries == 0) { throw std::invalid_argument("invalid storage recovery configuration or limits"); }
@@ -180,12 +200,35 @@ public:
 private:
 	void initialization(std::string_view bytes) {
 		using namespace storage_detail;
-		if (bytes.size() > 52 + 31 * 8 || get64(bytes) != initial_magic) { throw Corruption("invalid consensus initialization"); }
+		const auto bound = 52 + 31 * 8 + 4 + 36 + 24 * std::size_t(limits_.members);  // RFTINIT2 with its largest membership
+		if (bytes.size() > bound) { throw Corruption("invalid consensus initialization"); }
+		const auto magic = get64(bytes);
+		if (magic != initial_magic && magic != initial_magic_v2 && magic != join_magic) { throw Corruption("invalid consensus initialization"); }
 		FixedConfiguration configuration;
 		configuration.cluster = identity(bytes); configuration.configuration = identity(bytes); configuration.local = get64(bytes);
+		if (magic == join_magic) {
+			end(bytes);
+			if (configuration != expected_) { throw Corruption("stored join record does not match"); }
+			state_.membership = Membership{};
+			return;
+		}
+		if (expected_.voters.empty()) { throw Corruption("a joiner's store holds a founding record"); }
 		auto count = get32(bytes);
 		if (count > limits_.voters || count > bytes.size() / 8) { throw Corruption("initialization voter count overflow"); }
 		for (std::uint32_t i = 0; i < count; ++i) { configuration.voters.push_back(get64(bytes)); }
+		if (magic == initial_magic_v2) {
+			auto size = get32(bytes);
+			if (size > bytes.size()) { throw Corruption("truncated founding membership"); }
+			auto m = decode_membership(bytes.substr(0, size), limits_); bytes.remove_prefix(size);
+			// The roles name exactly the founding voters, each its own node.
+			std::set<NodeId> voting, founding(configuration.voters.begin(), configuration.voters.end());
+			for (const auto& x : m.members) {
+				if (x.node != x.incarnation || x.role == MemberRole::Learner) { throw Corruption("founding membership member"); }
+				voting.insert(x.incarnation);
+			}
+			if (voting != founding || m.leaving) { throw Corruption("founding membership does not match its voters"); }
+			state_.membership = std::move(m);
+		}
 		end(bytes);
 		if (configuration != expected_) { throw Corruption("stored fixed configuration does not match"); }
 	}

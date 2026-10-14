@@ -1753,10 +1753,40 @@ void binary_transfer_codec() {
 	check(throws([&] { encode_transfer(TransferKind::Chunk, envelope, std::string(65561, 'x')); }), "oversized frame rejects before encoding");
 }
 
+void founding_and_join_records() {
+ auto directory = std::filesystem::current_path() / ".scratch" / ("worker-founding-" + std::to_string(::getpid()));
+ std::filesystem::create_directories(directory); ::chmod(directory.c_str(), 0700);
+ struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
+ FixedConfiguration three = configuration(); three.voters = {1, 2, 3};
+ Membership witness{{{1, 1, MemberRole::Voter}, {2, 2, MemberRole::Voter}, {3, 3, MemberRole::Witness}}, 4, 0};
+ FixedConfiguration joiner = configuration(); joiner.local = 7; joiner.voters.clear();
+ for (bool join : {false, true}) {
+  auto path = directory / (join ? "join" : "found"); std::filesystem::create_directories(path);
+  auto io = std::make_shared<kronuz::journal::PosixIO>(path);
+  auto& config = join ? joiner : three;
+  {
+   Worker worker(io, config, admission(), limits());
+   if (!join) { worker.found(witness); }
+   Identity id{}; id[0] = join ? 'J' : 'W'; worker.create(id);
+   for (unsigned turn = 0; !worker.ready() && turn < 100; ++turn) { worker.run_one({turn, 100}); }
+   check(worker.ready(), "a founding or joining worker initializes");
+   worker.close(); while (!worker.drained()) { worker.run_one({0, 100}); }
+  }
+  Worker recovered(io, config, admission(), limits()); recovered.recover([](auto&) {});
+  for (unsigned turn = 0; !recovered.ready() && turn < 100; ++turn) { recovered.run_one({turn, 100}); }
+  auto m = recovered.membership();
+  check(recovered.ready() && m && (join ? m->members.empty() : *m == witness), join ? "a joiner recovers from its join record" : "a 2 + witness group recovers its roles");
+  recovered.close(); while (!recovered.drained()) { recovered.run_one({0, 100}); }
+ }
+ Worker bad(std::make_shared<kronuz::journal::PosixIO>(directory), three, admission(), limits());
+ Membership wrong{{{1, 1, MemberRole::Voter}, {2, 2, MemberRole::Voter}, {4, 4, MemberRole::Witness}}, 5, 0};
+ check(throws([&] { bad.found(wrong); }), "founding roles must name the configured voters");
+}
+
 int main(int argc, char** argv) {
 	try {
 		if (argc == 2 && std::string_view(argv[1]) == "--terminal-regressions") { terminal_original_settlement(); terminal_checkpoint_originals(); terminal_output_and_dispatch_failure(); terminal_snapshot_readback(); terminal_published_activation(); terminal_reclamation_original(); std::cout << checks << " terminal checks, " << failures << " failures\n"; return failures ? 1 : 0; }
-		terminal_original_settlement(); terminal_checkpoint_originals(); terminal_output_and_dispatch_failure(); terminal_snapshot_readback(); terminal_published_activation(); terminal_reclamation_original();
+		terminal_original_settlement(); terminal_checkpoint_originals(); terminal_output_and_dispatch_failure(); terminal_snapshot_readback(); terminal_published_activation(); terminal_reclamation_original(); founding_and_join_records();
 		if (argc == 2 && std::string_view(argv[1]) == "--retained-admission-benchmark") { admission_benchmark = true; real_worker(); return failures ? 1 : 0; }
 		if (argc == 2 && std::string_view(argv[1]) == "--source-regressions") { owned_snapshot_sources(); std::cout << checks << " source checks, " << failures << " failures\n"; return failures ? 1 : 0; }
 		if (argc == 2 && std::string_view(argv[1]) == "--completion-regressions") { completion_appends(); completion_storage(); completion_channel_cancellation(); completion_snapshot_readback(); retired_completion_worker(); for (unsigned mode : {0u, 1u, 3u}) { binary_transfer_integration(65553, mode, false, true); } std::cout << checks << " completion checks, " << failures << " failures\n"; return failures ? 1 : 0; }

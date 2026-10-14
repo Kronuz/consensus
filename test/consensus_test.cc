@@ -1691,8 +1691,45 @@ void checkpoint_with_configuration_suffix() {
 	check(encoded, "a checkpoint retains a Configuration entry in its suffix");
 }
 
+void founding_records() {
+	using R = MemberRole;
+	// An all-voter founding writes today's record; roles write RFTINIT2.
+	check(encode_initialization(config(1), fixed_membership(config(1))) == encode_initialization(config(1)), "an all-voter founding keeps the RFTINIT1 record");
+	Membership witness{{{1, 1, R::Voter}, {2, 2, R::Voter}, {3, 3, R::Witness}}, 4, 0};
+	auto v2 = encode_initialization(config(1), witness);
+	{
+		Recovery recovery(config(1)); recovery.replay(1, v2);
+		auto state = recovery.finish(1);
+		check(state.membership == witness, "RFTINIT2 recovers the founding roles");
+	}
+	Membership stranger{{{1, 1, R::Voter}, {2, 2, R::Voter}, {4, 4, R::Witness}}, 5, 0};
+	check(throws([&] { Recovery r(config(1)); r.replay(1, encode_initialization(config(1), stranger)); }), "founding roles must name the founding voters");
+	for (std::size_t size = 0; size < v2.size(); ++size) {
+		check(throws([&] { Recovery r(config(1)); r.replay(1, std::string_view(v2).substr(0, size)); }), "a truncated RFTINIT2 is corruption");
+	}
+	// A joiner's record names its identities and incarnation, no membership.
+	FixedConfiguration joiner = config(7); joiner.voters.clear();
+	auto join = encode_join(joiner);
+	{
+		Recovery recovery(joiner); recovery.replay(1, join);
+		auto state = recovery.finish(1);
+		check(state.membership && state.membership->members.empty(), "RFTJOIN1 recovers an empty membership");
+		Core core(joiner, std::move(state)); core.step(Start{});
+		auto quiet = core.step(Tick{1000, 100});
+		check(!find<Send>(quiet) && !find<Persist>(quiet), "a joiner never campaigns");
+	}
+	check(throws([&] { Recovery r(joiner); r.replay(1, encode_initialization(config(1))); }), "a joiner's store refuses a founding record");
+	check(throws([&] { Recovery r(config(1)); r.replay(1, join); }), "a founding store refuses a join record");
+	FixedConfiguration other = joiner; other.local = 8;
+	check(throws([&] { Recovery r(other); r.replay(1, join); }), "a join record names its own incarnation");
+	check(throws([&] { (void)encode_join(config(1)); }), "a join record carries no voters");
+	for (std::size_t size = 0; size < join.size(); ++size) {
+		check(throws([&] { Recovery r(joiner); r.replay(1, std::string_view(join).substr(0, size)); }), "a truncated RFTJOIN1 is corruption");
+	}
+}
+
 int main() {
-	try { terminal_retirement(); snapshot_sender_maximum_fanout(); snapshot_sender_lost_ack_and_terms(); snapshot_sender_receiver_contact(); snapshot_sender_restart_clock_and_admission(); snapshot_sender_correlation(); snapshot_sender_keepalive_pacing(); snapshot_sender_retries_and_retention(); snapshot_timeout_retries(); portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); repair_at_or_below_commit(); prevote_guard_checkquorum(); membership_scripts(); membership_formats(); leadership_transfer(); witnesses(); checkpoint_with_configuration_suffix(); }
+	try { terminal_retirement(); snapshot_sender_maximum_fanout(); snapshot_sender_lost_ack_and_terms(); snapshot_sender_receiver_contact(); snapshot_sender_restart_clock_and_admission(); snapshot_sender_correlation(); snapshot_sender_keepalive_pacing(); snapshot_sender_retries_and_retention(); snapshot_timeout_retries(); portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); repair_at_or_below_commit(); prevote_guard_checkquorum(); membership_scripts(); membership_formats(); leadership_transfer(); witnesses(); checkpoint_with_configuration_suffix(); founding_records(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " consensus checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

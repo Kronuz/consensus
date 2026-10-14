@@ -102,14 +102,27 @@ public:
 	}
 	Worker(const Worker&) = delete;
 	Worker& operator=(const Worker&) = delete;
+	// Before create or recover: the founding membership's roles (D9), when a founding member
+	// is not a voter. A configuration with no voters is a joiner (D5).
+	void found(Membership founding) {
+		unopened();
+		validate_membership(founding, limits_);
+		std::set<NodeId> voting, voters(configuration_.voters.begin(), configuration_.voters.end());
+		for (const auto& x : founding.members) {
+			if (x.node != x.incarnation || x.role == MemberRole::Learner) { throw std::invalid_argument("founding membership member"); }
+			voting.insert(x.incarnation);
+		}
+		if (voting != voters || founding.leaving) { throw std::invalid_argument("founding membership does not match the voters"); }
+		founding_ = std::move(founding);
+	}
 	void create(kronuz::journal::Identity identity) {
 		unopened();
 		try {
 			store_.create(identity); store_.inventory_step(scheduling_.scan_entries);
 			// A new directory has only the bounded bootstrap names; a tiny
 			// configured scan budget can require several startup slices.
-			initialization_ = encode_initialization(configuration_);
-			core_ = std::make_unique<Core>(configuration_, RecoveredState{configuration_, {}, 0, 0, {}, 0}, limits_, timing_);
+			initialization_ = initial_record();
+			core_ = std::make_unique<Core>(configuration_, initial_state(), limits_, timing_);
 		} catch (const std::exception& error) { fail(error.what()); throw; }
 	}
 	template <class Restore> void recover(Restore restore_application) {
@@ -135,8 +148,8 @@ public:
 			if (frontier.sequence == 0 && frontier.base_sequence == 0 && frontier.version == 1 && !frontier.checkpoint && frontier.dependencies.empty()) {
 				// Generic bootstrap is already durable; typed initialization may
 				// have been queued when the previous process exited.
-				initialization_ = encode_initialization(configuration_);
-				core_ = std::make_unique<Core>(configuration_, RecoveredState{configuration_, {}, 0, 0, {}, 0}, limits_, timing_);
+				initialization_ = initial_record();
+				core_ = std::make_unique<Core>(configuration_, initial_state(), limits_, timing_);
 			} else { core_ = std::make_unique<Core>(configuration_, recovery.finish(frontier.sequence), limits_, timing_); }
 		} catch (const std::exception& error) { fail(error.what()); throw; }
 	}
@@ -153,6 +166,7 @@ public:
 	Role role() const noexcept { return core_ ? core_->role() : Role::Follower; }
 	bool busy() const noexcept { return core_ && core_->busy(); }
 	Term term() const noexcept { return core_ ? core_->term() : 0; }
+	std::optional<Membership> membership() const { return core_ ? std::optional<Membership>(core_->membership()) : std::nullopt; }
 	Index committed() const noexcept { return core_ ? core_->committed() : 0; }
 	Index applied_index() const noexcept { return core_ ? core_->applied() : 0; }
 	std::size_t retained_log_bytes() const noexcept { return core_ ? core_->retained_log_bytes() : 0; }
@@ -538,8 +552,15 @@ private:
 		}
 	}
 	enum class MaintenanceKind { Reclaim, BeginApplication, Application, SealApplication, OpenVerification, Readback, BeginBundle, Bundle, SealBundle, Publish, SourceOpen, SourceVerify, SourceRead };
+	std::string initial_record() const { return configuration_.voters.empty() ? encode_join(configuration_) : encode_initialization(configuration_, founding_); }
+	RecoveredState initial_state() const {
+		RecoveredState state{configuration_, {}, 0, 0, {}, 0};
+		if (configuration_.voters.empty()) { state.membership = Membership{}; }
+		else if (founding_ && encode_initialization(configuration_, founding_) != encode_initialization(configuration_)) { state.membership = founding_; }
+		return state;
+	}
 	void validate_configuration(const kronuz::journal::AdmissionLimits& admission) {
-		Core validate(configuration_, RecoveredState{configuration_, {}, 0, 0, {}, 0}, limits_, timing_);
+		Core validate(configuration_, initial_state(), limits_, timing_);
 		if (!scheduling_.foreground_burst || scheduling_.foreground_burst > 1048576 || !scheduling_.scan_entries || scheduling_.scan_entries > 4096 ||
 			admission.control_slots < 3 || admission.maximum_tickets < 5) { throw std::invalid_argument("invalid worker scheduling or control slots"); }
 		auto tick = plan_event(Tick{}, false, limits_);
@@ -993,6 +1014,7 @@ private:
 		persist_.reset(); completion_.reset(); application_.reset(); activation_completion_.reset(); checkpoint_.reset(); source_.reset(); published_.reset(); pending_publication_.reset(); release_pack(); terminal_ = Fenced{std::move(reason)};
 	}
 	FixedConfiguration configuration_;
+	std::optional<Membership> founding_;
 	Limits limits_;
 	Timing timing_;
 	WorkerLimits scheduling_;

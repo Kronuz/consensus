@@ -1736,6 +1736,17 @@ void hostile_transfer_frames() {
 	check(throws([&] { channel.consume_output(1, 1); }), "consuming output that was never produced is refused");
 	check(throws([&] { SnapshotChannel zero(fixture.worker, 0); }), "a transfer timeout of zero is refused");
 	check(!fixture.worker.fenced() && !channel.incoming_snapshot(), "hostile frames never fence the worker or start a transfer");
+	auto accepted = encode_transfer(TransferKind::Accepted, good, {}); TrustedSession stranger{3, local, other};
+	check(channel.receive(stranger, std::span<const char>(accepted.data(), accepted.size())).result == TransferReceive::Closed, "a session never registered is closed");
+	channel.register_session(session); channel.session_closed(stranger); check(channel.session_open(session), "closing an unknown session leaves the others open");
+	channel.run_one({50, 100}); channel.run_one({10, 100}); check(channel.session_open(session), "a tick earlier than the last is ignored");
+	bool limited = false;
+	for (NodeId peer = 3; peer < 3 + limits().members && !limited; ++peer) { limited = throws([&] { channel.register_session({peer, local, remote}); }); }
+	check(limited && channel.channel_count() == limits().members, "channels stop at the node's member limit");
+	fixture.worker.close(); channel.run_one({60, 100});
+	check(!channel.outbound() && !channel.session_open(session) && channel.receive(session, std::span<const char>(accepted.data(), accepted.size())).result == TransferReceive::Closed,
+		"a closing worker's channel sends and accepts nothing");
+	channel.register_session(session); check(!channel.session_open(session), "a closing worker registers no session");
 }
 
 // The snapshot and source API on a worker that is unopened, closed, fenced, or handed an id

@@ -561,6 +561,8 @@ private:
 		if (store_.fenced() && !failed_) { fail("storage fenced outside worker"); }
 		if (fenced()) { return SubmitResult::Fenced; }
 		if (!ready() || !output_.empty() || ((maintenance_due() || timer_blocked_) && !maintenance_tick) || cutover_debt_ || core_->busy() || completion_ || application_) { return SubmitResult::Busy; }
+		// A repair waits for a checkpoint in flight, whose capture predates it.
+		if (std::holds_alternative<Repair>(event) && (checkpoint_ || delivered_)) { return SubmitResult::Busy; }
 		try {
 			std::array<std::optional<kronuz::journal::AppendReservation>, 3> acquired;
 			for (std::size_t i = 0; i < plan.count; ++i) {
@@ -848,7 +850,7 @@ private:
 				break;
 			}
 			auto capture = *std::get<Local>(operation.mode).capture;
-			ingest_capture(core_->step_capture(LocalCheckpoint{capture.request, operation.token, capture.through, capture.term, configuration_.cluster, configuration_.configuration}));
+			ingest_capture(core_->step_capture(LocalCheckpoint{capture.request, operation.token, capture.through, capture.term, configuration_.cluster, configuration_.configuration, core_->epoch()}));
 			if (fenced()) { break; }
 			if (!core_->busy()) { store_.cancel_replacement(operation.replacement); checkpoint_.reset(); cutover_debt_ = false; }
 			break;

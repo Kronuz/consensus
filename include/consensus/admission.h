@@ -85,7 +85,7 @@ inline EventAdmissionPlan plan_event(const Event& event, bool busy, Limits limit
 					static_assert(std::is_same_v<M, void>, "new consensus message requires an admission plan");
 				}
 			}, value.message);
-		} else if constexpr (std::is_same_v<T, Start> || std::is_same_v<T, Read>) {
+		} else if constexpr (std::is_same_v<T, Start> || std::is_same_v<T, Read> || std::is_same_v<T, Repair>) {
 			// These events emit no persistence action.
 		} else {
 			static_assert(std::is_same_v<T, void>, "new consensus event requires an admission plan");

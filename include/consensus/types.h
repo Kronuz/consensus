@@ -136,7 +136,8 @@ struct Read { RequestId request; };
 struct Persisted { Token token; };
 struct Applied { Index through; };
 // The host owns the immutable application capture identified by capture.
-struct LocalCheckpoint { RequestId request; Token capture; Index through; Term term; Identity cluster, configuration; };
+// epoch: the application epoch the capture was taken under; Repair advances it.
+struct LocalCheckpoint { RequestId request; Token capture; Index through; Term term; Identity cluster, configuration; std::uint64_t epoch = 0; };
 // Trusted adapter: prepared identifies a staged, semantically validated image.
 struct InstallPrepared {
 	RequestId request; Token prepared; NodeId authenticated_peer; Term leader_term;
@@ -149,10 +150,15 @@ struct SnapshotTransferFailed { NodeId peer; SnapshotKey key; };
 struct StorageFault { std::string error; };
 enum class FailureSource { Storage, Application };
 struct Failed { FailureSource source; Token token; std::string error; };
-using Event = std::variant<Start, Tick, Receive, Propose, Read, Persisted, Applied, Failed, LocalCheckpoint, StorageFault, InstallPrepared, InstallActivated, InstallActivationFailed, SnapshotSourceReady, SnapshotTransferFailed>;
+// The host restored its application image at `boundary` (base_index <= index <= applied),
+// verified whole: the core rewinds its applied cursor there and delivers the committed
+// entries after it again from its own log. Hard state, role, leader, and commit index
+// stay as they are.
+struct Repair { RequestId request; LogBoundary boundary; };
+using Event = std::variant<Start, Tick, Receive, Propose, Read, Persisted, Applied, Failed, LocalCheckpoint, StorageFault, InstallPrepared, InstallActivated, InstallActivationFailed, SnapshotSourceReady, SnapshotTransferFailed, Repair>;
 
 enum class Role { Follower, Candidate, Leader, Fenced };
-enum class RejectReason { Busy, NotLeader, NotReady, LogFull, TooLarge, DuplicateRequest, InvalidCheckpoint };
+enum class RejectReason { Busy, NotLeader, NotReady, LogFull, TooLarge, DuplicateRequest, InvalidCheckpoint, InvalidRepair, LeaderMustTransfer };
 struct Persist { Token token; StorageBatch batch; };
 struct PersistCheckpoint { Token token; Token capture; RecoveredState state; };
 struct PersistInstall { Token token, prepared; RecoveredState state; };
@@ -171,8 +177,9 @@ struct Committed { Index first; std::vector<Entry> entries; };
 struct ReadReady { RequestId request; Index index; };
 struct RoleChanged { Role role; Term term; NodeId leader; };
 struct Reject { RequestId request; RejectReason reason; };
+struct RepairCompleted { RequestId request; LogBoundary boundary; std::uint64_t epoch; };
 struct Fenced { std::string reason; };
-using Action = std::variant<Persist, Send, ProposalPlaced, Committed, ReadReady, RoleChanged, Reject, Fenced, PersistCheckpoint, CheckpointPublished, SnapshotNeeded, PersistInstall, ActivateInstall, InstallRejected, InstallCompleted, SnapshotTransmit, SnapshotReleased>;
+using Action = std::variant<Persist, Send, ProposalPlaced, Committed, ReadReady, RoleChanged, Reject, Fenced, PersistCheckpoint, CheckpointPublished, SnapshotNeeded, PersistInstall, ActivateInstall, InstallRejected, InstallCompleted, SnapshotTransmit, SnapshotReleased, RepairCompleted>;
 using Actions = std::vector<Action>;
 
 } // namespace kronuz::consensus

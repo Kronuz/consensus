@@ -63,6 +63,7 @@ struct Host {
 	std::unique_ptr<Core> core;
 	std::vector<std::string> journal;
 	std::vector<std::string> applied_commands;
+	std::vector<Entry> applied_entries;  // every applied entry, so a test can restore an image at an index
 	std::vector<RequestId> ready_reads;
 	std::optional<Persist> pending;
 	std::optional<Committed> applying;
@@ -78,7 +79,7 @@ struct Host {
 	void restart() {
 		auto state = recovered(); auto configuration = state.configuration;
 		core = std::make_unique<Core>(std::move(configuration), std::move(state), limits);
-		pending.reset(); applying.reset(); applied_commands.clear(); ready_reads.clear();
+		pending.reset(); applying.reset(); applied_commands.clear(); applied_entries.clear(); ready_reads.clear();
 	}
 };
 struct Envelope { NodeId from, to; Message message; };
@@ -122,6 +123,7 @@ struct Network {
 		auto committed = std::move(*host.applying); host.applying.reset();
 		for (const auto& entry : committed.entries) {
 			if (entry.kind == EntryKind::Command) { host.applied_commands.push_back(entry.payload); }
+			host.applied_entries.push_back(entry);
 		}
 		consume(id, host.core->step(Applied{committed.entries.back().index}));
 	}
@@ -728,6 +730,69 @@ void real_store_integration() {
 	}
 }
 
+// Track C, D10: a voter restores its application image at a boundary at or below its
+// applied cursor and replays its own log from there; hard state, role, and leader stay.
+void repair_at_or_below_commit() {
+	Network cluster(3); cluster.start(); cluster.elect(1);
+	for (RequestId r = 1; r <= 6; ++r) { cluster.consume(1, cluster.host(1).core->step(Propose{r, "c" + std::to_string(r)})); cluster.pump(); }
+	for (unsigned round = 0; round < 4; ++round) { cluster.tick(cluster.now + 10); cluster.pump(); }
+	auto& follower = cluster.host(2);
+	const auto reference = cluster.host(1).applied_commands;
+	const Index applied = follower.core->applied();
+	check(applied == cluster.host(1).core->committed() && reference.size() == 6, "repair setup: every command applied everywhere");
+	auto term_at = [&](Index b) { return b == 0 ? Term{0} : follower.applied_entries.at(b - 1).term; };
+	// Restore the image at every boundary in [base_index, applied]; the replay reaches the
+	// same applied sequence, with the hard state and role unchanged.
+	const auto hard = follower.core->durable_hard_state();
+	std::size_t repaired = 0;
+	for (Index b = follower.core->base_index(); b <= applied; ++b) {
+		const Term term = term_at(b);
+		follower.applied_entries.resize(b);
+		follower.applied_commands.clear();
+		for (const auto& e : follower.applied_entries) { if (e.kind == EntryKind::Command) { follower.applied_commands.push_back(e.payload); } }
+		auto actions = follower.core->step(Repair{100 + b, {b, term}});
+		auto done = find<RepairCompleted>(actions);
+		check(done && done->boundary.index == b, "repair accepted at a boundary in [base_index, applied]");
+		cluster.consume(2, std::move(actions));
+		repaired += follower.applied_commands == reference && follower.core->applied() == applied;
+		check(follower.core->durable_hard_state() == hard && follower.core->role() == Role::Follower, "repair changes no hard state or role");
+	}
+	check(repaired == applied - follower.core->base_index() + 1, "every repair replays to the undamaged applied sequence");
+	auto reason = [](const Actions& actions) { auto r = find<Reject>(actions); return r ? std::optional<RejectReason>(r->reason) : std::nullopt; };
+	check(reason(follower.core->step(Repair{200, {applied + 1, term_at(applied)}})) == RejectReason::InvalidRepair, "a boundary above applied is refused");
+	check(reason(follower.core->step(Repair{201, {applied, term_at(applied) + 1}})) == RejectReason::InvalidRepair, "a boundary whose term differs is refused");
+	check(reason(cluster.host(1).core->step(Repair{202, {applied, term_at(applied)}})) == RejectReason::LeaderMustTransfer, "a leader transfers before it repairs");
+	// A capture from before the repair's epoch is rejected; one under the current epoch is not.
+	const Index through = applied - 1;
+	check(reason(follower.core->step(LocalCheckpoint{203, 7, through, term_at(through), config(2).cluster, config(2).configuration, 0})) == RejectReason::InvalidCheckpoint,
+		"a capture from before the repair is rejected");
+	auto published = follower.core->step(LocalCheckpoint{204, 7, through, term_at(through), config(2).cluster, config(2).configuration, follower.core->epoch()});
+	auto checkpoint = find<PersistCheckpoint>(published);
+	check(checkpoint != nullptr, "a capture under the current epoch publishes");
+	if (checkpoint) { cluster.consume(2, follower.core->step(Persisted{checkpoint->token})); }
+	check(follower.core->base_index() == through, "the checkpoint raised the base");
+	check(reason(follower.core->step(Repair{205, {through - 1, term_at(through - 1)}})) == RejectReason::InvalidRepair, "a boundary below base_index is refused");
+	// A delivery outstanding refuses a repair.
+	follower.auto_apply = false;
+	cluster.consume(1, cluster.host(1).core->step(Propose{7, "c7"})); cluster.pump();
+	for (unsigned round = 0; round < 4; ++round) { cluster.tick(cluster.now + 10); cluster.pump(); }
+	check(follower.applying.has_value(), "repair setup: a delivery outstanding");
+	check(reason(follower.core->step(Repair{206, {through, term_at(through)}})) == RejectReason::Busy, "a repair waits for the outstanding delivery");
+	cluster.complete_apply(2); follower.auto_apply = true;
+	// The voter keeps voting and following: a new leader commits, and the repaired voter applies it.
+	cluster.isolated.insert(1);
+	for (unsigned round = 0; round < 200; ++round) { cluster.tick(cluster.now + 10); cluster.pump(); }
+	NodeId leader = 0;
+	for (NodeId id : {NodeId(2), NodeId(3)}) { if (cluster.host(id).core->role() == Role::Leader) { leader = id; } }
+	check(leader != 0, "the repaired voter takes part in electing a new leader");
+	if (leader) {
+		cluster.consume(leader, cluster.host(leader).core->step(Propose{8, "c8"})); cluster.pump();
+		for (unsigned round = 0; round < 4; ++round) { cluster.tick(cluster.now + 10); cluster.pump(); }
+		check(follower.applied_commands.back() == "c8" && cluster.host(3).applied_commands == follower.applied_commands, "after repair the voter applies what the group commits");
+	}
+	std::cout << "repair: " << repaired << " boundaries\n";
+}
+
 void reordered_crash_schedules(std::size_t voters, std::uint64_t seed) {
 	Network cluster(voters); cluster.start(); std::mt19937_64 random(seed);
 	auto consistent_prefixes = [&] {
@@ -1193,7 +1258,7 @@ void terminal_retirement() {
 }
 
 int main() {
-	try { terminal_retirement(); snapshot_sender_maximum_fanout(); snapshot_sender_lost_ack_and_terms(); snapshot_sender_receiver_contact(); snapshot_sender_restart_clock_and_admission(); snapshot_sender_correlation(); snapshot_sender_keepalive_pacing(); snapshot_sender_retries_and_retention(); snapshot_timeout_retries(); portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); }
+	try { terminal_retirement(); snapshot_sender_maximum_fanout(); snapshot_sender_lost_ack_and_terms(); snapshot_sender_receiver_contact(); snapshot_sender_restart_clock_and_admission(); snapshot_sender_correlation(); snapshot_sender_keepalive_pacing(); snapshot_sender_retries_and_retention(); snapshot_timeout_retries(); portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); repair_at_or_below_commit(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " consensus checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

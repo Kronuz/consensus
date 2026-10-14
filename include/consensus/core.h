@@ -75,6 +75,9 @@ public:
 	Term term() const noexcept { return hard_.term; }
 	Index committed() const noexcept { return durable_.commit_index; }
 	Index applied() const noexcept { return applied_; }
+	// The application epoch: Repair advances it, and a LocalCheckpoint from an older one is
+	// rejected, so a capture of damaged state never becomes the base.
+	std::uint64_t epoch() const noexcept { return epoch_; }
 	std::size_t retained_log_bytes() const noexcept { return log_bytes_; }
 	std::size_t retired_log_bytes() const noexcept { return entries_.retired_bytes(); }
 	std::size_t retired_log_entries() const noexcept { return entries_.retired_entries(); }
@@ -353,7 +356,7 @@ private:
 
 	void handle(LocalCheckpoint request, Actions& output) {
 		if (!started_ || busy()) { output.emplace_back(Reject{request.request, RejectReason::Busy}); return; }
-		if (request.capture == 0 || request.cluster != configuration_.cluster || request.configuration != configuration_.configuration ||
+		if (request.capture == 0 || request.epoch != epoch_ || request.cluster != configuration_.cluster || request.configuration != configuration_.configuration ||
 			request.through <= base_index_ || request.through > applied_ || applied_ > durable_.commit_index ||
 			log_term(request.through) != request.term) {
 			output.emplace_back(Reject{request.request, RejectReason::InvalidCheckpoint}); return;
@@ -379,6 +382,19 @@ private:
 			else if (!pending_ || failure.token != pending_->token) { return; }
 		} else if (failure.token != delivered_through_ || delivered_through_ == 0) { return; }
 		fence(std::move(failure.error), output);
+	}
+	void handle(Repair request, Actions& output) {
+		auto reject = [&](RejectReason reason) { output.emplace_back(Reject{request.request, reason}); };
+		if (!started_ || busy() || delivered_through_) { reject(RejectReason::Busy); return; }
+		if (role_ == Role::Leader && configuration_.voters.size() > 1) { reject(RejectReason::LeaderMustTransfer); return; }
+		const auto b = request.boundary;
+		if (b.index < base_index_ || b.index > applied_ || (b.index == base_index_ ? b.term != base_term_ : log_term(b.index) != b.term)) {
+			reject(RejectReason::InvalidRepair);
+			return;
+		}
+		applied_ = b.index; ++epoch_;
+		output.emplace_back(RepairCompleted{request.request, b, epoch_});
+		deliver(output);
 	}
 	void handle(Applied completion, Actions& output) {
 		if (completion.through <= applied_) { return; }
@@ -683,6 +699,7 @@ private:
 	std::uint64_t now_ = 0, election_delay_, election_deadline_ = 0, heartbeat_deadline_ = 0;
 	Token next_token_ = 0;
 	Index applied_ = 0, delivered_through_ = 0;
+	std::uint64_t epoch_ = 0;
 	bool started_ = false, capture_mode_ = false, retiring_ = false;
 	std::optional<FrozenCheckpoint> captured_;
 	std::shared_ptr<CaptureOwner> capture_owner_ = std::make_shared<CaptureOwner>(CaptureOwner{this});

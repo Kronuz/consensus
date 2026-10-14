@@ -1793,6 +1793,16 @@ void worker_api_guards() {
 		check(throws([&] { worker.offer_application_chunk(*checkpoint, "too long", true); }), "an application chunk stays within the reserved image");
 		check(worker.cancel_checkpoint(*checkpoint) == CancelResult::Canceled, "an idle checkpoint cancels");
 	} else { check(false, "a healthy worker reserves a checkpoint"); }
+	if (auto earlier = worker.reserve_snapshot(other.context("data"))) {
+		check(worker.cancel_snapshot(*earlier) == CancelResult::Canceled && worker.take_snapshot_result(), "an idle snapshot cancels with a result");
+		auto later = worker.reserve_snapshot(other.context("data")); check(later.has_value(), "a later snapshot reserves");
+		check(!worker.snapshot_validated(*earlier) && !worker.snapshot_canceling(*earlier) && !worker.snapshot_context(*earlier) &&
+			worker.cancel_snapshot(*earlier) == CancelResult::Stale, "an earlier snapshot id of the same worker is stale");
+		if (later) { check(worker.snapshot_context(*later).has_value() && !worker.snapshot_validated(*later), "the current snapshot reports its context, unvalidated"); worker.cancel_snapshot(*later); worker.take_snapshot_result(); }
+		if (auto local = worker.reserve_checkpoint(5)) {
+			check(!worker.snapshot_context(*earlier) && worker.checkpoint_active(*local), "a local checkpoint has no snapshot context"); worker.cancel_checkpoint(*local);
+		}
+	} else { check(false, "a healthy worker reserves a snapshot"); }
 	auto& w = owner.worker;
 	check(throws([&] { w.offer_snapshot_chunk(*id, 1, "data", true); }) && throws([&] { w.offer_snapshot_chunk(*id, 0, "", false); }) &&
 		throws([&] { w.offer_snapshot_chunk(*id, 0, "dat", true); }) && throws([&] { w.offer_snapshot_chunk(*id, 0, std::string(65537, 'x')); }),

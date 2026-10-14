@@ -179,10 +179,11 @@ public:
 	// and the newest committed one (Track C, D1).
 	const Membership& membership() const noexcept { return configs_.empty() ? base_membership_ : configs_.rbegin()->second; }
 	const Membership& committed_membership() const noexcept { return membership_at(durable_.commit_index); }
-	// Whether a ChangeMembership would pass D3's preconditions now: a leader, not busy, that
-	// committed an entry of its term, with no configuration above its commit index.
+	// Whether a ChangeMembership would pass D3's preconditions now: a leader, not busy or
+	// transferring and not a witness, that committed an entry of its term, with no
+	// configuration above its commit index.
 	bool can_change_membership() const noexcept {
-		return started_ && role_ == Role::Leader && !busy() && durable_.commit_index > base_index_ &&
+		return started_ && role_ == Role::Leader && !busy() && !transfer_ && !witness_self() && durable_.commit_index > base_index_ &&
 			log_term(durable_.commit_index) == hard_.term && (configs_.empty() || configs_.rbegin()->first <= durable_.commit_index);
 	}
 	// A member's matched index, as the leader knows it (D8).

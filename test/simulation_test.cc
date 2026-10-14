@@ -72,13 +72,27 @@ FixedConfiguration config(NodeId local, std::size_t voters) {
 
 struct Durable {
 	HardState hard;
-	std::vector<Entry> log;  // log[i] has index i + 1
+	Index base = 0;  // the checkpoint's boundary; 0 without one
+	Term base_term = 0;
+	std::optional<Membership> membership;  // the checkpoint's base membership, as recorded
+	std::vector<Entry> image;  // the application image: every entry through `base`
+	std::vector<Entry> log;  // log[i] has index base + i + 1
 	void apply(const StorageBatch& batch) {
 		if (batch.hard) { hard = *batch.hard; }
 		if (batch.log) {
-			log.resize(std::size_t(batch.log->replace_from - 1));
+			log.resize(std::size_t(batch.log->replace_from - base - 1));
 			for (const auto& e : batch.log->entries) { log.push_back(e); }
 		}
+	}
+	void install(const RecoveredState& state, std::vector<Entry> through) {
+		hard = state.hard; base = state.base_index; base_term = state.base_term;
+		membership = state.membership; log = state.entries; image = std::move(through);
+	}
+	Index last() const { return base + log.size(); }
+	// The entry at `index`, from the image or the log; null past the end.
+	const Entry* entry(Index index) const {
+		if (index == 0 || index > last()) { return nullptr; }
+		return index <= base ? &image.at(index - 1) : &log[index - base - 1];
 	}
 };
 
@@ -90,6 +104,9 @@ struct Node {
 	std::unique_ptr<Core> core;
 	Durable durable;
 	std::optional<Persist> pending;
+	std::optional<PersistCheckpoint> checkpointing;
+	struct Install { PersistInstall persist; std::vector<Entry> image; NodeId from; SnapshotKey key; };
+	std::optional<Install> installing;  // an install from `from`, with the image it brings
 	std::optional<Committed> applying;
 	std::vector<std::string> applied;  // commands applied since the last restart
 	std::vector<Entry> applied_entries;  // every entry applied since the last restart
@@ -124,6 +141,8 @@ public:
 			auto pick_node = std::next(nodes_.begin(), std::ptrdiff_t(random_() % nodes_.size()));
 			NodeId id = pick_node->first;
 			auto& n = pick_node->second;
+			// Every seed crashes, partitions, reads, checkpoints, and transfers; membership seeds
+			// also change members and limits.
 			if (pick < 80) {
 				tick(n);
 			} else if (pick < 180) {
@@ -131,23 +150,33 @@ public:
 			} else if (pick < 450) {
 				deliver_one();
 			} else if (pick < 600) {
-				if (n.up && n.pending) { complete_persist(n); }
+				if (n.up && (n.pending || n.checkpointing || n.installing)) { complete_storage(n); }
 			} else if (pick < 700) {
 				if (n.up && n.applying) { complete_apply(n); }
 			} else if (pick < 701) {
 				repair(n);
-			} else if (pick < 712 && membership_changes_) {
-				change_membership();
 			} else if (pick < 702) {
 				crash(random_() % 2 ? leader_or(n) : n);
-			} else if (pick < 706) {
-				toggle_partition(random_() % 2 ? leader_or(n).id : id);
-			} else if (pick >= 712 && pick < 716) {
+			} else if (pick < 707) {
+				if (random_() % 2) { toggle_partition(random_() % 2 ? leader_or(n).id : id); }
+			} else if (pick < 719) {
+				if (membership_changes_) { change_membership(); }
+			} else if (pick < 723) {
 				transfer();
+			} else if (pick < 735) {
+				read(n);
+			} else if (pick < 741) {
+				checkpoint(n);
+			} else if (pick < 760) {
+				serve_snapshot();
 			} else {
 				for (auto& [i, m] : nodes_) { tick(m); }
+				if (!n.up && random_() % 8 == 0) { restart(n); }  // a crashed node comes back
 			}
-			if (step % 16 == 0) { check_logs(); }
+			if (membership_changes_ && step == forced_at_) { force_replaced_configuration(); }
+			if (forced_leader_ && step == forced_at_ + 1500) { isolated_.erase(*forced_leader_); forced_leader_.reset(); }
+
+			if (step % 16 == 0) { check_logs(); check_memberships(); }
 			bool any = false;
 			for (auto& [i, m] : nodes_) { any |= m.up && m.core->role() == Role::Leader; }
 			led_steps += any;
@@ -158,19 +187,27 @@ public:
 	// Heals partitions and crashes; clocks keep their skew. Pre-vote (Track C, D7) keeps a
 	// node with a stale log and a fast clock from disrupting elections: before it, seed 217
 	// at 2,000 steps stayed leaderless while its vote requests reset slower voters' timers.
+	void quiet_round() {
+		advance(5);
+		for (auto& [id, n] : nodes_) {
+			tick(n);
+			if (n.pending || n.checkpointing || n.installing) { complete_storage(n); }
+			if (n.applying) { complete_apply(n); }
+			serve_snapshot();
+		}
+		while (!network_.empty()) { deliver_front(); }
+	}
 	void heal() {
 		isolated_.clear();
 		for (auto& [id, n] : nodes_) {
 			if (!n.up) { restart(n); }
 		}
+		// T2's forced self-removal, once everything is up.
+		for (int round = 0; round < 1000 && !failures && !force_self_removal(); ++round) { quiet_round(); }
+		for (int round = 0; round < 300 && !failures; ++round) { quiet_round(); }
+		cut_.clear();
 		for (int round = 0; round < 4000 && !failures; ++round) {
-			advance(5);
-			for (auto& [id, n] : nodes_) {
-				tick(n);
-				if (n.pending) { complete_persist(n); }
-				if (n.applying) { complete_apply(n); }
-			}
-			while (!network_.empty()) { deliver_front(); }
+			quiet_round();
 			if (round >= 2000 && round % 50 == 0 && applied_healed() < healed_quorum()) {  // until a majority applies it
 				for (auto& [id, n] : nodes_) {
 					if (n.core->role() == Role::Leader) { act(n, n.core->step(Propose{++request_, "healed"})); }
@@ -189,6 +226,7 @@ public:
 	}
 
 	std::uint64_t restarts = 0, kept = 0, lost = 0, elections = 0, led_steps = 0, repairs = 0, transfers = 0, changes_proposed = 0, memberships_committed = 0;
+	std::uint64_t reads = 0, checkpoints = 0, installs = 0, limit_changes = 0, replaced_configurations = 0, forced_removals = 0;
 	std::map<int, std::uint64_t> reject_reasons;
 	Term max_term() const {
 		Term t = 0;
@@ -228,14 +266,22 @@ private:
 		RecoveredState state;
 		state.configuration = node_config(n);
 		state.hard = n.durable.hard;
+		state.base_index = state.applied_index = n.durable.base;
+		state.base_term = n.durable.base_term;
 		state.entries = n.durable.log;
-		if (n.joiner) { state.membership = Membership{}; }  // the join record: no membership yet
+		if (n.durable.base) { state.membership = n.durable.membership; }
+		else if (n.joiner) { state.membership = Membership{}; }  // the join record: no membership yet
 		else if (witness_) { state.membership = founding_; }
 		n.core = std::make_unique<Core>(node_config(n), std::move(state), limits_, timing_);
 		n.pending.reset();
+		n.checkpointing.reset();
+		n.installing.reset();
 		n.applying.reset();
+		n.applied_entries = n.durable.image;  // the application restores its image
 		n.applied.clear();
-		n.applied_entries.clear();
+		for (const auto& e : n.applied_entries) {
+			if (e.kind == EntryKind::Command) { n.applied.push_back(e.payload); }
+		}
 		n.up = true;
 		act(n, n.core->step(Tick{local_time(n), election_delay()}));
 		act(n, n.core->step(Start{}));
@@ -251,9 +297,11 @@ private:
 			return;
 		}
 		++restarts;
-		if (n.pending) {
-			if (random_() % 2) {
-				n.durable.apply(n.pending->batch);  // the batch reached the disk; its completion did not
+		if (n.pending || n.checkpointing || n.installing) {
+			if (random_() % 2) {  // the operation reached the disk; its completion did not
+				if (n.pending) { n.durable.apply(n.pending->batch); }
+				if (n.checkpointing) { n.durable.install(n.checkpointing->state, image(n, n.checkpointing->state.base_index)); }
+				if (n.installing) { n.durable.install(n.installing->persist.state, n.installing->image); }
 				++kept;
 			} else {
 				++lost;
@@ -272,10 +320,56 @@ private:
 		if (!n.up) { return; }
 		act(n, n.core->step(Propose{++request_, "c" + std::to_string(request_)}));
 	}
+	// The applied entries through `through`: what a checkpoint's application image holds.
+	static std::vector<Entry> image(const Node& n, Index through) {
+		return {n.applied_entries.begin(), n.applied_entries.begin() + std::ptrdiff_t(std::min<std::size_t>(through, n.applied_entries.size()))};
+	}
+	void complete_storage(Node& n) {
+		if (n.pending) { complete_persist(n); return; }
+		if (n.checkpointing) {
+			auto c = std::move(*n.checkpointing); n.checkpointing.reset();
+			n.durable.install(c.state, image(n, c.state.base_index));
+			++checkpoints;
+			act(n, n.core->step(Persisted{c.token}));
+			return;
+		}
+		if (n.installing) {
+			auto install = std::move(*n.installing); n.installing.reset();
+			if (n.applying) { complete_apply(n); }  // activation follows the outstanding delivery
+			n.durable.install(install.persist.state, install.image);
+			auto published = n.core->step(Persisted{install.persist.token});
+			const bool activate = std::any_of(published.begin(), published.end(), [](const Action& a) { return std::holds_alternative<ActivateInstall>(a); });
+			act(n, std::move(published));
+			if (!n.up || !activate) { return; }
+			n.applied_entries = install.image;
+			n.applied.clear();
+			for (const auto& e : n.applied_entries) {
+				if (e.kind == EntryKind::Command) { n.applied.push_back(e.payload); }
+			}
+			check_prefixes();
+			auto completed = n.core->step(InstallActivated{install.persist.token});
+			for (const auto& a : completed) {
+				if (std::holds_alternative<InstallCompleted>(a)) {
+					++installs;
+					network_.push_back({n.id, install.from, SnapshotResponse{n.core->term(), install.key, SnapshotReply::Installed}, now_ + random_() % 60});
+				}
+			}
+			act(n, std::move(completed));
+		}
+	}
 	void complete_persist(Node& n) {
 		auto p = std::move(*n.pending);
 		n.pending.reset();
 		const Index before = n.durable.hard.commit_index;
+		if (p.batch.log) {
+			for (Index i = p.batch.log->replace_from; i <= n.durable.last(); ++i) {
+				auto old = n.durable.entry(i);
+				if (old && old->kind == EntryKind::Configuration && (i - p.batch.log->replace_from >= p.batch.log->entries.size() || p.batch.log->entries[i - p.batch.log->replace_from] != *old)) {
+					++replaced_configurations;
+					break;
+				}
+			}
+		}
 		n.durable.apply(p.batch);
 		if (n.durable.hard.commit_index > before && n.core->role() == Role::Leader) { check_commit(n, n.durable.hard.commit_index); }
 		act(n, n.core->step(Persisted{p.token}));
@@ -311,8 +405,16 @@ private:
 		Membership next = leader->core->membership();
 		std::vector<NodeId> learners, voters;
 		for (const auto& x : next.members) { (voting(x.role) ? voters : learners).push_back(x.incarnation); }
-		const auto choice = random_() % 3;
-		if (choice == 0 && next.members.size() < 7) {
+		const auto choice = random_() % 4;
+		if (choice == 3) {
+			// R16: lower or raise the group's limits beneath the node's.
+			Limits l = limits_;
+			l.reads = 1 + random_() % limits_.reads;
+			l.uncommitted_entries = 16 + random_() % (limits_.uncommitted_entries - 15);
+			l.command_bytes = 16 + random_() % (limits_.command_bytes - 15);
+			next.limits = l;
+			++limit_changes;
+		} else if (choice == 0 && next.members.size() < 7) {
 			const NodeId incarnation = next.next_incarnation++;
 			next.members.push_back({incarnation, incarnation, MemberRole::Learner});
 			auto& joiner = nodes_[incarnation];
@@ -375,6 +477,120 @@ private:
 		}
 		act(n, std::move(actions));
 	}
+	// A linearizable read: its index covers every commit any node knew when it was admitted.
+	void read(Node& n) {
+		auto& l = leader_or(n);
+		if (!l.up || l.core->role() != Role::Leader) { return; }
+		Index floor = 0;
+		for (const auto& [id, m] : nodes_) { if (m.up) { floor = std::max(floor, m.core->committed()); } }
+		read_floors_[++request_] = floor;
+		act(l, l.core->step(Read{request_}));
+	}
+	void check_read(const ReadReady& ready) {
+		auto it = read_floors_.find(ready.request);
+		if (it == read_floors_.end()) { return; }
+		++reads;
+		if (ready.index < it->second) { fail("a read at index " + std::to_string(ready.index) + " misses commit " + std::to_string(it->second)); }
+		read_floors_.erase(it);
+	}
+	// A local checkpoint through what the node applied.
+	void checkpoint(Node& n) {
+		if (!n.up || n.applying) { return; }
+		const Index through = n.core->applied();
+		if (through <= n.durable.base || through > n.applied_entries.size()) { return; }
+		const auto c = config(1, voters_);
+		act(n, n.core->step(LocalCheckpoint{++request_, 1, through, n.applied_entries[through - 1].term, c.cluster, c.configuration, n.core->epoch()}));
+	}
+	// A leader's snapshot to a lagging peer: the image it checkpointed, with the membership
+	// the snapshot carries for that peer; a transfer fails when the peer is unreachable.
+	void serve_snapshot() {
+		if (snapshot_requests_.empty()) { return; }
+		auto [from, peer, key] = snapshot_requests_.front();
+		snapshot_requests_.pop_front();
+		auto& l = nodes_.at(from);
+		if (!l.up || l.core->role() != Role::Leader) { return; }
+		auto ready = l.core->step(SnapshotSourceReady{peer, key});
+		const bool transmit = std::any_of(ready.begin(), ready.end(), [](const Action& a) { return std::holds_alternative<SnapshotTransmit>(a); });
+		act(l, std::move(ready));
+		if (!transmit || !l.up) { return; }
+		auto it = nodes_.find(peer);
+		if (it == nodes_.end() || !it->second.up || isolated_.count(from) || isolated_.count(peer) || random_() % 10 == 0) {
+			act(l, l.core->step(SnapshotTransferFailed{peer, key}));
+			return;
+		}
+		auto& t = it->second;
+		const auto c = config(1, voters_);
+		auto prepared = t.core->step(InstallPrepared{++request_, ++prepared_, from, key.leader_term, c.cluster, c.configuration, key.boundary, l.core->snapshot_membership(peer)});
+		for (const auto& a : prepared) {
+			if (auto install = std::get_if<PersistInstall>(&a)) { t.installing = Node::Install{*install, image(l, key.boundary.index), from, key}; }
+			if (auto rejected = std::get_if<InstallRejected>(&a)) {
+				const auto reply = rejected->reason == InstallRejectReason::CaughtUp ? SnapshotReply::CaughtUp : SnapshotReply::Rejected;
+				network_.push_back({peer, from, SnapshotResponse{t.core->term(), key, reply}, now_ + random_() % 60});
+			}
+		}
+		act(t, std::move(prepared));
+	}
+	// T2's forced schedule: a leader cut off from the rest appends a Configuration entry that
+	// only it holds; the others elect a new leader and write past it, and once the cut heals
+	// the entry is replaced, so its membership must roll back (D1).
+	void force_replaced_configuration() {
+		Node* leader = nullptr;
+		for (auto& [id, m] : nodes_) { if (m.up && m.core->can_change_membership()) { leader = &m; } }
+		if (!leader) { ++forced_at_; return; }  // try again next step
+		Membership next = leader->core->membership();
+		if (next.members.size() >= 7) { return; }
+		const NodeId incarnation = next.next_incarnation++;
+		next.members.push_back({incarnation, incarnation, MemberRole::Learner});
+		auto& joiner = nodes_[incarnation];
+		if (!joiner.core) {
+			joiner.id = incarnation; joiner.joiner = true; joiner.rate = 1.0; joiner.local = leader->local;
+			restart(joiner);
+		}
+		isolated_.insert(leader->id);
+		forced_leader_ = leader->id;
+		act(*leader, leader->core->step(ChangeMembership{++request_, std::move(next)}));
+		if (leader->pending) { complete_storage(*leader); }
+	}
+	// T2's forced schedule: a leader removes itself while it reaches only one other voter, so
+	// the removal must not commit until a quorum of the new membership holds it (D4).
+	bool force_self_removal() {
+		Node* leader = nullptr;
+		for (auto& [id, m] : nodes_) { if (m.up && m.core->can_change_membership()) { leader = &m; } }
+		if (!leader) { return false; }
+		Membership next = leader->core->membership();
+		std::vector<NodeId> others;
+		for (const auto& x : next.members) { if (x.role == MemberRole::Voter && x.incarnation != leader->id) { others.push_back(x.incarnation); } }
+		if (others.size() < 2 || next.leaving) { return true; }  // nothing to force here
+		const NodeId reachable = others[random_() % others.size()];
+		for (const auto& [id, m] : nodes_) {
+			if (id != leader->id && id != reachable) { cut_.insert({leader->id, id}); cut_.insert({id, leader->id}); }
+		}
+		std::erase_if(next.members, [&](const Member& x) { return x.incarnation == leader->id; });
+		auto actions = leader->core->step(ChangeMembership{++request_, std::move(next)});
+		if (std::any_of(actions.begin(), actions.end(), [](const Action& x) { return std::holds_alternative<Reject>(x); })) {
+			if (std::getenv("SIM_DEBUG")) { for (const auto& x : actions) { if (auto r = std::get_if<Reject>(&x)) { std::fprintf(stderr, "forced removal refused: %d\n", int(r->reason)); } } }
+			cut_.clear();
+			return false;
+		}
+		++forced_removals;
+		act(*leader, std::move(actions));
+		return true;
+	}
+	// The membership in force on every quiet node is the one its durable state implies: the
+	// base membership, then the newest Configuration entry in its log (D1).
+	void check_memberships() {
+		for (const auto& [id, n] : nodes_) {
+			if (!n.up || n.pending || n.checkpointing || n.installing) { continue; }
+			Membership m = n.durable.base && n.durable.membership ? *n.durable.membership : (n.joiner && !n.durable.base ? Membership{} : founding_);
+			for (const auto& e : n.durable.log) {
+				if (e.kind == EntryKind::Configuration) { m = decode_membership(e.payload); }
+			}
+			const auto& held = n.core->membership();
+			if (held.members != m.members || held.leaving != m.leaving || held.next_incarnation != m.next_incarnation) {
+				fail("node " + std::to_string(id) + "'s membership differs from its durable log's");
+			}
+		}
+	}
 	void toggle_partition(NodeId id) {
 		if (!isolated_.erase(id) && isolated_.size() + 1 < nodes_.size()) { isolated_.insert(id); }
 	}
@@ -394,7 +610,7 @@ private:
 	}
 	void deliver(const Envelope& e) {
 		auto& n = nodes_.at(e.to);
-		if (!n.up || isolated_.count(e.from) || isolated_.count(e.to)) { return; }
+		if (!n.up || isolated_.count(e.from) || isolated_.count(e.to) || cut_.count({e.from, e.to})) { return; }
 		act(n, n.core->step(Receive{e.from, e.message}));
 	}
 
@@ -411,6 +627,12 @@ private:
 			} else if (auto c = std::get_if<Committed>(&a)) {
 				if (n.applying) { fail("two application batches outstanding"); }
 				n.applying = std::move(*c);
+			} else if (auto c = std::get_if<PersistCheckpoint>(&a)) {
+				n.checkpointing = std::move(*c);
+			} else if (auto ready = std::get_if<ReadReady>(&a)) {
+				check_read(*ready);
+			} else if (auto needed = std::get_if<SnapshotNeeded>(&a)) {
+				snapshot_requests_.push_back({n.id, needed->peer, needed->key});
 			} else if (auto r = std::get_if<RoleChanged>(&a)) {
 				if (r->role == Role::Leader) { on_leader(n, r->term); }
 			} else if (std::holds_alternative<Fenced>(a)) {
@@ -428,7 +650,7 @@ private:
 		// Leader completeness: the new leader holds every entry any node applied. Its no-op
 		// is not durable yet, so compare against its durable log.
 		for (const auto& [index, entry] : committed_) {
-			if (index > n.durable.log.size() || n.durable.log[index - 1] != entry) {
+			if (auto held = n.durable.entry(index); !held || *held != entry) {
 				fail("leader " + std::to_string(n.id) + " of term " + std::to_string(term) + " lacks applied entry " + std::to_string(index));
 				return;
 			}
@@ -442,19 +664,19 @@ private:
 	// quorum of the voters of the membership it uses, itself counted only while it is one.
 	void check_commit(const Node& leader, Index index) {
 		// The membership its durable log puts in force, not the core's own view of it.
-		Membership m = founding_;  // every log here starts at index 1, over the founding membership
+		Membership m = leader.durable.base ? leader.durable.membership.value_or(founding_) : founding_;
 		for (const auto& e : leader.durable.log) {
 			if (e.kind == EntryKind::Configuration) { m = decode_membership(e.payload); }
 		}
 		if (m.members.empty()) { return; }
-		const Entry& entry = leader.durable.log.at(index - 1);
+		const Entry& entry = *leader.durable.entry(index);
 		std::size_t holding = 0;
 		for (const auto& x : m.members) {
 			if (!voting(x.role)) { continue; }
 			auto it = nodes_.find(x.incarnation);
 			if (it == nodes_.end()) { continue; }
-			const auto& log = it->second.durable.log;
-			holding += index <= log.size() && log[index - 1] == entry;
+			auto held = it->second.durable.entry(index);
+			holding += held && *held == entry;
 		}
 		if (holding < voter_count(m) / 2 + 1) {
 			fail("leader " + std::to_string(leader.id) + " committed index " + std::to_string(index) + " held by " + std::to_string(holding) + " of " +
@@ -489,7 +711,7 @@ private:
 			}
 		}
 		if (auto a = std::get_if<AppendResponse>(&s.message); a && a->success) {
-			if (a->matched > n.durable.log.size()) { fail("node " + std::to_string(n.id) + " acknowledged entries before they were durable"); }
+			if (a->matched > n.durable.last()) { fail("node " + std::to_string(n.id) + " acknowledged entries before they were durable"); }
 		}
 	}
 	void check_prefixes() {
@@ -505,11 +727,13 @@ private:
 		for (const auto& [a, x] : nodes_) {
 			for (const auto& [b, y] : nodes_) {
 				if (a >= b) { continue; }
-				const auto& l = x.durable.log;
-				const auto& r = y.durable.log;
-				for (std::size_t i = std::min(l.size(), r.size()); i-- > 0;) {
-					if (l[i].term == r[i].term) {
-						if (!std::equal(l.begin(), l.begin() + std::ptrdiff_t(i + 1), r.begin())) { fail("log matching violated at index " + std::to_string(i + 1)); }
+				const auto& l = x.durable;
+				const auto& r = y.durable;
+				for (Index i = std::min(l.last(), r.last()); i > 0; --i) {
+					if (l.entry(i)->term == r.entry(i)->term) {
+						for (Index j = 1; j <= i; ++j) {
+							if (*l.entry(j) != *r.entry(j)) { fail("log matching violated at index " + std::to_string(j)); break; }
+						}
 						break;
 					}
 				}
@@ -533,6 +757,13 @@ private:
 	std::map<Term, NodeId> leaders_;
 	std::map<Index, Entry> committed_;
 	std::map<std::pair<NodeId, Term>, NodeId> ballots_;
+	std::map<RequestId, Index> read_floors_;
+	struct SnapshotRequest { NodeId from, peer; SnapshotKey key; };
+	std::deque<SnapshotRequest> snapshot_requests_;
+	Token prepared_ = 0;
+	std::size_t forced_at_ = 2000 + random_() % 4000;
+	std::set<std::pair<NodeId, NodeId>> cut_;  // (from, to) links down
+	std::optional<NodeId> forced_leader_;
 };
 
 }  // namespace
@@ -542,6 +773,7 @@ int main(int argc, char** argv) {
 	const std::uint64_t steps = argc > 2 ? std::strtoull(argv[2], nullptr, 10) : 10000;
 	const std::uint64_t first = argc > 3 ? std::strtoull(argv[3], nullptr, 10) : 1;
 	std::uint64_t restarts = 0, kept = 0, lost = 0, elections = 0, repairs = 0, transfers = 0, changes = 0, committed_changes = 0;
+	std::uint64_t reads = 0, checkpoints = 0, installs = 0, limit_changes = 0, replaced = 0, removals = 0;
 	for (std::uint64_t seed = first; seed < first + seeds && !failures; ++seed) {
 		current_seed = seed;
 		Simulation sim(seed, 3 + 2 * (seed % 3 == 0), seed % 2 == 0, seed % 5 == 1);  // even seeds change membership
@@ -557,9 +789,17 @@ int main(int argc, char** argv) {
 		transfers += sim.transfers;
 		changes += sim.changes_proposed;
 		committed_changes += sim.memberships_committed;
+		reads += sim.reads;
+		checkpoints += sim.checkpoints;
+		installs += sim.installs;
+		limit_changes += sim.limit_changes;
+		replaced += sim.replaced_configurations;
+		removals += sim.forced_removals;
 	}
 	std::printf("simulation: %llu seeds x %llu steps, %llu elections, %llu restarts (%llu kept a pending batch, %llu lost one), %llu repairs, %llu transfers, %llu membership changes proposed, %llu committed memberships applied: %s\n",
 		(unsigned long long)seeds, (unsigned long long)steps, (unsigned long long)elections, (unsigned long long)restarts, (unsigned long long)kept,
 		(unsigned long long)lost, (unsigned long long)repairs, (unsigned long long)transfers, (unsigned long long)changes, (unsigned long long)committed_changes, failures ? "FAILED" : "ok");
+	std::printf("  %llu linearizable reads, %llu checkpoints, %llu installs, %llu limit changes, %llu replaced configuration entries, %llu forced self-removals\n", (unsigned long long)reads,
+		(unsigned long long)checkpoints, (unsigned long long)installs, (unsigned long long)limit_changes, (unsigned long long)replaced, (unsigned long long)removals);
 	return failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }

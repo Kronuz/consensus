@@ -349,6 +349,58 @@ void witness_bound() {
 	check(!first<PersistCheckpoint>(w.step(LocalCheckpoint{1, 9, 4, 1, founding_config(3).cluster, founding_config(3).configuration})), "the witness refuses a checkpoint past it");
 }
 
+
+// T2's seeded fault "D3(a) off" (Ongaro, raft-dev, 2015): leader 1 promotes learner 5, held
+// only by 1 and 5; 2, 3, and 4 elect 2, which removes 1 before committing an entry of its
+// term, and commits that with 3 alone; healed, 1 wins with 4 and 5 under its promotion.
+// With D3(a), 2's change waits for its term's commit, and the two never diverge.
+void single_server_change() {
+	auto c = founded(4);
+	c.add_joiner(5);
+	c.commit_one("a");
+	Membership with5 = c.core(1).membership(); with5.members.push_back({5, 5, MemberRole::Learner}); with5.next_incarnation = 6;
+	check(c.change(1, with5), "the leader adds learner 5");
+	c.run(400);
+	auto cut_off = [&](NodeId a, std::initializer_list<NodeId> others) {
+		for (NodeId b : others) { c.cut.insert({a, b}); c.cut.insert({b, a}); }
+	};
+	cut_off(1, {2, 3, 4});
+	Membership promoted = c.core(1).membership();
+	for (auto& x : promoted.members) { if (x.incarnation == 5) { x.role = MemberRole::Voter; } }
+	check(c.change(1, promoted), "the leader promotes 5; only 1 and 5 hold it");
+	c.run(50);
+	const Index at = c.core(1).last_index();
+	cut_off(5, {2, 3, 4});
+	c.nodes.at(1).down = true; c.nodes.at(5).down = true;
+	// 3 and 4 have not heard from a leader for over election_min, but their timers have not
+	// fired; 2's does, so it alone campaigns.
+	c.now += 60;
+	c.consume(2, c.core(2).step(Tick{c.now + 40, 100}));
+	auto& two = c.core(2);
+	for (int i = 0; i < 1000 && two.role() != Role::Leader && !c.wire.empty(); ++i) { c.pump(1); }
+	check(two.role() == Role::Leader, "2 leads 2, 3, and 4");
+	// 2's term never commits: from here 4 never hears from it.
+	c.cut.insert({2, 4});
+	std::erase_if(c.wire, [](const ProbeEnvelope& e) { return e.from == 2 && e.to == 4; });
+	c.pump();
+	Membership without1 = two.membership();
+	std::erase_if(without1.members, [](const Member& x) { return x.incarnation == 1; });
+	RejectReason reason{};
+	const bool admitted = c.change(2, without1, &reason);
+	check(!admitted && reason == RejectReason::NotReady, "2 cannot change the membership before committing an entry of its term (D3(a))");
+	c.run(300);
+	// 2 and 3 committed whatever they could; now only 1, 4, and 5 run.
+	const Index two_committed = two.committed();
+	c.nodes.at(2).down = true; c.nodes.at(3).down = true;
+	c.nodes.at(1).down = false; c.nodes.at(5).down = false;
+	c.cut.clear();
+	c.now += 300; c.consume(1, c.core(1).step(Tick{c.now, 100}));
+	c.run(1000);
+	const bool diverged = c.core(1).committed() >= at && two_committed >= at && c.core(1).committed_membership() != c.core(2).committed_membership() &&
+		find_member(c.core(1).committed_membership(), 1) && !find_member(c.core(2).committed_membership(), 1);
+	check(!diverged, "no two members commit different memberships at one index");
+}
+
 }  // namespace
 
 int main() {
@@ -360,6 +412,7 @@ int main() {
 		removal();
 		direct_voter_refused();
 		witness_bound();
+		single_server_change();
 	} catch (const std::exception& error) {
 		check(false, error.what());
 	}

@@ -29,6 +29,7 @@ mutants=(
 	$'a follower checks entries by its node limits, not by position\tif (!fits(entry, running)) {\tif (!fits(entry, limits_)) {'
 	$'a leader grants pre-votes\treturn role_ == Role::Leader || (role_ == Role::Follower\treturn (role_ == Role::Follower'
 	$'learners refuse votes\tbool grant = request.term == hard_.term && (!hard_.voted_for\tbool grant = request.term == hard_.term && is_voter(configuration_.local) && (!hard_.voted_for'
+	$'repair below base_index\tif (b.index < base_index_ || b.index > durable_.commit_index ||\tif (b.index > durable_.commit_index ||'
 	$'commit of an earlier term by counting\tif (candidate <= durable_.commit_index || log_term(candidate) != hard_.term) { return; }\tif (candidate <= durable_.commit_index) { return; }'
 )
 status=0
@@ -53,7 +54,9 @@ PY
 	"$dir/unit" >"$dir/unit.log" 2>&1 || unit=yes
 	"$dir/membership" >"$dir/membership.log" 2>&1 || membership=yes
 	"$dir/simulation" "$seeds" "$steps" >"$dir/simulation.log" 2>&1 || simulation=yes
-	echo "$name: unit $unit, membership $membership, simulation $simulation ($seeds seeds)"
+	first=""
+	[[ $simulation == yes ]] && first=", first at $(grep -m1 -o '^seed [0-9]*' "$dir/simulation.log" || echo 'the heal')"
+	echo "$name: unit $unit, membership $membership, simulation $simulation ($seeds seeds$first)"
 	if [[ $unit == no && $membership == no && $simulation == no ]]; then status=1; fi
 done
 exit $status

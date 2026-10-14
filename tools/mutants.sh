@@ -26,6 +26,7 @@ mutants=(
 	$'no membership rollback on a replaced suffix\tvoid note_truncate(Index from) { configs_.erase(configs_.lower_bound(from), configs_.end()); }\tvoid note_truncate(Index) {}'
 	$'a removed leader counts itself\t\t\tif (is_voter(configuration_.local)) { matches.push_back(last_index()); }\t\t\tmatches.push_back(last_index());'
 	$'a follower checks entries by its node limits, not by position\tif (entry.payload.size() > running.command_bytes) {\tif (entry.payload.size() > limits_.command_bytes) {'
+	$'a leader grants pre-votes\treturn role_ == Role::Leader || (role_ == Role::Follower\treturn (role_ == Role::Follower'
 	$'commit of an earlier term by counting\tif (candidate <= durable_.commit_index || log_term(candidate) != hard_.term) { return; }\tif (candidate <= durable_.commit_index) { return; }'
 )
 status=0

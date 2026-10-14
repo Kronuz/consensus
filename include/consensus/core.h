@@ -652,7 +652,9 @@ private:
 	bool log_up_to_date(Index index, Term term) const {
 		return term > log_term(last_index()) || (term == log_term(last_index()) && index >= last_index());
 	}
-	bool heard_from_leader() const { return role_ == Role::Follower && leader_ != 0 && now_ - leader_contact_ < timing_.election_min; }
+	// A leader is a current leader too: it refuses pre-votes and ignores untransferred votes,
+	// so a rejoining node cannot depose it (D7); CheckQuorum removes a leader cut off.
+	bool heard_from_leader() const { return role_ == Role::Leader || (role_ == Role::Follower && leader_ != 0 && now_ - leader_contact_ < timing_.election_min); }
 	bool valid(const VoteResponse&) const { return true; }
 	bool valid(const SnapshotResponse& response) const { return valid_snapshot_response(response); }
 	bool valid(const AppendResponse& response) const {
@@ -844,6 +846,8 @@ private:
 		if (answering < quorum()) { follower(0, output); return; }
 		// D6: a transfer that has not ended in one election timeout aborts; proposals resume.
 		if (transfer_ && now_ >= transfer_->until) { transfer_.reset(); }
+		// A lost TimeoutNow is resent each heartbeat; the target acts once per token.
+		if (transfer_ && now_ >= heartbeat_deadline_) { transfer_->sent = false; }
 		// D9: a witness that leads hands leadership to its most caught-up data voter.
 		if (!transfer_ && witness_self()) {
 			NodeId best = 0; Index matched = 0;
@@ -875,6 +879,7 @@ private:
 				replicate(id, peer, output, probe);
 			}
 		}
+		timeout_now(output);
 		if (heartbeat) { heartbeat_deadline_ = deadline(timing_.heartbeat); }
 	}
 	void campaign(Actions& output, bool transfer = false) {

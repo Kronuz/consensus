@@ -427,6 +427,19 @@ void prevote_guard_checkquorum() {
 	check(ignored.empty() && voter.core->term() == term, "a vote request within election_min of the leader's contact is ignored");
 	auto transfer = voter.core->step(Receive{3, VoteRequest{term + 1, voter.core->last_index(), voter.core->term(), true}});
 	check(voter.core->term() == term + 1 && find<Persist>(transfer), "a transfer's vote request passes the guard");
+	// A leader is a current leader: it refuses pre-votes and ignores untransferred votes, so a
+	// rejoining node with an up-to-date log cannot depose it.
+	{
+		Network rejoin; rejoin.start(); rejoin.elect();
+		auto& leading = *rejoin.host(1).core;
+		const Term held = leading.term();
+		auto asked = leading.step(Receive{3, PreVoteRequest{held + 1, leading.last_index(), leading.term()}});
+		auto answer = find<Send>(asked);
+		auto refusal = answer ? std::get_if<PreVoteResponse>(&answer->message) : nullptr;
+		check(refusal && !refusal->granted && leading.term() == held, "a leader refuses a pre-vote");
+		auto voted = leading.step(Receive{3, VoteRequest{held + 1, leading.last_index(), leading.term()}});
+		check(voted.empty() && leading.role() == Role::Leader && leading.term() == held, "a leader ignores an untransferred vote request");
+	}
 	// CheckQuorum: a leader whose voters stop answering steps down within election_max.
 	Network quiet; quiet.start(); quiet.elect();
 	auto& leader = quiet.host(1);
@@ -1594,6 +1607,14 @@ void leadership_transfer() {
 	// The append lost during isolation is retried after rpc_timeout, within the transfer.
 	for (std::uint64_t from = lag.now, t = from + 10; t <= from + 150 && lag.host(3).core->role() != Role::Leader; t += 10) { lag.tick(t); lag.pump(); }
 	check(lag.host(3).core->role() == Role::Leader && lag.host(3).core->last_index() >= 3, "the caught-up target wins");
+
+	// A lost TimeoutNow is resent on the next heartbeat.
+	Network lossy; lossy.start(); lossy.elect();
+	lossy.isolated = {2};
+	lossy.consume(1, lossy.host(1).core->step(TransferLeadership{55, 2})); lossy.pump();
+	lossy.isolated.clear();
+	for (std::uint64_t from = lossy.now, t = from + 10; t <= from + 150 && lossy.host(2).core->role() != Role::Leader; t += 10) { lossy.tick(t); lossy.pump(); }
+	check(lossy.host(2).core->role() == Role::Leader, "a transfer survives a lost TimeoutNow");
 
 	// A transfer to an unreachable target aborts after one election timeout.
 	Network gone; gone.start(); gone.elect();

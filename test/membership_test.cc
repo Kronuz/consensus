@@ -521,6 +521,29 @@ void founding_limits() {
 	check(above.limits && !within(*above.limits, node), "founding limits above the node's are outside it");
 }
 
+
+// Condition 16: a joiner that keeps its log through an install below the entry naming its
+// membership takes the membership the install names.
+void joiner_retained_install() {
+	RecoveredState js; js.configuration = joiner_config(4); js.membership = Membership{};
+	Core joiner(joiner_config(4), std::move(js), {}, compact); joiner.step(Start{});
+	Membership founding = fixed_membership(founding_config(1));
+	Membership with4 = founding; with4.members.push_back({4, 4, MemberRole::Learner}); with4.next_incarnation = 5;
+	std::vector<Entry> entries{{1, 1, EntryKind::NoOp, {}}, {2, 1, EntryKind::Command, "a"}, {3, 1, EntryKind::Command, "b"}, {4, 1, EntryKind::Command, "c"},
+		{5, 1, EntryKind::Configuration, encode_membership(with4)}};
+	auto appended = joiner.step(Receive{1, AppendRequest{1, 9, 0, 0, 0, 0, entries, 0}});
+	if (auto persist = first<Persist>(appended)) { joiner.step(Persisted{persist->token}); }
+	check(joiner.last_index() == 5 && joiner.committed() == 0, "the joiner holds the entries, none committed");
+	auto prepared = joiner.step(InstallPrepared{60, 88, 1, 1, founding_config(1).cluster, founding_config(1).configuration, {3, 1}, founding});
+	auto install = first<PersistInstall>(prepared);
+	check(install && install->state.membership == std::optional<Membership>(founding) && install->state.entries.size() == 2, "the install keeps the log above 3 and takes the named membership");
+	if (!install) { return; }
+	check(reopens(joiner_config(4), install->state), "the joiner reopens from it");
+	auto published = joiner.step(Persisted{install->token});
+	if (auto activate = first<ActivateInstall>(published)) { joiner.step(InstallActivated{activate->token}); }
+	check(joiner.base_index() == 3 && joiner.membership() == with4, "its membership in force is the one entry 5 names");
+}
+
 }  // namespace
 
 int main() {
@@ -538,6 +561,7 @@ int main() {
 		witness_replaced_while_lagging();
 		unequal_node_limits();
 		founding_limits();
+		joiner_retained_install();
 	} catch (const std::exception& error) {
 		check(false, error.what());
 	}

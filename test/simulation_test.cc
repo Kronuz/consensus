@@ -193,8 +193,8 @@ public:
 		advance(5);
 		for (auto& [id, n] : nodes_) {
 			tick(n);
-			if (n.pending || n.checkpointing || n.installing) { complete_storage(n); }
-			if (n.applying) { complete_apply(n); }
+			if (n.up && (n.pending || n.checkpointing || n.installing)) { complete_storage(n); }
+			if (n.up && n.applying) { complete_apply(n); }
 			serve_snapshot();
 		}
 		while (!network_.empty()) { deliver_front(); }
@@ -206,19 +206,37 @@ public:
 		}
 		// T2's forced self-removal, once everything is up.
 		for (int round = 0; round < 1000 && !failures && !force_self_removal(); ++round) { quiet_round(); }
-		for (int round = 0; round < 300 && !failures; ++round) { quiet_round(); }
+		for (int round = 0; round < 300 && !failures; ++round) {
+			quiet_round();
+			if (!removal_leader_) { continue; }
+			auto& l = nodes_.at(*removal_leader_);
+			if (!l.up || votes_in(l.core->committed_membership(), l.id)) { continue; }
+			// The removal committed: count what was still in flight.
+			bool waiting = false;
+			for (const auto& [id, m] : nodes_) { waiting |= l.core->awaiting_snapshot(id).has_value(); }
+			removals_with_snapshot += waiting;
+			removals_with_read += read_floors_.count(removal_read_) > 0;
+			removal_leader_.reset();
+		}
+		removal_leader_.reset();
+		hold_snapshots_ = false;
 		cut_.clear();
+		if (membership_changes_) { force_replacement(); }
+		for (auto& [id, n] : nodes_) {
+			if (!n.up) { restart(n); }  // the forced crash's node returns with the rest
+		}
 		for (int round = 0; round < 4000 && !failures; ++round) {
 			quiet_round();
 			if (round >= 2000 && round % 50 == 0 && applied_healed() < healed_quorum()) {  // until a majority applies it
 				for (auto& [id, n] : nodes_) {
-					if (n.core->role() == Role::Leader) { act(n, n.core->step(Propose{++request_, "healed"})); }
+					if (n.up && n.core->role() == Role::Leader) { act(n, n.core->step(Propose{++request_, "healed"})); }
 				}
 			}
 		}
 		if (applied_healed() < healed_quorum()) {
 			fail("healed group did not commit a new entry on a majority");
 			for (auto& [id, n] : nodes_) {
+				if (!n.up) { continue; }
 				std::fprintf(stderr, "  node %llu: up %d role %d term %llu committed %llu applied %llu last %llu durable log %zu pending %d applying %d\n", (unsigned long long)id, n.up,
 					int(n.core->role()), (unsigned long long)n.core->term(), (unsigned long long)n.core->committed(), (unsigned long long)n.core->applied(),
 					(unsigned long long)n.core->last_index(), n.durable.log.size(), n.pending.has_value(), n.applying.has_value());
@@ -233,6 +251,7 @@ public:
 
 	std::uint64_t restarts = 0, kept = 0, lost = 0, elections = 0, led_steps = 0, repairs = 0, transfers = 0, changes_proposed = 0, memberships_committed = 0;
 	std::uint64_t reads = 0, checkpoints = 0, installs = 0, limit_changes = 0, replaced_configurations = 0, forced_removals = 0;
+	std::uint64_t forced_replacements = 0, removals_with_snapshot = 0, removals_with_read = 0, delayed_timeout_nows = 0;
 	std::map<int, std::uint64_t> reject_reasons;
 	Term max_term() const {
 		Term t = 0;
@@ -529,7 +548,7 @@ private:
 	// A leader's snapshot to a lagging peer: the image it checkpointed, with the membership
 	// the snapshot carries for that peer; a transfer fails when the peer is unreachable.
 	void serve_snapshot() {
-		if (snapshot_requests_.empty()) { return; }
+		if (snapshot_requests_.empty() || hold_snapshots_) { return; }
 		auto [from, peer, key] = snapshot_requests_.front();
 		snapshot_requests_.pop_front();
 		auto& l = nodes_.at(from);
@@ -592,9 +611,33 @@ private:
 		std::vector<NodeId> others;
 		for (const auto& x : next.members) { if (x.role == MemberRole::Voter && x.incarnation != leader->id) { others.push_back(x.incarnation); } }
 		if (others.size() < 2 || next.leaving) { return true; }  // nothing to force here
-		const NodeId reachable = others[random_() % others.size()];
-		for (const auto& [id, m] : nodes_) {
-			if (id != leader->id && id != reachable) { cut_.insert({leader->id, id}); cut_.insert({id, leader->id}); }
+		if (others.size() >= 4) {
+			// Five voters: one voter is cut off and falls behind a checkpoint, so the removal
+			// commits on the other three while a read and that voter's snapshot are in flight.
+			const NodeId behind = others[random_() % others.size()];
+			cut_.insert({leader->id, behind}); cut_.insert({behind, leader->id});
+			const NodeId lid = leader->id;
+			const Index target = leader->core->committed() + 3;
+			for (int i = 0; i < 400 && !failures; ++i) {  // commit past what the cut voter holds
+				auto& l = nodes_.at(lid);
+				if (!l.up || l.core->role() != Role::Leader) { cut_.clear(); return false; }
+				if (l.core->applied() >= target) { break; }
+				if (i % 20 == 0) { propose(l); }
+				quiet_round();
+			}
+			leader = &nodes_.at(lid);
+			if (!leader->core->can_change_membership()) { cut_.clear(); return false; }
+			checkpoint(*leader);
+			if (leader->checkpointing) { complete_storage(*leader); }
+			read(*leader);
+			hold_snapshots_ = true;
+			removal_leader_ = leader->id;
+			removal_read_ = request_;
+		} else {
+			const NodeId reachable = others[random_() % others.size()];
+			for (const auto& [id, m] : nodes_) {
+				if (id != leader->id && id != reachable) { cut_.insert({leader->id, id}); cut_.insert({id, leader->id}); }
+			}
 		}
 		std::erase_if(next.members, [&](const Member& x) { return x.incarnation == leader->id; });
 		auto actions = leader->core->step(ChangeMembership{++request_, std::move(next)});
@@ -606,6 +649,45 @@ private:
 		++forced_removals;
 		act(*leader, std::move(actions));
 		return true;
+	}
+	// T2's forced schedule: a crash between a promotion and the removal it implies. The leader
+	// promotes a caught-up learner in place of another voter, and fails once the promotion
+	// commits, before the leaving voter's removal does.
+	void force_replacement() {
+		auto rounds = [&](int bound, auto&& done) {
+			for (int i = 0; i < bound && !failures; ++i) { if (done()) { return true; } quiet_round(); }
+			return done();
+		};
+		Node* leader = nullptr;
+		if (!rounds(1000, [&] { for (auto& [id, m] : nodes_) { if (m.up && m.core->can_change_membership()) { leader = &m; return true; } } return false; })) { return; }
+		Membership next = leader->core->membership();
+		NodeId learner = 0;
+		for (const auto& x : next.members) { if (x.role == MemberRole::Learner) { learner = x.incarnation; } }
+		if (!learner) {
+			if (next.members.size() >= 7) { return; }
+			learner = next.next_incarnation++;
+			next.members.push_back({learner, learner, MemberRole::Learner});
+			auto& j = nodes_[learner];
+			j.id = learner; j.joiner = true; j.rate = 1.0; j.local = leader->local; j.limits = node_limits();
+			restart(j);
+			act(*leader, leader->core->step(ChangeMembership{++request_, next}));
+		}
+		const NodeId lid = leader->id;
+		auto& l = nodes_.at(lid);
+		if (!rounds(1000, [&] { return l.up && l.core->can_change_membership() && l.core->progress(learner) && *l.core->progress(learner) >= l.core->committed(); })) { return; }
+		Membership promote = l.core->membership();
+		std::vector<NodeId> voters;
+		for (const auto& x : promote.members) { if (x.role == MemberRole::Voter && x.incarnation != lid) { voters.push_back(x.incarnation); } }
+		if (voters.empty() || promote.leaving) { return; }
+		for (auto& x : promote.members) { if (x.incarnation == learner) { x.role = MemberRole::Voter; } }
+		promote.leaving = voters[random_() % voters.size()];
+		auto actions = l.core->step(ChangeMembership{++request_, promote});
+		if (std::any_of(actions.begin(), actions.end(), [](const Action& x) { return std::holds_alternative<Reject>(x); })) { return; }
+		act(l, std::move(actions));
+		if (rounds(1000, [&] { return !l.up || l.core->committed_membership().leaving != 0; }) && l.up && l.core->committed_membership().leaving) {
+			++forced_replacements;
+			crash(l);
+		}
 	}
 	// The membership in force on every quiet node is the one its durable state implies: the
 	// base membership, then the newest Configuration entry in its log (D1).
@@ -659,6 +741,10 @@ private:
 				n.pending = std::move(*p);
 			} else if (auto s = std::get_if<Send>(&a)) {
 				check_send(n, *s);
+				if (std::holds_alternative<TimeoutNow>(s->message)) {  // T2's forced schedule: a delayed duplicate
+					network_.push_back({n.id, s->peer, s->message, now_ + 600 + random_() % 600});
+					++delayed_timeout_nows;
+				}
 				if (random_() % 20 == 0) { continue; }  // lost
 				network_.push_back({n.id, s->peer, s->message, now_ + random_() % 60});
 				while (network_.size() > 4096) { network_.pop_front(); }
@@ -687,9 +773,21 @@ private:
 		if (!fresh && it->second != n.id) { fail("two leaders in term " + std::to_string(term)); }
 		// Leader completeness: the new leader holds every entry any node applied. Its no-op
 		// is not durable yet, so compare against its durable log.
+		// Leader completeness covers entries committed in earlier terms. A leader's RoleChanged
+		// arrives once its no-op persists, by when a later term may have committed more.
 		for (const auto& [index, entry] : committed_) {
+			if (auto at = commit_terms_.find(index); at != commit_terms_.end() && at->second >= term) { continue; }
 			if (auto held = n.durable.entry(index); !held || *held != entry) {
 				fail("leader " + std::to_string(n.id) + " of term " + std::to_string(term) + " lacks applied entry " + std::to_string(index));
+				if (std::getenv("SIM_DEBUG")) {
+					for (const auto& [i, m] : nodes_) {
+						std::fprintf(stderr, "  node %llu up %d joiner %d term %llu voted %llu base %llu last %llu commit %llu applied %zu cmd-limit %zu members:", (unsigned long long)i, m.up, m.joiner,
+							(unsigned long long)m.durable.hard.term, (unsigned long long)m.durable.hard.voted_for.value_or(0), (unsigned long long)m.durable.base, (unsigned long long)m.durable.last(),
+							(unsigned long long)m.durable.hard.commit_index, m.applied_entries.size(), m.limits.command_bytes);
+						if (m.core) { for (const auto& x : m.core->membership().members) { std::fprintf(stderr, " %llu/%d", (unsigned long long)x.incarnation, int(x.role)); } }
+						std::fprintf(stderr, "\n");
+					}
+				}
 				return;
 			}
 		}
@@ -701,6 +799,7 @@ private:
 	// Commit safety: when a leader commits an index, the entry there is already durable on a
 	// quorum of the voters of the membership it uses, itself counted only while it is one.
 	void check_commit(const Node& leader, Index index) {
+		for (Index i = index; i > 0 && !commit_terms_.count(i); --i) { commit_terms_[i] = leader.durable.hard.term; }
 		// The membership its durable log puts in force, not the core's own view of it.
 		Membership m = leader.durable.base ? leader.durable.membership.value_or(founding_) : founding_;
 		for (const auto& e : leader.durable.log) {
@@ -794,6 +893,7 @@ private:
 	RequestId request_ = 0;
 	std::map<Term, NodeId> leaders_;
 	std::map<Index, Entry> committed_;
+	std::map<Index, Term> commit_terms_;  // the term in which each index was first committed
 	std::map<std::pair<NodeId, Term>, NodeId> ballots_;
 	std::map<RequestId, Index> read_floors_;
 	struct SnapshotRequest { NodeId from, peer; SnapshotKey key; };
@@ -802,6 +902,9 @@ private:
 	std::size_t forced_at_ = 2000 + random_() % 4000;
 	std::set<std::pair<NodeId, NodeId>> cut_;  // (from, to) links down
 	std::optional<NodeId> forced_leader_;
+	bool hold_snapshots_ = false;
+	std::optional<NodeId> removal_leader_;
+	RequestId removal_read_ = 0;
 	std::uint64_t trace_after_ = std::getenv("SIM_TRACE_AFTER") ? std::strtoull(std::getenv("SIM_TRACE_AFTER"), nullptr, 10) : 0;
 };
 
@@ -812,7 +915,7 @@ int main(int argc, char** argv) {
 	const std::uint64_t steps = argc > 2 ? std::strtoull(argv[2], nullptr, 10) : 10000;
 	const std::uint64_t first = argc > 3 ? std::strtoull(argv[3], nullptr, 10) : 1;
 	std::uint64_t restarts = 0, kept = 0, lost = 0, elections = 0, repairs = 0, transfers = 0, changes = 0, committed_changes = 0;
-	std::uint64_t reads = 0, checkpoints = 0, installs = 0, limit_changes = 0, replaced = 0, removals = 0;
+	std::uint64_t reads = 0, checkpoints = 0, installs = 0, limit_changes = 0, replaced = 0, removals = 0, replacements = 0, with_snapshot = 0, with_read = 0, duplicated = 0;
 	for (std::uint64_t seed = first; seed < first + seeds && !failures; ++seed) {
 		current_seed = seed;
 		Simulation sim(seed, 3 + 2 * (seed % 3 == 0), seed % 2 == 0, seed % 5 == 1);  // even seeds change membership
@@ -834,11 +937,17 @@ int main(int argc, char** argv) {
 		limit_changes += sim.limit_changes;
 		replaced += sim.replaced_configurations;
 		removals += sim.forced_removals;
+		replacements += sim.forced_replacements;
+		with_snapshot += sim.removals_with_snapshot;
+		with_read += sim.removals_with_read;
+		duplicated += sim.delayed_timeout_nows;
 	}
 	std::printf("simulation: %llu seeds x %llu steps, %llu elections, %llu restarts (%llu kept a pending batch, %llu lost one), %llu repairs, %llu transfers, %llu membership changes proposed, %llu committed memberships applied: %s\n",
 		(unsigned long long)seeds, (unsigned long long)steps, (unsigned long long)elections, (unsigned long long)restarts, (unsigned long long)kept,
 		(unsigned long long)lost, (unsigned long long)repairs, (unsigned long long)transfers, (unsigned long long)changes, (unsigned long long)committed_changes, failures ? "FAILED" : "ok");
 	std::printf("  %llu linearizable reads, %llu checkpoints, %llu installs, %llu limit changes, %llu replaced configuration entries, %llu forced self-removals\n", (unsigned long long)reads,
 		(unsigned long long)checkpoints, (unsigned long long)installs, (unsigned long long)limit_changes, (unsigned long long)replaced, (unsigned long long)removals);
+	std::printf("  forced: %llu crashes between promotion and removal; removals committed with a snapshot in flight %llu, with a read in flight %llu; %llu delayed duplicate TimeoutNows\n",
+		(unsigned long long)replacements, (unsigned long long)with_snapshot, (unsigned long long)with_read, (unsigned long long)duplicated);
 	return failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }

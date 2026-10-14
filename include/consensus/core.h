@@ -393,6 +393,7 @@ private:
 			auto& operation = *install_;
 			if (operation.retain_suffix) {
 				note_base(operation.boundary.index);
+				if (base_membership_.members.empty() && operation.membership) { base_membership_ = *operation.membership; }
 				auto count = static_cast<std::size_t>(operation.boundary.index - base_index_);
 				log_bytes_ = entries_.suffix_bytes(count);
 				entries_.erase_prefix(count);
@@ -447,7 +448,11 @@ private:
 		if (unnamed && (!retain || membership_at(request.boundary.index).members.empty())) { reject(InstallRejectReason::Invalid); return; }
 		next_hard.commit_index = request.boundary.index;
 		RecoveredState state{configuration_, next_hard, request.boundary.index, request.boundary.term, {}, request.boundary.index};
-		state.membership = retain_base_membership(retain ? std::optional<Membership>(membership_at(request.boundary.index)) : request.membership);
+		// A joiner that retains its log below the entry naming its membership takes the
+		// membership the request names (condition 16).
+		Membership retained = membership_at(request.boundary.index);
+		if (retain && retained.members.empty() && request.membership) { retained = *request.membership; }
+		state.membership = retain_base_membership(retain ? std::optional<Membership>(retained) : request.membership);
 		if (retain) {
 			auto first = static_cast<std::size_t>(request.boundary.index - base_index_);
 			if (!capture_mode_) {

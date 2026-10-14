@@ -1727,6 +1727,9 @@ void hostile_transfer_frames() {
 	check(receive(encode_transfer(TransferKind::Result, good, result_body(TransferOutcome::Failed, 3))) == TransferReceive::Closed, "a Failed Result carries no term");
 	check(receive(encode_transfer(TransferKind::Result, good, result_body(TransferOutcome::Installed, 2))) == TransferReceive::Closed, "a Result below its key's leader term closes the session");
 	check(receive(encode_transfer(TransferKind::Result, good, result_body(TransferOutcome::Failed, 0))) == TransferReceive::Accepted, "a Failed Result for no sending transfer is ignored");
+	for (auto outcome : {TransferOutcome::CaughtUp, TransferOutcome::Rejected}) {
+		check(receive(encode_transfer(TransferKind::Result, good, result_body(outcome, 3))) != TransferReceive::Closed, "a durable CaughtUp or Rejected Result reaches the core");
+	}
 	check(receive(encode_transfer(TransferKind::Credit, good, transfer_chunk_body(9, 4, {}, false, true))) == TransferReceive::Accepted, "a Credit for no sending transfer is ignored");
 	check(receive(encode_transfer(TransferKind::Cancel, good, {})) == TransferReceive::Accepted, "a Cancel for no receiving transfer is ignored");
 	std::string magic(12, 'X'), bound("RFTXFR01", 8); kronuz::journal::put32(bound, 5);
@@ -1807,6 +1810,41 @@ void worker_api_guards() {
 	check(worker.consume_validation(*id, 1) == ValidationAck::Fenced && worker.validation_succeeded(*id, 1) == ValidationAck::Fenced && worker.request_install(*id) == SubmitResult::Fenced &&
 		worker.snapshot_activated(*id, 1) == ValidationAck::Fenced && worker.snapshot_activation_failed(*id, 1) == ValidationAck::Fenced &&
 		worker.source_peer_failed(2) == ValidationAck::Fenced && worker.run_one({0, 100}) == TurnResult::Fenced && !worker.snapshot_source(), "a fenced worker answers Fenced");
+}
+
+// A receiving transfer refuses chunks it does not own or that break its sequence, and holds
+// a second Begin while one is in progress.
+void receiving_protocol() {
+	SnapshotFixture fixture("receiving-protocol"); SnapshotChannel channel(fixture.worker);
+	Identity local{}, remote{}, third{}; local[0] = 'l'; remote[0] = 'r'; third[0] = 't';
+	TrustedSession a{2, local, remote}, b{3, local, third};
+	auto fixed = fixture.worker.configuration(); const TransferEnvelope envelope{fixed.cluster, fixed.configuration, remote, local, 2, 1, {1, 17, {1, 1}}};
+	auto other_key = envelope; other_key.key.transfer = 18;
+	auto from_b = envelope; from_b.source = 3; from_b.source_session = third;
+	auto begin = [&](const TransferEnvelope& e) { return encode_transfer(TransferKind::Begin, e, encode_snapshot(fixture.context("data").descriptor, *fixture.worker.snapshot_policy())); };
+	auto send = [&](const TrustedSession& session, const std::string& bytes) { return channel.receive(session, std::span<const char>(bytes.data(), bytes.size())).result; };
+	auto drain_output = [&] { while (auto output = channel.outbound()) { channel.consume_output(output->token, output->bytes.size()); } };
+	auto start = [&] {
+		channel.register_session(a); channel.register_session(b);
+		bool owned = send(a, begin(envelope)) == TransferReceive::Accepted && channel.incoming_snapshot().has_value(); drain_output(); return owned;
+	};
+	auto finish = [&] {
+		channel.session_closed(a); channel.session_closed(b);
+		for (unsigned turn = 0; turn < 100 && !(channel.drained() && !fixture.worker.pending_snapshot_result()); ++turn) { fixture.pump(); channel.run_one({0, 100}); }
+		check(channel.drained() && !fixture.worker.fenced(), "a refused transfer drains without fencing");
+	};
+	auto chunk = [&](const TransferEnvelope& e, std::uint64_t offset, std::string_view payload, bool final) { return encode_transfer(TransferKind::Chunk, e, transfer_chunk_body(9, offset, payload, final)); };
+	check(start() && send(a, chunk(other_key, 0, "data", true)) == TransferReceive::Closed, "a Chunk for another transfer closes the session"); finish();
+	check(start() && send(a, chunk(envelope, 1, "ata", true)) == TransferReceive::Closed, "a Chunk out of sequence closes the session"); finish();
+	check(start() && send(a, chunk(envelope, 0, "datum", true)) == TransferReceive::Closed, "a Chunk past the image closes the session"); finish();
+	check(start() && send(a, chunk(envelope, 0, "", false)) == TransferReceive::Closed, "an empty non-final Chunk closes the session"); finish();
+	check(start() && send(a, chunk(envelope, 0, "data", true)) == TransferReceive::Accepted && send(a, chunk(envelope, 4, "", true)) == TransferReceive::Closed,
+		"a Chunk after the final one closes the session"); finish();
+	check(start() && send(b, begin(from_b)) == TransferReceive::Busy, "a Begin from another session waits while one transfer is in progress"); finish();
+	check(start() && send(a, begin(other_key)) == TransferReceive::Busy, "a Begin for another transfer waits while one is in progress"); finish();
+	SnapshotFixture disabled("reception-disabled", std::nullopt); SnapshotChannel refusing(disabled.worker); refusing.register_session(a);
+	auto bytes = encode_transfer(TransferKind::Begin, envelope, encode_snapshot(fixture.context("data").descriptor, *fixture.worker.snapshot_policy()));
+	check(refusing.receive(a, std::span<const char>(bytes.data(), bytes.size())).result == TransferReceive::Closed, "a worker without snapshot reception refuses a Begin");
 }
 
 void channel_dispatch_and_unstarted_result() {
@@ -2033,7 +2071,7 @@ int main(int argc, char** argv) {
 		if (argc == 2 && std::string_view(argv[1]) == "--completion-regressions") { completion_appends(); completion_storage(); completion_channel_cancellation(); completion_snapshot_readback(); retired_completion_worker(); for (unsigned mode : {0u, 1u, 3u}) { binary_transfer_integration(65553, mode, false, true); } std::cout << checks << " completion checks, " << failures << " failures\n"; return failures ? 1 : 0; }
 		if (argc == 2 && std::string_view(argv[1]) == "--review-regressions") { channel_dispatch_and_unstarted_result(); binary_transfer_integration(65553); binary_transfer_integration(65553, 5); owned_snapshot_sources(); std::cout << checks << " review checks, " << failures << " failures\n"; return failures ? 1 : 0; }
 		if (argc == 2 && std::string_view(argv[1]) == "--transfer-benchmark") { std::ofstream(std::filesystem::current_path() / ".scratch" / "snapshot-transfer-benchmark.csv") << "image_bytes,wall_s,cpu_s,wire_bytes,retained_frame_bytes,payload_buffer_capacity,process_maxrss_native,sender_payload_reads,receiver_payload_reads\n"; binary_transfer_integration(1048576, 0, true); binary_transfer_integration(67108864, 0, true); std::cout << checks << " benchmark checks, " << failures << " failures\n"; return failures ? 1 : 0; }
-		completion_appends(); completion_storage(); completion_channel_cancellation(); completion_snapshot_readback(); retired_completion_worker(); for (unsigned mode : {0u, 1u, 3u}) { binary_transfer_integration(65553, mode, false, true); } checkpoint_format_recovery(); legacy_source_export_rejection(); binary_channel_validation(); hostile_transfer_frames(); worker_api_guards(); channel_dispatch_and_unstarted_result(); binary_transfer_codec(); for (std::size_t length : {std::size_t{0}, std::size_t{9}, std::size_t{65553}, std::size_t{1048576}}) { binary_transfer_integration(length); }
+		completion_appends(); completion_storage(); completion_channel_cancellation(); completion_snapshot_readback(); retired_completion_worker(); for (unsigned mode : {0u, 1u, 3u}) { binary_transfer_integration(65553, mode, false, true); } checkpoint_format_recovery(); legacy_source_export_rejection(); binary_channel_validation(); hostile_transfer_frames(); receiving_protocol(); worker_api_guards(); channel_dispatch_and_unstarted_result(); binary_transfer_codec(); for (std::size_t length : {std::size_t{0}, std::size_t{9}, std::size_t{65553}, std::size_t{1048576}}) { binary_transfer_integration(length); }
 		for (unsigned mode : {1u, 2u, 3u, 5u}) { binary_transfer_integration(65553, mode); }
 		owned_snapshot_sources(); snapshot_reception_and_validation(); snapshot_policy_and_rejection(); snapshot_cancellation_phases(); snapshot_read_faults(); snapshot_restart_cleanup(); snapshot_protocol_progress(); snapshot_installation(); snapshot_rejection_branches(); snapshot_old_application(); snapshot_install_reopening(); snapshot_install_admission(); snapshot_publication_faults(); maintenance_preserves_protocol_timers(); real_worker(); partial_control_pack(); failures_and_multi_action_output(); interrupted_initialization(); checkpoint_crash_and_progress(); preparation_preserves_protocol_timers(); checkpoint_cancellation_and_completion(); checkpoint_faults(); worker_repair(); } catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " worker checks, " << failures << " failures\n"; return failures ? 1 : 0;

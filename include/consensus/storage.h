@@ -144,9 +144,10 @@ public:
 			const auto& entry = state.entries[i];
 			if (entry.index != state.base_index + i + 1 || entry.term == 0 || entry.term < previous || entry.term > state.hard.term ||
 				entry.payload.size() > limits_.command_bytes || entry.payload.size() > limits_.log_bytes - bytes ||
-				(entry.kind != EntryKind::Command && entry.kind != EntryKind::NoOp) || (entry.kind == EntryKind::NoOp && !entry.payload.empty())) {
+				static_cast<unsigned>(entry.kind) > static_cast<unsigned>(EntryKind::Configuration) || (entry.kind == EntryKind::NoOp && !entry.payload.empty())) {
 				throw storage_detail::Corruption("invalid consensus checkpoint suffix");
 			}
+			if (entry.kind == EntryKind::Configuration) { (void)decode_membership(entry.payload, limits_); }  // throws Corruption
 			previous = entry.term; bytes += entry.payload.size();
 		}
 		return bytes;

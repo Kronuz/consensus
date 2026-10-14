@@ -1674,8 +1674,25 @@ void witnesses() {
 	check(find<PersistCheckpoint>(within) != nullptr, "a witness checkpoints within the data voters' match");
 }
 
+void checkpoint_with_configuration_suffix() {
+	// A checkpoint's retained suffix can hold a Configuration entry above its base.
+	RecoveredState state = empty(1);
+	Membership next = fixed_membership(config(1));
+	next.members.push_back({4, 4, MemberRole::Learner}); next.next_incarnation = 5;
+	state.hard = HardState{1, std::nullopt, 2};
+	state.base_index = 1; state.base_term = 1; state.applied_index = 1;
+	state.entries = {{2, 1, EntryKind::Configuration, encode_membership(next)}};
+	kronuz::journal::ArtifactDescriptor application{};
+	bool encoded = !throws([&] {
+		auto bytes = encode_checkpoint(state, 3, application);
+		auto bundle = decode_checkpoint(bytes, state.configuration, 3, application);
+		check(bundle.state.entries.size() == 1 && bundle.state.entries[0].kind == EntryKind::Configuration, "the suffix's Configuration entry round-trips");
+	});
+	check(encoded, "a checkpoint retains a Configuration entry in its suffix");
+}
+
 int main() {
-	try { terminal_retirement(); snapshot_sender_maximum_fanout(); snapshot_sender_lost_ack_and_terms(); snapshot_sender_receiver_contact(); snapshot_sender_restart_clock_and_admission(); snapshot_sender_correlation(); snapshot_sender_keepalive_pacing(); snapshot_sender_retries_and_retention(); snapshot_timeout_retries(); portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); repair_at_or_below_commit(); prevote_guard_checkquorum(); membership_scripts(); membership_formats(); leadership_transfer(); witnesses(); }
+	try { terminal_retirement(); snapshot_sender_maximum_fanout(); snapshot_sender_lost_ack_and_terms(); snapshot_sender_receiver_contact(); snapshot_sender_restart_clock_and_admission(); snapshot_sender_correlation(); snapshot_sender_keepalive_pacing(); snapshot_sender_retries_and_retention(); snapshot_timeout_retries(); portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); repair_at_or_below_commit(); prevote_guard_checkquorum(); membership_scripts(); membership_formats(); leadership_transfer(); witnesses(); checkpoint_with_configuration_suffix(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " consensus checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

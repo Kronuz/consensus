@@ -341,6 +341,7 @@ public:
 	const SnapshotResult* pending_snapshot_result() const noexcept { return snapshot_result_ ? &*snapshot_result_ : nullptr; }
 	std::optional<SnapshotPolicy> snapshot_policy() const { return snapshot_limits_ ? std::optional<SnapshotPolicy>{{configuration_.cluster, configuration_.configuration, snapshot_limits_->application_format, snapshot_limits_->application_bytes}} : std::nullopt; }
 	const FixedConfiguration& configuration() const noexcept { return configuration_; }
+	const Limits& limits() const noexcept { return limits_; }
 	std::optional<SnapshotResult> take_snapshot_result() { auto result = std::move(snapshot_result_); snapshot_result_.reset(); return result; }
 	SubmitResult request_install(const SnapshotId& id) {
 		if (closing_) { return SubmitResult::Busy; }

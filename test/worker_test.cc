@@ -1814,10 +1814,114 @@ void snapshot_senders() {
  check(!reserve("unauthenticated", founding, 0), "no Worker accepts a snapshot from an unauthenticated peer");
 }
 
+// Track C, T4 through Workers: voter 3 loses its disk and returns as incarnation 4. The
+// leader adds 4 as a learner, 4 installs the leader's image through real snapshot
+// channels, catches up, and is promoted in place of 3, which the core then removes; 4's
+// store reopens with the membership in force.
+void worker_rejoin_by_install() {
+	struct Node {
+		std::shared_ptr<SnapshotFixture::Directory> directory; std::shared_ptr<FaultIO> owned_io; Worker worker; SnapshotChannel transfer;
+		std::deque<Receive> messages; std::string application, candidate; Token eof = 0; bool dead = false;
+		Node(NodeId id, FixedConfiguration config) : directory(std::make_shared<SnapshotFixture::Directory>("rejoin-" + std::to_string(id))), owned_io(std::make_shared<FaultIO>(directory->path)),
+			worker(owned_io, config, {{1024ull * 1024 * 1024, 4096}, {16 * 1024, 3}, {256ull * 1024 * 1024, 4}, 8, 3}, limits(), compact, {4, 1, false, false}, SnapshotLimits{7, 1 << 20}), transfer(worker) {
+			kronuz::journal::Identity identity{}; identity[0] = static_cast<char>('r' + id); worker.create(identity);
+			for (unsigned turn = 0; turn < 100 && !worker.ready(); ++turn) { worker.run_one({0, 100}); if (auto job = worker.take_io_operation()) { kronuz::journal::drive_synchronously(*job); } }
+			worker.try_submit(Start{}); worker.take_actions();
+		}
+	};
+	auto founding = [](NodeId id) { auto c = SnapshotFixture::fixed(); c.local = id; c.voters = {1, 2, 3}; return c; };
+	std::map<NodeId, std::unique_ptr<Node>> nodes;
+	for (NodeId id : {1u, 2u, 3u}) { nodes.emplace(id, std::make_unique<Node>(id, founding(id))); }
+	auto& leader = *nodes.at(1);
+	const std::string image = "image";
+	auto drain = [&](Node& node) {
+		for (const auto& action : node.worker.take_actions()) {
+			if (auto range = std::get_if<Committed>(&action)) {
+				for (const auto& entry : range->entries) { if (entry.kind == EntryKind::Command) { node.application += "/" + entry.payload; } }
+				node.worker.applied({range->entries.back().index});
+			}
+			if (auto send = std::get_if<Send>(&action)) {
+				auto to = nodes.find(send->peer);
+				if (to != nodes.end() && !to->second->dead && !node.dead) { to->second->messages.push_back({node.worker.configuration().local, send->message}); }
+			}
+		}
+	};
+	Identity a{}, b{}; a[0] = 'l'; b[0] = 'j';
+	std::optional<CheckpointId> capture; bool offered = false, added = false, promoted = false;
+	RequestId request = 5000;
+	auto membership_has = [&](Node& n, NodeId id, MemberRole role) { auto m = n.worker.membership(); auto x = m ? find_member(*m, id) : nullptr; return x && x->role == role; };
+	for (unsigned turn = 0; turn < 60000; ++turn) {
+		const std::uint64_t clock = 100 + turn / 20;
+		for (auto& [id, node] : nodes) {
+			if (node->dead) { continue; }
+			if (!node->messages.empty() && node->worker.try_submit(node->messages.front()) == SubmitResult::Accepted) { node->messages.pop_front(); }
+			node->worker.run_one({clock, id == 1 ? 100u : 200u});
+			if (auto job = node->worker.take_io_operation()) { kronuz::journal::drive_synchronously(*job); }
+			drain(*node);
+		}
+		// Node 3's disk is lost once the group commits; the leader checkpoints with its image.
+		if (!nodes.at(3)->dead && leader.worker.applied_index() >= 1 && leader.worker.role() == Role::Leader) { nodes.at(3)->dead = true; }
+		if (nodes.at(3)->dead && !capture && leader.worker.applied_index() >= 1) {
+			capture = leader.worker.reserve_checkpoint(image.size());
+			if (capture) { leader.worker.attach_capture(*capture, {leader.worker.applied_index(), 1, leader.worker.term()}); }
+		}
+		if (capture && !offered && leader.worker.offer_application_chunk(*capture, image, true) == SubmitResult::Accepted) { offered = true; leader.application = image; }
+		// Node 3 returns as incarnation 4, a joiner, and the leader adds it as a learner.
+		if (offered && leader.worker.base_index() >= 1 && !added) {
+			if (!nodes.count(4)) {
+				auto joiner = SnapshotFixture::fixed(); joiner.local = 4; joiner.voters.clear();
+				nodes.emplace(4, std::make_unique<Node>(4, joiner));
+				leader.transfer.register_session({4, a, b}); nodes.at(4)->transfer.register_session({1, b, a});
+			}
+			Membership with4 = *leader.worker.membership(); with4.members.push_back({4, 4, MemberRole::Learner}); with4.next_incarnation = 5;
+			if (leader.worker.try_submit(ChangeMembership{++request, with4}) == SubmitResult::Accepted) { added = true; }
+		}
+		if (added) {
+			auto& joiner = *nodes.at(4);
+			leader.transfer.run_one({clock, 100}); joiner.transfer.run_one({clock, 200});
+			auto wire = [&](Node& from, Node& to, TrustedSession session) {
+				auto output = from.transfer.outbound(); if (!output) { return; }
+				auto input = to.transfer.receive(session, output->bytes);
+				if (input.consumed) { from.transfer.consume_output(output->token, input.consumed); }
+			};
+			wire(leader, joiner, {1, b, a}); wire(joiner, leader, {4, a, b});
+			if (auto view = joiner.worker.validation_chunk()) {
+				joiner.candidate.append(view->bytes.data(), view->bytes.size());
+				joiner.worker.consume_validation(view->snapshot, view->chunk);
+				if (view->verified_eof) { joiner.eof = view->chunk; joiner.worker.validation_succeeded(view->snapshot, view->chunk); }
+			}
+			if (auto activation = joiner.worker.snapshot_activation()) { joiner.application = std::move(joiner.candidate); joiner.worker.snapshot_activated(activation->snapshot, activation->token); }
+			// Once 4 holds the image and the leader can change again, promote it in place of 3.
+			if (!promoted && joiner.worker.base_index() >= 1 && membership_has(leader, 4, MemberRole::Learner) && turn % 50 == 0) {
+				Membership replace = *leader.worker.membership();
+				for (auto& x : replace.members) { if (x.incarnation == 4) { x.role = MemberRole::Voter; } }
+				replace.leaving = 3;
+				leader.worker.try_submit(ChangeMembership{++request, replace});
+			}
+			promoted = membership_has(leader, 4, MemberRole::Voter);
+			if (promoted && !find_member(*leader.worker.membership(), 3) && joiner.worker.applied_index() == leader.worker.applied_index() && !joiner.worker.busy()) { break; }
+		}
+		if (leader.worker.fenced()) { break; }
+	}
+	auto& joiner = nodes.count(4) ? *nodes.at(4) : leader;
+	check(added && joiner.worker.base_index() >= 1 && joiner.application.starts_with(image), "a returning node installs the leader's image through real snapshot channels");
+	check(promoted && !find_member(*leader.worker.membership(), 3) && membership_has(joiner, 4, MemberRole::Voter), "it replaces its lost incarnation, which the core removes");
+	if (!nodes.count(4)) { return; }
+	auto io = nodes.at(4)->owned_io; auto keep = nodes.at(4)->directory;
+	nodes.at(4)->worker.close(); while (!nodes.at(4)->worker.drained()) { nodes.at(4)->worker.run_one({0, 100}); if (auto job = nodes.at(4)->worker.take_io_operation()) { kronuz::journal::drive_synchronously(*job); } }
+	nodes.erase(4);  // releases its store; its directory stays for the reopen
+	auto joiner_config = SnapshotFixture::fixed(); joiner_config.local = 4; joiner_config.voters.clear();
+	Worker reopened(io, joiner_config, {{1024ull * 1024 * 1024, 4096}, {16 * 1024, 3}, {256ull * 1024 * 1024, 4}, 8, 3}, limits(), compact, {4, 1, false, false}, SnapshotLimits{7, 1 << 20});
+	reopened.recover([](auto&) {});
+	for (unsigned turn = 0; turn < 200 && !reopened.ready(); ++turn) { reopened.run_one({0, 100}); if (auto job = reopened.take_io_operation()) { kronuz::journal::drive_synchronously(*job); } }
+	auto m = reopened.membership();
+	check(reopened.ready() && m && find_member(*m, 4) && find_member(*m, 4)->role == MemberRole::Voter, "the returned node's store reopens with the membership in force");
+}
+
 int main(int argc, char** argv) {
 	try {
 		if (argc == 2 && std::string_view(argv[1]) == "--terminal-regressions") { terminal_original_settlement(); terminal_checkpoint_originals(); terminal_output_and_dispatch_failure(); terminal_snapshot_readback(); terminal_published_activation(); terminal_reclamation_original(); std::cout << checks << " terminal checks, " << failures << " failures\n"; return failures ? 1 : 0; }
-		terminal_original_settlement(); terminal_checkpoint_originals(); terminal_output_and_dispatch_failure(); terminal_snapshot_readback(); terminal_published_activation(); terminal_reclamation_original(); founding_and_join_records(); snapshot_senders();
+		terminal_original_settlement(); terminal_checkpoint_originals(); terminal_output_and_dispatch_failure(); terminal_snapshot_readback(); terminal_published_activation(); terminal_reclamation_original(); founding_and_join_records(); snapshot_senders(); worker_rejoin_by_install();
 		if (argc == 2 && std::string_view(argv[1]) == "--retained-admission-benchmark") { admission_benchmark = true; real_worker(); return failures ? 1 : 0; }
 		if (argc == 2 && std::string_view(argv[1]) == "--source-regressions") { owned_snapshot_sources(); std::cout << checks << " source checks, " << failures << " failures\n"; return failures ? 1 : 0; }
 		if (argc == 2 && std::string_view(argv[1]) == "--completion-regressions") { completion_appends(); completion_storage(); completion_channel_cancellation(); completion_snapshot_readback(); retired_completion_worker(); for (unsigned mode : {0u, 1u, 3u}) { binary_transfer_integration(65553, mode, false, true); } std::cout << checks << " completion checks, " << failures << " failures\n"; return failures ? 1 : 0; }

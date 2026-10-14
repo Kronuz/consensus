@@ -38,7 +38,7 @@ class SnapshotChannel {
 public:
 	explicit SnapshotChannel(Worker& worker, std::uint64_t timeout = 60000) : worker_(worker), timeout_(timeout) {
 		if (!timeout) { throw std::invalid_argument("invalid transfer timeout"); }
-		channels_.reserve(worker.configuration().voters.size() - 1);
+		channels_.reserve(worker.configuration().voters.empty() ? 0 : worker.configuration().voters.size() - 1);
 		for (auto peer : worker.configuration().voters) { if (peer != worker.configuration().local) { channels_.emplace_back(peer); } }
 	}
 	SnapshotChannel(const SnapshotChannel&) = delete;
@@ -46,7 +46,13 @@ public:
 	void register_session(TrustedSession session) {
 		if (worker_.closing()) { return; }
 		auto channel = find(session.peer);
-		if (!channel || session.local == Identity{} || session.remote == Identity{}) { throw std::invalid_argument("invalid trusted snapshot session"); }
+		if (session.peer == 0 || session.peer == worker_.configuration().local || session.local == Identity{} || session.remote == Identity{}) { throw std::invalid_argument("invalid trusted snapshot session"); }
+		// A member added after founding, or any peer of a joiner, gets its channel when its
+		// session opens (D5), up to the node's member limit.
+		if (!channel) {
+			if (channels_.size() >= worker_.limits().members) { throw std::length_error("snapshot channel count exceeds the member limit"); }
+			channel = &channels_.emplace_back(session.peer);
+		}
 		if (channel->session) { session_closed(*channel->session); }
 		channel->session = session; channel->used = 0;
 	}

@@ -401,6 +401,90 @@ void single_server_change() {
 	check(!diverged, "no two members commit different memberships at one index");
 }
 
+
+// T4: a node that lost its disk rejoins as a new incarnation, and a replacement removes the
+// old one.
+void disk_lost_rejoin() {
+	auto c = founded();
+	c.commit_one("a");
+	c.nodes.at(3).down = true;  // node 3's disk is gone for good
+	c.add_joiner(4);            // it returns as incarnation 4
+	auto& leader = c.core(1);
+	Membership with4 = leader.membership(); with4.members.push_back({4, 4, MemberRole::Learner}); with4.next_incarnation = 5;
+	check(c.change(1, with4), "the returning node joins as a learner");
+	c.run(400);
+	Membership replace = leader.membership();
+	for (auto& x : replace.members) { if (x.incarnation == 4) { x.role = MemberRole::Voter; } }
+	replace.leaving = 3;
+	check(c.change(1, replace), "it replaces its old incarnation");
+	c.run(600);
+	const auto& now_in = leader.committed_membership();
+	check(votes_in(now_in, 4) && !find_member(now_in, 3) && voter_count(now_in) == 3 && c.commit_one("b"), "the old incarnation is removed and the group commits");
+}
+
+// T4: a witness at its retained-log limit with a data voter lagging stalls commits and
+// truncates nothing past what every data voter matched; once the voter returns it resumes.
+void witness_at_limit() {
+	Membership founding{{{1, 1, MemberRole::Voter}, {2, 2, MemberRole::Voter}, {3, 3, MemberRole::Witness}}, 4, 0};
+	Limits small; small.log_entries = 24; small.control_entries = 4;
+	ProbeCluster c;
+	for (NodeId id : {1u, 2u, 3u}) {
+		RecoveredState state; state.configuration = founding_config(id); state.membership = founding;
+		c.add(id, founding_config(id), std::move(state), id == 3 ? small : Limits{});  // only the witness is short of room
+	}
+	c.now = 100; c.consume(1, c.core(1).step(Tick{c.now, 100}));
+	c.run(400);
+	check(c.leader() == 1u && c.commit_one("a"), "data voter 1 leads the 2 + witness group");
+	c.nodes.at(2).down = true;
+	auto& witness = c.core(3);
+	bool stalled = false;
+	for (int i = 0; i < 40 && !stalled; ++i) {
+		stalled = !c.commit_one("w" + std::to_string(i), 300);
+		// The witness checkpoints as far as its bound allows.
+		if (witness.witness_bound() > witness.base_index()) {
+			auto actions = witness.step(LocalCheckpoint{50u + i, 9, witness.witness_bound(), witness.term(), founding_config(3).cluster, founding_config(3).configuration});
+			c.consume(3, std::move(actions));
+		}
+	}
+	check(stalled, "with data voter 2 down, the witness fills its log and commits stall");
+	check(witness.base_index() <= c.core(2).last_index(), "the witness truncated nothing past what data voter 2 holds");
+	c.nodes.at(2).down = false;
+	c.run(600);
+	if (witness.witness_bound() > witness.base_index()) {
+		auto cp = witness.step(LocalCheckpoint{90, 9, witness.witness_bound(), witness.term(), founding_config(3).cluster, founding_config(3).configuration});
+		c.consume(3, std::move(cp));
+	}
+	check(c.commit_one("after", 3000), "once data voter 2 catches up, the witness truncates and commits resume");
+}
+
+// T4: a witness is replaced while a data voter lags: the 2 + 2 window commits on the
+// leader and both witnesses, and the old witness leaves.
+void witness_replaced_while_lagging() {
+	Membership founding{{{1, 1, MemberRole::Voter}, {2, 2, MemberRole::Voter}, {3, 3, MemberRole::Witness}}, 4, 0};
+	ProbeCluster c;
+	for (NodeId id : {1u, 2u, 3u}) {
+		RecoveredState state; state.configuration = founding_config(id); state.membership = founding;
+		c.add(id, founding_config(id), std::move(state));
+	}
+	c.now = 100; c.consume(1, c.core(1).step(Tick{c.now, 100}));
+	c.run(400);
+	c.commit_one("a");
+	c.nodes.at(2).down = true;  // data voter 2 lags
+	c.add_joiner(5);
+	auto& leader = c.core(1);
+	Membership with5 = leader.membership(); with5.members.push_back({5, 5, MemberRole::Learner}); with5.next_incarnation = 6;
+	check(c.change(1, with5), "the new witness joins as a learner");
+	c.run(400);
+	Membership replace = leader.membership();
+	for (auto& x : replace.members) { if (x.incarnation == 5) { x.role = MemberRole::Witness; } }
+	replace.leaving = 3;
+	check(c.change(1, replace), "the leader replaces witness 3 with witness 5 (2 + 2 window)");
+	c.run(600);
+	const auto& now_in = leader.committed_membership();
+	const auto w = find_member(now_in, 5);
+	check(w && w->role == MemberRole::Witness && !find_member(now_in, 3) && c.commit_one("b"), "the replacement completes and the group commits with data voter 2 down");
+}
+
 }  // namespace
 
 int main() {
@@ -413,6 +497,9 @@ int main() {
 		direct_voter_refused();
 		witness_bound();
 		single_server_change();
+		disk_lost_rejoin();
+		witness_at_limit();
+		witness_replaced_while_lagging();
 	} catch (const std::exception& error) {
 		check(false, error.what());
 	}

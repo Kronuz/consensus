@@ -806,7 +806,7 @@ private:
 				auto selected = store_.select_published_dependency(0);
 				if (!published_ || !published_->format || *published_->format != snapshot_limits_->application_format || published_->boundary != key->boundary || core_->base_boundary() != key->boundary || !selected || selected->generation() != published_->generation || selected->descriptor().length > snapshot_limits_->application_bytes) { ingest(core_->step(SnapshotTransferFailed{peer, *key})); return; }
 				if (next_source_ == std::numeric_limits<Token>::max()) { throw std::length_error("source identity exhausted"); }
-				const auto& artifact = selected->descriptor(); SnapshotDescriptor descriptor{configuration_.cluster, configuration_.configuration, *published_->format, key->boundary.index, key->boundary.term, artifact.length, artifact.checksum};
+				const auto& artifact = selected->descriptor(); SnapshotDescriptor descriptor{configuration_.cluster, configuration_.configuration, *published_->format, key->boundary.index, key->boundary.term, artifact.length, artifact.checksum, core_->base_membership()};
 				source_ = std::make_unique<Source>(std::move(*selected), peer, *key, ++next_source_, descriptor); return;
 			}
 			return;
@@ -880,7 +880,7 @@ private:
 				pack_[0] = std::move(incoming->cutover_permit); incoming->cutover_permit.reset(); pack_count_ = 1; pack_next_ = 0;
 				auto context = incoming->context;
 				ingest_capture(core_->step_capture(InstallPrepared{context.request, operation.token, context.authenticated_peer, context.leader_term,
-					configuration_.cluster, configuration_.configuration, {context.descriptor.through, context.descriptor.term}}));
+					configuration_.cluster, configuration_.configuration, {context.descriptor.through, context.descriptor.term}, context.descriptor.membership}));
 				break;
 			}
 			auto capture = *std::get<Local>(operation.mode).capture;

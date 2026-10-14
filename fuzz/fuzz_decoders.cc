@@ -21,12 +21,13 @@
  */
 
 // libFuzzer target for consensus's decoders (Track C, T8): control frames, memberships,
-// founding and join records, storage batches, and checkpoint bundles. data[0] picks the
-// decoder; the rest is its input. Each must decode or throw, never crash or read out of
-// bounds, and what decodes must re-encode to the same bytes where the encoding is
-// canonical.
+// founding and join records, storage batches, checkpoint bundles, and snapshot
+// descriptors. data[0] picks the decoder; the rest is its input. Each must decode or
+// throw, never crash or read out of bounds, and what decodes must re-encode to the same
+// bytes where the encoding is canonical.
 #include "consensus/checkpoint.h"
 #include "consensus/membership.h"
+#include "consensus/snapshot.h"
 #include "consensus/storage.h"
 #include "consensus/transport/codec.h"
 
@@ -60,7 +61,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
 	if (size == 0) { return 0; }
 	const std::string_view input(reinterpret_cast<const char*>(data) + 1, size - 1);
 	try {
-		switch (data[0] % 6) {
+		switch (data[0] % 7) {
 		case 0: {
 			auto message = transport::decode(input);
 			require(transport::encode(message) == input);
@@ -93,9 +94,16 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
 			(void)decode_checkpoint(input, founding(), 1, application);
 			break;
 		}
+		case 6: {
+			const auto c = founding();
+			SnapshotPolicy policy{c.cluster, c.configuration, 7, 1 << 20};
+			auto descriptor = decode_snapshot(input, policy);
+			require(encode_snapshot(descriptor, policy) == input);
+			break;
+		}
 		}
 	} catch (const std::exception& error) {
-		if (std::getenv("FUZZ_DEBUG")) { std::fprintf(stderr, "decoder %u: %s\n", data[0] % 6u, error.what()); }
+		if (std::getenv("FUZZ_DEBUG")) { std::fprintf(stderr, "decoder %u: %s\n", data[0] % 7u, error.what()); }
 	}
 	return 0;
 }

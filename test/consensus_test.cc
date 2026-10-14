@@ -1195,6 +1195,16 @@ void portable_snapshot_descriptors() {
 	check(descriptor.application_crc32c == 0xe3069283u && kronuz::journal::crc32c("") == 0, "portable payload checksum uses standard CRC32C vectors");
 	auto bytes = encode_snapshot(descriptor, policy);
 	check(bytes.size() == 72 && bytes.substr(0, 8) == "RFTSNP01" && decode_snapshot(bytes, policy) == descriptor, "portable snapshot has exact versioned framing and round trips");
+	// RFTSNP02 carries the base membership; a reader before it rejects the magic.
+	{
+		auto with = descriptor;
+		with.membership = Membership{{{1, 1, MemberRole::Voter}, {2, 2, MemberRole::Voter}, {5, 9, MemberRole::Learner}}, 6, 0};
+		auto v2 = encode_snapshot(with, policy);
+		check(v2.substr(0, 8) == "RFTSNP02" && decode_snapshot(v2, policy) == with, "a snapshot descriptor carries its base membership");
+		bool truncated = true;
+		for (std::size_t size = 0; size < v2.size(); ++size) { truncated &= throws([&] { (void)decode_snapshot(std::string_view(v2).substr(0, size), policy); }); }
+		check(truncated && throws([&] { (void)decode_snapshot(v2 + "x", policy); }), "a truncated or padded RFTSNP02 is corruption");
+	}
 	check(static_cast<unsigned char>(bytes[40]) == 7 && static_cast<unsigned char>(bytes[44]) == 42 && static_cast<unsigned char>(bytes[52]) == 3 && static_cast<unsigned char>(bytes[60]) == 9, "portable scalar fields use fixed little-endian offsets");
 	auto wide = descriptor; auto wide_policy = policy;
 	wide_policy.application_format = wide.application_format = 0x01020304u;

@@ -65,7 +65,7 @@ inline TransferFrame decode_transfer(std::string_view bytes) {
 	envelope.key.leader_term = get64(bytes); envelope.key.transfer = get64(bytes); envelope.key.boundary.index = get64(bytes); envelope.key.boundary.term = get64(bytes);
 	if (!valid_snapshot_key(envelope.key) || !envelope.source || !envelope.destination || envelope.source == envelope.destination) { throw Corruption("invalid snapshot transfer envelope"); }
 	switch (kind) {
-	case TransferKind::Begin: if (bytes.size() != snapshot_descriptor_bytes) { throw Corruption("invalid Begin size"); } break;
+	case TransferKind::Begin: if (bytes.size() < snapshot_descriptor_bytes || bytes.size() > maximum_snapshot_descriptor_bytes) { throw Corruption("invalid Begin size"); } break;
 	case TransferKind::Accepted: case TransferKind::Cancel: if (!bytes.empty()) { throw Corruption("unexpected control payload"); } break;
 	case TransferKind::Chunk: case TransferKind::Credit: {
 		if (bytes.size() < 24) { throw Corruption("truncated chunk control"); }

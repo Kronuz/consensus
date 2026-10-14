@@ -23,6 +23,7 @@
 #pragma once
 
 #include "types.h"
+#include "membership.h"
 #include "journal/codec.h"
 #include <algorithm>
 #include <limits>
@@ -38,6 +39,8 @@ struct SnapshotDescriptor {
 	Term term = 0;
 	std::uint64_t application_bytes = 0;
 	std::uint32_t application_crc32c = 0;
+	// The membership in force at `through` (Track C, D1); absent, the fixed voters (RFTSNP01).
+	std::optional<Membership> membership{};
 	bool operator==(const SnapshotDescriptor&) const = default;
 };
 struct SnapshotPolicy {
@@ -46,6 +49,8 @@ struct SnapshotPolicy {
 	std::uint64_t maximum_application_bytes = 0;
 };
 inline constexpr std::size_t snapshot_descriptor_bytes = 72;
+// RFTSNP02 adds the membership, at most ceilings.members members with limits.
+inline constexpr std::size_t maximum_snapshot_descriptor_bytes = snapshot_descriptor_bytes + 4 + 36 + 24 * ceilings.members + 80;
 
 inline void validate_snapshot(const SnapshotDescriptor& descriptor, const SnapshotPolicy& policy) {
 	if (descriptor.cluster != policy.cluster || descriptor.configuration != policy.configuration ||
@@ -58,16 +63,22 @@ inline void validate_snapshot(const SnapshotDescriptor& descriptor, const Snapsh
 }
 inline std::string encode_snapshot(const SnapshotDescriptor& descriptor, const SnapshotPolicy& policy) {
 	validate_snapshot(descriptor, policy);
-	std::string result; result.reserve(snapshot_descriptor_bytes); result.append("RFTSNP01", 8);
+	std::string result; result.reserve(snapshot_descriptor_bytes); result.append(descriptor.membership ? "RFTSNP02" : "RFTSNP01", 8);
 	result.append(descriptor.cluster.data(), descriptor.cluster.size());
 	result.append(descriptor.configuration.data(), descriptor.configuration.size());
 	kronuz::journal::put32(result, descriptor.application_format);
 	kronuz::journal::put64(result, descriptor.through); kronuz::journal::put64(result, descriptor.term);
 	kronuz::journal::put64(result, descriptor.application_bytes); kronuz::journal::put32(result, descriptor.application_crc32c);
+	if (descriptor.membership) {
+		auto bytes = encode_membership(*descriptor.membership);
+		kronuz::journal::put32(result, static_cast<std::uint32_t>(bytes.size())); result += bytes;
+	}
 	return result;
 }
 inline SnapshotDescriptor decode_snapshot(std::string_view bytes, const SnapshotPolicy& policy) {
-	if (bytes.size() != snapshot_descriptor_bytes || bytes.substr(0, 8) != "RFTSNP01") {
+	const bool v2 = bytes.substr(0, 8) == "RFTSNP02";
+	if ((!v2 && (bytes.size() != snapshot_descriptor_bytes || bytes.substr(0, 8) != "RFTSNP01")) ||
+		(v2 && (bytes.size() < snapshot_descriptor_bytes + 4 || bytes.size() > maximum_snapshot_descriptor_bytes))) {
 		throw kronuz::journal::Corruption("unsupported portable snapshot framing");
 	}
 	bytes.remove_prefix(8); SnapshotDescriptor result;
@@ -76,6 +87,11 @@ inline SnapshotDescriptor decode_snapshot(std::string_view bytes, const Snapshot
 	result.application_format = kronuz::journal::get32(bytes);
 	result.through = kronuz::journal::get64(bytes); result.term = kronuz::journal::get64(bytes);
 	result.application_bytes = kronuz::journal::get64(bytes); result.application_crc32c = kronuz::journal::get32(bytes);
+	if (v2) {
+		auto size = kronuz::journal::get32(bytes);
+		if (size != bytes.size()) { throw kronuz::journal::Corruption("snapshot membership length"); }
+		result.membership = decode_membership(bytes);
+	}
 	validate_snapshot(result, policy); return result;
 }
 

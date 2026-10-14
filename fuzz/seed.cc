@@ -1,6 +1,7 @@
 // Writes fuzz_decoders' seed corpus: one valid input per decoder, prefixed by its selector.
 #include "consensus/checkpoint.h"
 #include "consensus/membership.h"
+#include "consensus/snapshot.h"
 #include "consensus/storage.h"
 #include "consensus/transport/codec.h"
 
@@ -33,6 +34,11 @@ int main(int argc, char** argv) {
 	state.base_index = 1; state.base_term = 1; state.applied_index = 1; state.membership = limited;
 	state.entries = {{2, 1, EntryKind::Command, "x"}};
 	write(5, encode_checkpoint(state, 1, kronuz::journal::ArtifactDescriptor{}));
+	SnapshotPolicy policy{c.cluster, c.configuration, 7, 1 << 20};
+	SnapshotDescriptor descriptor{c.cluster, c.configuration, 7, 42, 3, 0, kronuz::journal::crc32c("")};
+	write(6, encode_snapshot(descriptor, policy));
+	descriptor.membership = limited;
+	write(6, encode_snapshot(descriptor, policy));
 	std::printf("%d seeds\n", n);
 	return 0;
 }

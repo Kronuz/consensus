@@ -156,6 +156,9 @@ public:
 	bool transferring() const noexcept { return transfer_.has_value(); }
 	// The limits the group applies to its next entry (R16).
 	const Limits& group_limits() const { return limits_in_force(); }
+	// The membership in force at the base index, as a snapshot carries it; absent for a
+	// fixed group's founding membership.
+	std::optional<Membership> base_membership() const { return retain_base_membership(base_membership_); }
 	Index witness_bound() const noexcept { return witness_bound_; }
 	const HardState& durable_hard_state() const noexcept { return durable_; }
 	const FixedConfiguration& configuration() const noexcept { return configuration_; }

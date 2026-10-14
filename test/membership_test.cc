@@ -48,6 +48,9 @@ void check(bool value, const char* what) {
 	if (!value) { ++failures; std::fprintf(stderr, "FAIL: %s\n", what); }
 }
 constexpr Timing compact{20, 40, 100, 200, 60000};
+template <class F> bool throws_invalid(F&& f) {
+	try { f(); return false; } catch (const std::invalid_argument&) { return true; }
+}
 
 template <class T> const T* first(const Actions& actions) {
 	for (const auto& a : actions) { if (auto v = std::get_if<T>(&a)) { return v; } }
@@ -560,6 +563,58 @@ void lowered_node_limits_reopen() {
 	check(reopened, "with its node limit lowered to 100 bytes, it still reopens its log");
 }
 
+
+// Every rejection in the limits and membership validators, one condition at a time.
+void validators() {
+	using R = MemberRole;
+	using Field = std::size_t Limits::*;
+	const Field fields[] = {&Limits::voters, &Limits::command_bytes, &Limits::log_bytes, &Limits::log_entries, &Limits::control_entries,
+		&Limits::rpc_bytes, &Limits::rpc_entries, &Limits::reads, &Limits::uncommitted_entries, &Limits::members};
+	const Limits good;
+	check(!throws_invalid([&] { validate_limits(good); }) && within(good, good), "default limits are valid and within themselves");
+	for (auto field : fields) {
+		Limits zero = good; zero.*field = 0;
+		Limits huge = good; huge.*field = ceilings.*field + 1;
+		Limits more = good; more.*field = good.*field + 1;
+		check(throws_invalid([&] { validate_limits(zero); }) || field == &Limits::log_bytes, "a zero limit is refused");
+		check(throws_invalid([&] { validate_limits(huge); }), "a limit above its ceiling is refused");
+		check(!within(more, good), "a group limit above the node's is outside it");
+	}
+	Limits inverted = good; inverted.control_entries = good.log_entries + 1;
+	check(throws_invalid([&] { validate_limits(inverted); }), "control entries above log entries are refused");
+	inverted = good; inverted.rpc_bytes = good.log_bytes + 1;
+	check(throws_invalid([&] { validate_limits(inverted); }), "an RPC above the retained log is refused");
+
+	const Membership three{{{1, 1, R::Voter}, {2, 2, R::Voter}, {3, 3, R::Voter}}, 4, 0};
+	auto bad = [&](Membership m) { return throws_invalid([&] { validate_membership(m, good); }); };
+	check(!bad(three), "a three-voter membership is valid");
+	check(bad(Membership{{}, 1, 0}), "an empty membership is refused");
+	Limits two_members = good; two_members.members = 2;
+	check(throws_invalid([&] { validate_membership(three, two_members); }), "more members than the limit are refused");
+	check(bad({{{2, 2, R::Voter}, {1, 1, R::Voter}}, 4, 0}), "unsorted incarnations are refused");
+	check(bad({{{1, 1, R::Voter}, {4, 4, R::Voter}}, 4, 0}), "an incarnation at the counter is refused");
+	check(bad({{{1, 0, R::Voter}}, 2, 0}), "a member without a node is refused");
+	check(bad({{{1, 1, static_cast<R>(3)}}, 2, 0}), "an unknown role is refused");
+	check(bad({{{1, 1, R::Learner}}, 2, 0}), "a membership without voters is refused");
+	Limits one_voter = good; one_voter.voters = 1;
+	check(throws_invalid([&] { validate_membership(three, one_voter); }), "more voters than the limit are refused");
+	check(bad({{{1, 1, R::Voter}, {2, 2, R::Learner}}, 3, 2}), "a leaving member that does not vote is refused");
+	Membership limited = three; limited.limits = good; limited.limits->reads = 0;
+	check(bad(limited), "a membership's own invalid limits are refused");
+	check(bad({{{1, 1, R::Voter}, {2, 2, R::Witness}}, 3, 0}), "1 + witness is refused");
+	check(bad({{{1, 1, R::Voter}, {2, 2, R::Voter}, {3, 3, R::Voter}, {4, 4, R::Witness}}, 5, 0}), "3 + witness outside a window is refused");
+	check(bad({{{1, 1, R::Voter}, {2, 2, R::Voter}, {3, 3, R::Witness}, {4, 4, R::Witness}}, 5, 0}), "2 + 2 witnesses outside a window are refused");
+
+	auto change = [&](const Membership& next) { return throws_invalid([&] { validate_change(three, next, good); }); };
+	check(change({{{1, 1, R::Voter}, {2, 2, R::Voter}, {3, 3, R::Voter}}, 3, 0}), "the incarnation counter cannot go back");
+	check(change({{{1, 1, R::Voter}, {2, 2, R::Voter}}, 4, 0}) == false, "one voter removed is a single step");
+	check(change({{{1, 1, R::Voter}}, 4, 0}), "two voters removed is not a single step");
+	check(change({{{1, 1, R::Voter}, {2, 2, R::Voter}, {3, 9, R::Voter}}, 4, 0}), "an incarnation cannot move to another node");
+	check(change({{{1, 1, R::Voter}, {2, 2, R::Voter}, {3, 3, R::Voter}, {4, 4, R::Voter}}, 5, 0}), "a new member cannot join as a voter");
+	check(change({{{1, 1, R::Voter}, {2, 2, R::Voter}, {3, 3, R::Witness}}, 4, 0}), "a voter becoming a witness is not a single step");
+	check(change({{{1, 1, R::Voter}, {2, 2, R::Voter}, {3, 3, R::Voter}, {4, 4, R::Learner}}, 5, 3}), "a leaving voter needs a promotion beside it");
+}
+
 }  // namespace
 
 int main() {
@@ -579,6 +634,7 @@ int main() {
 		founding_limits();
 		joiner_retained_install();
 		lowered_node_limits_reopen();
+		validators();
 	} catch (const std::exception& error) {
 		check(false, error.what());
 	}

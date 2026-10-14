@@ -1709,6 +1709,78 @@ void binary_channel_validation() {
 	}
 }
 
+// A peer's frames that are malformed, unbound, or out of protocol close only its session;
+// frames that name no transfer in progress are accepted and ignored.
+void hostile_transfer_frames() {
+	SnapshotFixture fixture("hostile-frames"); SnapshotChannel channel(fixture.worker);
+	Identity local{}, remote{}, other{}; local[0] = 'l'; remote[0] = 'r'; other[0] = 'o'; TrustedSession session{2, local, remote};
+	auto fixed = fixture.worker.configuration(); const TransferEnvelope good{fixed.cluster, fixed.configuration, remote, local, 2, 1, {3, 17, {1, 1}}};
+	auto receive = [&](const std::string& bytes) { channel.register_session(session); return channel.receive(session, std::span<const char>(bytes.data(), bytes.size())).result; };
+	auto result_body = [](TransferOutcome outcome, std::uint64_t term) { std::string body(1, static_cast<char>(outcome)); body.append(7, '\0'); kronuz::journal::put64(body, term); return body; };
+	std::vector<TransferEnvelope> unbound(6, good);
+	unbound[0].cluster = other; unbound[1].configuration = other; unbound[2].source = 3; unbound[3].destination = 5; unbound[4].source_session = other; unbound[5].destination_session = other;
+	for (const auto& envelope : unbound) { check(receive(encode_transfer(TransferKind::Accepted, envelope, {})) == TransferReceive::Closed, "a frame bound to another session closes it"); }
+	auto context = fixture.context("data"); auto mismatched = good; mismatched.key.boundary = {1, 2};
+	check(receive(encode_transfer(TransferKind::Begin, mismatched, encode_snapshot(context.descriptor, *fixture.worker.snapshot_policy()))) == TransferReceive::Closed, "a Begin whose key names another boundary closes the session");
+	check(receive(encode_transfer(TransferKind::Chunk, good, transfer_chunk_body(9, 0, "data", true))) == TransferReceive::Closed, "a Chunk with no transfer in progress closes the session");
+	check(receive(encode_transfer(TransferKind::Result, good, result_body(TransferOutcome::Installed, 0))) == TransferReceive::Closed, "a Result other than Failed needs a durable term");
+	check(receive(encode_transfer(TransferKind::Result, good, result_body(TransferOutcome::Failed, 3))) == TransferReceive::Closed, "a Failed Result carries no term");
+	check(receive(encode_transfer(TransferKind::Result, good, result_body(TransferOutcome::Installed, 2))) == TransferReceive::Closed, "a Result below its key's leader term closes the session");
+	check(receive(encode_transfer(TransferKind::Result, good, result_body(TransferOutcome::Failed, 0))) == TransferReceive::Accepted, "a Failed Result for no sending transfer is ignored");
+	check(receive(encode_transfer(TransferKind::Credit, good, transfer_chunk_body(9, 4, {}, false, true))) == TransferReceive::Accepted, "a Credit for no sending transfer is ignored");
+	check(receive(encode_transfer(TransferKind::Cancel, good, {})) == TransferReceive::Accepted, "a Cancel for no receiving transfer is ignored");
+	std::string magic(12, 'X'), bound("RFTXFR01", 8); kronuz::journal::put32(bound, 5);
+	check(receive(magic) == TransferReceive::Closed && receive(bound) == TransferReceive::Closed, "a bad frame magic or length closes the session");
+	check(throws([&] { channel.register_session({0, local, remote}); }) && throws([&] { channel.register_session({1, local, remote}); }) &&
+		throws([&] { channel.register_session({2, Identity{}, remote}); }) && throws([&] { channel.register_session({2, local, Identity{}}); }), "a session needs a peer other than itself and both identities");
+	check(throws([&] { channel.consume_output(1, 1); }), "consuming output that was never produced is refused");
+	check(throws([&] { SnapshotChannel zero(fixture.worker, 0); }), "a transfer timeout of zero is refused");
+	check(!fixture.worker.fenced() && !channel.incoming_snapshot(), "hostile frames never fence the worker or start a transfer");
+}
+
+// The snapshot and source API on a worker that is unopened, closed, fenced, or handed an id
+// it does not own: each answers without touching storage.
+void worker_api_guards() {
+	{
+		SnapshotFixture::Directory directory("unopened"); auto io = std::make_shared<FaultIO>(directory.path);
+		Worker unopened(io, SnapshotFixture::fixed(), SnapshotFixture::quota(), limits(), compact, {4, 1}, SnapshotLimits{7, 100000});
+		check(unopened.role() == Role::Follower && !unopened.busy() && unopened.term() == 0 && !unopened.membership() && unopened.committed() == 0 &&
+			unopened.applied_index() == 0 && unopened.retained_log_bytes() == 0 && unopened.retired_log_bytes() == 0 && unopened.retired_log_entries() == 0 &&
+			unopened.base_index() == 0 && unopened.base_boundary() == LogBoundary{} && !unopened.ready(), "an unopened worker reports an empty follower");
+		check(throws([&] { unopened.run_one({0, 100}); }), "an unopened worker refuses a turn");
+	}
+	SnapshotFixture owner("guards-owner"), other("guards-other");
+	auto id = owner.worker.reserve_snapshot(owner.context("data")); check(id.has_value(), "the owner reserves a snapshot");
+	if (!id) { return; }
+	auto& worker = other.worker;
+	auto bad = [&](auto edit) { auto context = other.context("data"); edit(context); return throws([&] { worker.reserve_snapshot(context); }); };
+	check(bad([](SnapshotContext& c) { c.request = 0; }) && bad([](SnapshotContext& c) { c.transfer = 0; }) && bad([](SnapshotContext& c) { c.leader_term = 0; }) &&
+		bad([](SnapshotContext& c) { c.descriptor.term = 2; }) && bad([](SnapshotContext& c) { c.authenticated_peer = 1; }) && bad([](SnapshotContext& c) { c.authenticated_peer = 0; }),
+		"a snapshot sender context needs a request, a transfer, a term at or above the image's, and another peer");
+	check(worker.consume_validation(*id, 1) == ValidationAck::Stale && worker.validation_succeeded(*id, 1) == ValidationAck::Stale &&
+		!worker.snapshot_validated(*id) && !worker.snapshot_canceling(*id) && !worker.snapshot_context(*id) &&
+		worker.snapshot_activated(*id, 1) == ValidationAck::Stale && worker.snapshot_activation_failed(*id, 1) == ValidationAck::Stale &&
+		worker.cancel_snapshot(*id) == CancelResult::Stale && throws([&] { worker.offer_snapshot_chunk(*id, 0, "data", true); }), "another worker's snapshot id is stale");
+	check(worker.source_peer_failed(2) == ValidationAck::NotReady, "a peer with no source has nothing to fail");
+	auto& w = owner.worker;
+	check(throws([&] { w.offer_snapshot_chunk(*id, 1, "data", true); }) && throws([&] { w.offer_snapshot_chunk(*id, 0, "", false); }) &&
+		throws([&] { w.offer_snapshot_chunk(*id, 0, "dat", true); }) && throws([&] { w.offer_snapshot_chunk(*id, 0, std::string(65537, 'x')); }),
+		"snapshot input is sequential, bounded, and ends exactly at the image's size");
+	check(w.validation_succeeded(*id, 1) == ValidationAck::NotReady && w.consume_validation(*id, 1) == ValidationAck::Stale, "validation answers follow the snapshot's phase");
+	w.close();
+	check(w.consume_validation(*id, 1) == ValidationAck::NotReady && w.validation_succeeded(*id, 1) == ValidationAck::NotReady && w.request_install(*id) == SubmitResult::Busy &&
+		w.snapshot_activation_failed(*id, 1) == ValidationAck::NotReady && w.offer_snapshot_chunk(*id, 0, "data", true).result == SubmitResult::Busy && !w.snapshot_activation(),
+		"a closing worker accepts no snapshot progress");
+	// A granted pre-vote starts a campaign, whose durable term meets the failing sync.
+	other.io.fail_sync = true; worker.try_submit(Tick{1000, 100}); worker.run_one({1000, 100}); worker.take_actions();
+	worker.try_submit(Receive{2, PreVoteResponse{worker.term(), worker.term() + 1, true}});
+	for (unsigned turn = 0; turn < 50 && !worker.fenced(); ++turn) { worker.run_one({1000, 100}); worker.take_actions(); }
+	check(worker.fenced(), "a failed sync fences the worker");
+	check(worker.consume_validation(*id, 1) == ValidationAck::Fenced && worker.validation_succeeded(*id, 1) == ValidationAck::Fenced && worker.request_install(*id) == SubmitResult::Fenced &&
+		worker.snapshot_activated(*id, 1) == ValidationAck::Fenced && worker.snapshot_activation_failed(*id, 1) == ValidationAck::Fenced &&
+		worker.source_peer_failed(2) == ValidationAck::Fenced && worker.run_one({0, 100}) == TurnResult::Fenced && !worker.snapshot_source(), "a fenced worker answers Fenced");
+}
+
 void channel_dispatch_and_unstarted_result() {
 	for (bool unstarted : {false, true}) {
 		SnapshotFixture fixture("dispatch-unstarted-" + std::to_string(unstarted), SnapshotLimits{7, 100000}, SnapshotFixture::quota(), !unstarted); SnapshotChannel channel(fixture.worker);
@@ -1753,6 +1825,12 @@ void binary_transfer_codec() {
 	auto chunk = encode_transfer(TransferKind::Chunk, envelope, transfer_chunk_body(8, 0, "abc", true)); check(decode_transfer(chunk).body.size() == 27, "bounded chunk framing round trips");
 	chunk[transfer_header_bytes + 20] = 2; check(throws([&] { decode_transfer(chunk); }), "unknown chunk flags reject");
 	check(throws([&] { encode_transfer(TransferKind::Chunk, envelope, std::string(65561, 'x')); }), "oversized frame rejects before encoding");
+	auto refused = [&](auto edit, TransferKind kind = TransferKind::Cancel) { auto e = envelope; edit(e); return throws([&] { encode_transfer(kind, e, {}); }); };
+	check(refused([](TransferEnvelope& e) { e.key.transfer = 0; }) && refused([](TransferEnvelope& e) { e.source = 0; }) && refused([](TransferEnvelope& e) { e.destination = 0; }) &&
+		refused([](TransferEnvelope& e) { e.destination = e.source; }) && refused([](TransferEnvelope&) {}, TransferKind{0}) && refused([](TransferEnvelope&) {}, TransferKind{7}),
+		"an envelope needs a valid key, two distinct peers, and a known kind");
+	check(throws([&] { transfer_chunk_body(0, 0, "x", true); }) && throws([&] { transfer_chunk_body(1, 0, std::string(65537, 'x'), true); }) &&
+		throws([&] { transfer_chunk_body(1, 0, "x", true, true); }), "a chunk body needs a token, at most 64 KiB, and no payload in a credit");
 }
 
 void founding_and_join_records() {
@@ -1927,7 +2005,7 @@ int main(int argc, char** argv) {
 		if (argc == 2 && std::string_view(argv[1]) == "--completion-regressions") { completion_appends(); completion_storage(); completion_channel_cancellation(); completion_snapshot_readback(); retired_completion_worker(); for (unsigned mode : {0u, 1u, 3u}) { binary_transfer_integration(65553, mode, false, true); } std::cout << checks << " completion checks, " << failures << " failures\n"; return failures ? 1 : 0; }
 		if (argc == 2 && std::string_view(argv[1]) == "--review-regressions") { channel_dispatch_and_unstarted_result(); binary_transfer_integration(65553); binary_transfer_integration(65553, 5); owned_snapshot_sources(); std::cout << checks << " review checks, " << failures << " failures\n"; return failures ? 1 : 0; }
 		if (argc == 2 && std::string_view(argv[1]) == "--transfer-benchmark") { std::ofstream(std::filesystem::current_path() / ".scratch" / "snapshot-transfer-benchmark.csv") << "image_bytes,wall_s,cpu_s,wire_bytes,retained_frame_bytes,payload_buffer_capacity,process_maxrss_native,sender_payload_reads,receiver_payload_reads\n"; binary_transfer_integration(1048576, 0, true); binary_transfer_integration(67108864, 0, true); std::cout << checks << " benchmark checks, " << failures << " failures\n"; return failures ? 1 : 0; }
-		completion_appends(); completion_storage(); completion_channel_cancellation(); completion_snapshot_readback(); retired_completion_worker(); for (unsigned mode : {0u, 1u, 3u}) { binary_transfer_integration(65553, mode, false, true); } checkpoint_format_recovery(); legacy_source_export_rejection(); binary_channel_validation(); channel_dispatch_and_unstarted_result(); binary_transfer_codec(); for (std::size_t length : {std::size_t{0}, std::size_t{9}, std::size_t{65553}, std::size_t{1048576}}) { binary_transfer_integration(length); }
+		completion_appends(); completion_storage(); completion_channel_cancellation(); completion_snapshot_readback(); retired_completion_worker(); for (unsigned mode : {0u, 1u, 3u}) { binary_transfer_integration(65553, mode, false, true); } checkpoint_format_recovery(); legacy_source_export_rejection(); binary_channel_validation(); hostile_transfer_frames(); worker_api_guards(); channel_dispatch_and_unstarted_result(); binary_transfer_codec(); for (std::size_t length : {std::size_t{0}, std::size_t{9}, std::size_t{65553}, std::size_t{1048576}}) { binary_transfer_integration(length); }
 		for (unsigned mode : {1u, 2u, 3u, 5u}) { binary_transfer_integration(65553, mode); }
 		owned_snapshot_sources(); snapshot_reception_and_validation(); snapshot_policy_and_rejection(); snapshot_cancellation_phases(); snapshot_read_faults(); snapshot_restart_cleanup(); snapshot_protocol_progress(); snapshot_installation(); snapshot_rejection_branches(); snapshot_old_application(); snapshot_install_reopening(); snapshot_install_admission(); snapshot_publication_faults(); maintenance_preserves_protocol_timers(); real_worker(); partial_control_pack(); failures_and_multi_action_output(); interrupted_initialization(); checkpoint_crash_and_progress(); preparation_preserves_protocol_timers(); checkpoint_cancellation_and_completion(); checkpoint_faults(); worker_repair(); } catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " worker checks, " << failures << " failures\n"; return failures ? 1 : 0;

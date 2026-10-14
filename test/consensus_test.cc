@@ -87,8 +87,15 @@ struct Host {
 	std::optional<Persist> pending;
 	std::optional<Committed> applying;
 	bool auto_persist = true, auto_apply = true;
+	bool verify_replay = true;  // off once an install puts state the test journal cannot hold
 	explicit Host(NodeId local, std::size_t voters = 3, Limits bounds = {}) : id(local), limits(bounds), core(std::make_unique<Core>(config(local, voters), empty(local, voters), bounds)) {
 		journal.push_back(encode_initialization(config(local, voters)));
+	}
+	// A joiner (Track C, D5): no voters, a join record, an empty membership.
+	Host(NodeId local, FixedConfiguration joiner, Limits bounds = {}) : id(local), limits(bounds) {
+		RecoveredState state; state.configuration = joiner; state.membership = Membership{};
+		core = std::make_unique<Core>(joiner, std::move(state), bounds);
+		journal.push_back(encode_join(joiner));
 	}
 	RecoveredState recovered() const {
 		Recovery recovery(core->configuration(), limits);
@@ -106,6 +113,7 @@ struct Network {
 	std::map<NodeId, std::unique_ptr<Host>> hosts;
 	std::deque<Envelope> network;
 	std::set<NodeId> isolated;
+	std::vector<SnapshotNeeded> snapshots;  // requested by leaders; the test drives each transfer
 	std::uint64_t now = 0;
 	explicit Network(std::size_t count = 3, Limits limits = {}) {
 		for (NodeId i = 1; i <= count; ++i) { hosts.emplace(i, std::make_unique<Host>(i, count, limits)); }
@@ -123,6 +131,7 @@ struct Network {
 				check(!host.applying, "only one application batch outstanding"); host.applying = std::move(*committed);
 				if (host.auto_apply) { complete_apply(id); }
 			} else if (auto ready = std::get_if<ReadReady>(&action)) { host.ready_reads.push_back(ready->request); }
+			else if (auto needed = std::get_if<SnapshotNeeded>(&action)) { snapshots.push_back(*needed); }
 			else if (std::holds_alternative<Fenced>(action)) { check(false, "normal deterministic host unexpectedly fenced"); }
 		}
 	}
@@ -132,9 +141,9 @@ struct Network {
 		auto pending = std::move(*host.pending); host.pending.reset();
 		host.journal.push_back(encode_storage_batch(pending.batch));
 		// Semantic storage replay checks each completed batch, not just CRCs.
-		host.recovered();
+		if (host.verify_replay) { host.recovered(); }
 		consume(id, host.core->step(Persisted{pending.token}));
-		check(host.core->durable_hard_state() == host.recovered().hard, "durable hard state agrees with storage replay");
+		check(!host.verify_replay || host.core->durable_hard_state() == host.recovered().hard, "durable hard state agrees with storage replay");
 	}
 	void complete_apply(NodeId id) {
 		auto& host = this->host(id);
@@ -164,7 +173,7 @@ struct Network {
 	void pump(std::size_t bound = 10000) {
 		while (!network.empty() && bound--) {
 			auto envelope = std::move(network.front()); network.pop_front();
-			if (isolated.contains(envelope.from) || isolated.contains(envelope.to)) { continue; }
+			if (isolated.contains(envelope.from) || isolated.contains(envelope.to) || !hosts.contains(envelope.to)) { continue; }
 			consume(envelope.to, host(envelope.to).core->step(Tick{now, 100 + 20 * (envelope.to - 1)}));
 			consume(envelope.to, host(envelope.to).core->step(Receive{envelope.from, std::move(envelope.message)}));
 		}
@@ -1833,8 +1842,58 @@ void limits_by_position() {
 	check(find<Reject>(blocked) && find<Reject>(blocked)->reason == RejectReason::LogFull, "a retained log above its lowered limit blocks proposals");
 }
 
+void learner_install_and_promotion() {
+	// T4: a learner joins a group whose membership changed before the leader's checkpoint,
+	// catches up by install with the base membership, and is promoted in place of a voter.
+	using R = MemberRole;
+	Network cluster; cluster.start(); cluster.elect();
+	auto& leader = *cluster.host(1).core;
+	auto settle = [&] { for (int i = 0; i < 4; ++i) { cluster.pump(); cluster.tick(cluster.now + 30); } cluster.pump(); };
+	Membership with5 = leader.membership(); with5.members.push_back({5, 5, R::Learner}); with5.next_incarnation = 6;
+	cluster.consume(1, leader.step(ChangeMembership{100, with5})); settle();
+	cluster.consume(1, leader.step(Propose{101, "a"})); settle();
+	const Index through = leader.applied();
+	auto cp = leader.step(LocalCheckpoint{102, 1, through, leader.term(), config(1).cluster, config(1).configuration});
+	auto persisted = find<PersistCheckpoint>(cp);
+	check(persisted != nullptr, "the leader checkpoints past the membership change");
+	if (!persisted) { return; }
+	leader.step(Persisted{persisted->token});
+	check(leader.base_index() == through && leader.base_membership() && leader.base_membership()->members.size() == 4, "the checkpoint's base membership names the learner added before it");
+
+	FixedConfiguration joiner = config(6); joiner.voters.clear();
+	cluster.hosts.emplace(6, std::make_unique<Host>(6, joiner));
+	auto& learner = cluster.host(6);
+	cluster.consume(6, learner.core->step(Tick{cluster.now, 100})); cluster.consume(6, learner.core->step(Start{}));
+	Membership with6 = leader.membership(); with6.members.push_back({6, 6, R::Learner}); with6.next_incarnation = 7;
+	cluster.consume(1, leader.step(ChangeMembership{103, with6})); settle();
+	auto request = std::find_if(cluster.snapshots.begin(), cluster.snapshots.end(), [](const SnapshotNeeded& n) { return n.peer == 6; });
+	check(request != cluster.snapshots.end(), "the leader asks for a snapshot for the new learner");
+	if (request == cluster.snapshots.end()) { return; }
+	const auto key = request->key;
+	check(find<SnapshotTransmit>(leader.step(SnapshotSourceReady{6, key})) != nullptr, "the leader transmits once its source is ready");
+	auto prepared = learner.core->step(InstallPrepared{200, 77, 1, key.leader_term, config(1).cluster, config(1).configuration, key.boundary, leader.base_membership()});
+	auto install = find<PersistInstall>(prepared);
+	check(install != nullptr, "the learner prepares the install");
+	if (!install) { return; }
+	learner.verify_replay = false;
+	auto published = learner.core->step(Persisted{install->token});
+	auto activate = find<ActivateInstall>(published);
+	auto completed = activate ? learner.core->step(InstallActivated{activate->token}) : Actions{};
+	check(find<InstallCompleted>(completed) != nullptr, "the learner activates the install");
+	cluster.consume(1, leader.step(Receive{6, SnapshotResponse{learner.core->term(), key, SnapshotReply::Installed}})); settle();
+	check(find_member(learner.core->membership(), 5) && find_member(learner.core->membership(), 6), "the installed learner holds the membership in force");
+	check(leader.progress(6) == leader.last_index(), "the learner catches up by install, then by append");
+	// Promote the learner in place of voter 3; the core removes 3 once the promotion commits.
+	Membership promoted = leader.membership();
+	for (auto& x : promoted.members) { if (x.incarnation == 6) { x.role = R::Voter; } }
+	promoted.leaving = 3;
+	cluster.consume(1, leader.step(ChangeMembership{104, promoted})); settle(); settle();
+	const auto& now_in = leader.committed_membership();
+	check(votes_in(now_in, 6) && !find_member(now_in, 3) && voter_count(now_in) == 3, "the learner is promoted and the replaced voter removed");
+}
+
 int main() {
-	try { terminal_retirement(); snapshot_sender_maximum_fanout(); snapshot_sender_lost_ack_and_terms(); snapshot_sender_receiver_contact(); snapshot_sender_restart_clock_and_admission(); snapshot_sender_correlation(); snapshot_sender_keepalive_pacing(); snapshot_sender_retries_and_retention(); snapshot_timeout_retries(); portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); repair_at_or_below_commit(); prevote_guard_checkquorum(); membership_scripts(); membership_formats(); leadership_transfer(); witnesses(); checkpoint_with_configuration_suffix(); founding_records(); limits_by_position(); }
+	try { terminal_retirement(); snapshot_sender_maximum_fanout(); snapshot_sender_lost_ack_and_terms(); snapshot_sender_receiver_contact(); snapshot_sender_restart_clock_and_admission(); snapshot_sender_correlation(); snapshot_sender_keepalive_pacing(); snapshot_sender_retries_and_retention(); snapshot_timeout_retries(); portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); repair_at_or_below_commit(); prevote_guard_checkquorum(); membership_scripts(); membership_formats(); leadership_transfer(); witnesses(); checkpoint_with_configuration_suffix(); founding_records(); limits_by_position(); learner_install_and_promotion(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " consensus checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

@@ -2,6 +2,7 @@
 #include "consensus/checkpoint.h"
 #include "consensus/membership.h"
 #include "consensus/snapshot.h"
+#include "consensus/snapshot_transfer.h"
 #include "consensus/storage.h"
 #include "consensus/transport/codec.h"
 
@@ -39,6 +40,13 @@ int main(int argc, char** argv) {
 	write(6, encode_snapshot(descriptor, policy));
 	descriptor.membership = limited;
 	write(6, encode_snapshot(descriptor, policy));
+	TransferEnvelope envelope{c.cluster, c.configuration, {}, {}, 1, 2, SnapshotKey{7, 9, {42, 3}}};
+	write(7, encode_transfer(TransferKind::Begin, envelope, encode_snapshot(descriptor, policy)));
+	write(7, encode_transfer(TransferKind::Accepted, envelope, {}));
+	write(7, encode_transfer(TransferKind::Chunk, envelope, transfer_chunk_body(5, 0, "chunk", true)));
+	write(7, encode_transfer(TransferKind::Credit, envelope, transfer_chunk_body(5, 64, {}, false, true)));
+	write(7, encode_transfer(TransferKind::Result, envelope, std::string("\1\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16)));
+	write(7, encode_transfer(TransferKind::Cancel, envelope, {}));
 	std::printf("%d seeds\n", n);
 	return 0;
 }

@@ -21,13 +21,14 @@
  */
 
 // libFuzzer target for consensus's decoders (Track C, T8): control frames, memberships,
-// founding and join records, storage batches, checkpoint bundles, and snapshot
-// descriptors. data[0] picks the decoder; the rest is its input. Each must decode or
+// founding and join records, storage batches, checkpoint bundles, snapshot descriptors,
+// and snapshot transfer frames. data[0] picks the decoder; the rest is its input. Each must decode or
 // throw, never crash or read out of bounds, and what decodes must re-encode to the same
 // bytes where the encoding is canonical.
 #include "consensus/checkpoint.h"
 #include "consensus/membership.h"
 #include "consensus/snapshot.h"
+#include "consensus/snapshot_transfer.h"
 #include "consensus/storage.h"
 #include "consensus/transport/codec.h"
 
@@ -63,7 +64,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
 	try {
 		// FUZZ_DECODER pins every input to one decoder, so each gets measured hours of its own.
 		static const int pinned = std::getenv("FUZZ_DECODER") ? std::atoi(std::getenv("FUZZ_DECODER")) : -1;
-		switch (pinned >= 0 ? pinned : data[0] % 7) {
+		switch (pinned >= 0 ? pinned : data[0] % 8) {
 		case 0: {
 			auto message = transport::decode(input);
 			require(transport::encode(message) == input);
@@ -103,9 +104,14 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
 			require(encode_snapshot(descriptor, policy) == input);
 			break;
 		}
+		case 7: {
+			auto frame = decode_transfer(input);
+			require(encode_transfer(frame.kind, frame.envelope, frame.body) == input);
+			break;
+		}
 		}
 	} catch (const std::exception& error) {
-		if (std::getenv("FUZZ_DEBUG")) { std::fprintf(stderr, "decoder %u: %s\n", data[0] % 7u, error.what()); }
+		if (std::getenv("FUZZ_DEBUG")) { std::fprintf(stderr, "decoder %u: %s\n", data[0] % 8u, error.what()); }
 	}
 	return 0;
 }

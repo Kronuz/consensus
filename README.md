@@ -1,11 +1,11 @@
 # Strict fixed-voter consensus
 
-`cluster::consensus::Core` is an additive deterministic Raft state machine. It has no sockets, clock reads, randomness, filesystem calls, or application callbacks. It leaves the volatile legacy `cluster::Raft` API and wire format unchanged. Detent’s authority integrates this module through its bounded Node, storage driver and authenticated peer transport. Fleet distribution remains a separate application layer.
+`kronuz::consensus::Core` is a deterministic Raft state machine. It has no sockets, clock reads, randomness, filesystem calls, or application callbacks. It leaves the volatile legacy `cluster::Raft` API and wire format unchanged. Detent’s authority integrates this module through its bounded Node, storage driver and authenticated peer transport. Fleet distribution remains a separate application layer.
 
 ```sh
-cmake -S consensus -B .scratch/consensus -DCMAKE_BUILD_TYPE=Release
-cmake --build .scratch/consensus -j4
-ctest --test-dir .scratch/consensus --output-on-failure
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j4
+ctest --test-dir build --output-on-failure
 ```
 
 The standalone `consensus_demo DIRECTORY create|open [COMMAND]` exercises a single voter, real journal barriers, and deterministic application reconstruction. The directory must already exist and be dedicated to this example. Its fixed demo identities and logical ticks are illustrative; production uses provisioned identities and real monotonic time. `create` is explicit and cannot overwrite initialized state; `open` recovers it.
@@ -111,7 +111,7 @@ Two reproducible 1,000-step schedules use three voters (seed `1380009556`) and f
 | 1 | 1,024 | 1,197 | 0.000006 | 0.000011 | 0.085114 | 0.002370 | 0.085141 | 946,176 |
 | 65,535 | 67,107,840 | 68,484,227 | 0.064412 | 0.064330 | 0.570458 | 0.477923 | 0.635166 | 572,751,872 |
 
-The largest fixture reserves one retained slot for its included no-op; its command suffix approaches the default 64 MiB payload bound. Process peak RSS comes from `getrusage`, includes fixture initialization and earlier cases, and is not incremental daemon memory. At baseline revision `96ea4dd`, suffix capture, owning bundle argument, validation state, and encoded buffer coexisted, so bounded payloads required a larger memory budget. These single samples do not establish tail latency, fleet capacity, energy, or cost. Run `.scratch/consensus/consensus_checkpoint_bench` from the repository root; its dedicated scratch directories are removed after each case. Production integration must budget this pause or change the mechanism.
+The largest fixture reserves one retained slot for its included no-op; its command suffix approaches the default 64 MiB payload bound. Process peak RSS comes from `getrusage`, includes fixture initialization and earlier cases, and is not incremental daemon memory. At baseline revision `96ea4dd`, suffix capture, owning bundle argument, validation state, and encoded buffer coexisted, so bounded payloads required a larger memory budget. These single samples do not establish tail latency, fleet capacity, energy, or cost. Run `build/consensus_checkpoint_bench` from the repository root; its dedicated scratch directories are removed after each case. Production integration must budget this pause or change the mechanism.
 
 Const-reference semantic validation and encoding now avoid two unnecessary suffix copies, and encoding reserves its exact checked size. Use `encode_checkpoint(action.state, covered_sequence, application.descriptor())` when the action already owns the immutable suffix. The owning-bundle overload delegates to the same implementation. Repeating the identical fixture produced:
 

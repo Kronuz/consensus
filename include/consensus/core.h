@@ -295,14 +295,26 @@ private:
 	// The limits a group applies: its newest configuration's, else the node's (R16).
 	const Limits& limits_of(const Membership& m) const { return m.limits ? *m.limits : limits_; }
 	const Limits& limits_in_force() const { return limits_of(membership()); }
+	// What a leader sends and admits: the group's command and RPC limits, within its own
+	// node's and every reported member's, so no member's transport or admission refuses it.
+	Limits wire_limits() const {
+		Limits out = limits_in_force();
+		auto cap = [&](const Limits& node) {
+			out.command_bytes = std::min(out.command_bytes, node.command_bytes);
+			out.rpc_bytes = std::min(out.rpc_bytes, node.rpc_bytes);
+			out.rpc_entries = std::min(out.rpc_entries, node.rpc_entries);
+		};
+		cap(limits_);
+		for (NodeId member : replicas()) {
+			if (auto found = peer_limits_.find(member); found != peer_limits_.end()) { cap(found->second); }
+		}
+		return out;
+	}
+	void handle(PeerLimits report, Actions&) {
+		if (report.incarnation && report.incarnation != configuration_.local) { peer_limits_[report.incarnation] = report.limits; }
+	}
 	// Commands are bound by the command limit in force; a Configuration entry only by its
 	// encoding (maximum_membership_bytes), so lowering the limit cannot wedge a group (R16).
-	static bool within(const Limits& group, const Limits& node) {
-		return group.voters <= node.voters && group.command_bytes <= node.command_bytes && group.log_bytes <= node.log_bytes &&
-			group.log_entries <= node.log_entries && group.control_entries <= node.control_entries && group.rpc_bytes <= node.rpc_bytes &&
-			group.rpc_entries <= node.rpc_entries && group.reads <= node.reads && group.uncommitted_entries <= node.uncommitted_entries &&
-			group.members <= node.members;
-	}
 	static bool fits(const Entry& entry, const Limits& limits) {
 		return entry.kind == EntryKind::Command ? entry.payload.size() <= limits.command_bytes : entry.payload.size() <= maximum_membership_bytes;
 	}
@@ -552,6 +564,16 @@ private:
 		// A group's limits stay within the node's, which bound its transport, admission,
 		// codec, and Worker; a group lowers and raises them beneath (R16).
 		if (change.next.limits && !within(*change.next.limits, limits_)) { reject(RejectReason::InvalidMembership); return; }
+		// Nor above any reported member's node, the new membership's included.
+		if (change.next.limits) {
+			for (const auto& x : change.next.members) {
+				auto found = peer_limits_.find(x.incarnation);
+				if (found == peer_limits_.end()) { continue; }
+				const auto& node = found->second;
+				const auto& l = *change.next.limits;
+				if (l.command_bytes > node.command_bytes || l.rpc_bytes > node.rpc_bytes || l.rpc_entries > node.rpc_entries) { reject(RejectReason::InvalidMembership); return; }
+			}
+		}
 		for (const auto& x : change.next.members) {
 			auto old = find_member(current, x.incarnation);
 			if (old && !voting(old->role) && voting(x.role)) {
@@ -622,7 +644,7 @@ private:
 		if (witness_self()) { output.emplace_back(Reject{proposal.request, RejectReason::NotLeader}); return; }  // D9
 		if (transfer_) { output.emplace_back(Reject{proposal.request, RejectReason::Busy}); return; }
 		const auto& limits = limits_in_force();
-		if (proposal.command.size() > limits.command_bytes) { output.emplace_back(Reject{proposal.request, RejectReason::TooLarge}); return; }
+		if (proposal.command.size() > wire_limits().command_bytes) { output.emplace_back(Reject{proposal.request, RejectReason::TooLarge}); return; }
 		if (last_index() - durable_.commit_index >= limits.uncommitted_entries) {
 			output.emplace_back(Reject{proposal.request, RejectReason::Busy}); return;
 		}
@@ -977,7 +999,8 @@ private:
 		}
 		Index previous = peer.next - 1;
 		std::vector<Entry> batch; std::size_t bytes = 0;
-		const auto rpc_entries = std::min(limits_in_force().rpc_entries, limits_.rpc_entries), rpc_bytes = std::min(limits_in_force().rpc_bytes, limits_.rpc_bytes);
+		const auto wire = wire_limits();
+		const auto rpc_entries = wire.rpc_entries, rpc_bytes = wire.rpc_bytes;
 		for (Index index = peer.next; index <= last_index() && batch.size() < rpc_entries; ++index) {
 			const auto& entry = log_entry(index);
 			if (entry.payload.size() > rpc_bytes - bytes) { break; }
@@ -1066,6 +1089,7 @@ private:
 	std::pair<NodeId, Token> acted_timeout_{};  // the last TimeoutNow this node acted on
 	bool timed_out_ = false;
 	std::uint64_t leadership_start_ = 0;  // when this node last became leader
+	std::map<NodeId, Limits> peer_limits_;  // members' node limits, as the host reported them
 	bool handed_off_ = false;  // a self-removing leader tried its transfer
 	Index witness_bound_ = 0;  // a witness truncates only through this (D9)
 };

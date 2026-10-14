@@ -198,7 +198,11 @@ struct ChangeMembership { RequestId request; Membership next; };
 // A leader hands leadership to a voter of its membership in force (D6). Proposals are
 // refused until the target wins or one election timeout passes.
 struct TransferLeadership { RequestId request; NodeId target; };
-using Event = std::variant<Start, Tick, Receive, Propose, Read, Persisted, Applied, Failed, LocalCheckpoint, StorageFault, InstallPrepared, InstallActivated, InstallActivationFailed, SnapshotSourceReady, SnapshotTransferFailed, Repair, ChangeMembership, TransferLeadership>;
+// The host reports a member's node limits, learned when its node connects (R16). A leader
+// keeps commands and RPCs within every reported member's; one not reported is taken to
+// match the leader's own node.
+struct PeerLimits { NodeId incarnation; Limits limits; };
+using Event = std::variant<Start, Tick, Receive, Propose, Read, Persisted, Applied, Failed, LocalCheckpoint, StorageFault, InstallPrepared, InstallActivated, InstallActivationFailed, SnapshotSourceReady, SnapshotTransferFailed, Repair, ChangeMembership, TransferLeadership, PeerLimits>;
 
 enum class Role { Follower, Candidate, Leader, Fenced };
 enum class RejectReason { Busy, NotLeader, NotReady, LogFull, TooLarge, DuplicateRequest, InvalidCheckpoint, InvalidRepair, LeaderMustTransfer, InvalidMembership, InvalidTarget };

@@ -30,6 +30,7 @@ mutants=(
 	$'a leader grants pre-votes\treturn role_ == Role::Leader || (role_ == Role::Follower\treturn (role_ == Role::Follower'
 	$'learners refuse votes\tbool grant = request.term == hard_.term && (!hard_.voted_for\tbool grant = request.term == hard_.term && is_voter(configuration_.local) && (!hard_.voted_for'
 	$'repair below base_index\tif (b.index < base_index_ || b.index > durable_.commit_index ||\tif (b.index > durable_.commit_index ||'
+	$'a leader ignores members\' node limits\t\t\tif (auto found = peer_limits_.find(member); found != peer_limits_.end()) { cap(found->second); }\t\t\t(void)member;'
 	$'commit of an earlier term by counting\tif (candidate <= durable_.commit_index || log_term(candidate) != hard_.term) { return; }\tif (candidate <= durable_.commit_index) { return; }'
 )
 status=0

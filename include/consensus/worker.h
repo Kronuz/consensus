@@ -113,6 +113,8 @@ public:
 			voting.insert(x.incarnation);
 		}
 		if (voting != voters || founding.leaving) { throw std::invalid_argument("founding membership does not match the voters"); }
+		// A group's limits stay within its node's (R16).
+		if (founding.limits && !within(*founding.limits, limits_)) { throw std::invalid_argument("founding limits above the node's"); }
 		founding_ = std::move(founding);
 	}
 	void create(kronuz::journal::Identity identity) {

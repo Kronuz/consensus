@@ -59,12 +59,12 @@ inline bool flag(std::string_view& bytes) {
 inline void end(std::string_view bytes) { if (!bytes.empty()) { throw Corruption("trailing consensus storage bytes"); } }
 } // namespace storage_detail
 
-// The founding record. Roles are written (RFTINIT2) only when a founding member is not a
-// voter, so an all-voter group's record stays the one older readers know.
+// The founding record. RFTINIT2 is written only when a founding member is not a voter or
+// the founding carries limits, so a fixed group's record stays the one older readers know.
 inline std::string encode_initialization(const FixedConfiguration& configuration, const std::optional<Membership>& founding = {}) {
 	using namespace storage_detail;
 	if (configuration.voters.size() > 31) { throw std::length_error("too many voters"); }
-	const bool roles = founding && std::any_of(founding->members.begin(), founding->members.end(), [](const Member& x) { return x.role != MemberRole::Voter; });
+	const bool roles = founding && (founding->limits || std::any_of(founding->members.begin(), founding->members.end(), [](const Member& x) { return x.role != MemberRole::Voter; }));
 	std::string result;
 	put64(result, roles ? initial_magic_v2 : initial_magic); identity(result, configuration.cluster); identity(result, configuration.configuration);
 	put64(result, configuration.local); put32(result, static_cast<std::uint32_t>(configuration.voters.size()));
@@ -227,8 +227,8 @@ private:
 				voting.insert(x.incarnation);
 			}
 			if (voting != founding || m.leaving) { throw Corruption("founding membership does not match its voters"); }
-			// RFTINIT2 is written only for a non-voter, so each founding has one encoding.
-			if (std::all_of(m.members.begin(), m.members.end(), [](const Member& x) { return x.role == MemberRole::Voter; })) { throw Corruption("founding roles without a non-voter"); }
+			// RFTINIT2 is written only for a non-voter or limits, so each founding has one encoding.
+			if (!m.limits && std::all_of(m.members.begin(), m.members.end(), [](const Member& x) { return x.role == MemberRole::Voter; })) { throw Corruption("founding roles without a non-voter or limits"); }
 			state_.membership = std::move(m);
 		}
 		end(bytes);

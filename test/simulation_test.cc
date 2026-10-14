@@ -99,6 +99,7 @@ struct Durable {
 struct Node {
 	NodeId id;
 	bool joiner = false;  // started from a join record (Track C, D5), no membership
+	Limits limits;  // this node's own limits; nodes differ in their command limit (R16)
 	double rate;  // local clock rate
 	double local = 0;  // local clock, advanced at `rate`
 	std::unique_ptr<Core> core;
@@ -130,6 +131,7 @@ public:
 			auto& n = nodes_[id];
 			n.id = id;
 			n.rate = 0.5 + double(random_() % 1501) / 1000.0;
+			n.limits = node_limits();
 			restart(n);
 		}
 	}
@@ -276,7 +278,7 @@ private:
 		if (n.durable.base) { state.membership = n.durable.membership; }
 		else if (n.joiner) { state.membership = Membership{}; }  // the join record: no membership yet
 		else if (witness_) { state.membership = founding_; }
-		n.core = std::make_unique<Core>(node_config(n), std::move(state), limits_, timing_);
+		n.core = std::make_unique<Core>(node_config(n), std::move(state), n.limits, timing_);
 		n.pending.reset();
 		n.checkpointing.reset();
 		n.installing.reset();
@@ -289,6 +291,17 @@ private:
 		n.up = true;
 		act(n, n.core->step(Tick{local_time(n), election_delay()}));
 		act(n, n.core->step(Start{}));
+		// The hello tells each side the other's node limits.
+		for (auto& [id, m] : nodes_) {
+			if (id == n.id || !m.core) { continue; }
+			act(n, n.core->step(PeerLimits{id, m.limits}));
+			if (m.up) { act(m, m.core->step(PeerLimits{n.id, n.limits})); }
+		}
+	}
+	Limits node_limits() {
+		Limits l = limits_;
+		l.command_bytes = 16 + random_() % 49;
+		return l;
 	}
 	// Track C's profile rules: a barrier here takes about 60 units (a persist completes at
 	// random) and a delivery up to 60, so an election round (two barriers and a round trip)
@@ -327,7 +340,9 @@ private:
 	}
 	void propose(Node& n) {
 		if (!n.up) { return; }
-		act(n, n.core->step(Propose{++request_, "c" + std::to_string(request_)}));
+		auto command = "c" + std::to_string(++request_);
+		command.resize(command.size() + random_() % 56, '.');  // some exceed a member's command limit
+		act(n, n.core->step(Propose{request_, std::move(command)}));
 	}
 	// The applied entries through `through`: what a checkpoint's application image holds.
 	static std::vector<Entry> image(const Node& n, Index through) {
@@ -417,10 +432,10 @@ private:
 		const auto choice = random_() % 4;
 		if (choice == 3) {
 			// R16: lower or raise the group's limits beneath the node's.
-			Limits l = limits_;
-			l.reads = 1 + random_() % limits_.reads;
-			l.uncommitted_entries = 16 + random_() % (limits_.uncommitted_entries - 15);
-			l.command_bytes = 16 + random_() % (limits_.command_bytes - 15);
+			Limits l = leader->limits;
+			l.reads = 1 + random_() % l.reads;
+			l.uncommitted_entries = 16 + random_() % (l.uncommitted_entries - 15);
+			l.command_bytes = 16 + random_() % (l.command_bytes - 15);
 			next.limits = l;
 			++limit_changes;
 		} else if (choice == 0 && next.members.size() < 7) {
@@ -431,6 +446,7 @@ private:
 				joiner.id = incarnation;
 				joiner.joiner = true;
 				joiner.rate = 0.5 + double(random_() % 1501) / 1000.0;
+				joiner.limits = node_limits();
 				joiner.local = leader->local;
 				restart(joiner);
 			}
@@ -558,7 +574,7 @@ private:
 		next.members.push_back({incarnation, incarnation, MemberRole::Learner});
 		auto& joiner = nodes_[incarnation];
 		if (!joiner.core) {
-			joiner.id = incarnation; joiner.joiner = true; joiner.rate = 1.0; joiner.local = leader->local;
+			joiner.id = incarnation; joiner.joiner = true; joiner.rate = 1.0; joiner.local = leader->local; joiner.limits = node_limits();
 			restart(joiner);
 		}
 		isolated_.insert(leader->id);

@@ -53,6 +53,14 @@ inline void validate_limits(const Limits& l) {
 	}
 }
 
+// Whether a group's limits stay within a node's, field by field (R16).
+inline bool within(const Limits& group, const Limits& node) noexcept {
+	return group.voters <= node.voters && group.command_bytes <= node.command_bytes && group.log_bytes <= node.log_bytes &&
+		group.log_entries <= node.log_entries && group.control_entries <= node.control_entries && group.rpc_bytes <= node.rpc_bytes &&
+		group.rpc_entries <= node.rpc_entries && group.reads <= node.reads && group.uncommitted_entries <= node.uncommitted_entries &&
+		group.members <= node.members;
+}
+
 inline bool voting(MemberRole role) noexcept { return role == MemberRole::Voter || role == MemberRole::Witness; }
 
 // The founding membership of a fixed configuration: every voter its own node and incarnation.

@@ -485,6 +485,42 @@ void witness_replaced_while_lagging() {
 	check(w && w->role == MemberRole::Witness && !find_member(now_in, 3) && c.commit_one("b"), "the replacement completes and the group commits with data voter 2 down");
 }
 
+
+// M4's remainder: a leader keeps commands and group limits within every reported member's
+// node limits, so members with unequal node limits never wedge.
+void unequal_node_limits() {
+	Limits wide; wide.command_bytes = 2 * 1024 * 1024;
+	Limits narrow;  // 1 MiB commands
+	ProbeCluster c;
+	c.add_founding(1, 3, wide);
+	c.add_founding(2, 3, narrow);
+	c.add_founding(3, 3, narrow);
+	c.now = 100; c.consume(1, c.core(1).step(Tick{c.now, 100}));
+	c.run(400);
+	auto& leader = c.core(1);
+	check(c.leader() == 1u, "the node with wider limits leads");
+	for (NodeId id : {2u, 3u}) { c.consume(1, leader.step(PeerLimits{id, narrow})); }
+	auto big = leader.step(Propose{900, std::string(1536 * 1024, 'b')});
+	check(first<Reject>(big) && first<Reject>(big)->reason == RejectReason::TooLarge, "a command above a member's node limit is refused, not wedged");
+	Membership raised = leader.membership(); raised.limits = wide;
+	RejectReason reason{};
+	check(!c.change(1, raised, &reason) && reason == RejectReason::InvalidMembership, "group limits above a member's node limits are refused");
+	check(c.commit_one(std::string(512 * 1024, 's')), "commands within every member's limits commit");
+}
+
+// Founding limits stay within the node's and survive in RFTINIT2.
+void founding_limits() {
+	Limits node;
+	Membership founding = fixed_membership(founding_config(1)); founding.limits = node; founding.limits->command_bytes = 4096;
+	auto bytes = encode_initialization(founding_config(1), founding);
+	Recovery recovery(founding_config(1)); recovery.replay(1, bytes);
+	auto state = recovery.finish(1);
+	check(bytes.substr(0, 8) != encode_initialization(founding_config(1)).substr(0, 8) && state.membership && state.membership->limits == founding.limits,
+		"an all-voter founding with limits is written as RFTINIT2 and keeps them");
+	Membership above = founding; above.limits->command_bytes = node.command_bytes * 2; above.limits->rpc_bytes = node.rpc_bytes * 2;
+	check(above.limits && !within(*above.limits, node), "founding limits above the node's are outside it");
+}
+
 }  // namespace
 
 int main() {
@@ -500,6 +536,8 @@ int main() {
 		disk_lost_rejoin();
 		witness_at_limit();
 		witness_replaced_while_lagging();
+		unequal_node_limits();
+		founding_limits();
 	} catch (const std::exception& error) {
 		check(false, error.what());
 	}

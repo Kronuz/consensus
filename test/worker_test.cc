@@ -1783,6 +1783,9 @@ void founding_and_join_records() {
  Worker bad(std::make_shared<kronuz::journal::PosixIO>(directory), three, admission(), limits(), compact);
  Membership wrong{{{1, 1, MemberRole::Voter}, {2, 2, MemberRole::Voter}, {4, 4, MemberRole::Witness}}, 5, 0};
  check(throws([&] { bad.found(wrong); }), "founding roles must name the configured voters");
+ Membership greedy{{{1, 1, MemberRole::Voter}, {2, 2, MemberRole::Voter}, {3, 3, MemberRole::Witness}}, 4, 0};
+ greedy.limits = limits(); greedy.limits->command_bytes = limits().command_bytes * 2; greedy.limits->rpc_bytes = limits().rpc_bytes * 2; greedy.limits->log_bytes = limits().log_bytes * 2;
+ check(throws([&] { bad.found(greedy); }), "founding limits above the node's are refused");
 }
 
 // Track C, D5 (review M3): any authenticated incarnation of the group may send a snapshot,

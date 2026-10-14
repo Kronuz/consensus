@@ -99,7 +99,7 @@ inline EventAdmissionPlan plan_event(const Event& event, bool busy, Limits limit
 				add(AdmissionClass::Control, storage_batch_size(false, true, 1, encode_membership(value.next).size()));
 				add(AdmissionClass::Control, hard);
 			}
-		} else if constexpr (std::is_same_v<T, Start> || std::is_same_v<T, Read> || std::is_same_v<T, Repair> || std::is_same_v<T, TransferLeadership>) {
+		} else if constexpr (std::is_same_v<T, Start> || std::is_same_v<T, Read> || std::is_same_v<T, Repair> || std::is_same_v<T, TransferLeadership> || std::is_same_v<T, PeerLimits>) {
 			// These events emit no persistence action.
 		} else {
 			static_assert(std::is_same_v<T, void>, "new consensus event requires an admission plan");

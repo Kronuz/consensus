@@ -89,6 +89,25 @@ public:
 	}
 	std::uint64_t now() const { return now_; }
 	std::function<void()> observe;  // called after every event
+	// A node joining from a join record (D5): no voters, no membership.
+	void add_joiner(NodeId id) {
+		FixedConfiguration c; c.cluster[0] = 'L'; c.configuration[0] = 'T'; c.local = id;
+		RecoveredState state; state.configuration = c; state.membership = Membership{};
+		nodes_[id].core = std::make_unique<Core>(c, std::move(state), Limits{}, profile_.timing);
+		step(id, Tick{now_, delay()});
+		step(id, Start{});
+		at(now_ + tick_, [this, id] { tick(id); });
+	}
+	// Proposes a membership change on `leader` until it is placed; true once placed.
+	bool change(NodeId leader, const Membership& next, std::uint64_t until) {
+		while (now_ < until) {
+			if (core(leader).role() != Role::Leader) { return false; }
+			auto actions = step(leader, ChangeMembership{++request_, next});
+			if (!std::any_of(actions.begin(), actions.end(), [](const Action& a) { return std::holds_alternative<Reject>(a); })) { return true; }
+			run_until(now_ + tick_);
+		}
+		return false;
+	}
 	void run_until(std::uint64_t until, const std::function<bool()>& done = {}) {
 		while (!events_.empty() && events_.top().at <= until) {
 			auto event = events_.top(); events_.pop();
@@ -229,7 +248,8 @@ double percentile(std::vector<double> v, double p) {
 }
 
 void run(const Profile& profile, std::uint64_t seeds) {
-	std::vector<double> heal, transfer, stepdown, recover, handoff, survive;
+	std::vector<double> heal, transfer, stepdown, recover, handoff, survive, promotion, replacement;
+	std::uint64_t unpromoted = 0, unreplaced = 0, removed_raised = 0, removed_runs = 0;
 	std::uint64_t unsurvived = 0, unhanded = 0, raised = 0, lone_raised = 0, unhealed = 0, untransferred = 0, unrecovered = 0;
 	const auto& t = profile.timing;
 	for (std::uint64_t seed = 1; seed <= seeds; ++seed) {
@@ -311,6 +331,52 @@ void run(const Profile& profile, std::uint64_t seeds) {
 				if (led) { ++unhanded; }
 			}
 		}
+		// Condition 13: the leader fails in a promotion's window, and in a replacement's (after
+		// the promotion commits, before the leaving voter's removal does).
+		for (bool replace : {false, true}) {
+			const std::set<NodeId> three{1, 2, 3};
+			Cluster c(seed + 5000000 + replace, 3, profile);
+			c.commit_one(three, 20000);
+			auto l = c.leader(three);
+			if (!l) { ++(replace ? unreplaced : unpromoted); continue; }
+			c.add_joiner(4);
+			Membership with4 = c.core(*l).membership(); with4.members.push_back({4, 4, MemberRole::Learner}); with4.next_incarnation = 5;
+			c.change(*l, with4, c.now() + 10000);
+			c.run_until(c.now() + 20000, [&] { auto p = c.core(*l).progress(4); return c.core(*l).can_change_membership() && p && *p >= c.core(*l).committed(); });
+			Membership promoted = c.core(*l).membership();
+			for (auto& x : promoted.members) { if (x.incarnation == 4) { x.role = MemberRole::Voter; } }
+			NodeId leaving = 0;
+			if (replace) { for (NodeId id : three) { if (id != *l) { leaving = id; break; } } promoted.leaving = leaving; }
+			if (!c.change(*l, promoted, c.now() + 10000)) { ++(replace ? unreplaced : unpromoted); continue; }
+			if (replace) { c.run_until(c.now() + 20000, [&] { return c.core(*l).committed_membership().leaving != 0; }); }
+			for (NodeId id = 1; id <= 4; ++id) { if (id != *l) { c.cut(*l, id); c.cut(id, *l); } }
+			const auto failed = c.now();
+			std::set<NodeId> rest{1, 2, 3, 4}; rest.erase(*l);
+			if (c.commit_one(rest, failed + 30000)) { (replace ? replacement : promotion).push_back(double(c.now() - failed)); } else { ++(replace ? unreplaced : unpromoted); }
+		}
+		// Condition 13: a removed voter, cut off before it learns of its removal, never raises
+		// the remaining group's term once it returns.
+		{
+			const std::set<NodeId> three{1, 2, 3};
+			Cluster c(seed + 6000000, 3, profile);
+			c.commit_one(three, 20000);
+			auto l = c.leader(three);
+			if (l) {
+				NodeId gone = *l == 3 ? 2 : 3;
+				c.cut(*l, gone); c.cut(gone, *l);
+				for (NodeId id : three) { if (id != *l && id != gone) { c.cut(id, gone); c.cut(gone, id); } }
+				Membership without = c.core(*l).membership();
+				std::erase_if(without.members, [&](const Member& x) { return x.incarnation == gone; });
+				std::set<NodeId> kept = three; kept.erase(gone);
+				if (c.change(*l, without, c.now() + 10000) && c.commit_one(kept, c.now() + 20000)) {
+					++removed_runs;
+					const Term before = c.max_term(kept);
+					c.heal();
+					c.run_until(c.now() + 20000);
+					removed_raised += c.max_term(kept) != before;
+				}
+			}
+		}
 		// A leader that cannot receive steps down, and a new leader commits.
 		{
 			Cluster c(seed + 3000000, voters, profile);
@@ -342,6 +408,12 @@ void run(const Profile& profile, std::uint64_t seeds) {
 		survive99, survive.size(), (unsigned long long)unsurvived, handoff.size(), handoff_max, (unsigned long long)unhanded);
 	check(!unsurvived && survive99 <= 5000, std::string(profile.name) + ": 2 + witness survives any single failure");
 	check(!unhanded && handoff_max <= double(t.election_max), std::string(profile.name) + ": a witness leader hands off within election_max");
+	const auto promotion99 = percentile(promotion, 0.99), replacement99 = percentile(replacement, 0.99);
+	std::printf("%26s membership: leader fails in a promotion's window, new leader commits p99 %6.0f (%zu, %llu failed); in a replacement's window p99 %6.0f (%zu, %llu failed); removed voter raised the term %llu of %llu\n", "",
+		promotion99, promotion.size(), (unsigned long long)unpromoted, replacement99, replacement.size(), (unsigned long long)unreplaced, (unsigned long long)removed_raised, (unsigned long long)removed_runs);
+	check(!unpromoted && promotion99 <= 5000, std::string(profile.name) + ": a leader failing in a promotion's window is replaced within 5 s");
+	check(!unreplaced && replacement99 <= 5000, std::string(profile.name) + ": a leader failing in a replacement's window is replaced within 5 s");
+	check(!removed_raised && removed_runs, std::string(profile.name) + ": a removed voter never raises the group's term");
 }
 
 }  // namespace

@@ -9,9 +9,9 @@
 namespace kronuz::consensus::transport {
 inline std::size_t control_frame_bound(kronuz::consensus::Limits limits) {
 	constexpr auto maximum = std::numeric_limits<std::size_t>::max();
-	if (limits.rpc_bytes > maximum - 68 || limits.rpc_entries > (maximum - 68 - limits.rpc_bytes) / 32)
+	if (limits.rpc_bytes > maximum - 76 || limits.rpc_entries > (maximum - 76 - limits.rpc_bytes) / 32)
 		throw std::invalid_argument("control frame bound overflow");
-	return 68 + 32 * limits.rpc_entries + limits.rpc_bytes;
+	return 76 + 32 * limits.rpc_entries + limits.rpc_bytes;
 }
 // Versioned, bounded binary control messages. TLS admission supplies identity;
 // decoded bytes never create an authenticated peer capability.
@@ -89,6 +89,7 @@ inline std::string encode(const kronuz::consensus::Message &message,
 						throw std::invalid_argument("control frame bound");
 					bytes += entry.payload;
 				}
+				number(value.data_matched);
 			} else if constexpr (std::is_same_v<T, AppendResponse>) {
 				number(value.rpc);
 				number(value.success);
@@ -177,6 +178,7 @@ inline kronuz::consensus::Message decode(std::string_view bytes, kronuz::consens
 			value.entries.push_back(
 				{index, entry_term, static_cast<EntryKind>(entry_kind), std::string(payload)});
 		}
+		value.data_matched = get64(bytes);
 		result = std::move(value);
 		break;
 	}

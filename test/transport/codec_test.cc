@@ -120,7 +120,7 @@ int main() {
 		entry.payload.assign(maximum.command_bytes, 'x');
 	}
 	auto largest_bytes = kronuz::consensus::transport::encode(largest, maximum);
-	assert(largest_bytes.size() == 68 + 32 * largest.entries.size() + maximum.rpc_bytes);
+	assert(largest_bytes.size() == 76 + 32 * largest.entries.size() + maximum.rpc_bytes);
 	assert(kronuz::consensus::transport::encode(kronuz::consensus::transport::decode(largest_bytes, maximum), maximum) ==
 		   largest_bytes);
 	for (auto bad : {kronuz::consensus::transport::encode(messages[1]), kronuz::consensus::transport::encode(messages[2]),

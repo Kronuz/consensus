@@ -1661,6 +1661,17 @@ void witnesses() {
 	for (std::uint64_t from = cluster.now, t = from + 10; t <= from + 400 && witness.role() == Role::Leader; t += 10) { cluster.tick(t); cluster.pump(); }
 	const bool handed = cluster.host(1).core->role() == Role::Leader || cluster.host(2).core->role() == Role::Leader;
 	check(handed && witness.role() == Role::Follower && witness.term() == led + 1, "the witness transfers leadership to a data voter");
+	// A witness checkpoints only through what every data voter has matched.
+	auto bound_state = empty(3); bound_state.membership = founding;
+	Core w(config(3), std::move(bound_state)); w.step(Start{});
+	auto appended = w.step(Receive{1, AppendRequest{1, 9, 0, 0, 2, 0, {{1, 1, EntryKind::NoOp, {}}, {2, 1, EntryKind::Command, "x"}}, 1}});
+	auto delivered = w.step(Persisted{find<Persist>(appended)->token});
+	check(find<Committed>(delivered) && w.witness_bound() == 1, "a witness records the data voters' matched index");
+	w.step(Applied{2});
+	auto past = w.step(LocalCheckpoint{80, 5, 2, 1, w.configuration().cluster, w.configuration().configuration});
+	check(find<Reject>(past) && find<Reject>(past)->reason == RejectReason::InvalidCheckpoint, "a witness refuses a checkpoint past the data voters");
+	auto within = w.step(LocalCheckpoint{81, 6, 1, 1, w.configuration().cluster, w.configuration().configuration});
+	check(find<PersistCheckpoint>(within) != nullptr, "a witness checkpoints within the data voters' match");
 }
 
 int main() {

@@ -127,6 +127,7 @@ struct AppendRequest {
 	Index commit;
 	Token read_probe;
 	std::vector<Entry> entries;
+	Index data_matched = 0;  // what every data voter has matched, for a witness's truncation (D9)
 };
 struct LogBoundary { Index index; Term term; bool operator==(const LogBoundary&) const = default; };
 struct SnapshotKey { Term leader_term; Token transfer; LogBoundary boundary; bool operator==(const SnapshotKey&) const = default; };

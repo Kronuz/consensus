@@ -154,6 +154,7 @@ public:
 	}
 	bool busy() const noexcept { return pending_.has_value() || install_.has_value(); }
 	bool transferring() const noexcept { return transfer_.has_value(); }
+	Index witness_bound() const noexcept { return witness_bound_; }
 	const HardState& durable_hard_state() const noexcept { return durable_; }
 	const FixedConfiguration& configuration() const noexcept { return configuration_; }
 	// The membership in force (the newest Configuration entry in the log, committed or not)
@@ -442,6 +443,7 @@ private:
 		if (!started_ || busy()) { output.emplace_back(Reject{request.request, RejectReason::Busy}); return; }
 		if (request.capture == 0 || request.epoch != epoch_ || request.cluster != configuration_.cluster || request.configuration != configuration_.configuration ||
 			request.through <= base_index_ || request.through > applied_ || applied_ > durable_.commit_index ||
+			(witness_self() && request.through > witness_bound_) ||
 			log_term(request.through) != request.term) {
 			output.emplace_back(Reject{request.request, RejectReason::InvalidCheckpoint}); return;
 		}
@@ -724,6 +726,7 @@ private:
 			batch.log = LogMutation{replace_from, std::move(suffix)};
 		}
 		auto verified = request.previous + request.entries.size();
+		witness_bound_ = std::max(witness_bound_, std::min(request.data_matched, verified));
 		hard_.commit_index = std::max(hard_.commit_index, std::min(request.commit, verified));
 		output.emplace_back(Send{source, AppendResponse{hard_.term, request.rpc, true, verified, verified + 1, request.read_probe}});
 	}
@@ -889,7 +892,18 @@ private:
 		}
 		auto rpc = token();
 		peer.flight = Flight{rpc, previous, previous + batch.size(), probe, now_};
-		output.emplace_back(Send{id, AppendRequest{hard_.term, rpc, previous, log_term(previous), durable_.commit_index, probe, std::move(batch)}});
+		output.emplace_back(Send{id, AppendRequest{hard_.term, rpc, previous, log_term(previous), durable_.commit_index, probe, std::move(batch), data_matched()}});
+	}
+	// D9: the least index every data voter of the membership in force has matched.
+	Index data_matched() const {
+		Index least = maximum;
+		for (const auto& x : membership().members) {
+			if (x.role != MemberRole::Voter) { continue; }
+			if (x.incarnation == configuration_.local) { least = std::min(least, last_index()); continue; }
+			auto found = peers_.find(x.incarnation);
+			least = std::min(least, found == peers_.end() ? Index{0} : found->second.matched);
+		}
+		return least == maximum ? 0 : least;
 	}
 	void advance_commit(Actions& output) {
 		if (busy() || role_ != Role::Leader) { return; }
@@ -958,6 +972,7 @@ private:
 	std::optional<Transfer> transfer_;  // a leader's transfer in progress (D6)
 	std::pair<NodeId, Token> acted_timeout_{};  // the last TimeoutNow this node acted on
 	bool timed_out_ = false;
+	Index witness_bound_ = 0;  // a witness truncates only through this (D9)
 };
 
 } // namespace kronuz::consensus

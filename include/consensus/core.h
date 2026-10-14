@@ -291,6 +291,7 @@ private:
 		auto m = decode_membership(entry.payload);
 		if (!m.limits) { m.limits = membership_at(entry.index - 1).limits; }
 		configs_[entry.index] = std::move(m);
+		++membership_version_;
 	}
 	// The limits a group applies: its newest configuration's, else the node's (R16).
 	const Limits& limits_of(const Membership& m) const { return m.limits ? *m.limits : limits_; }
@@ -298,6 +299,11 @@ private:
 	// What a leader sends and admits: the group's command and RPC limits, within its own
 	// node's and every reported member's, so no member's transport or admission refuses it.
 	Limits wire_limits() const {
+		// Cached until the membership, the committed membership, or a report changes: a
+		// leader asks once per RPC, and the scan is over every member.
+		auto committed_at = configs_.upper_bound(durable_.commit_index);
+		const std::pair<std::uint64_t, Index> key{membership_version_, committed_at == configs_.begin() ? 0 : std::prev(committed_at)->first};
+		if (wire_cache_ && wire_key_ == key) { return *wire_cache_; }
 		Limits out = limits_in_force();
 		auto cap = [&](const Limits& node) {
 			out.command_bytes = std::min(out.command_bytes, node.command_bytes);
@@ -308,10 +314,11 @@ private:
 		for (NodeId member : replicas()) {
 			if (auto found = peer_limits_.find(member); found != peer_limits_.end()) { cap(found->second); }
 		}
+		wire_cache_ = out; wire_key_ = key;
 		return out;
 	}
 	void handle(PeerLimits report, Actions&) {
-		if (report.incarnation && report.incarnation != configuration_.local) { peer_limits_[report.incarnation] = report.limits; }
+		if (report.incarnation && report.incarnation != configuration_.local) { peer_limits_[report.incarnation] = report.limits; ++membership_version_; }
 	}
 	// Commands are bound by the command limit in force; a Configuration entry only by its
 	// encoding (maximum_membership_bytes), so lowering the limit cannot wedge a group (R16).
@@ -327,8 +334,9 @@ private:
 	}
 	// The limits an entry at `index` is checked against: those in force just before it.
 	const Limits& limits_at(Index index) const { return limits_of(membership_at(index - 1)); }
-	void note_truncate(Index from) { configs_.erase(configs_.lower_bound(from), configs_.end()); }
+	void note_truncate(Index from) { configs_.erase(configs_.lower_bound(from), configs_.end()); ++membership_version_; }
 	void note_base(Index through) {
+		++membership_version_;
 		base_membership_ = membership_at(through);
 		configs_.erase(configs_.begin(), configs_.upper_bound(through));
 	}
@@ -405,7 +413,7 @@ private:
 				log_bytes_ = entries_.suffix_bytes(count);
 				entries_.erase_prefix(count);
 			} else {
-				entries_.clear(); log_bytes_ = 0; configs_.clear();
+				entries_.clear(); log_bytes_ = 0; configs_.clear(); ++membership_version_;
 				if (operation.membership) { base_membership_ = *operation.membership; }
 			}
 			base_index_ = operation.boundary.index; base_term_ = operation.boundary.term;
@@ -1102,6 +1110,9 @@ private:
 	bool timed_out_ = false;
 	std::uint64_t leadership_start_ = 0;  // when this node last became leader
 	std::map<NodeId, Limits> peer_limits_;  // members' node limits, as the host reported them
+	std::uint64_t membership_version_ = 0;  // bumped whenever a membership or a report changes
+	mutable std::optional<Limits> wire_cache_;
+	mutable std::pair<std::uint64_t, Index> wire_key_{};
 	bool handed_off_ = false;  // a self-removing leader tried its transfer
 	Index witness_bound_ = 0;  // a witness truncates only through this (D9)
 };

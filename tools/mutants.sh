@@ -24,7 +24,7 @@ mutants=(
 	$'votes and pre-votes without the log check\treturn term > log_term(last_index()) || (term == log_term(last_index()) && index >= last_index());\treturn true;'
 	$'repair with a delivery outstanding\tif (!started_ || busy() || delivered_through_) { reject(RejectReason::Busy); return; }\tif (!started_ || busy()) { reject(RejectReason::Busy); return; }'
 	$'membership change before the leader commits in its term\tif (durable_.commit_index == 0 || log_term(durable_.commit_index) != hard_.term ||\tif (durable_.commit_index == 0 ||'
-	$'no membership rollback on a replaced suffix\tvoid note_truncate(Index from) { configs_.erase(configs_.lower_bound(from), configs_.end()); }\tvoid note_truncate(Index) {}'
+	$'no membership rollback on a replaced suffix\tvoid note_truncate(Index from) { configs_.erase(configs_.lower_bound(from), configs_.end()); ++membership_version_; }\tvoid note_truncate(Index) { ++membership_version_; }'
 	$'a removed leader counts itself\t\t\tif (is_voter(configuration_.local)) { matches.push_back(last_index()); }\t\t\tmatches.push_back(last_index());'
 	$'a follower checks entries by its node limits, not by position\tif (!fits(entry, running)) {\tif (!fits(entry, limits_)) {'
 	$'a leader grants pre-votes\treturn role_ == Role::Leader || (role_ == Role::Follower\treturn (role_ == Role::Follower'

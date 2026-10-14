@@ -208,6 +208,67 @@ void invalid_suffix() {
 	}
 	require(rejected, "failed encoder cannot resume");
 }
+void encoder_guards() {
+	kronuz::journal::ArtifactDescriptor application{};
+	auto rejects = [&](RecoveredState state, Limits limits = {}) {
+		try {
+			IncrementalCheckpointEncoder encoder(BorrowedCheckpointState{&state}, 1, application, limits);
+			std::array<char, 256> buffer{};
+			while (!encoder.done()) {
+				encoder.next(buffer);
+			}
+		} catch (const kronuz::journal::Corruption &) {
+			return true;
+		}
+		return false;
+	};
+	auto edited = [](auto edit) {
+		auto state = fixture(3, 2);
+		edit(state);
+		return state;
+	};
+	require(rejects(edited([](RecoveredState &s) { s.entries[1].term = 0; })), "a suffix entry needs a term");
+	require(rejects(edited([](RecoveredState &s) { s.entries[0].term = 2, s.entries[1].term = 1; })), "suffix terms never decrease");
+	require(rejects(edited([](RecoveredState &s) { s.entries[2].term = 3; })), "a suffix term stays within the hard state's");
+	require(rejects(edited([](RecoveredState &s) { s.entries[1].kind = static_cast<EntryKind>(9); })), "a suffix entry has a known kind");
+	require(rejects(edited([](RecoveredState &s) { s.entries[1].kind = EntryKind::NoOp; })), "a NoOp carries no payload");
+	Limits small;
+	small.command_bytes = 1;
+	require(rejects(fixture(3, 2), small), "a suffix payload stays within the command limit");
+	small.command_bytes = small.rpc_bytes = small.log_bytes = 5;
+	require(rejects(fixture(3, 2), small), "the suffix stays within the retained log's bytes");
+	bool refused = false;
+	try {
+		auto state = fixture(1, 1);
+		IncrementalCheckpointEncoder encoder(BorrowedCheckpointState{&state}, 0, application);
+	} catch (const kronuz::journal::Corruption &) {
+		refused = true;
+	}
+	require(refused, "a checkpoint needs a storage sequence");
+	auto state = fixture(1, 1);
+	IncrementalCheckpointEncoder encoder(BorrowedCheckpointState{&state}, 1, application);
+	std::array<char, 8> buffer{};
+	int empty = 0;
+	for (auto budget : {std::size_t{0}, std::size_t{1}}) {
+		try {
+			encoder.next(budget ? std::span<char>{} : std::span<char>(buffer), budget);
+		} catch (const std::invalid_argument &) {
+			++empty;
+		}
+	}
+	require(empty == 2, "an encoding step needs room and a record budget");
+	for (bool entries : {true, false}) {
+		refused = false;
+		try {
+			Limits huge;
+			(entries ? huge.log_entries : huge.log_bytes) = std::numeric_limits<std::size_t>::max();
+			(void)checkpoint_detail::maximum_size(huge);
+		} catch (const std::length_error &) {
+			refused = true;
+		}
+		require(refused, "a bundle bound that overflows is refused");
+	}
+}
 } // namespace
 int main() {
 	try {
@@ -222,6 +283,7 @@ int main() {
 			compare(1, 1024 * 1024, 65536, format);
 		}
 		invalid_suffix();
+		encoder_guards();
 		frozen_capabilities();
 		std::cout << checks << " incremental checkpoint checks passed\n";
 	} catch (const std::exception &error) {

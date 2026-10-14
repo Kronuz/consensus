@@ -266,7 +266,8 @@ public:
 		if (!snapshot_limits_) { throw std::invalid_argument("snapshot reception is disabled"); }
 		validate_snapshot(context.descriptor, {configuration_.cluster, configuration_.configuration, snapshot_limits_->application_format, snapshot_limits_->application_bytes});
 		if (!context.request || !context.transfer || !context.leader_term || context.descriptor.term > context.leader_term ||
-			context.authenticated_peer == configuration_.local || std::find(configuration_.voters.begin(), configuration_.voters.end(), context.authenticated_peer) == configuration_.voters.end() ||
+			// Any authenticated incarnation of the group may lead it (D5), not only a founding voter.
+			context.authenticated_peer == configuration_.local || context.authenticated_peer == 0 ||
 			(core_ && context.leader_term < core_->term())) { throw std::invalid_argument("invalid snapshot sender context"); }
 		if (!ready() || checkpoint_ || snapshot_result_) { return std::nullopt; }
 		if (next_checkpoint_ == std::numeric_limits<Token>::max()) { throw std::length_error("snapshot identity exhausted"); }
@@ -580,9 +581,11 @@ private:
 		if (!kronuz::journal::detail::resources_fit(pack, admission.control_pool)) { throw std::invalid_argument("worker control pool cannot fund continuation pack"); }
 		// Checked bounds for one complete Core action batch, including internal
 		// persistence and checkpoint actions. No unbounded output queue exists.
-		output_count_ = checked_add(checked_multiply(limits_.reads, 2), checked_add(checked_multiply(limits_.voters, 4), 16));
-		output_payload_ = checked_add(limits_.log_bytes, checked_multiply(checked_add(limits_.voters, 2), limits_.rpc_bytes));
-		output_entries_ = checked_add(limits_.log_entries, checked_multiply(checked_add(limits_.voters, 2), limits_.rpc_entries));
+		// A leader sends to every member, learners included; a group's limits stay within the
+		// node's (R16).
+		output_count_ = checked_add(checked_multiply(limits_.reads, 2), checked_add(checked_multiply(limits_.members, 4), 16));
+		output_payload_ = checked_add(limits_.log_bytes, checked_multiply(checked_add(limits_.members, 2), limits_.rpc_bytes));
+		output_entries_ = checked_add(limits_.log_entries, checked_multiply(checked_add(limits_.members, 2), limits_.rpc_entries));
 	}
 	SubmitResult submit(Event event, bool maintenance_tick) {
 		return submit_retained(event, maintenance_tick);
@@ -794,19 +797,20 @@ private:
 			return true;
 		}
 		if (core_->busy() || !output_.empty() || completion_ || persist_ || application_ || cutover_debt_) { return false; }
-		for (auto peer : configuration_.voters) { if (core_->awaiting_snapshot(peer)) { return true; } }
+		for (auto peer : core_->peers()) { if (core_->awaiting_snapshot(peer)) { return true; } }
 		return false;
 	}
 	void source_one() {
 		refresh_source();
 		if (!source_) {
-			for (std::size_t checked = 0; checked < configuration_.voters.size(); ++checked) {
-				auto peer = configuration_.voters[source_next_]; source_next_ = (source_next_ + 1) % configuration_.voters.size(); auto key = core_->awaiting_snapshot(peer); if (!key) { continue; }
+			const auto peers = core_->peers();
+			for (std::size_t checked = 0; checked < peers.size(); ++checked) {
+				auto peer = peers[source_next_ % peers.size()]; source_next_ = (source_next_ + 1) % peers.size(); auto key = core_->awaiting_snapshot(peer); if (!key) { continue; }
 				if (core_->busy() || !output_.empty() || completion_ || persist_ || application_ || cutover_debt_) { return; }
 				auto selected = store_.select_published_dependency(0);
 				if (!published_ || !published_->format || *published_->format != snapshot_limits_->application_format || published_->boundary != key->boundary || core_->base_boundary() != key->boundary || !selected || selected->generation() != published_->generation || selected->descriptor().length > snapshot_limits_->application_bytes) { ingest(core_->step(SnapshotTransferFailed{peer, *key})); return; }
 				if (next_source_ == std::numeric_limits<Token>::max()) { throw std::length_error("source identity exhausted"); }
-				const auto& artifact = selected->descriptor(); SnapshotDescriptor descriptor{configuration_.cluster, configuration_.configuration, *published_->format, key->boundary.index, key->boundary.term, artifact.length, artifact.checksum, core_->base_membership()};
+				const auto& artifact = selected->descriptor(); SnapshotDescriptor descriptor{configuration_.cluster, configuration_.configuration, *published_->format, key->boundary.index, key->boundary.term, artifact.length, artifact.checksum, core_->snapshot_membership(peer)};
 				source_ = std::make_unique<Source>(std::move(*selected), peer, *key, ++next_source_, descriptor); return;
 			}
 			return;

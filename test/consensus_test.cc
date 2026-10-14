@@ -37,6 +37,12 @@
 
 using namespace kronuz::consensus;
 namespace {
+// The unit tests run on a compact timing profile (ticks of 10 to 20); the library default is
+// Track C's R4 profile, which the liveness test covers.
+constexpr Timing compact{20, 40, 100, 200, 60000};
+struct TestCore : Core {
+	TestCore(FixedConfiguration c, RecoveredState s, Limits l = {}, Timing t = compact) : Core(std::move(c), std::move(s), l, t) {}
+};
 int checks = 0, failures = 0;
 void check(bool value, std::string_view message) {
 	++checks;
@@ -79,7 +85,7 @@ Actions campaign(Core& core, Tick tick) {
 struct Host {
 	NodeId id;
 	Limits limits;
-	std::unique_ptr<Core> core;
+	std::unique_ptr<TestCore> core;
 	std::vector<std::string> journal;
 	std::vector<std::string> applied_commands;
 	std::vector<Entry> applied_entries;  // every applied entry, so a test can restore an image at an index
@@ -88,13 +94,13 @@ struct Host {
 	std::optional<Committed> applying;
 	bool auto_persist = true, auto_apply = true;
 	bool verify_replay = true;  // off once an install puts state the test journal cannot hold
-	explicit Host(NodeId local, std::size_t voters = 3, Limits bounds = {}) : id(local), limits(bounds), core(std::make_unique<Core>(config(local, voters), empty(local, voters), bounds)) {
+	explicit Host(NodeId local, std::size_t voters = 3, Limits bounds = {}) : id(local), limits(bounds), core(std::make_unique<TestCore>(config(local, voters), empty(local, voters), bounds)) {
 		journal.push_back(encode_initialization(config(local, voters)));
 	}
 	// A joiner (Track C, D5): no voters, a join record, an empty membership.
 	Host(NodeId local, FixedConfiguration joiner, Limits bounds = {}) : id(local), limits(bounds) {
 		RecoveredState state; state.configuration = joiner; state.membership = Membership{};
-		core = std::make_unique<Core>(joiner, std::move(state), bounds);
+		core = std::make_unique<TestCore>(joiner, std::move(state), bounds);
 		journal.push_back(encode_join(joiner));
 	}
 	RecoveredState recovered() const {
@@ -104,7 +110,7 @@ struct Host {
 	}
 	void restart() {
 		auto state = recovered(); auto configuration = state.configuration;
-		core = std::make_unique<Core>(std::move(configuration), std::move(state), limits);
+		core = std::make_unique<TestCore>(std::move(configuration), std::move(state), limits);
 		pending.reset(); applying.reset(); applied_commands.clear(); applied_entries.clear(); ready_reads.clear();
 	}
 };
@@ -182,7 +188,7 @@ struct Network {
 };
 
 void persistence_barriers() {
-	Core core(config(1), empty(1)); core.step(Start{});
+	TestCore core(config(1), empty(1)); core.step(Start{});
 	auto election = campaign(core, Tick{100, 100}); auto persist = find<Persist>(election);
 	check(persist && election.size() == 1 && !find<Send>(election), "term and self-vote persistence precedes election requests");
 	if (!persist) { return; }
@@ -200,7 +206,7 @@ void persistence_barriers() {
 	check(core.role() == Role::Fenced && find<Fenced>(failure), "failed no-op persistence fences consensus");
 	check(core.step(Tick{500, 100}).empty(), "fenced node cannot campaign or acknowledge traffic");
 
-	Core follower(config(2), empty(2)); follower.step(Start{});
+	TestCore follower(config(2), empty(2)); follower.step(Start{});
 	auto grant = follower.step(Receive{1, VoteRequest{3, 0, 0}}); auto ballot = find<Persist>(grant);
 	check(ballot && !find<Send>(grant), "higher term and granted ballot persist before response");
 	if (ballot) {
@@ -216,20 +222,20 @@ void persistence_barriers() {
 }
 
 void delayed_completions_do_not_campaign() {
-	Core candidate(config(1), empty(1)); candidate.step(Start{});
+	TestCore candidate(config(1), empty(1)); candidate.step(Start{});
 	auto election = campaign(candidate, Tick{100, 100}); auto ballot = find<Persist>(election);
 	if (!ballot) { check(false, "delayed candidate has an election ballot"); return; }
 	candidate.step(Tick{1000, 100}); auto completed = candidate.step(Persisted{ballot->token});
 	check(candidate.term() == 1 && !candidate.busy() && !find<Persist>(completed) && find<Send>(completed), "delayed candidate completion releases votes without another campaign");
 	auto next = campaign(candidate, Tick{1000, 100});  // the tick starts a pre-vote; its quorum, the campaign
 	check(find<Persist>(next) && candidate.term() == 2, "separately admitted tick at the same time may start the next campaign");
-	Core follower(config(2), empty(2)); follower.step(Start{});
+	TestCore follower(config(2), empty(2)); follower.step(Start{});
 	auto voted = follower.step(Receive{1, VoteRequest{3, 0, 0}}); auto vote = find<Persist>(voted);
 	if (!vote) { check(false, "delayed follower has a durable vote transition"); return; }
 	follower.step(Tick{1000, 100}); auto response = follower.step(Persisted{vote->token});
 	check(follower.term() == 3 && follower.role() == Role::Follower && !find<Persist>(response) && find<Send>(response), "delayed follower completion cannot opportunistically campaign");
 	check(find<Persist>(campaign(follower, Tick{1000, 100})) && follower.term() == 4, "next admitted tick campaigns after delayed follower persistence");
-	Core single(config(1, 1), empty(1, 1)); single.step(Start{});
+	TestCore single(config(1, 1), empty(1, 1)); single.step(Start{});
 	auto actions = single.step(Tick{100, 100}); unsigned completions = 0;
 	while (auto persist = find<Persist>(actions)) {
 		if (++completions > 4) { check(false, "single-voter continuation chain is bounded"); return; }
@@ -238,7 +244,7 @@ void delayed_completions_do_not_campaign() {
 	check(completions == 3 && single.role() == Role::Leader && single.committed() == 1 && find<Committed>(actions), "slow single-voter ballot no-op and commit finish without an extra tick");
 	single.step(Applied{1});
 	check(find<ReadReady>(single.step(Read{99})), "application delivery and fresh single-voter reads still complete immediately");
-	Core leader(config(1), empty(1)); leader.step(Start{});
+	TestCore leader(config(1), empty(1)); leader.step(Start{});
 	auto initial = campaign(leader, Tick{100, 100}); leader.step(Persisted{find<Persist>(initial)->token});
 	auto elected = leader.step(Receive{2, VoteResponse{1, true}}); auto noop = find<Persist>(elected);
 	leader.step(Tick{250, 100}); auto replication = leader.step(Persisted{noop->token});  // slow, within CheckQuorum's window
@@ -329,7 +335,7 @@ void membership_scripts() {
 	// commit 1, term 1) wins term 2 and has not committed its no-op: a change is refused.
 	{
 		RecoveredState state = empty(1, 4); state.hard = HardState{1, 1, 1}; state.entries = {{1, 1, EntryKind::NoOp, {}}};
-		Core leader(config(1, 4), state); leader.step(Start{}); leader.step(Applied{1});
+		TestCore leader(config(1, 4), state); leader.step(Start{}); leader.step(Applied{1});
 		auto ballot_actions = campaign(leader, Tick{100, 100});
 		auto ballot = find<Persist>(ballot_actions);
 		if (ballot) { leader.step(Persisted{ballot->token}); }
@@ -345,7 +351,7 @@ void membership_scripts() {
 	// D4: a leader that removes itself does not count itself: with one peer's acknowledgement
 	// of the removal, out of three remaining voters, the removal does not commit.
 	{
-		Core leader(config(1, 4), empty(1, 4)); leader.step(Start{});
+		TestCore leader(config(1, 4), empty(1, 4)); leader.step(Start{});
 		auto ballot_actions = campaign(leader, Tick{100, 100});  // find returns into it
 		auto ballot = find<Persist>(ballot_actions);
 		if (ballot) { leader.step(Persisted{ballot->token}); }
@@ -408,21 +414,21 @@ void membership_scripts() {
 
 void prevote_guard_checkquorum() {
 	// A pre-vote request never changes the receiver's term or ballot.
-	Core follower(config(2), empty(2)); follower.step(Start{});
+	TestCore follower(config(2), empty(2)); follower.step(Start{});
 	auto answer = follower.step(Receive{1, PreVoteRequest{5, 0, 0}});
 	auto reply = find<Send>(answer);
 	auto pre = reply ? std::get_if<PreVoteResponse>(&reply->message) : nullptr;
 	check(pre && pre->granted && pre->request_term == 5 && follower.term() == 0 && !follower.durable_hard_state().voted_for && !find<Persist>(answer),
 		"a pre-vote is granted without changing the receiver's term or ballot");
 	// A refusal that carries a higher term updates the pre-candidate's term.
-	Core pre_candidate(config(1), empty(1)); pre_candidate.step(Start{});
+	TestCore pre_candidate(config(1), empty(1)); pre_candidate.step(Start{});
 	auto asked = pre_candidate.step(Tick{100, 100});
 	check(!find<Persist>(asked) && pre_candidate.term() == 0, "an expired timer sends pre-votes, not a campaign");
 	auto refused = pre_candidate.step(Receive{2, PreVoteResponse{7, 1, false}});
 	check(pre_candidate.term() == 7 && find<Persist>(refused), "a refusal with a higher term updates the pre-candidate's term");
 	// A pre-vote whose candidate's log is behind is refused, and never starts a campaign.
 	RecoveredState ahead = empty(2); ahead.hard = HardState{2, std::nullopt, 0}; ahead.entries = {{1, 2, EntryKind::NoOp, {}}};
-	Core current(config(2), ahead); current.step(Start{});
+	TestCore current(config(2), ahead); current.step(Start{});
 	auto stale_actions = current.step(Receive{1, PreVoteRequest{3, 0, 0}});
 	auto stale = find<Send>(stale_actions);
 	auto stale_reply = stale ? std::get_if<PreVoteResponse>(&stale->message) : nullptr;
@@ -471,7 +477,7 @@ void replication_and_restart() {
 }
 
 void affirmative_majority_and_inheritance() {
-	Core candidate(config(1, 5), empty(1, 5)); candidate.step(Start{});
+	TestCore candidate(config(1, 5), empty(1, 5)); candidate.step(Start{});
 	auto initial = campaign(candidate, Tick{100, 100}); candidate.step(Persisted{find<Persist>(initial)->token});
 	candidate.step(Receive{2, VoteResponse{1, true}}); candidate.step(Receive{3, VoteResponse{1, false}});
 	check(candidate.role() == Role::Candidate, "two affirmative voters and denial cannot elect in five-voter configuration");
@@ -565,7 +571,7 @@ void application_lag_does_not_spin_reads() {
 	Network capacity; capacity.start(); capacity.elect(); capacity.isolated.insert(3);
 	auto& smaller = capacity.host(2); auto state = smaller.recovered(); auto configuration = state.configuration;
 	smaller.limits.log_entries = 1; smaller.limits.control_entries = 1;
-	smaller.core = std::make_unique<Core>(std::move(configuration), std::move(state), smaller.limits);
+	smaller.core = std::make_unique<TestCore>(std::move(configuration), std::move(state), smaller.limits);
 	capacity.consume(2, smaller.core->step(Tick{100, 120})); capacity.consume(2, smaller.core->step(Start{}));
 	capacity.consume(1, capacity.host(1).core->step(Propose{37, "peer at capacity"})); capacity.pump(100);
 	check(capacity.network.empty() && capacity.host(1).core->committed() == 1, "capacity rejection backs off without a fixed-time replication loop");
@@ -628,20 +634,20 @@ void bounds_and_semantic_recovery() {
 		"semantic replay rejects different content at the same index and term");
 
 	RecoveredState retained = empty(2); retained.hard = HardState{1, 1, 0}; retained.entries = {{1, 1, EntryKind::Command, "first"}};
-	Core conflict(config(2), std::move(retained)); conflict.step(Start{});
+	TestCore conflict(config(2), std::move(retained)); conflict.step(Start{});
 	auto rejected_content = conflict.step(Receive{1, AppendRequest{1, 1, 0, 0, 0, 0, {{1, 1, EntryKind::Command, "different"}}}});
 	check(find<Fenced>(rejected_content) && !find<Send>(rejected_content), "live consensus fails closed on same-index same-term content conflict");
 
 	RecoveredState exhausted = empty(1); exhausted.hard = HardState{1, 1, 4};
 	for (Index index = 1; index <= 4; ++index) { exhausted.entries.push_back(Entry{index, 1, EntryKind::NoOp, {}}); }
-	Core full_core(config(1), std::move(exhausted), limits); full_core.step(Start{});
+	TestCore full_core(config(1), std::move(exhausted), limits); full_core.step(Start{});
 	auto election = campaign(full_core, Tick{100, 100}); full_core.step(Persisted{find<Persist>(election)->token});
 	auto unable_to_lead = full_core.step(Receive{2, VoteResponse{2, true}});
 	check(full_core.role() == Role::Follower && full_core.last_index() == 4 && !find<Persist>(unable_to_lead),
 		"exhausted control reserve cannot publish leadership or append beyond log bound");
 
 	RecoveredState last_term = empty(1); last_term.hard = HardState{std::numeric_limits<Term>::max() - 1, std::nullopt, 0};
-	Core term_core(config(1), std::move(last_term)); term_core.step(Start{});
+	TestCore term_core(config(1), std::move(last_term)); term_core.step(Start{});
 	auto last_election = campaign(term_core, Tick{100, 100}); term_core.step(Persisted{find<Persist>(last_election)->token});
 	auto last_noop = term_core.step(Receive{2, VoteResponse{std::numeric_limits<Term>::max(), true}});
 	check(term_core.role() == Role::Leader && find<Persist>(last_noop), "final representable term may elect and append its no-op");
@@ -658,7 +664,7 @@ void local_checkpoint_core() {
 	auto state = empty(1); state.hard = HardState{1, 2, 3};
 	for (Index index = 1; index <= 4; ++index) { state.entries.push_back(Entry{index, 1, EntryKind::Command, "value"}); }
 	Limits limits; limits.rpc_entries = 1;
-	Core core(config(1), state, limits);
+	TestCore core(config(1), state, limits);
 	core.step(Start{}); auto second = core.step(Applied{1});
 	check(find<Committed>(second) && find<Committed>(second)->first == 2, "checkpoint fixture has an outstanding application range");
 	auto invalid = core.step(LocalCheckpoint{10, 7, 2, 1, config(1).cluster, config(1).configuration});
@@ -680,7 +686,7 @@ void local_checkpoint_core() {
 	auto prefix = core.step(Receive{2, AppendRequest{1, 90, 0, 0, 3, 0, {}}});
 	auto reply = find<Send>(prefix);
 	check(reply && std::get<AppendResponse>(reply->message).compacted && std::get<AppendResponse>(reply->message).compacted->index == 1, "compacted follower reports its explicit boundary");
-	Core restored(config(1), checkpoint->state, limits); auto replay = restored.step(Start{});
+	TestCore restored(config(1), checkpoint->state, limits); auto replay = restored.step(Start{});
 	check(restored.applied() == 1 && find<Committed>(replay) && find<Committed>(replay)->first == 2, "checkpoint restart replays committed suffix above application boundary");
 	auto failure = restored.step(StorageFault{"artifact preparation failed"});
 	check(restored.role() == Role::Fenced && find<Fenced>(failure), "out-of-band storage failure fences without pending persistence");
@@ -691,7 +697,7 @@ void compacted_index_exhaustion() {
 	for (Index base : {std::numeric_limits<Index>::max() - 1, std::numeric_limits<Index>::max() - 2}) {
 		auto state = empty(1, 1); state.base_index = state.applied_index = state.hard.commit_index = base;
 		state.base_term = state.hard.term = 1;
-		Core core(config(1, 1), state); core.step(Start{}); auto election = campaign(core, Tick{100, 100});
+		TestCore core(config(1, 1), state); core.step(Start{}); auto election = campaign(core, Tick{100, 100});
 		auto vote = find<Persist>(election); check(vote, "near-exhausted voter durably records its ballot"); if (!vote) { continue; }
 		auto elected = core.step(Persisted{vote->token});
 		if (base == std::numeric_limits<Index>::max() - 1) {
@@ -718,7 +724,7 @@ const AppendRequest* append_to(const Actions& actions, NodeId peer) {
 }
 // Snapshot and retry tests run a leader for long stretches with one peer answering; a long
 // election_max keeps CheckQuorum (Track C, D7) out of what they measure.
-Timing patient() { Timing t; t.election_max = 1'000'000'000; return t; }
+Timing patient() { Timing t = compact; t.election_max = 1'000'000'000; return t; }
 Actions elect_checkpoint_fixture(Core& core) {
 	core.step(Start{}); if (core.committed() > core.applied()) { core.step(Applied{core.committed()}); }
 	auto election = campaign(core, Tick{100, 100}); auto vote = find<Persist>(election);
@@ -730,7 +736,7 @@ Actions elect_checkpoint_fixture(Core& core) {
 void compacted_replication() {
 	auto state = empty(1); state.hard = HardState{1, 1, 2};
 	for (Index index = 1; index <= 3; ++index) { state.entries.push_back(Entry{index, 1, EntryKind::Command, "value"}); }
-	Core core(config(1), state); auto traffic = elect_checkpoint_fixture(core); auto first = append_to(traffic, 2);
+	TestCore core(config(1), state); auto traffic = elect_checkpoint_fixture(core); auto first = append_to(traffic, 2);
 	if (!first) { throw std::runtime_error("fixture first flight"); }
 	auto rewind = core.step(Receive{2, AppendResponse{2, first->rpc, false, 0, 1, 0}}); auto old = append_to(rewind, 2);
 	if (!old) { throw std::runtime_error("fixture prefix flight"); }
@@ -751,7 +757,7 @@ void compacted_replication() {
 	check(find<ReadReady>(ready), "fresh verified Append establishes the pending read quorum");
 
 	state.base_index = state.applied_index = 2; state.base_term = 1; state.entries.erase(state.entries.begin(), state.entries.begin() + 2);
-	Core compacted(config(1), state, {}, patient()); auto election = elect_checkpoint_fixture(compacted); auto append = append_to(election, 2);
+	TestCore compacted(config(1), state, {}, patient()); auto election = elect_checkpoint_fixture(compacted); auto append = append_to(election, 2);
 	if (!append) { throw std::runtime_error("compacted fixture flight"); }
 	auto needed = compacted.step(Receive{2, AppendResponse{2, append->rpc, false, 0, 1, 0}});
 	check(find<SnapshotNeeded>(needed), "leader requests snapshot when a peer needs compacted history");
@@ -763,7 +769,7 @@ void compacted_replication() {
 
 	auto empty_suffix = empty(1); empty_suffix.base_index = empty_suffix.applied_index = empty_suffix.hard.commit_index = 2;
 	empty_suffix.base_term = empty_suffix.hard.term = 1;
-	Core boundary_only(config(1), empty_suffix); auto boundary_traffic = elect_checkpoint_fixture(boundary_only); auto boundary_append = append_to(boundary_traffic, 2);
+	TestCore boundary_only(config(1), empty_suffix); auto boundary_traffic = elect_checkpoint_fixture(boundary_only); auto boundary_append = append_to(boundary_traffic, 2);
 	if (!boundary_append) { throw std::runtime_error("empty suffix flight"); }
 	check(boundary_append->previous == 2 && boundary_append->previous_term == 1, "empty retained suffix election uses checkpoint boundary term");
 	auto boundary_ack = boundary_only.step(Receive{2, AppendResponse{2, boundary_append->rpc, true, 3, 4, 0}}); auto boundary_commit = find<Persist>(boundary_ack);
@@ -775,7 +781,7 @@ void compacted_replication() {
 
 	state = empty(1); state.hard = HardState{1, 1, 2};
 	for (Index index = 1; index <= 3; ++index) { state.entries.push_back(Entry{index, 1, EntryKind::Command, "value"}); }
-	Core crossing(config(1), state); traffic = elect_checkpoint_fixture(crossing); first = append_to(traffic, 2);
+	TestCore crossing(config(1), state); traffic = elect_checkpoint_fixture(crossing); first = append_to(traffic, 2);
 	rewind = crossing.step(Receive{2, AppendResponse{2, first->rpc, false, 0, 1, 0}}); old = append_to(rewind, 2);
 	if (!old) { throw std::runtime_error("crossing fixture flight"); } auto rpc = old->rpc;
 	auto publication = crossing.step(LocalCheckpoint{90, 1, 2, 1, config(1).cluster, config(1).configuration}); auto checkpoint = find<PersistCheckpoint>(publication);
@@ -823,7 +829,7 @@ void real_journal_integration() {
 		kronuz::journal::PosixIO io(directory); kronuz::journal::Journal journal(io, 1024 * 1024);
 		kronuz::journal::Identity identity{}; identity[0] = 'J'; journal.create(identity);
 		journal.append_batch(encode_initialization(config(1, 1)));
-		Core core(config(1, 1), empty(1, 1));
+		TestCore core(config(1, 1), empty(1, 1));
 		std::optional<kronuz::journal::PreparedArtifact> application;
 		std::deque<Action> actions;
 		auto enqueue = [&](Actions next) { for (auto& action : next) { actions.push_back(std::move(action)); } };
@@ -878,7 +884,7 @@ void real_journal_integration() {
 			});
 		auto state = recovery.finish(frontier.sequence);
 		check(state.base_index == 2 && state.hard.commit_index == 3 && state.entries.size() == 1, "actual journal reopening reconstructs strict committed state");
-		Core restored(config(1, 1), std::move(state)); auto committed = restored.step(Start{});
+		TestCore restored(config(1, 1), std::move(state)); auto committed = restored.step(Start{});
 		auto delivery = find<Committed>(committed);
 		check(delivery && delivery->entries.back().payload == "after snapshot", "restored application delivery includes only committed suffix command");
 		if (delivery) {
@@ -905,7 +911,7 @@ void real_store_integration() {
 			journal.append(*reservation, bytes);
 		};
 		append(kronuz::journal::AdmissionClass::Control, encode_initialization(config(1, 1)));
-		Core core(config(1, 1), empty(1, 1));
+		TestCore core(config(1, 1), empty(1, 1));
 		std::optional<kronuz::journal::ArtifactDescriptor> application;
 		std::optional<kronuz::journal::ReplacementId> replacement;
 		std::deque<Action> actions;
@@ -966,7 +972,7 @@ void real_store_integration() {
 		while (!journal.inventory_step(1).complete) {}
 		auto state = recovery.finish(frontier.sequence);
 		check(state.base_index == 2 && state.hard.commit_index == 3 && state.entries.size() == 1, "actual journal reopening reconstructs strict committed state");
-		Core restored(config(1, 1), std::move(state)); auto committed = restored.step(Start{});
+		TestCore restored(config(1, 1), std::move(state)); auto committed = restored.step(Start{});
 		auto delivery = find<Committed>(committed);
 		check(delivery && delivery->entries.back().payload == "after snapshot", "restored application delivery includes only committed suffix command");
 		if (delivery) {
@@ -1173,7 +1179,7 @@ void event_admission_plans() {
 	check(throws([] { plan_event(Persisted{1}, false); }) && throws([] { plan_event(LocalCheckpoint{1, 1, 1, 1, {}, {}}, false); }), "external persistence completions and raw checkpoint requests reject explicitly");
 	check(plan_event(Start{}, false).count == 0 && plan_event(Read{1}, false).count == 0, "nonpersistent events do not charge a storage pack");
 	for (Message message : {Message{VoteResponse{9, false}}, Message{AppendRequest{9, 1, 0, 0, 0, 0, {}}}}) {
-		Core core(config(1), empty(1)); core.step(Start{});
+		TestCore core(config(1), empty(1)); core.step(Start{});
 		auto event = Receive{2, message}; auto plan = plan_event(event, false);
 		auto actions = core.step(event); auto persist = find<Persist>(actions);
 		check(persist && plan.count > 0 && storage_batch_size(persist->batch) <= plan.appends[0].encoded_bytes, "higher-term hard-state writes fit response and empty-append plans");
@@ -1273,7 +1279,7 @@ void portable_snapshot_installation() {
 		auto fixed = config(1); return InstallPrepared{13, 77, 2, 3, fixed.cluster, fixed.configuration, {3, 2}};
 	};
 	for (bool before : {false, true}) { for (bool retain : {false, true}) { for (bool higher : {false, true}) {
-		Core core(config(1), fixture()); auto initial = core.step(Start{});
+		TestCore core(config(1), fixture()); auto initial = core.step(Start{});
 		check(find<Committed>(initial) && find<Committed>(initial)->entries.back().index == 2, "install fixture has an outstanding committed application range");
 		auto prepared = request(); prepared.leader_term += higher; if (!retain) { prepared.boundary.term = 3; }
 		auto actions = core.step(prepared); auto persist = find<PersistInstall>(actions);
@@ -1310,7 +1316,7 @@ void portable_snapshot_installation() {
 		auto election = campaign(core, Tick{1200, 100}); check(find<Persist>(election), "a separately admitted expired Tick may campaign after installation activation");
 	} } }
 	for (bool higher : {false, true}) {
-		Core core(config(1), fixture()); core.step(Start{}); auto prepared = request(); prepared.boundary = {2, 1}; prepared.leader_term += higher;
+		TestCore core(config(1), fixture()); core.step(Start{}); auto prepared = request(); prepared.boundary = {2, 1}; prepared.leader_term += higher;
 		auto stale = core.step(prepared);
 		if (higher) {
 			auto hard = find<Persist>(stale); check(hard && hard->batch.hard && !find<InstallRejected>(stale) && !find<PersistInstall>(stale), "caught-up higher-term snapshot persists its receiver term before rejection");
@@ -1321,7 +1327,7 @@ void portable_snapshot_installation() {
 			core.durable_hard_state().voted_for == (higher ? std::optional<NodeId>{} : std::optional<NodeId>{2}), "caught-up images preserve application state and the proper receiver ballot");
 	}
 	for (unsigned invalid = 0; invalid < 12; ++invalid) {
-		Core core(config(1), fixture()); core.step(Start{}); auto prepared = request();
+		TestCore core(config(1), fixture()); core.step(Start{}); auto prepared = request();
 		switch (invalid) {
 		case 0: prepared.request = 0; break; case 1: prepared.prepared = 0; break;
 		case 2: prepared.authenticated_peer = 1; break; case 3: prepared.authenticated_peer = 0; break;  // any authenticated incarnation may send (D5)
@@ -1334,14 +1340,14 @@ void portable_snapshot_installation() {
 		check(rejected && rejected->reason == (invalid == 7 ? InstallRejectReason::StaleTerm : InstallRejectReason::Invalid) && !core.busy() && core.term() == 3 && core.committed() == 2, "invalid or stale sender context changes no receiver state");
 	}
 	{
-		Core unstarted(config(1), fixture()); auto rejected = unstarted.step(request());
+		TestCore unstarted(config(1), fixture()); auto rejected = unstarted.step(request());
 		check(find<InstallRejected>(rejected) && find<InstallRejected>(rejected)->reason == InstallRejectReason::Busy && !unstarted.busy(), "unstarted Core does not admit installation");
-		Core core(config(1), fixture()); core.step(Start{}); campaign(core, Tick{100, 100}); auto term = core.term();
+		TestCore core(config(1), fixture()); core.step(Start{}); campaign(core, Tick{100, 100}); auto term = core.term();
 		auto prepared = request(); prepared.leader_term = 9; rejected = core.step(prepared);
 		check(find<InstallRejected>(rejected) && find<InstallRejected>(rejected)->reason == InstallRejectReason::Busy && core.busy() && core.term() == term, "ordinary pending persistence rejects installation without observing another term");
 	}
 	{
-		Core core(config(1), fixture()); core.step(Start{}); core.step(Applied{2}); auto prepared = request();
+		TestCore core(config(1), fixture()); core.step(Start{}); core.step(Applied{2}); auto prepared = request();
 		prepared.boundary.index = std::numeric_limits<Index>::max() - 1;
 		prepared.boundary.term = prepared.leader_term = std::numeric_limits<Term>::max();
 		auto actions = core.step(prepared); auto persist = find<PersistInstall>(actions);
@@ -1352,7 +1358,7 @@ void portable_snapshot_installation() {
 		}
 	}
 	for (unsigned failure = 0; failure < 5; ++failure) {
-		Core core(config(1), fixture()); core.step(Start{}); auto actions = core.step(request()); auto token = find<PersistInstall>(actions)->token;
+		TestCore core(config(1), fixture()); core.step(Start{}); auto actions = core.step(request()); auto token = find<PersistInstall>(actions)->token;
 		check(core.step(Failed{FailureSource::Storage, token + 100, "stale"}).empty(), "stale install storage failure cannot fence another operation");
 		if (failure != 0 && failure != 4) { core.step(Persisted{token}); }
 		Actions failed;
@@ -1371,7 +1377,7 @@ void portable_snapshot_installation() {
 
 void snapshot_timeout_retries() {
 	auto state = empty(1); state.hard = HardState{1, 1, 2}; state.base_index = state.applied_index = 2; state.base_term = 1; state.entries = {{3, 1, EntryKind::Command, "tail"}};
-	Core core(config(1), state, {}, patient()); auto election = elect_checkpoint_fixture(core); auto first = append_to(election, 2); if (!first) { throw std::runtime_error("snapshot retry fixture flight"); }
+	TestCore core(config(1), state, {}, patient()); auto election = elect_checkpoint_fixture(core); auto first = append_to(election, 2); if (!first) { throw std::runtime_error("snapshot retry fixture flight"); }
 	auto needed = core.step(Receive{2, AppendResponse{2, first->rpc, false, 0, 1, 0}}); check(find<SnapshotNeeded>(needed), "snapshot timeout fixture requests missing history");
 	core.step(Tick{60100, 100}); auto retry = core.step(Tick{60140, 100}); auto probe = append_to(retry, 2);
 	check(probe && probe->previous == 2, "expired snapshot request retries through a fresh ordinary prefix probe");
@@ -1382,7 +1388,7 @@ struct SnapshotSenderFixture {
 	static RecoveredState state() {
 		auto result = empty(1); result.hard = {1, 1, 2}; result.base_index = result.applied_index = 2; result.base_term = 1; result.entries = {{3, 1, EntryKind::Command, "tail"}}; return result;
 	}
-	Core core; SnapshotKey key{}; Actions requested, election;
+	TestCore core; SnapshotKey key{}; Actions requested, election;
 	explicit SnapshotSenderFixture(Timing timing = patient()) : core(config(1), state(), {}, timing) {
 		election = elect_checkpoint_fixture(core); auto first = append_to(election, 2); if (!first) { throw std::runtime_error("sender fixture initial data flight"); }
 		requested = core.step(Receive{2, AppendResponse{2, first->rpc, false, 0, 1, 0}}); auto needed = find<SnapshotNeeded>(requested); if (!needed) { throw std::runtime_error("sender fixture snapshot request"); } key = needed->key;
@@ -1491,7 +1497,7 @@ void snapshot_sender_lost_ack_and_terms() {
 	check(released && released->key == malformed.key && released->reason == SnapshotReleaseReason::Fenced && find<Fenced>(fenced), "direct fencing retires active source resources without a progress acknowledgment");
 }
 void snapshot_sender_receiver_contact() {
-	SnapshotSenderFixture fixture; auto& leader = fixture.core; Core follower(config(2), empty(2)); follower.step(Tick{100, 100}); follower.step(Start{});
+	SnapshotSenderFixture fixture; auto& leader = fixture.core; TestCore follower(config(2), empty(2)); follower.step(Tick{100, 100}); follower.step(Start{});
 	auto initial = append_to(fixture.requested, 2); if (!initial) { throw std::runtime_error("contact fixture genesis keepalive"); }
 	auto contact = follower.step(Receive{1, *initial}); if (auto persist = find<Persist>(contact)) { follower.step(Tick{100, 100}); follower.step(Persisted{persist->token}); }
 	fixture.ready(); unsigned delivered = 1;
@@ -1508,7 +1514,7 @@ void snapshot_sender_receiver_contact() {
 }
 void snapshot_sender_restart_clock_and_admission() {
 	SnapshotSenderFixture old; old.ready(); auto recovered = SnapshotSenderFixture::state(); recovered.hard = {2, 1, 2}; recovered.entries.push_back({4, 2, EntryKind::NoOp, ""});
-	Core restarted(config(1), recovered); auto election = elect_checkpoint_fixture(restarted); auto first = append_to(election, 2); if (!first) { throw std::runtime_error("restarted sender initial flight"); }
+	TestCore restarted(config(1), recovered); auto election = elect_checkpoint_fixture(restarted); auto first = append_to(election, 2); if (!first) { throw std::runtime_error("restarted sender initial flight"); }
 	auto requested = restarted.step(Receive{2, AppendResponse{3, first->rpc, false, 0, 1, 0}}); auto needed = find<SnapshotNeeded>(requested); if (!needed) { throw std::runtime_error("restarted sender snapshot request"); }
 	auto key = needed->key; check(key.transfer == old.key.transfer && key.leader_term == 3 && old.key.leader_term == 2, "restart can reuse numeric transfers only under a newly persisted leader epoch"); restarted.step(SnapshotSourceReady{2, key});
 	check(!find<SnapshotReleased>(restarted.step(Receive{2, SnapshotResponse{3, old.key, SnapshotReply::Installed}})), "old incarnation cannot complete a same-numbered restarted flight");
@@ -1526,7 +1532,7 @@ void snapshot_sender_restart_clock_and_admission() {
 void snapshot_sender_maximum_fanout() {
 	auto cfg = config(1); cfg.voters.clear(); for (NodeId peer = 1; peer <= 31; ++peer) { cfg.voters.push_back(peer); }
 	auto state = SnapshotSenderFixture::state(); state.configuration = cfg; Limits capacity; capacity.voters = 31;
-	Core core(cfg, state, capacity); core.step(Start{}); auto ballot_actions = campaign(core, Tick{100, 100}); auto ballot = find<Persist>(ballot_actions); if (!ballot) { throw std::runtime_error("fanout ballot"); } core.step(Persisted{ballot->token});
+	TestCore core(cfg, state, capacity); core.step(Start{}); auto ballot_actions = campaign(core, Tick{100, 100}); auto ballot = find<Persist>(ballot_actions); if (!ballot) { throw std::runtime_error("fanout ballot"); } core.step(Persisted{ballot->token});
 	Actions traffic;
 	for (NodeId voter = 2; voter <= 16; ++voter) { auto actions = core.step(Receive{voter, VoteResponse{2, true}}); if (auto noop = find<Persist>(actions)) { traffic = core.step(Persisted{noop->token}); } }
 	std::map<NodeId, SnapshotKey> keys;
@@ -1550,7 +1556,7 @@ void terminal_retirement() {
  for (Index index = 1; index <= 4096; ++index) {
   state.entries.push_back({index, 1, EntryKind::Command, std::string(index == 4096 ? 1024 * 1024 : 1024, 'x')});
  }
- Core core(config(1), std::move(state));
+ TestCore core(config(1), std::move(state));
  core.step(Start{}); core.step(Applied{1});
  auto frozen = core.step_capture(LocalCheckpoint{11, 7, 1, 1, config(1).cluster, config(1).configuration});
  check(frozen.capture && frozen.capture->size() == 4095, "terminal fixture retains a frozen suffix");
@@ -1677,11 +1683,11 @@ void witnesses() {
 	Membership founding{{{1, 1, R::Voter}, {2, 2, R::Voter}, {3, 3, R::Witness}}, 4, 0};
 	for (NodeId id : {1u, 2u, 3u}) {
 		auto state = empty(id); state.membership = founding;
-		cluster.host(id).core = std::make_unique<Core>(config(id), std::move(state));
+		cluster.host(id).core = std::make_unique<TestCore>(config(id), std::move(state));
 	}
 	// Alone: a witness that wins refuses proposals and reads.
 	auto lone_state = empty(3); lone_state.membership = founding;
-	Core lone(config(3), std::move(lone_state)); lone.step(Start{});
+	TestCore lone(config(3), std::move(lone_state)); lone.step(Start{});
 	auto ballot = campaign(lone, Tick{100, 100});
 	lone.step(Persisted{find<Persist>(ballot)->token});
 	auto noop = lone.step(Receive{1, VoteResponse{lone.term(), true}});
@@ -1706,7 +1712,7 @@ void witnesses() {
 		Network cut;
 		for (NodeId id : {1u, 2u, 3u}) {
 			auto state = empty(id); state.membership = founding;
-			cut.host(id).core = std::make_unique<Core>(config(id), std::move(state));
+			cut.host(id).core = std::make_unique<TestCore>(config(id), std::move(state));
 		}
 		cut.start(); cut.now = 200; cut.isolated = {1};
 		auto& w3 = *cut.host(3).core;
@@ -1716,7 +1722,7 @@ void witnesses() {
 	}
 	// A witness checkpoints only through what every data voter has matched.
 	auto bound_state = empty(3); bound_state.membership = founding;
-	Core w(config(3), std::move(bound_state)); w.step(Start{});
+	TestCore w(config(3), std::move(bound_state)); w.step(Start{});
 	auto appended = w.step(Receive{1, AppendRequest{1, 9, 0, 0, 2, 0, {{1, 1, EntryKind::NoOp, {}}, {2, 1, EntryKind::Command, "x"}}, 1}});
 	auto delivered = w.step(Persisted{find<Persist>(appended)->token});
 	check(find<Committed>(delivered) && w.witness_bound() == 1, "a witness records the data voters' matched index");
@@ -1774,7 +1780,7 @@ void founding_records() {
 		Recovery recovery(joiner); recovery.replay(1, join);
 		auto state = recovery.finish(1);
 		check(state.membership && state.membership->members.empty(), "RFTJOIN1 recovers an empty membership");
-		Core core(joiner, std::move(state)); core.step(Start{});
+		TestCore core(joiner, std::move(state)); core.step(Start{});
 		auto quiet = core.step(Tick{1000, 100});
 		check(!find<Send>(quiet) && !find<Persist>(quiet), "a joiner never campaigns");
 	}
@@ -1801,7 +1807,12 @@ void limits_by_position() {
 	Membership odd = plain; odd.limits = inconsistent;
 	check(throws([&] { (void)decode_membership(encode_membership(odd)); }), "inconsistent limits are corruption");
 
-	Network cluster; cluster.start(); cluster.elect();
+	// The leader's node carries 2 MiB commands; its followers' nodes default to 1 MiB, so they
+	// accept a raised command only by position.
+	Limits wide_node; wide_node.command_bytes = 2 * 1024 * 1024;
+	Network cluster(3, wide_node);
+	for (NodeId id : {2u, 3u}) { cluster.hosts[id] = std::make_unique<Host>(id, 3); }
+	cluster.start(); cluster.elect();
 	auto& leader = *cluster.host(1).core;
 	auto change = [&](Limits limits) {
 		Membership next = leader.membership(); next.limits = limits;
@@ -1811,19 +1822,20 @@ void limits_by_position() {
 		return !rejected;
 	};
 	const std::string big(1536 * 1024, 'b');
+	Limits lowered = wide_node; lowered.command_bytes = 1024 * 1024;
+	check(change(lowered), "a leader lowers the group's command limit");
 	auto early = leader.step(Propose{91, big});
-	check(find<Reject>(early) && find<Reject>(early)->reason == RejectReason::TooLarge, "a command above the node's default is refused");
-	// Raise: followers whose node default is lower accept it by position.
-	Limits raised; raised.command_bytes = 2 * 1024 * 1024;
-	check(change(raised), "a leader raises the group's command limit");
+	check(find<Reject>(early) && find<Reject>(early)->reason == RejectReason::TooLarge, "a command above the group's limit is refused");
+	// Raise: followers whose node limit is lower accept it by position.
+	check(change(wide_node), "a leader raises the group's command limit back to its node's");
 	cluster.consume(1, leader.step(Propose{92, big})); cluster.pump(); cluster.tick(cluster.now + 30); cluster.pump();
 	for (NodeId id : {1u, 2u, 3u}) {
 		auto& applied = cluster.host(id).applied_commands;
 		check(!applied.empty() && applied.back().size() == big.size(), "every member applies a command admitted under raised limits");
 	}
 	// Lower: earlier entries stay valid, in the log and after a restart; new ones are refused.
-	Limits lowered; lowered.command_bytes = 512 * 1024;
-	check(change(lowered), "a leader lowers the group's command limit");
+	Limits low = wide_node; low.command_bytes = 512 * 1024;
+	check(change(low), "a leader lowers the group's command limit");
 	auto late = leader.step(Propose{93, std::string(700 * 1024, 'c')});
 	check(find<Reject>(late) && find<Reject>(late)->reason == RejectReason::TooLarge, "a command above a lowered limit is refused");
 	for (NodeId id : {2u, 3u}) {
@@ -1832,9 +1844,14 @@ void limits_by_position() {
 		cluster.consume(id, host.core->step(Start{}));
 		check(!host.applied_commands.empty() && host.applied_commands.back().size() == big.size(), "the large command replays after a lowering");
 	}
-	// A group's RPC limits stay within the node's transport.
-	Limits wide; wide.rpc_bytes = 4 * 1024 * 1024; wide.log_bytes = 128 * 1024 * 1024;
-	check(!change(wide), "RPC limits above the node's transport are refused");
+	// A group's command and RPC limits stay within the node's.
+	Limits beyond = wide_node; beyond.rpc_bytes = 4 * 1024 * 1024; beyond.log_bytes = 128 * 1024 * 1024;
+	check(!change(beyond), "RPC limits above the node's are refused");
+	// A command limit below a Configuration entry's size does not wedge the group.
+	Limits tiny = wide_node; tiny.command_bytes = 64; tiny.rpc_bytes = 4096;
+	check(change(tiny), "a leader lowers the command limit below a membership's encoding");
+	const auto before = leader.committed();
+	check(change(wide_node) && leader.committed() > before && leader.group_limits() == wide_node, "a later membership change still commits and raises it back");
 	// A retained-log limit below usage blocks proposals.
 	Limits tight; tight.command_bytes = 1024; tight.rpc_bytes = 1024; tight.log_bytes = 1024;
 	check(change(tight), "a leader lowers the retained-log limit below usage");

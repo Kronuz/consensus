@@ -75,7 +75,7 @@ public:
 		for (std::size_t i = 0; i < entries_.size(); ++i) {
 			const auto& entry = entries_[i];
 			if (entry.index != base_index_ + i + 1 || !valid_entry(entry) || entry.term > hard_.term || entry.term < previous_term ||
-				entry.payload.size() > limits_at(entry.index).command_bytes || entry.payload.size() > ceilings.log_bytes - log_bytes_) { throw std::invalid_argument("invalid recovered entry"); }
+				!fits(entry, limits_at(entry.index)) || entry.payload.size() > ceilings.log_bytes - log_bytes_) { throw std::invalid_argument("invalid recovered entry"); }
 			log_bytes_ += entry.payload.size(); previous_term = entry.term;
 			note_append(entry);
 		}
@@ -154,11 +154,24 @@ public:
 	}
 	bool busy() const noexcept { return pending_.has_value() || install_.has_value(); }
 	bool transferring() const noexcept { return transfer_.has_value(); }
+	// The incarnations a leader replicates to (every member, and removed ones until their
+	// removal commits); empty otherwise.
+	std::vector<NodeId> peers() const {
+		std::vector<NodeId> out;
+		for (const auto& [id, peer] : peers_) { out.push_back(id); }
+		return out;
+	}
 	// The limits the group applies to its next entry (R16).
 	const Limits& group_limits() const { return limits_in_force(); }
 	// The membership in force at the base index, as a snapshot carries it; absent for a
 	// fixed group's founding membership.
 	std::optional<Membership> base_membership() const { return retain_base_membership(base_membership_); }
+	// The base membership a snapshot for `peer` carries: implicit only for a founding voter,
+	// which knows the founding membership; explicit for anyone else, a joiner included (D5).
+	std::optional<Membership> snapshot_membership(NodeId peer) const {
+		const bool founding = std::find(configuration_.voters.begin(), configuration_.voters.end(), peer) != configuration_.voters.end();
+		return founding ? base_membership() : std::optional<Membership>(base_membership_);
+	}
 	Index witness_bound() const noexcept { return witness_bound_; }
 	const HardState& durable_hard_state() const noexcept { return durable_; }
 	const FixedConfiguration& configuration() const noexcept { return configuration_; }
@@ -281,6 +294,17 @@ private:
 	// The limits a group applies: its newest configuration's, else the node's (R16).
 	const Limits& limits_of(const Membership& m) const { return m.limits ? *m.limits : limits_; }
 	const Limits& limits_in_force() const { return limits_of(membership()); }
+	// Commands are bound by the command limit in force; a Configuration entry only by its
+	// encoding (maximum_membership_bytes), so lowering the limit cannot wedge a group (R16).
+	static bool within(const Limits& group, const Limits& node) {
+		return group.voters <= node.voters && group.command_bytes <= node.command_bytes && group.log_bytes <= node.log_bytes &&
+			group.log_entries <= node.log_entries && group.control_entries <= node.control_entries && group.rpc_bytes <= node.rpc_bytes &&
+			group.rpc_entries <= node.rpc_entries && group.reads <= node.reads && group.uncommitted_entries <= node.uncommitted_entries &&
+			group.members <= node.members;
+	}
+	static bool fits(const Entry& entry, const Limits& limits) {
+		return entry.kind == EntryKind::Command ? entry.payload.size() <= limits.command_bytes : entry.payload.size() <= maximum_membership_bytes;
+	}
 	// The limits an entry at `index` is checked against: those in force just before it.
 	const Limits& limits_at(Index index) const { return limits_of(membership_at(index - 1)); }
 	void note_truncate(Index from) { configs_.erase(configs_.lower_bound(from), configs_.end()); }
@@ -395,6 +419,8 @@ private:
 			request.leader_term == 0 || request.boundary.index == 0 || request.boundary.index == maximum ||
 			request.boundary.term == 0 || request.boundary.term > request.leader_term) { reject(InstallRejectReason::Invalid); return; }
 		if (request.leader_term < hard_.term) { reject(InstallRejectReason::StaleTerm); return; }
+		// A joiner knows no founding membership, so an install must name its base (D5).
+		const bool unnamed = !request.membership && configuration_.voters.empty();
 		auto next_hard = durable_;
 		if (request.leader_term > next_hard.term) { next_hard.term = request.leader_term; next_hard.voted_for.reset(); }
 		if (request.boundary.index <= durable_.commit_index) {
@@ -405,6 +431,7 @@ private:
 			return;
 		}
 		bool retain = request.boundary.index <= last_index() && log_term(request.boundary.index) == request.boundary.term;
+		if (unnamed && (!retain || membership_at(request.boundary.index).members.empty())) { reject(InstallRejectReason::Invalid); return; }
 		next_hard.commit_index = request.boundary.index;
 		RecoveredState state{configuration_, next_hard, request.boundary.index, request.boundary.term, {}, request.boundary.index};
 		state.membership = retain_base_membership(retain ? std::optional<Membership>(membership_at(request.boundary.index)) : request.membership);
@@ -458,7 +485,8 @@ private:
 		if (request.capture == 0 || request.epoch != epoch_ || request.cluster != configuration_.cluster || request.configuration != configuration_.configuration ||
 			request.through <= base_index_ || request.through > applied_ || applied_ > durable_.commit_index ||
 			(witness_self() && request.through > witness_bound_) ||
-			log_term(request.through) != request.term) {
+			log_term(request.through) != request.term || membership_at(request.through).members.empty()) {
+			// A joiner cannot checkpoint below the entry that first names its membership.
 			output.emplace_back(Reject{request.request, RejectReason::InvalidCheckpoint}); return;
 		}
 		for (const auto& [id, peer] : peers_) {
@@ -520,9 +548,9 @@ private:
 		} catch (const std::invalid_argument&) {
 			reject(RejectReason::InvalidMembership); return;
 		}
-		// A group's RPC limits stay within what this node's transport carries.
-		if (change.next.limits && (change.next.limits->command_bytes > limits_.rpc_bytes || change.next.limits->rpc_bytes > limits_.rpc_bytes ||
-			change.next.limits->rpc_entries > limits_.rpc_entries)) { reject(RejectReason::InvalidMembership); return; }
+		// A group's limits stay within the node's, which bound its transport, admission,
+		// codec, and Worker; a group lowers and raises them beneath (R16).
+		if (change.next.limits && !within(*change.next.limits, limits_)) { reject(RejectReason::InvalidMembership); return; }
 		for (const auto& x : change.next.members) {
 			auto old = find_member(current, x.incarnation);
 			if (old && !voting(old->role) && voting(x.role)) {
@@ -562,6 +590,18 @@ private:
 		auto& peer = peers_.at(target);
 		if (peer.next <= last_index()) { replicate(target, peer, output, needed_probe(target)); }
 		timeout_now(output);
+	}
+	// The most caught-up data voter of the membership in force among those that answered
+	// since this node became leader and within the election timeout (D4, D9).
+	std::optional<NodeId> handoff_target() const {
+		std::optional<NodeId> best; Index matched = 0;
+		for (const auto& [id, peer] : peers_) {
+			auto member = find_member(membership(), id);
+			auto answer = answered_.find(id);
+			const bool live = answer != answered_.end() && now_ - answer->second < timing_.election_max && answer->second > leadership_start_;
+			if (member && member->role == MemberRole::Voter && live && (!best || peer.matched > matched)) { best = id; matched = peer.matched; }
+		}
+		return best;
 	}
 	bool witness_self() const {
 		auto self = find_member(membership(), configuration_.local);
@@ -622,7 +662,7 @@ private:
 		// A pre-vote request names the term its sender would campaign at: answered without
 		// changing this node's term or ballot (Track C, D7).
 		if (auto request = std::get_if<PreVoteRequest>(&receive.message)) {
-			bool grant = request->term > hard_.term && is_voter(configuration_.local) && !heard_from_leader() && log_up_to_date(request->last_index, request->last_term);
+			bool grant = request->term > hard_.term && !heard_from_leader() && log_up_to_date(request->last_index, request->last_term);
 			output.emplace_back(Send{receive.authenticated_peer, PreVoteResponse{hard_.term, request->term, grant}}); return;
 		}
 		// The leader-contact guard: a voter that heard from a current leader within
@@ -675,7 +715,7 @@ private:
 		return true;
 	}
 	void receive_message(NodeId source, VoteRequest request, StorageBatch&, Actions& output) {
-		bool grant = request.term == hard_.term && is_voter(configuration_.local) && (!hard_.voted_for || *hard_.voted_for == source) && log_up_to_date(request.last_index, request.last_term);
+		bool grant = request.term == hard_.term && (!hard_.voted_for || *hard_.voted_for == source) && log_up_to_date(request.last_index, request.last_term);
 		if (grant) { hard_.voted_for = source; reset_election(); }
 		output.emplace_back(Send{source, VoteResponse{hard_.term, grant}});
 	}
@@ -730,7 +770,7 @@ private:
 			Limits running = limits_at(replace_from), widest = running;
 			for (std::size_t i = first; i < request.entries.size(); ++i) {
 				const auto& entry = request.entries[i];
-				if (entry.payload.size() > running.command_bytes) {
+				if (!fits(entry, running)) {
 					output.emplace_back(Send{source, AppendResponse{hard_.term, request.rpc, false, 0, replace_from, request.read_probe}}); return;
 				}
 				if (entry.kind == EntryKind::Configuration) {
@@ -760,7 +800,9 @@ private:
 			batch.log = LogMutation{replace_from, std::move(suffix)};
 		}
 		auto verified = request.previous + request.entries.size();
-		witness_bound_ = std::max(witness_bound_, std::min(request.data_matched, verified));
+		// The current leader's report, within what this witness verified and the leader
+		// committed; a later leader may report less, and the bound follows it down.
+		witness_bound_ = std::min({request.data_matched, verified, request.commit});
 		hard_.commit_index = std::max(hard_.commit_index, std::min(request.commit, verified));
 		output.emplace_back(Send{source, AppendResponse{hard_.term, request.rpc, true, verified, verified + 1, request.read_probe}});
 	}
@@ -848,23 +890,31 @@ private:
 		if (transfer_ && now_ >= transfer_->until) { transfer_.reset(); }
 		// A lost TimeoutNow is resent each heartbeat; the target acts once per token.
 		if (transfer_ && now_ >= heartbeat_deadline_) { transfer_->sent = false; }
-		// D9: a witness that leads hands leadership to its most caught-up data voter among
-		// those that answered within the election timeout.
+		// D9: a witness that leads hands leadership to a data voter.
 		if (!transfer_ && witness_self()) {
-			NodeId best = 0; Index matched = 0;
-			for (const auto& [id, peer] : peers_) {
-				auto member = find_member(membership(), id);
-				auto answer = answered_.find(id);
-				const bool live = answer != answered_.end() && now_ - answer->second < timing_.election_max && answer->second > leadership_start_;
-				if (member && member->role == MemberRole::Voter && live && (!best || peer.matched > matched)) { best = id; matched = peer.matched; }
-			}
-			if (best) { start_transfer(best, output); }
+			if (auto target = handoff_target()) { start_transfer(*target, output); }
 		}
 		// D4: a leader whose own removal committed steps down, transfer or not. D3: a
 		// committed replacement's leaving voter is removed next, by whichever leader holds
 		// the committed membership, so the replacement completes across leader changes.
 		const auto& committed = committed_membership();
-		if (!votes_in(committed, configuration_.local) && committed == membership()) { follower(0, output); return; }
+		// D4: a member whose removal committed is no longer replicated to.
+		const auto keep = replicas();
+		for (auto it = peers_.begin(); it != peers_.end();) {
+			if (keep.contains(it->first)) { ++it; continue; }
+			if (it->second.snapshot) { output.emplace_back(SnapshotReleased{it->first, it->second.snapshot->key, SnapshotReleaseReason::Removed}); }
+			answered_.erase(it->first);
+			it = peers_.erase(it);
+		}
+		// A leader whose own removal committed hands off first, then steps down once the
+		// transfer ends or aborts (D4, D6).
+		if (!votes_in(committed, configuration_.local) && committed == membership()) {
+			if (!handed_off_) {
+				handed_off_ = true;
+				if (auto target = handoff_target()) { start_transfer(*target, output); return; }
+			}
+			if (!transfer_) { follower(0, output); return; }
+		}
 		if (committed.leaving && committed == membership() && log_term(durable_.commit_index) == hard_.term) {
 			Membership next = committed;
 			std::erase_if(next.members, [&](const Member& x) { return x.incarnation == committed.leaving; });
@@ -900,7 +950,7 @@ private:
 			follower(0, output); return; // Control reserve exhausted: fail closed.
 		}
 		role_ = Role::Leader; leader_ = configuration_.local; peers_.clear(); grants_.clear(); answered_.clear(); transfer_.reset();
-		leadership_start_ = now_;
+		leadership_start_ = now_; handed_off_ = false;
 		for (NodeId replica : replicas()) {
 			peers_.emplace(replica, Peer{last_index() + 1, 0, {}});
 			if (is_voter(replica)) { answered_[replica] = now_; }
@@ -1015,6 +1065,7 @@ private:
 	std::pair<NodeId, Token> acted_timeout_{};  // the last TimeoutNow this node acted on
 	bool timed_out_ = false;
 	std::uint64_t leadership_start_ = 0;  // when this node last became leader
+	bool handed_off_ = false;  // a self-removing leader tried its transfer
 	Index witness_bound_ = 0;  // a witness truncates only through this (D9)
 };
 

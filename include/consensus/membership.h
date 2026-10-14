@@ -37,6 +37,10 @@ namespace kronuz::consensus {
 inline constexpr Limits ceilings{31, std::size_t{64} << 20, std::size_t{16} << 30, std::size_t{8} << 20, 4096,
 	std::size_t{256} << 20, 65536, 65536, std::size_t{8} << 20, 255};
 
+// A Configuration entry's largest encoding: the most members, with limits. Configuration
+// entries are bounded by this, never by command_bytes, so lowering it cannot wedge a group.
+inline constexpr std::size_t maximum_membership_bytes = 4 + 8 + 8 + 24 * ceilings.members + 8 + 8 + 80;
+
 // Throws std::invalid_argument when a group's limits are inconsistent or above the ceilings.
 inline void validate_limits(const Limits& l) {
 	if (l.voters == 0 || l.command_bytes == 0 || l.rpc_entries == 0 || l.log_entries == 0 || l.reads == 0 || l.uncommitted_entries == 0 ||
@@ -73,7 +77,9 @@ inline std::size_t voter_count(const Membership& m) {
 }
 
 // Throws std::invalid_argument when the membership cannot be in force.
-inline void validate_membership(const Membership& m, const Limits& limits) {
+// limits: those in force when the membership carries none of its own (R16).
+inline void validate_membership(const Membership& m, const Limits& in_force) {
+	const Limits& limits = m.limits ? *m.limits : in_force;
 	if (m.members.empty() || m.members.size() > limits.members) { throw std::invalid_argument("membership size"); }
 	NodeId previous = 0;
 	std::size_t witnesses = 0;
@@ -88,10 +94,7 @@ inline void validate_membership(const Membership& m, const Limits& limits) {
 	const auto voters = voter_count(m);
 	if (voters == 0 || voters > limits.voters || voters > 31) { throw std::invalid_argument("membership voters"); }
 	if (m.leaving && !votes_in(m, m.leaving)) { throw std::invalid_argument("membership leaving"); }
-	if (m.limits) {
-		validate_limits(*m.limits);
-		if (m.members.size() > m.limits->members || voters > m.limits->voters) { throw std::invalid_argument("membership exceeds its limits"); }
-	}
+	if (m.limits) { validate_limits(*m.limits); }
 	// D9: a witness only in rf = 2 + witness; inside a replacement's window, 3 + 1 while a
 	// data voter leaves, or 2 + 2 while the witness does.
 	if (witnesses) {
@@ -103,8 +106,8 @@ inline void validate_membership(const Membership& m, const Limits& limits) {
 }
 
 // The single-step rule (D3): at most one voter or witness added or removed, any learners;
-// no incarnation reused, none moved to another node. The leader checks a promoted
-// learner's progress itself.
+// no incarnation reused, none moved to another node, and a new member only as a learner.
+// The leader checks a promoted learner's progress itself.
 inline void validate_change(const Membership& current, const Membership& next, const Limits& limits) {
 	validate_membership(next, limits);
 	if (next.next_incarnation < current.next_incarnation) { throw std::invalid_argument("membership incarnation counter"); }
@@ -113,7 +116,8 @@ inline void validate_change(const Membership& current, const Membership& next, c
 		auto old = find_member(current, x.incarnation);
 		if (!old) {
 			if (x.incarnation < current.next_incarnation) { throw std::invalid_argument("membership reuses an incarnation"); }
-			changed += voting(x.role);
+			// A new member joins as a learner, so it votes only once it has caught up (D3(c)).
+			if (voting(x.role)) { throw std::invalid_argument("a new member joins as a learner"); }
 		} else {
 			if (old->node != x.node) { throw std::invalid_argument("membership moves an incarnation"); }
 			changed += voting(old->role) != voting(x.role);

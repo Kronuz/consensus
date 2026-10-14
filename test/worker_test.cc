@@ -37,6 +37,8 @@ int checks = 0, failures = 0;
 bool admission_benchmark = false;
 void check(bool value, std::string_view message) { ++checks; if (!value) { ++failures; std::cerr << "FAIL: " << message << '\n'; } }
 template <class F> bool throws(F&& function) { try { function(); return false; } catch (const std::exception&) { return true; } }
+// The tests run on a compact timing profile; the library default is Track C's R4 profile.
+constexpr Timing compact{20, 40, 100, 200, 60000};
 FixedConfiguration configuration() { FixedConfiguration result; result.local = 1; result.voters = {1}; result.cluster[0] = 'C'; result.configuration[0] = 'V'; return result; }
 Limits limits() { Limits result; result.command_bytes = 1024; result.rpc_bytes = 2048; result.log_bytes = 4096; result.log_entries = 32; result.control_entries = 4; result.rpc_entries = 4; return result; }
 kronuz::journal::AdmissionLimits admission() { return {{4000, 100}, {2000, 3}, {1000, 4}, 5, 3}; }
@@ -88,7 +90,7 @@ void terminal_original_settlement() {
  auto io = std::make_shared<kronuz::journal::PosixIO>(directory);
  {
   WorkerLimits scheduling; scheduling.async_appends = true;
-  Worker worker(io, configuration(), admission(), limits(), {}, scheduling);
+  Worker worker(io, configuration(), admission(), limits(), compact, scheduling);
   Identity id{}; id[0] = 'S'; worker.create(id);
   while (worker.run_one({0, 100}) != TurnResult::IOPending) {}
   auto job = worker.take_io_operation();
@@ -109,7 +111,7 @@ void terminal_original_settlement() {
   check(worker.drained() && !worker.owns_io_operation(job) && !worker.fenced(),
    "terminal drain follows original durable barriers and retained retirement");
  }
- Worker recovered(io, configuration(), admission(), limits()); recovered.recover([](auto&) {});
+ Worker recovered(io, configuration(), admission(), limits(), compact); recovered.recover([](auto&) {});
  for (unsigned turn = 0; !recovered.ready() && turn < 100; ++turn) { recovered.run_one({turn, 100}); }
  check(recovered.ready(), "accepted initialization survives terminal close and reopening");
  recovered.close(); while (!recovered.drained()) { recovered.run_one({0, 100}); }
@@ -125,7 +127,7 @@ void terminal_checkpoint_originals() {
   auto capacity = kronuz::journal::AdmissionLimits{{256 * 1024, 512}, {16 * 1024, 3}, {64 * 1024, 4}, 8, 3};
   bool held = false;
   {
-   Worker worker(io, configuration(), capacity, limits(), {}, {16, 128, false, true});
+   Worker worker(io, configuration(), capacity, limits(), compact, {16, 128, false, true});
    Identity id{}; id[0] = 'P'; worker.create(id);
    auto pump = [&] {
     worker.run_one({100, 100});
@@ -169,7 +171,7 @@ void terminal_checkpoint_originals() {
     "terminal close preserves only actually published checkpoints");
   }
   bool restored = false;
-  Worker recovered(io, configuration(), capacity, limits());
+  Worker recovered(io, configuration(), capacity, limits(), compact);
   recovered.recover([&](auto &reader) {
    std::array<char, 5> bytes{};
    check(reader.descriptor().length == bytes.size() && reader.read_at(0, bytes) == bytes.size() &&
@@ -189,7 +191,7 @@ void terminal_output_and_dispatch_failure() {
   std::filesystem::create_directories(directory); ::chmod(directory.c_str(), 0700);
   struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
   auto io = std::make_shared<kronuz::journal::PosixIO>(directory);
-  Worker worker(io, configuration(), admission(), limits(), {}, {16,128,true});
+  Worker worker(io, configuration(), admission(), limits(), compact, {16,128,true});
   Identity id{}; id[0]='F'; worker.create(id);
   for (unsigned turn=0; turn<100 && !worker.ready(); ++turn) {
    worker.run_one({100,100});
@@ -231,8 +233,8 @@ void completion_appends() {
 		std::filesystem::create_directories(directory); ::chmod(directory.c_str(), 0700);
 		struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
 		auto io = std::make_shared<kronuz::journal::PosixIO>(directory);
-		check(throws([&] { Worker rejected(*io, configuration(), admission(), limits(), {}, {16, 128, true}); }), "asynchronous worker rejects borrowed backend before IO");
-		Worker worker(io, configuration(), admission(), limits(), {}, {16, 128, true});
+		check(throws([&] { Worker rejected(*io, configuration(), admission(), limits(), compact, {16, 128, true}); }), "asynchronous worker rejects borrowed backend before IO");
+		Worker worker(io, configuration(), admission(), limits(), compact, {16, 128, true});
 		kronuz::journal::Identity identity{}; identity[0] = 'A'; worker.create(identity);
 		for (unsigned turn = 0; turn < 10; ++turn) {
 			// Bootstrap inventory is bounded; claim only after initialization is queued.
@@ -289,7 +291,7 @@ void completion_storage() {
 		std::filesystem::create_directories(directory); ::chmod(directory.c_str(), 0700);
 		struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
 		auto io = std::make_shared<kronuz::journal::PosixIO>(directory);
-		Worker worker(io, configuration(), {{256 * 1024, 512}, {16 * 1024, 3}, {64 * 1024, 4}, 8, 3}, limits(), {}, {16, 128, false, true});
+		Worker worker(io, configuration(), {{256 * 1024, 512}, {16 * 1024, 3}, {64 * 1024, 4}, 8, 3}, limits(), compact, {16, 128, false, true});
 		kronuz::journal::Identity identity{}; identity[0] = 'Q'; worker.create(identity);
 		auto pump = [&] {
 			worker.run_one({100, 100});
@@ -329,7 +331,7 @@ void retired_completion_worker() {
 	std::filesystem::create_directories(directory); ::chmod(directory.c_str(), 0700);
 	struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
 	auto io = std::make_shared<kronuz::journal::PosixIO>(directory);
-	auto worker = std::make_unique<Worker>(io, configuration(), admission(), limits(), Timing{}, WorkerLimits{16, 128, true});
+	auto worker = std::make_unique<Worker>(io, configuration(), admission(), limits(), compact, WorkerLimits{16, 128, true});
 	kronuz::journal::Identity identity{}; identity[0] = 'R'; worker->create(identity);
 	for (unsigned turn = 0; turn < 10; ++turn) { if (worker->run_one({100, 100}) == TurnResult::IOPending) { break; } }
 	auto operation = worker->take_io_operation(); check(bool(operation), "retired worker hands initialization to its driver");
@@ -338,7 +340,7 @@ void retired_completion_worker() {
 	worker.reset(); io.reset();
 	check(operation->complete(std::move(original)), "accepted original completion survives Worker and backend facade retirement");
 	kronuz::journal::drive_synchronously(*operation); operation.reset();
-	kronuz::journal::PosixIO reopened(directory); Worker recovered(reopened, configuration(), admission(), limits());
+	kronuz::journal::PosixIO reopened(directory); Worker recovered(reopened, configuration(), admission(), limits(), compact);
 	recovered.recover([](auto&) { throw std::runtime_error("unexpected retired checkpoint"); });
 	for (unsigned turn = 0; turn < 10 && !recovered.ready(); ++turn) { recovered.run_one({100, 100}); }
 	check(recovered.ready() && !recovered.fenced(), "retired Worker operation completes typed durable initialization and releases lock");
@@ -349,7 +351,7 @@ void real_worker() {
 	struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
 	std::vector<std::string> commands;
 	{
-		kronuz::journal::PosixIO io(directory); Worker worker(io, configuration(), admission(), limits(), {}, {2, 1});
+		kronuz::journal::PosixIO io(directory); Worker worker(io, configuration(), admission(), limits(), compact, {2, 1});
 		kronuz::journal::Identity identity{}; identity[0] = 'W'; worker.create(identity);
 		for (unsigned turn = 0; turn < 10 && !worker.ready(); ++turn) { worker.run_one({100, 100}); }
 		check(worker.ready(), "worker completes bounded bootstrap inventory and initialization");
@@ -426,7 +428,7 @@ void real_worker() {
 		check(accepted == 32 && slices >= 15, "continuous foreground reads cannot bypass mandatory bounded reclamation turns");
 	}
 	{
-		kronuz::journal::PosixIO io(directory); Worker worker(io, configuration(), admission(), limits(), {}, {2, 1});
+		kronuz::journal::PosixIO io(directory); Worker worker(io, configuration(), admission(), limits(), compact, {2, 1});
 		worker.recover([](auto&) { throw std::runtime_error("unexpected checkpoint"); });
 		for (unsigned turn = 0; turn < 10 && !worker.ready(); ++turn) { worker.run_one({100, 100}); }
 		check(worker.ready() && worker.committed() == 2, "worker owns typed recovery before protocol admission");
@@ -442,7 +444,7 @@ void partial_control_pack() {
 	struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
 	kronuz::journal::AdmissionLimits scarce{{1343, 100}, {1179, 3}, {0, 0}, 5, 3};
 	{
-		kronuz::journal::PosixIO io(directory); Worker worker(io, configuration(), scarce, limits());
+		kronuz::journal::PosixIO io(directory); Worker worker(io, configuration(), scarce, limits(), compact);
 		kronuz::journal::Identity identity{}; identity[0] = 'P'; worker.create(identity);
 		while (!worker.ready()) { worker.run_one({100, 100}); }
 		worker.try_submit(Start{}); worker.try_submit(Tick{100, 100});
@@ -452,7 +454,7 @@ void partial_control_pack() {
 		check(worker.try_submit(Tick{100, 100}) == SubmitResult::Accepted && worker.accounting()->used == used, "leader tick needs no campaign pack or storage growth under pressure");
 	}
 	{
-		kronuz::journal::PosixIO io(directory); Worker worker(io, configuration(), scarce, limits());
+		kronuz::journal::PosixIO io(directory); Worker worker(io, configuration(), scarce, limits(), compact);
 		worker.recover([](auto&) {}); while (!worker.ready()) { worker.run_one({100, 100}); }
 		worker.try_submit(Start{}); worker.take_actions(); auto used = worker.accounting()->used;
 		check(worker.try_submit(Tick{100, 100}) == SubmitResult::Pressure && worker.term() == 1, "partial campaign pack denial leaves recovered follower term unchanged");
@@ -465,7 +467,7 @@ void failures_and_multi_action_output() {
 		std::filesystem::create_directories(directory); ::chmod(directory.c_str(), 0700);
 		struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
 		FaultIO io(directory); auto fixed = configuration(); if (!inject) { fixed.voters = {1, 2, 3}; }
-		Worker worker(io, fixed, admission(), limits()); kronuz::journal::Identity identity{}; identity[0] = 'F';
+		Worker worker(io, fixed, admission(), limits(), compact); kronuz::journal::Identity identity{}; identity[0] = 'F';
 		worker.create(identity); while (!worker.ready()) { worker.run_one({100, 100}); }
 		worker.try_submit(Start{}); worker.try_submit(Tick{100, 100});
 		if (fixed.voters.size() > 1) {  // pre-vote (Track C, D7): one peer's grant starts the campaign
@@ -492,12 +494,12 @@ void interrupted_initialization() {
 	std::filesystem::create_directories(directory); ::chmod(directory.c_str(), 0700);
 	struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
 	{
-		kronuz::journal::PosixIO io(directory); Worker worker(io, configuration(), admission(), limits());
+		kronuz::journal::PosixIO io(directory); Worker worker(io, configuration(), admission(), limits(), compact);
 		kronuz::journal::Identity identity{}; identity[0] = 'B'; worker.create(identity);
 		check(!worker.ready(), "create can return before queued typed initialization is durable");
 	}
 	{
-		kronuz::journal::PosixIO io(directory); Worker worker(io, configuration(), admission(), limits());
+		kronuz::journal::PosixIO io(directory); Worker worker(io, configuration(), admission(), limits(), compact);
 		worker.recover([](auto&) {});
 		for (unsigned turn = 0; turn < 10 && !worker.ready(); ++turn) { worker.run_one({100, 100}); }
 		check(worker.ready() && worker.try_submit(Start{}) == SubmitResult::Accepted, "verified empty bootstrap resumes typed initialization after restart");
@@ -522,7 +524,7 @@ void checkpoint_crash_and_progress() {
 	std::vector<std::string> expected_suffix;
 	Index committed = 0;
 	{
-		FaultIO io(directory); Worker worker(io, configuration(), quota, limits(), {}, {1, 128});
+		FaultIO io(directory); Worker worker(io, configuration(), quota, limits(), compact, {1, 128});
 		kronuz::journal::Identity identity{}; identity[0] = 'S'; worker.create(identity);
 		while (!worker.ready()) { worker.run_one({100, 100}); }
 		std::map<RequestId, std::string> requested; std::map<Index, std::string> placed;
@@ -570,7 +572,7 @@ void checkpoint_crash_and_progress() {
 		// Close after Store publication, before delivering its held Persisted.
 	}
 	{
-		FaultIO io(directory); Worker worker(io, configuration(), quota, limits());
+		FaultIO io(directory); Worker worker(io, configuration(), quota, limits(), compact);
 		std::string image;
 		worker.recover([&](auto& reader) { image.resize(static_cast<std::size_t>(reader.descriptor().length)); reader.read_at(0, std::span<char>(image.data(), image.size())); });
 		while (!worker.ready()) { worker.run_one({100, 100}); }
@@ -588,7 +590,7 @@ void preparation_preserves_protocol_timers() {
 	std::filesystem::create_directories(directory); ::chmod(directory.c_str(), 0700);
 	struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
 	FaultIO io(directory); auto fixed = configuration(); fixed.voters = {1, 2, 3};
-	Worker worker(io, fixed, {{256 * 1024, 512}, {16 * 1024, 3}, {64 * 1024, 4}, 8, 3}, limits(), {}, {4, 128});
+	Worker worker(io, fixed, {{256 * 1024, 512}, {16 * 1024, 3}, {64 * 1024, 4}, 8, 3}, limits(), compact, {4, 128});
 	kronuz::journal::Identity identity{}; identity[0] = 'T'; worker.create(identity); while (!worker.ready()) { worker.run_one({100, 100}); }
 	std::map<NodeId, Receive> responses; unsigned sends = 0;
 	auto drain = [&] {
@@ -626,7 +628,7 @@ void maintenance_preserves_protocol_timers() {
 	struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
 	FaultIO io(directory); auto fixed = configuration(); fixed.voters = {1, 2, 3};
 	auto bounded_reads = limits(); bounded_reads.reads = 1;
-	Worker worker(io, fixed, {{256 * 1024, 512}, {16 * 1024, 3}, {64 * 1024, 4}, 8, 3}, bounded_reads, {}, {1, 128});
+	Worker worker(io, fixed, {{256 * 1024, 512}, {16 * 1024, 3}, {64 * 1024, 4}, 8, 3}, bounded_reads, compact, {1, 128});
 	kronuz::journal::Identity identity{}; identity[0] = 'T'; worker.create(identity); while (!worker.ready()) { worker.run_one({100, 100}); }
 	std::map<NodeId, Receive> responses; unsigned sends = 0;
 	auto drain = [&] {
@@ -669,14 +671,14 @@ void checkpoint_cancellation_and_completion() {
 	auto directory = std::filesystem::current_path() / ".scratch" / ("worker-cancel-" + std::to_string(::getpid()));
 	std::filesystem::create_directories(directory); ::chmod(directory.c_str(), 0700);
 	struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
-	FaultIO io(directory); Worker worker(io, configuration(), {{256 * 1024, 512}, {16 * 1024, 3}, {64 * 1024, 4}, 8, 3}, limits());
+	FaultIO io(directory); Worker worker(io, configuration(), {{256 * 1024, 512}, {16 * 1024, 3}, {64 * 1024, 4}, 8, 3}, limits(), compact);
 	start_single(worker, 'C');
 	auto id = worker.reserve_checkpoint(16); if (!id) { check(false, "cancellation fixture reservation"); return; }
 	check(worker.cancel_checkpoint(*id) == CancelResult::Canceled && worker.cancel_checkpoint(*id) == CancelResult::Stale, "unstarted cancellation refunds once and invalidates its session token");
 	check(throws([&] { worker.attach_capture(*id, {1, 1, 1}); }), "stale checkpoint token cannot attach a new capture");
 	id = worker.reserve_checkpoint(16); worker.attach_capture(*id, {2, 1, 1});
 	{
-		Worker other(io, configuration(), {{256 * 1024, 512}, {16 * 1024, 3}, {64 * 1024, 4}, 8, 3}, limits());
+		Worker other(io, configuration(), {{256 * 1024, 512}, {16 * 1024, 3}, {64 * 1024, 4}, 8, 3}, limits(), compact);
 		check(throws([&] { other.attach_capture(*id, {2, 1, 1}); }) && other.cancel_checkpoint(*id) == CancelResult::Stale, "foreign checkpoint token rejects before unopened storage changes");
 	}
 	check(throws([&] { worker.attach_capture(*id, {3, 1, 1}); }), "capture metadata attaches exactly once");
@@ -730,7 +732,7 @@ void worker_repair() {
 	auto directory = std::filesystem::current_path() / ".scratch" / ("worker-repair-" + std::to_string(::getpid()));
 	std::filesystem::create_directories(directory); ::chmod(directory.c_str(), 0700);
 	struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
-	FaultIO io(directory); Worker worker(io, configuration(), {{256 * 1024, 512}, {16 * 1024, 3}, {64 * 1024, 4}, 8, 3}, limits());
+	FaultIO io(directory); Worker worker(io, configuration(), {{256 * 1024, 512}, {16 * 1024, 3}, {64 * 1024, 4}, 8, 3}, limits(), compact);
 	start_single(worker, 'R');
 	std::vector<std::string> applied;
 	std::vector<RepairCompleted> repaired;
@@ -784,7 +786,7 @@ void checkpoint_faults() {
 		struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
 		auto quota = kronuz::journal::AdmissionLimits{{256 * 1024, 512}, {16 * 1024, 3}, {64 * 1024, 4}, 8, 3};
 		{
-			FaultIO io(directory); Worker worker(io, configuration(), quota, limits()); start_single(worker, 'F');
+			FaultIO io(directory); Worker worker(io, configuration(), quota, limits(), compact); start_single(worker, 'F');
 			auto id = worker.reserve_checkpoint(16); worker.attach_capture(*id, {1, 1, 1}); worker.offer_application_chunk(*id, "image", true);
 			auto synced = io.directory_syncs;
 			if (!publication) { worker.try_submit(Read{20}); io.fail_sync = true; }
@@ -797,7 +799,7 @@ void checkpoint_faults() {
 			auto terminal = worker.take_actions(); check(terminal.size() == 1 && std::holds_alternative<Fenced>(terminal[0]), "checkpoint failure retains a terminal notice");
 		}
 		{
-			FaultIO io(directory); Worker worker(io, configuration(), quota, limits()); std::string image;
+			FaultIO io(directory); Worker worker(io, configuration(), quota, limits(), compact); std::string image;
 			worker.recover([&](auto& reader) { image.resize(static_cast<std::size_t>(reader.descriptor().length)); reader.read_at(0, std::span<char>(image.data(), image.size())); });
 			for (unsigned turn = 0; turn < 100 && !worker.ready(); ++turn) { worker.run_one({100, 100}); }
 			check(worker.ready() && worker.committed() == 1 && (worker.base_index() == 0 || (worker.base_index() == 1 && image == "image")), "fresh recovery retains acknowledged state after uncertain checkpoint IO");
@@ -817,7 +819,7 @@ struct SnapshotFixture {
 	static kronuz::journal::AdmissionLimits quota() { return {{512 * 1024, 4096}, {16 * 1024, 3}, {128 * 1024, 4}, 8, 3}; }
 	Directory directory; std::shared_ptr<FaultIO> owned_io; FaultIO& io; Worker worker; bool unexpected_install = false; std::string application_state;
 	explicit SnapshotFixture(std::string name, std::optional<SnapshotLimits> snapshots = SnapshotLimits{7, 100000}, kronuz::journal::AdmissionLimits capacity = quota(), bool start = true, bool async = false)
-		: directory(std::move(name)), owned_io(std::make_shared<FaultIO>(directory.path)), io(*owned_io), worker(owned_io, fixed(), capacity, limits(), {}, {4, 1, false, async}, snapshots) {
+		: directory(std::move(name)), owned_io(std::make_shared<FaultIO>(directory.path)), io(*owned_io), worker(owned_io, fixed(), capacity, limits(), compact, {4, 1, false, async}, snapshots) {
 		kronuz::journal::Identity identity{}; identity[0] = 'S'; worker.create(identity);
 		for (unsigned turn = 0; turn < 100 && !worker.ready(); ++turn) { worker.run_one({0, 100}); if (auto job = worker.take_io_operation()) { kronuz::journal::drive_synchronously(*job); } }
 		if (start) { worker.try_submit(Start{}); drain(); }
@@ -1022,7 +1024,7 @@ void snapshot_policy_and_rejection() {
 	auto local = worker.reserve_checkpoint(16); check(local && !worker.reserve_snapshot(context), "reserved local checkpoint excludes inbound replacement"); if (local) { worker.cancel_checkpoint(*local); }
 	for (unsigned fault = 0; fault < 9; ++fault) {
 		auto invalid = context;
-		switch (fault) { case 0: invalid.request = 0; break; case 1: invalid.transfer = 0; break; case 2: invalid.authenticated_peer = 1; break; case 3: invalid.authenticated_peer = 4; break; case 4: invalid.leader_term = 0; break; case 5: invalid.descriptor.configuration[0] ^= 1; break; case 6: invalid.descriptor.application_format = 8; break; case 7: invalid.descriptor.application_bytes = 100001; break; case 8: invalid.descriptor.term = 2; break; }
+		switch (fault) { case 0: invalid.request = 0; break; case 1: invalid.transfer = 0; break; case 2: invalid.authenticated_peer = 1; break; case 3: invalid.authenticated_peer = 0; break; case 4: invalid.leader_term = 0; break; case 5: invalid.descriptor.configuration[0] ^= 1; break; case 6: invalid.descriptor.application_format = 8; break; case 7: invalid.descriptor.application_bytes = 100001; break; case 8: invalid.descriptor.term = 2; break; }
 		check(throws([&] { worker.reserve_snapshot(invalid); }) && !worker.fenced() && worker.accounting()->used == used && !worker.take_snapshot_result(), "malformed snapshot policy/context reserves nothing and queues no result");
 	}
 	auto id = worker.reserve_snapshot(context); if (!id) { check(false, "policy fixture reservation"); return; }
@@ -1118,7 +1120,7 @@ void snapshot_restart_cleanup() {
 		SnapshotFixture::Directory directory("restart-" + std::to_string(sealed));
 		kronuz::journal::StorageResources baseline{};
 		{
-			FaultIO io(directory.path); Worker worker(io, SnapshotFixture::fixed(), SnapshotFixture::quota(), limits(), {}, {4, 1}, SnapshotLimits{7, 100000});
+			FaultIO io(directory.path); Worker worker(io, SnapshotFixture::fixed(), SnapshotFixture::quota(), limits(), compact, {4, 1}, SnapshotLimits{7, 100000});
 			kronuz::journal::Identity identity{}; identity[0] = 'S'; worker.create(identity);
 			while (!worker.ready()) { worker.run_one({0, 100}); }
 			baseline = worker.accounting()->used;
@@ -1131,7 +1133,7 @@ void snapshot_restart_cleanup() {
 			check(staged == kronuz::journal::detail::artifact_header_size + (sealed ? payload.size() : 7) && (!sealed || worker.validation_chunk()), "restart fixture leaves actual unpublished artifact bytes and optionally a held verifier view");
 		}
 		{
-			FaultIO io(directory.path); Worker worker(io, SnapshotFixture::fixed(), SnapshotFixture::quota(), limits(), {}, {4, 1}, SnapshotLimits{7, 100000});
+			FaultIO io(directory.path); Worker worker(io, SnapshotFixture::fixed(), SnapshotFixture::quota(), limits(), compact, {4, 1}, SnapshotLimits{7, 100000});
 			bool restored = false; worker.recover([&](auto&) { restored = true; });
 			for (unsigned turn = 0; turn < 300; ++turn) { worker.run_one({0, 100}); worker.take_actions(); }
 			check(worker.ready() && !worker.fenced() && !restored && worker.base_index() == 0 && worker.committed() == 0 && worker.storage_frontier().sequence == 1 && !worker.storage_frontier().checkpoint, "reopen preserves the old durable frontier without activating an abandoned candidate");
@@ -1313,7 +1315,7 @@ void snapshot_install_reopening() {
 		SnapshotFixture::Directory directory("install-reopen-" + std::to_string(matching) + "-" + std::to_string(close_phase));
 		std::uint64_t sequence = 0; std::string live_application = "old"; Term incoming_term = matching && close_phase == 0 ? 1 : 2;
 		{
-			FaultIO io(directory.path); Worker worker(io, SnapshotFixture::fixed(), SnapshotFixture::quota(), limits(), {}, {4, 1}, SnapshotLimits{7, 100000});
+			FaultIO io(directory.path); Worker worker(io, SnapshotFixture::fixed(), SnapshotFixture::quota(), limits(), compact, {4, 1}, SnapshotLimits{7, 100000});
 			kronuz::journal::Identity identity{}; identity[0] = 'S'; worker.create(identity); while (!worker.ready()) { worker.run_one({0, 100}); }
 			auto drain = [&] { for (const auto& action : worker.take_actions()) { if (auto range = std::get_if<Committed>(&action)) { worker.applied({range->entries.back().index}); } } };
 			auto pump = [&] { worker.run_one({0, 100}); drain(); }; worker.try_submit(Start{}); drain();
@@ -1349,7 +1351,7 @@ void snapshot_install_reopening() {
 			check(decoded && frontier.identity[0] == 'S' && frontier.sequence == sequence, "receiver storage identity and exact covered sequence survive publication");
 		}
 		{
-			FaultIO io(directory.path); Worker worker(io, SnapshotFixture::fixed(), SnapshotFixture::quota(), limits(), {}, {4, 1}, SnapshotLimits{7, 100000});
+			FaultIO io(directory.path); Worker worker(io, SnapshotFixture::fixed(), SnapshotFixture::quota(), limits(), compact, {4, 1}, SnapshotLimits{7, 100000});
 			std::string application;
 			worker.recover([&](auto& reader) { application.resize(static_cast<std::size_t>(reader.descriptor().length)); reader.read_at(0, std::span<char>(application.data(), application.size())); });
 			while (!worker.ready()) { worker.run_one({0, 100}); }
@@ -1396,7 +1398,7 @@ void snapshot_publication_faults() {
 	for (unsigned fault = 0; fault < 3; ++fault) {
 		SnapshotFixture::Directory directory("install-publication-fault-" + std::to_string(fault));
 		{
-			FaultIO io(directory.path); Worker worker(io, SnapshotFixture::fixed(), SnapshotFixture::quota(), limits(), {}, {4, 1}, SnapshotLimits{7, 100000});
+			FaultIO io(directory.path); Worker worker(io, SnapshotFixture::fixed(), SnapshotFixture::quota(), limits(), compact, {4, 1}, SnapshotLimits{7, 100000});
 			kronuz::journal::Identity identity{}; identity[0] = 'S'; worker.create(identity); while (!worker.ready()) { worker.run_one({0, 100}); } worker.try_submit(Start{}); worker.take_actions();
 			auto fixed = SnapshotFixture::fixed(); SnapshotContext context{2, 1, 13, 17, {fixed.cluster, fixed.configuration, 7, 1, 1, 5, kronuz::journal::crc32c("image")}};
 			auto id = worker.reserve_snapshot(context); if (!id) { continue; } worker.offer_snapshot_chunk(*id, 0, "image", true); Token eof = 0;
@@ -1406,7 +1408,7 @@ void snapshot_publication_faults() {
 			check(worker.fenced() && !worker.snapshot_activation() && !worker.take_snapshot_result() && worker.accounting()->tainted, "bundle sealing and both publication barriers fence without activation or success on uncertainty");
 		}
 		{
-			FaultIO io(directory.path); Worker worker(io, SnapshotFixture::fixed(), SnapshotFixture::quota(), limits()); std::string image;
+			FaultIO io(directory.path); Worker worker(io, SnapshotFixture::fixed(), SnapshotFixture::quota(), limits(), compact); std::string image;
 			worker.recover([&](auto& reader) { image.resize(static_cast<std::size_t>(reader.descriptor().length)); reader.read_at(0, std::span<char>(image.data(), image.size())); });
 			while (!worker.ready()) { worker.run_one({0, 100}); }
 			check(!worker.fenced() && (fault == 2 ? image == "image" && worker.base_index() == 1 && worker.committed() == 1 : image.empty() && worker.base_index() == 0 && worker.committed() == 0), "reopen selects the exact old or renamed new frontier after each publication failure boundary");
@@ -1522,7 +1524,7 @@ void binary_transfer_integration(std::size_t length, unsigned mode = 0, bool mea
 		SnapshotFixture::Directory directory; std::shared_ptr<FaultIO> owned_io; FaultIO& io; Worker worker; SnapshotChannel transfer;
 		std::deque<Receive> messages; std::string application, candidate; Token eof = 0;
 		Node(NodeId id, std::size_t size, unsigned mode, bool async) : directory("binary-" + std::to_string(size) + "-" + std::to_string(mode) + "-" + std::to_string(id)), owned_io(std::make_shared<FaultIO>(directory.path)), io(*owned_io),
-			worker(owned_io, [&] { auto fixed = SnapshotFixture::fixed(); fixed.local = id; return fixed; }(), {{1024ull * 1024 * 1024, 4096}, {16 * 1024, 3}, {256ull * 1024 * 1024, 4}, 8, 3}, limits(), {}, {4, 1, false, async}, SnapshotLimits{7, 128ull * 1024 * 1024}), transfer(worker) {
+			worker(owned_io, [&] { auto fixed = SnapshotFixture::fixed(); fixed.local = id; return fixed; }(), {{1024ull * 1024 * 1024, 4096}, {16 * 1024, 3}, {256ull * 1024 * 1024, 4}, 8, 3}, limits(), compact, {4, 1, false, async}, SnapshotLimits{7, 128ull * 1024 * 1024}), transfer(worker) {
 			kronuz::journal::Identity identity{}; identity[0] = static_cast<char>(id); worker.create(identity);
 			for (unsigned turn = 0; turn < 100 && !worker.ready(); ++turn) { worker.run_one({0, 100}); if (auto job = worker.take_io_operation()) { kronuz::journal::drive_synchronously(*job); } }
 			worker.try_submit(Start{}); worker.take_actions();
@@ -1620,7 +1622,7 @@ void checkpoint_format_recovery() {
 	for (bool known : {false, true}) {
 		SnapshotFixture::Directory directory("format-recovery-" + std::to_string(known));
 		{
-			FaultIO io(directory.path); Worker worker(io, configuration(), SnapshotFixture::quota(), limits(), {}, {4, 1}, known ? std::optional<SnapshotLimits>{{7, 100000}} : std::nullopt);
+			FaultIO io(directory.path); Worker worker(io, configuration(), SnapshotFixture::quota(), limits(), compact, {4, 1}, known ? std::optional<SnapshotLimits>{{7, 100000}} : std::nullopt);
 			kronuz::journal::Identity identity{}; identity[0] = 'f'; worker.create(identity);
 			for (unsigned turn = 0; turn < 100 && !worker.ready(); ++turn) { worker.run_one({0, 100}); } worker.try_submit(Start{}); worker.take_actions();
 			auto pump = [&] { worker.run_one({100, 100}); for (const auto& action : worker.take_actions()) { if (auto committed = std::get_if<Committed>(&action)) { worker.applied({committed->entries.back().index}); } } };
@@ -1631,7 +1633,7 @@ void checkpoint_format_recovery() {
 			check(worker.base_index() == 1 && !worker.fenced(), "format fixture publishes exact local image");
 		}
 		{
-			FaultIO io(directory.path); Worker worker(io, configuration(), SnapshotFixture::quota(), limits(), {}, {4, 1}, SnapshotLimits{8, 100000}); bool restored = false;
+			FaultIO io(directory.path); Worker worker(io, configuration(), SnapshotFixture::quota(), limits(), compact, {4, 1}, SnapshotLimits{8, 100000}); bool restored = false;
 			auto restore = [&](auto& reader) { std::array<char, 5> bytes{}; reader.read_at(0, bytes); restored = std::string_view(bytes.data(), bytes.size()) == "image"; };
 			if (known) { check(throws([&] { worker.recover(restore); }) && worker.fenced() && !restored, "changed format policy rejects known persisted format before application activation"); }
 			else { worker.recover(restore); for (unsigned turn = 0; turn < 100 && !worker.ready(); ++turn) { worker.run_one({100, 100}); } check(restored && worker.ready() && worker.base_index() == 1 && !worker.snapshot_source(), "legacy unknown-format image remains recoverable without inferred export format"); }
@@ -1648,7 +1650,7 @@ void legacy_source_export_rejection() {
 		RecoveredState state{fixed, {1, 1, 1}, 1, 1, {}, 1}; auto bundle = encode_checkpoint(state, 1, application, limits());
 		store.begin_artifact(*replacement, kronuz::journal::ArtifactPart::Bundle); store.write_chunk(*replacement, bundle); store.finish_artifact(*replacement); store.publish(*replacement, 1);
 	}
-	FaultIO io(directory.path); Worker worker(io, fixed, SnapshotFixture::quota(), limits(), {}, {4, 1}, SnapshotLimits{7, 100000}); std::string restored;
+	FaultIO io(directory.path); Worker worker(io, fixed, SnapshotFixture::quota(), limits(), compact, {4, 1}, SnapshotLimits{7, 100000}); std::string restored;
 	worker.recover([&](auto& reader) { std::array<char, 5> bytes{}; reader.read_at(0, bytes); restored.assign(bytes.data(), bytes.size()); }); for (unsigned turn = 0; turn < 100 && !worker.ready(); ++turn) { worker.run_one({0, 100}); }
 	std::map<NodeId, Receive> responses; unsigned needed = 0; bool exported = false;
 	auto drain = [&] { for (const auto& action : worker.take_actions()) {
@@ -1729,7 +1731,7 @@ void channel_dispatch_and_unstarted_result() {
 			if (frame.kind == TransferKind::Result) {
 				auto body = frame.body.substr(8); check(frame.body[0] == static_cast<char>(TransferOutcome::Failed) && kronuz::journal::get64(body) == 0 && fixture.worker.term() == 0 && !fixture.worker.fenced(), "Busy before Start generates a healthy termless Failed result");
 				SnapshotFixture::Directory directory("unstarted-result-sender"); FaultIO io(directory.path); auto configuration = fixed; configuration.local = 2;
-				Worker sender(io, configuration, SnapshotFixture::quota(), limits(), {}, {4, 1}, SnapshotLimits{7, 100000}); kronuz::journal::Identity identity{}; identity[0] = 'z'; sender.create(identity); for (unsigned ready = 0; ready < 100 && !sender.ready(); ++ready) { sender.run_one({0, 100}); }
+				Worker sender(io, configuration, SnapshotFixture::quota(), limits(), compact, {4, 1}, SnapshotLimits{7, 100000}); kronuz::journal::Identity identity{}; identity[0] = 'z'; sender.create(identity); for (unsigned ready = 0; ready < 100 && !sender.ready(); ++ready) { sender.run_one({0, 100}); }
 				SnapshotChannel sender_channel(sender); TrustedSession reverse{1, remote, local}; sender_channel.register_session(reverse); auto delivered = sender_channel.receive(reverse, output->bytes);
 				check(delivered.result == TransferReceive::Accepted && delivered.consumed == output->bytes.size() && !sender.fenced() && sender.term() == 0, "term-zero generated result crosses real adapter without fabricating or observing a term");
 				channel.consume_output(output->token, output->bytes.size()); check(channel.drained(), "unstarted rejected operation drains before channel destruction"); break;
@@ -1765,28 +1767,54 @@ void founding_and_join_records() {
   auto io = std::make_shared<kronuz::journal::PosixIO>(path);
   auto& config = join ? joiner : three;
   {
-   Worker worker(io, config, admission(), limits());
+   Worker worker(io, config, admission(), limits(), compact);
    if (!join) { worker.found(witness); }
    Identity id{}; id[0] = join ? 'J' : 'W'; worker.create(id);
    for (unsigned turn = 0; !worker.ready() && turn < 100; ++turn) { worker.run_one({turn, 100}); }
    check(worker.ready(), "a founding or joining worker initializes");
    worker.close(); while (!worker.drained()) { worker.run_one({0, 100}); }
   }
-  Worker recovered(io, config, admission(), limits()); recovered.recover([](auto&) {});
+  Worker recovered(io, config, admission(), limits(), compact); recovered.recover([](auto&) {});
   for (unsigned turn = 0; !recovered.ready() && turn < 100; ++turn) { recovered.run_one({turn, 100}); }
   auto m = recovered.membership();
   check(recovered.ready() && m && (join ? m->members.empty() : *m == witness), join ? "a joiner recovers from its join record" : "a 2 + witness group recovers its roles");
   recovered.close(); while (!recovered.drained()) { recovered.run_one({0, 100}); }
  }
- Worker bad(std::make_shared<kronuz::journal::PosixIO>(directory), three, admission(), limits());
+ Worker bad(std::make_shared<kronuz::journal::PosixIO>(directory), three, admission(), limits(), compact);
  Membership wrong{{{1, 1, MemberRole::Voter}, {2, 2, MemberRole::Voter}, {4, 4, MemberRole::Witness}}, 5, 0};
  check(throws([&] { bad.found(wrong); }), "founding roles must name the configured voters");
+}
+
+// Track C, D5 (review M3): any authenticated incarnation of the group may send a snapshot,
+// to a joiner's Worker and to a founding member's from a member added later.
+void snapshot_senders() {
+ auto directory = std::filesystem::current_path() / ".scratch" / ("worker-senders-" + std::to_string(::getpid()));
+ std::filesystem::create_directories(directory); ::chmod(directory.c_str(), 0700);
+ struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
+ auto reserve = [&](const char* name, FixedConfiguration config, NodeId sender) {
+  auto path = directory / name; std::filesystem::create_directories(path);
+  auto io = std::make_shared<kronuz::journal::PosixIO>(path);
+  Worker worker(io, config, SnapshotFixture::quota(), limits(), compact, {4, 1, false, false}, SnapshotLimits{7, 100000});
+  Identity id{}; id[0] = 'R'; worker.create(id);
+  for (unsigned turn = 0; turn < 100 && !worker.ready(); ++turn) { worker.run_one({0, 100}); }
+  worker.try_submit(Start{});
+  std::string payload = "image";
+  SnapshotContext context{sender, 1, 13, 17, {config.cluster, config.configuration, 7, 1, 1, payload.size(), kronuz::journal::crc32c(payload)}};
+  bool ok = !throws([&] { (void)worker.reserve_snapshot(context); });
+  worker.close(); while (!worker.drained()) { worker.run_one({0, 100}); }
+  return ok;
+ };
+ FixedConfiguration founding = configuration(); founding.local = 2; founding.voters = {1, 2, 3};
+ FixedConfiguration joiner = configuration(); joiner.local = 7; joiner.voters.clear();
+ check(reserve("joiner", joiner, 1), "a joiner's Worker accepts a snapshot from a member");
+ check(reserve("later", founding, 5), "a founding member's Worker accepts a snapshot from a member added later");
+ check(!reserve("unauthenticated", founding, 0), "no Worker accepts a snapshot from an unauthenticated peer");
 }
 
 int main(int argc, char** argv) {
 	try {
 		if (argc == 2 && std::string_view(argv[1]) == "--terminal-regressions") { terminal_original_settlement(); terminal_checkpoint_originals(); terminal_output_and_dispatch_failure(); terminal_snapshot_readback(); terminal_published_activation(); terminal_reclamation_original(); std::cout << checks << " terminal checks, " << failures << " failures\n"; return failures ? 1 : 0; }
-		terminal_original_settlement(); terminal_checkpoint_originals(); terminal_output_and_dispatch_failure(); terminal_snapshot_readback(); terminal_published_activation(); terminal_reclamation_original(); founding_and_join_records();
+		terminal_original_settlement(); terminal_checkpoint_originals(); terminal_output_and_dispatch_failure(); terminal_snapshot_readback(); terminal_published_activation(); terminal_reclamation_original(); founding_and_join_records(); snapshot_senders();
 		if (argc == 2 && std::string_view(argv[1]) == "--retained-admission-benchmark") { admission_benchmark = true; real_worker(); return failures ? 1 : 0; }
 		if (argc == 2 && std::string_view(argv[1]) == "--source-regressions") { owned_snapshot_sources(); std::cout << checks << " source checks, " << failures << " failures\n"; return failures ? 1 : 0; }
 		if (argc == 2 && std::string_view(argv[1]) == "--completion-regressions") { completion_appends(); completion_storage(); completion_channel_cancellation(); completion_snapshot_readback(); retired_completion_worker(); for (unsigned mode : {0u, 1u, 3u}) { binary_transfer_integration(65553, mode, false, true); } std::cout << checks << " completion checks, " << failures << " failures\n"; return failures ? 1 : 0; }

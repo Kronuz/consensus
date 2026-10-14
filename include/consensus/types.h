@@ -107,9 +107,12 @@ struct StorageBatch {
 	std::optional<HardState> hard;
 	std::optional<LogMutation> log;
 };
+// Milliseconds. The default is Track C's default profile (R4): the slowest platform
+// measured, macOS x86_64 APFS at a barrier p99 of 80 ms. A host on faster storage derives
+// its own by R4's rules.
 struct Timing {
-	std::uint64_t heartbeat = 20, rpc_timeout = 40;
-	std::uint64_t election_min = 100, election_max = 200;
+	std::uint64_t heartbeat = 100, rpc_timeout = 500;
+	std::uint64_t election_min = 1000, election_max = 2000;
 	std::uint64_t snapshot_timeout = 60000;
 };
 
@@ -209,7 +212,7 @@ struct InstallCompleted { RequestId request; Token prepared; LogBoundary boundar
 struct CheckpointPublished { RequestId request; Index through; };
 struct SnapshotNeeded { NodeId peer; SnapshotKey key; };
 struct SnapshotTransmit { NodeId peer; SnapshotKey key; };
-enum class SnapshotReleaseReason { Installed, CaughtUp, Rejected, Unavailable, Stale, TimedOut, LeadershipLost, Fenced };
+enum class SnapshotReleaseReason { Installed, CaughtUp, Rejected, Unavailable, Stale, TimedOut, LeadershipLost, Fenced, Removed };
 struct SnapshotReleased { NodeId peer; SnapshotKey key; SnapshotReleaseReason reason; };
 struct Send { NodeId peer; Message message; };
 struct ProposalPlaced { RequestId request; Term term; Index index; };

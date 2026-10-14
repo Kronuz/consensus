@@ -211,7 +211,7 @@ void native_worker(const std::filesystem::path &directory) {
 	limits.control_entries = 4;
 	limits.rpc_entries = 4;
 	kronuz::consensus::Worker worker(io, fixed, {{1024 * 1024, 1024}, {65536, 3}, {512 * 1024, 4}, 8, 3},
-									  limits, {}, {16, 128, false, true});
+									  limits, kronuz::consensus::Timing{20, 40, 100, 200, 60000}, {16, 128, false, true});  // compact test timing
 	Identity identity{};
 	identity[0] = 'W';
 	worker.create(identity);

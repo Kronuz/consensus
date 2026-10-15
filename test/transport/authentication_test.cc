@@ -1,5 +1,6 @@
 #include "consensus/transport/tls.h"
 #include <cassert>
+#include <cstdio>
 #include <filesystem>
 #include <iostream>
 #include <openssl/pem.h>
@@ -35,8 +36,13 @@ bool handshake(SSL *server, SSL *client) {
 			auto result = SSL_do_handshake(ssl);
 			if (result != 1) {
 				auto error = SSL_get_error(ssl, result);
-				if (error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE)
+				if (error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE) {
+					char reason[256];
+					ERR_error_string_n(ERR_peek_last_error(), reason, sizeof reason);
+					std::fprintf(stderr, "handshake stopped (%s side): %s\n", ssl == server ? "server" : "client", reason);
+					ERR_clear_error();
 					return false;
+				}
 			}
 		}
 		if (SSL_is_init_finished(server) && SSL_is_init_finished(client))

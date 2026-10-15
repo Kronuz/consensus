@@ -1853,7 +1853,7 @@ void limits_by_position() {
 	const auto before = leader.committed();
 	check(change(wide_node) && leader.committed() > before && leader.group_limits() == wide_node, "a later membership change still commits and raises it back");
 	// A retained-log limit below usage blocks proposals.
-	Limits tight; tight.command_bytes = 1024; tight.rpc_bytes = 1024; tight.log_bytes = 1024;
+	Limits tight; tight.command_bytes = 1024; tight.rpc_bytes = 1024; tight.log_bytes = 1024; tight.members = 8;  // an RPC holds 8 members' encoding
 	check(change(tight), "a leader lowers the retained-log limit below usage");
 	auto blocked = leader.step(Propose{94, "x"});
 	check(find<Reject>(blocked) && find<Reject>(blocked)->reason == RejectReason::LogFull, "a retained log above its lowered limit blocks proposals");

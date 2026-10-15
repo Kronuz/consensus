@@ -244,6 +244,15 @@ public:
 				for (const auto& x : n.core->membership().members) { std::fprintf(stderr, " %llu/%d", (unsigned long long)x.incarnation, int(x.role)); }
 				for (const auto& x : n.core->membership().members) { if (auto pr = n.core->progress(x.incarnation)) { std::fprintf(stderr, " p%llu=%llu", (unsigned long long)x.incarnation, (unsigned long long)*pr); } }
 				std::fprintf(stderr, " snapshots queued %zu\n", snapshot_requests_.size());
+				std::fprintf(stderr, "    node limits: command %zu rpc %zu entries %zu; group command %zu rpc %zu", n.limits.command_bytes, n.limits.rpc_bytes, n.limits.rpc_entries,
+					n.core->group_limits().command_bytes, n.core->group_limits().rpc_bytes);
+				if (n.core->role() == Role::Leader) {
+					for (const auto& [mid, m] : nodes_) {
+						if (mid == id || !m.up) { continue; }
+						if (auto e = n.durable.entry(m.core->last_index() + 1)) { std::fprintf(stderr, "; next for %llu: kind %d %zu bytes", (unsigned long long)mid, int(e->kind), e->payload.size()); }
+					}
+				}
+				std::fprintf(stderr, "\n");
 			}
 		}
 		check_logs();
@@ -252,6 +261,8 @@ public:
 	std::uint64_t restarts = 0, kept = 0, lost = 0, elections = 0, led_steps = 0, repairs = 0, transfers = 0, changes_proposed = 0, memberships_committed = 0;
 	std::uint64_t reads = 0, checkpoints = 0, installs = 0, limit_changes = 0, replaced_configurations = 0, forced_removals = 0;
 	std::uint64_t forced_replacements = 0, removals_with_snapshot = 0, removals_with_read = 0, delayed_timeout_nows = 0;
+	std::uint64_t held_back = 0;  // empty appends to peers below their next entry (M8)
+	std::uint64_t held_back_total() const { auto total = held_back; for (const auto& [_, n] : nodes_) { if (n.core) { total += n.core->held_back(); } } return total; }
 	std::map<int, std::uint64_t> reject_reasons;
 	Term max_term() const {
 		Term t = 0;
@@ -318,16 +329,21 @@ private:
 		n.up = true;
 		act(n, n.core->step(Tick{local_time(n), election_delay()}));
 		act(n, n.core->step(Start{}));
-		// The hello tells each side the other's node limits.
+		// The hello tells each side the other's node limits; the host keeps the last ones it
+		// heard, so a restarted core learns a down peer's too.
 		for (auto& [id, m] : nodes_) {
-			if (id == n.id || !m.core) { continue; }
+			if (id == n.id) { continue; }
 			act(n, n.core->step(PeerLimits{id, m.limits}));
-			if (m.up) { act(m, m.core->step(PeerLimits{n.id, n.limits})); }
+			if (m.up && m.core) { act(m, m.core->step(PeerLimits{n.id, n.limits})); }
 		}
 	}
 	Limits node_limits() {
 		Limits l = limits_;
 		l.command_bytes = 16 + random_() % 49;
+		// One node in four takes RPCs only a few commands wide, so entries are held back
+		// from it at random and it catches up by install (M8, condition 22).
+		// Never below a membership entry's encoding, which validate_limits refuses.
+		if (random_() % 4 == 0) { l.rpc_bytes = membership_bytes(l.members) + random_() % 64; l.rpc_entries = 1 + random_() % l.rpc_entries; }
 		return l;
 	}
 	// Track C's profile rules: a barrier here takes about 60 units (a persist completes at
@@ -357,6 +373,7 @@ private:
 			if (from.up) { act(from, from.core->step(SnapshotTransferFailed{n.id, n.installing->key})); }
 		}
 		n.up = false;
+		held_back += n.core->held_back();
 		n.core.reset();
 		if (random_() % 2) { restart(n); }
 	}
@@ -923,7 +940,7 @@ int main(int argc, char** argv) {
 	const std::uint64_t steps = argc > 2 ? std::strtoull(argv[2], nullptr, 10) : 10000;
 	const std::uint64_t first = argc > 3 ? std::strtoull(argv[3], nullptr, 10) : 1;
 	std::uint64_t restarts = 0, kept = 0, lost = 0, elections = 0, repairs = 0, transfers = 0, changes = 0, committed_changes = 0;
-	std::uint64_t reads = 0, checkpoints = 0, installs = 0, limit_changes = 0, replaced = 0, removals = 0, replacements = 0, with_snapshot = 0, with_read = 0, duplicated = 0;
+	std::uint64_t reads = 0, checkpoints = 0, installs = 0, limit_changes = 0, replaced = 0, removals = 0, replacements = 0, with_snapshot = 0, with_read = 0, duplicated = 0, held = 0;
 	for (std::uint64_t seed = first; seed < first + seeds && !failures; ++seed) {
 		current_seed = seed;
 		Simulation sim(seed, 3 + 2 * (seed % 3 == 0), seed % 2 == 0, seed % 5 == 1);  // even seeds change membership
@@ -949,13 +966,14 @@ int main(int argc, char** argv) {
 		with_snapshot += sim.removals_with_snapshot;
 		with_read += sim.removals_with_read;
 		duplicated += sim.delayed_timeout_nows;
+		held += sim.held_back_total();
 	}
 	std::printf("simulation: %llu seeds x %llu steps, %llu elections, %llu restarts (%llu kept a pending batch, %llu lost one), %llu repairs, %llu transfers, %llu membership changes proposed, %llu committed memberships applied: %s\n",
 		(unsigned long long)seeds, (unsigned long long)steps, (unsigned long long)elections, (unsigned long long)restarts, (unsigned long long)kept,
 		(unsigned long long)lost, (unsigned long long)repairs, (unsigned long long)transfers, (unsigned long long)changes, (unsigned long long)committed_changes, failures ? "FAILED" : "ok");
 	std::printf("  %llu linearizable reads, %llu checkpoints, %llu installs, %llu limit changes, %llu replaced configuration entries, %llu forced self-removals\n", (unsigned long long)reads,
 		(unsigned long long)checkpoints, (unsigned long long)installs, (unsigned long long)limit_changes, (unsigned long long)replaced, (unsigned long long)removals);
-	std::printf("  forced: %llu crashes between promotion and removal; removals committed with a snapshot in flight %llu, with a read in flight %llu; %llu delayed duplicate TimeoutNows\n",
-		(unsigned long long)replacements, (unsigned long long)with_snapshot, (unsigned long long)with_read, (unsigned long long)duplicated);
+	std::printf("  forced: %llu crashes between promotion and removal; removals committed with a snapshot in flight %llu, with a read in flight %llu; %llu delayed duplicate TimeoutNows; %llu appends held back from peers below their next entry\n",
+		(unsigned long long)replacements, (unsigned long long)with_snapshot, (unsigned long long)with_read, (unsigned long long)duplicated, (unsigned long long)held);
 	return failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }

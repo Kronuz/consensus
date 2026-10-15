@@ -2,10 +2,13 @@
 #include "consensus/transport/session.h"
 #include <cassert>
 #include <csignal>
+#include <cstdio>
 #include <filesystem>
 #include <future>
 #include <iostream>
 #include <openssl/pem.h>
+#include <string>
+#include <vector>
 
 using namespace kronuz::consensus::transport;
 using namespace std::chrono_literals;
@@ -154,15 +157,21 @@ template <class Socket> void exchange(const std::filesystem::path &directory, un
 	io.run();
 	unsigned errors = 0;
 	bool canceled = false;
+	std::vector<std::string> what;
 	for (auto *future : {&a, &b}) {
 		try {
 			future->get();
 		} catch (const asio::system_error &error) {
 			canceled = canceled || error.code() == asio::error::operation_aborted;
 			++errors;
-		} catch (const std::exception &) {
+			what.push_back(error.what());
+		} catch (const std::exception &error) {
 			++errors;
+			what.push_back(error.what());
 		}
+	}
+	if (failure ? errors == 0 : errors != 0) {
+		for (const auto &w : what) { std::fprintf(stderr, "failure mode %d: %s\n", int(failure), w.c_str()); }
 	}
 	assert(failure ? errors > 0 : errors == 0);
 	if (failure == 11 || failure == 12)

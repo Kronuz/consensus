@@ -37,9 +37,11 @@ namespace kronuz::consensus {
 inline constexpr Limits ceilings{31, std::size_t{64} << 20, std::size_t{16} << 30, std::size_t{8} << 20, 4096,
 	std::size_t{256} << 20, 65536, 65536, std::size_t{8} << 20, 255};
 
-// A Configuration entry's largest encoding: the most members, with limits. Configuration
-// entries are bounded by this, never by command_bytes, so lowering it cannot wedge a group.
-inline constexpr std::size_t maximum_membership_bytes = 4 + 8 + 8 + 24 * ceilings.members + 8 + 8 + 80;
+// A Configuration entry's largest encoding with `members` members, with limits.
+// Configuration entries are bounded by this, never by command_bytes, so lowering it cannot
+// wedge a group; an RPC limit below it could, so validate_limits refuses one.
+inline constexpr std::size_t membership_bytes(std::size_t members) { return 4 + 8 + 8 + 24 * members + 8 + 8 + 80; }
+inline constexpr std::size_t maximum_membership_bytes = membership_bytes(ceilings.members);
 
 // Throws std::invalid_argument when a group's limits are inconsistent or above the ceilings.
 inline void validate_limits(const Limits& l) {
@@ -48,7 +50,7 @@ inline void validate_limits(const Limits& l) {
 		l.voters > ceilings.voters || l.command_bytes > ceilings.command_bytes || l.log_bytes > ceilings.log_bytes ||
 		l.log_entries > ceilings.log_entries || l.control_entries > ceilings.control_entries || l.rpc_bytes > ceilings.rpc_bytes ||
 		l.rpc_entries > ceilings.rpc_entries || l.reads > ceilings.reads || l.uncommitted_entries > ceilings.uncommitted_entries ||
-		l.members > ceilings.members) {
+		l.members > ceilings.members || l.rpc_bytes < membership_bytes(l.members)) {
 		throw std::invalid_argument("membership limits");
 	}
 }

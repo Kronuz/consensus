@@ -91,6 +91,8 @@ public:
 	// rejected, so a capture of damaged state never becomes the base.
 	std::uint64_t epoch() const noexcept { return epoch_; }
 	std::size_t retained_log_bytes() const noexcept { return log_bytes_; }
+	// Appends sent empty because the peer's next entry is above its limits (M8).
+	std::uint64_t held_back() const noexcept { return held_back_; }
 	std::size_t retired_log_bytes() const noexcept { return entries_.retired_bytes(); }
 	std::size_t retired_log_entries() const noexcept { return entries_.retired_entries(); }
 	void retire_log() noexcept { entries_.retire(256, limits_.command_bytes); }
@@ -317,12 +319,16 @@ private:
 		wire_cache_ = out; wire_key_ = key;
 		return out;
 	}
-	// What a leader sends one peer: within the group's, its own node's, and that peer's
-	// limits only, so a member reporting lower limits holds back no other (M8). A peer below
-	// an entry it still needs catches up by install once a checkpoint covers it.
+	// What one peer's transport takes: its own node's limits and this node's, which encode
+	// and admit the frame; no other member's, so a member reporting lower limits holds back
+	// no other (M8). An entry above them, by command or RPC bytes, is held back; the peer
+	// catches up by install once a checkpoint covers it (condition 22). The group's limits
+	// are not among them: they apply by position, so an entry written before a lowering
+	// stays sendable.
 	Limits peer_wire_limits(NodeId peer) const {
-		Limits out = limits_in_force();
+		Limits out = limits_;
 		auto cap = [&](const Limits& node) {
+			out.command_bytes = std::min(out.command_bytes, node.command_bytes);
 			out.rpc_bytes = std::min(out.rpc_bytes, node.rpc_bytes);
 			out.rpc_entries = std::min(out.rpc_entries, node.rpc_entries);
 		};
@@ -1036,16 +1042,19 @@ private:
 		}
 		Index previous = peer.next - 1;
 		std::vector<Entry> batch; std::size_t bytes = 0;
-		const auto wire = peer_wire_limits(id);
-		const auto rpc_entries = wire.rpc_entries, rpc_bytes = wire.rpc_bytes;
+		// Node limits bound each entry; the group's limits in force, and the nodes', bound the
+		// batch, which always takes a first entry that fits the nodes.
+		const auto wire = peer_wire_limits(id); const auto& group = limits_in_force();
+		const auto rpc_entries = std::min(wire.rpc_entries, group.rpc_entries), rpc_bytes = std::min(wire.rpc_bytes, group.rpc_bytes);
 		for (Index index = peer.next; index <= last_index() && batch.size() < rpc_entries; ++index) {
 			const auto& entry = log_entry(index);
-			if (entry.payload.size() > rpc_bytes - bytes) { break; }
+			if (!fits(entry, wire) || entry.payload.size() > wire.rpc_bytes) { break; }
+			if (!batch.empty() && entry.payload.size() > rpc_bytes - bytes) { break; }
 			bytes += entry.payload.size(); batch.push_back(entry);
 		}
 		// An entry above this peer's limits goes by install: until then it hears heartbeats.
 		peer.blocked = batch.empty() && peer.next <= last_index();
-		if (peer.blocked) { peer.retry_after = deadline(timing_.heartbeat); }
+		if (peer.blocked) { peer.retry_after = deadline(timing_.heartbeat); ++held_back_; }
 		auto rpc = token();
 		peer.flight = Flight{rpc, previous, previous + batch.size(), probe, now_};
 		output.emplace_back(Send{id, AppendRequest{hard_.term, rpc, previous, log_term(previous), durable_.commit_index, probe, std::move(batch), data_matched()}});
@@ -1129,6 +1138,7 @@ private:
 	std::pair<NodeId, Token> acted_timeout_{};  // the last TimeoutNow this node acted on
 	bool timed_out_ = false;
 	std::uint64_t leadership_start_ = 0;  // when this node last became leader
+	std::uint64_t held_back_ = 0;  // appends sent empty: the peer's next entry is above its limits
 	std::map<NodeId, Limits> peer_limits_;  // members' node limits, as the host reported them
 	std::uint64_t membership_version_ = 0;  // bumped whenever a membership or a report changes
 	mutable std::optional<Limits> wire_cache_;

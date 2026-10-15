@@ -1,5 +1,7 @@
 # Strict fixed-voter consensus
 
+[![CI](https://github.com/Kronuz/consensus/actions/workflows/ci.yml/badge.svg)](https://github.com/Kronuz/consensus/actions/workflows/ci.yml)
+
 `kronuz::consensus::Core` is a deterministic Raft state machine. It has no sockets, clock reads, randomness, filesystem calls, or application callbacks. It leaves the volatile legacy `cluster::Raft` API and wire format unchanged. Detent’s authority integrates this module through its bounded Node, storage driver and authenticated peer transport. Fleet distribution remains a separate application layer.
 
 ```sh

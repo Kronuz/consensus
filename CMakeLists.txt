@@ -4,7 +4,7 @@ project(consensus LANGUAGES CXX)
 # Strict durable Raft: a deterministic Core, a Worker over journal storage, checkpoints,
 # and snapshot transfer, plus an optional authenticated peer transport. Header-only.
 include(FetchContent)
-FetchContent_Declare(journal GIT_REPOSITORY https://github.com/Kronuz/journal.git GIT_TAG ad92b2e94ff6dd5317b9f72ae7945c3b5b692994)
+FetchContent_Declare(journal GIT_REPOSITORY https://github.com/Kronuz/journal.git GIT_TAG 848758bba79ee9c3788e6a35865a6cff5360df1c)
 FetchContent_MakeAvailable(journal)
 
 add_library(consensus INTERFACE)
@@ -39,6 +39,8 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 		add_test(NAME consensus_${t} COMMAND consensus_${t}_test)
 		set_tests_properties(consensus_${t} PROPERTIES TIMEOUT 30)
 	endforeach()
+	# Sanitized and beside the shared-journal tests on two CPUs, the simulation needs more.
+	set_tests_properties(consensus_simulation PROPERTIES TIMEOUT 300)
 	# T1: stores written at b7073bb recover unchanged.
 	add_executable(consensus_compat_test test/compat_test.cc)
 	target_link_libraries(consensus_compat_test PRIVATE consensus::consensus)
@@ -52,6 +54,10 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	target_link_libraries(consensus_shared_worker_test PRIVATE consensus::consensus)
 	add_test(NAME consensus_shared_worker COMMAND consensus_shared_worker_test)
 	set_tests_properties(consensus_shared_worker PROPERTIES TIMEOUT 600)
+	add_executable(consensus_shared_cluster_test test/shared_cluster_test.cc)
+	target_link_libraries(consensus_shared_cluster_test PRIVATE consensus::consensus)
+	add_test(NAME consensus_shared_cluster COMMAND consensus_shared_cluster_test)
+	set_tests_properties(consensus_shared_cluster PROPERTIES TIMEOUT 600)
 	add_executable(consensus_worker_test test/worker_test.cc)
 	target_link_libraries(consensus_worker_test PRIVATE consensus::consensus)
 	add_test(NAME consensus_worker COMMAND consensus_worker_test)

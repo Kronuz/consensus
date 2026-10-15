@@ -100,6 +100,15 @@ public:
 		if (scheduling_.async_storage) { scheduling_.async_appends = true; }
 		validate_configuration(admission);
 	}
+	// D11: the group persists through its core's turn driver (journal's shared Store), so
+	// its appends and checkpoint records are asynchronous and complete at turn barriers.
+	Worker(std::shared_ptr<kronuz::journal::IO> io, kronuz::journal::TurnDriver& turns, std::uint64_t group, FixedConfiguration configuration,
+		kronuz::journal::AdmissionLimits admission, Limits limits = {}, Timing timing = {}, WorkerLimits scheduling = {}, std::optional<SnapshotLimits> snapshots = {})
+		: configuration_(std::move(configuration)), limits_(limits), timing_(timing), scheduling_(scheduling),
+		snapshot_limits_(snapshots), store_(std::move(io), turns, group, admission, batch_limit(configuration_, limits), artifact_limit(snapshots)) {
+		scheduling_.async_appends = scheduling_.async_storage = true;
+		validate_configuration(admission);
+	}
 	Worker(const Worker&) = delete;
 	Worker& operator=(const Worker&) = delete;
 	// Before create or recover: the founding membership's roles (D9), when a founding member
@@ -131,8 +140,8 @@ public:
 		unopened();
 		try {
 			Recovery recovery(configuration_, limits_);
-			auto frontier = store_.recover([&](auto sequence, auto bytes) { recovery.replay(sequence, bytes); },
-				[&](const auto& selected, auto& bundle, auto dependencies) {
+			auto replay = [&](auto sequence, auto bytes) { recovery.replay(sequence, bytes); };
+			auto restore = [&](const auto& selected, auto& bundle, auto dependencies) {
 					if (dependencies.size() != 1 || selected.dependencies.size() != 1 || bundle.descriptor().length > checkpoint_detail::maximum_size()) {
 						throw kronuz::journal::Corruption("invalid worker checkpoint dependencies or bundle bound");
 					}
@@ -146,7 +155,11 @@ public:
 					published_ = Publication{{decoded.state.base_index, decoded.state.base_term}, decoded.application_format, selected.generation};
 					recovery.restore(std::move(decoded.state), decoded.storage_sequence);
 					restore_application(dependencies[0]); // Build unpublished application state.
-				});
+				};
+			// A shared group whose directory still holds a per-group journal migrates (R20);
+			// the host calls finish_migration() once the driver's turns are durable.
+			auto frontier = store_.shared() && store_.layout() == kronuz::journal::Journal::Layout::Legacy
+				? store_.migrate(replay, restore) : store_.recover(replay, restore);
 			if (frontier.sequence == 0 && frontier.base_sequence == 0 && frontier.version == 1 && !frontier.checkpoint && frontier.dependencies.empty()) {
 				// Generic bootstrap is already durable; typed initialization may
 				// have been queued when the previous process exited.
@@ -154,6 +167,11 @@ public:
 				core_ = std::make_unique<Core>(configuration_, initial_state(), limits_, timing_);
 			} else { core_ = std::make_unique<Core>(configuration_, recovery.finish(frontier.sequence), limits_, timing_); }
 		} catch (const std::exception& error) { fail(error.what()); throw; }
+	}
+	// R20: after a migrating recover, once the turn driver has made its records durable.
+	bool migrating() const noexcept { return store_.migrating(); }
+	void finish_migration() {
+		try { store_.finish_migration(); } catch (const std::exception& error) { fail(error.what()); throw; }
 	}
 	bool ready() const noexcept { return !closing_ && core_ && initialization_.empty() && store_.accounting().has_value() && !fenced(); }
 	// Close protocol interest, then reap accepted originals before invalidating
@@ -186,6 +204,8 @@ public:
 	SubmitResult try_submit_retained(Event& event) { return submit_retained(event, false); }
 	std::shared_ptr<kronuz::journal::IOOperation> take_io_operation() {
 		if (io_dispatched_ || (!io_job_ && !maintenance_io_)) { return {}; }
+		// A shared store's appends and publications complete through the turn driver.
+		if (store_.shared() && (io_job_ || maintenance_kind_ == MaintenanceKind::Publish)) { return {}; }
 		io_dispatched_ = true; return io_job_ ? std::static_pointer_cast<kronuz::journal::IOOperation>(io_job_) : maintenance_io_;
 	}
 	void storage_operation_failed(const std::shared_ptr<kronuz::journal::IOOperation>& operation, std::string reason) {

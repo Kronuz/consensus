@@ -1935,7 +1935,7 @@ void founding_and_join_records() {
  Membership witness{{{1, 1, MemberRole::Voter}, {2, 2, MemberRole::Voter}, {3, 3, MemberRole::Witness}}, 4, 0};
  FixedConfiguration joiner = configuration(); joiner.local = 7; joiner.voters.clear();
  for (bool join : {false, true}) {
-  auto path = directory / (join ? "join" : "found"); std::filesystem::create_directories(path);
+  auto path = directory / (join ? "join" : "found"); std::filesystem::create_directories(path); ::chmod(path.c_str(), 0700);
   auto io = std::make_shared<kronuz::journal::PosixIO>(path);
   auto& config = join ? joiner : three;
   {
@@ -1972,7 +1972,7 @@ void snapshot_senders() {
  std::filesystem::create_directories(directory); ::chmod(directory.c_str(), 0700);
  struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
  auto reserve = [&](const char* name, FixedConfiguration config, NodeId sender) {
-  auto path = directory / name; std::filesystem::create_directories(path);
+  auto path = directory / name; std::filesystem::create_directories(path); ::chmod(path.c_str(), 0700);
   auto io = std::make_shared<kronuz::journal::PosixIO>(path);
   Worker worker(io, config, SnapshotFixture::quota(), limits(), compact, {4, 1, false, false}, SnapshotLimits{7, 100000});
   Identity id{}; id[0] = 'R'; worker.create(id);

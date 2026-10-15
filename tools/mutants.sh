@@ -32,6 +32,7 @@ mutants=(
 	$'repair below base_index\tif (b.index < base_index_ || b.index > durable_.commit_index ||\tif (b.index > durable_.commit_index ||'
 	$'a leader ignores members\' node limits\t\t\tif (auto found = peer_limits_.find(member); found != peer_limits_.end()) { cap(found->second); }\t\t\t(void)member;'
 	$'commit of an earlier term by counting\tif (candidate <= durable_.commit_index || log_term(candidate) != hard_.term) { return; }\tif (candidate <= durable_.commit_index) { return; }'
+	$'a read counts every acknowledgement\treturn std::size_t(std::count_if(read.acknowledgements.begin(), read.acknowledgements.end(), [&](NodeId id) { return is_voter(id); }));\treturn read.acknowledgements.size();'
 )
 # Runs a suite for at most $1 seconds; a mutant that hangs a suite fails it.
 bounded() {

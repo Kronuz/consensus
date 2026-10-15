@@ -664,6 +664,34 @@ void invalid_peer_limits() {
 	check(c.commit_one("after"), "an invalid report neither empties appends nor stops commits");
 }
 
+// Condition 20 (D4): a read admitted before its leader's self-removal counts, once the
+// removal is in force, only the remaining voters' acknowledgements.
+void read_across_self_removal() {
+	auto d = founded();
+	d.commit_one("a");
+	auto& leader = d.core(1);
+	d.cut = {{1, 2}, {2, 1}, {1, 3}, {3, 1}};
+	d.consume(1, leader.step(Read{77}));
+	Membership without1 = leader.membership();
+	std::erase_if(without1.members, [](const Member& x) { return x.incarnation == 1; });
+	d.consume(1, leader.step(ChangeMembership{78, without1}));
+	check(!votes_in(leader.membership(), 1), "the removal is in force on the leader");
+	auto answered = [&] {
+		for (const auto& batch : d.nodes.at(1).log) {
+			for (const auto& a : batch) {
+				if (auto r = std::get_if<ReadReady>(&a); r && r->request == 77) { return 1; }
+				if (auto r = std::get_if<Reject>(&a); r && r->request == 77) { return 2; }
+			}
+		}
+		return 0;
+	};
+	d.cut = {{1, 3}, {3, 1}};  // 2 answers; 3 does not
+	d.run(300);
+	check(answered() != 1, "one remaining voter's acknowledgement does not complete the read: the leader's own no longer counts");
+	d.cut.clear(); d.run(2000);
+	check(answered() != 0, "the read completes, or is refused, once the remaining voters answer");
+}
+
 // Bounds past the fuzzer's input length, and the empty storage batch it never built.
 template <class F> bool corrupt(F&& f, std::string_view what) {
 	try { f(); return false; } catch (const kronuz::journal::Corruption& error) { return std::string_view(error.what()).find(what) != std::string_view::npos; }
@@ -716,6 +744,7 @@ int main() {
 		decoder_bounds();
 		per_peer_wire_limits();
 		invalid_peer_limits();
+		read_across_self_removal();
 	} catch (const std::exception& error) {
 		check(false, error.what());
 	}

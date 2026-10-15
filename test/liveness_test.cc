@@ -347,7 +347,17 @@ void run(const Profile& profile, std::uint64_t seeds) {
 			for (auto& x : promoted.members) { if (x.incarnation == 4) { x.role = MemberRole::Voter; } }
 			NodeId leaving = 0;
 			if (replace) { for (NodeId id : three) { if (id != *l) { leaving = id; break; } } promoted.leaving = leaving; }
+			// The promotion commits on the old voters while 4 still counts itself a learner,
+			// so the survivors elect only if 4 votes (M1; condition 19).
+			if (!replace) { c.cut(*l, 4); }
 			if (!c.change(*l, promoted, c.now() + 10000)) { ++(replace ? unreplaced : unpromoted); continue; }
+			if (!replace) {
+				// The window: committed on the old voters, held by both, not by 4.
+				c.run_until(c.now() + 20000, [&] {
+					return votes_in(c.core(*l).committed_membership(), 4) && std::all_of(three.begin(), three.end(), [&](NodeId id) { return votes_in(c.core(id).membership(), 4); });
+				});
+				if (!votes_in(c.core(*l).committed_membership(), 4) || votes_in(c.core(4).membership(), 4)) { ++unpromoted; continue; }
+			}
 			if (replace) { c.run_until(c.now() + 20000, [&] { return c.core(*l).committed_membership().leaving != 0; }); }
 			for (NodeId id = 1; id <= 4; ++id) { if (id != *l) { c.cut(*l, id); c.cut(id, *l); } }
 			const auto failed = c.now();

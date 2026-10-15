@@ -4,7 +4,7 @@ project(consensus LANGUAGES CXX)
 # Strict durable Raft: a deterministic Core, a Worker over journal storage, checkpoints,
 # and snapshot transfer, plus an optional authenticated peer transport. Header-only.
 include(FetchContent)
-FetchContent_Declare(journal GIT_REPOSITORY https://github.com/Kronuz/journal.git GIT_TAG 848758bba79ee9c3788e6a35865a6cff5360df1c)
+FetchContent_Declare(journal GIT_REPOSITORY https://github.com/Kronuz/journal.git GIT_TAG a678e44e7fffd6b745bd89ac9589fdc15796be6e)
 FetchContent_MakeAvailable(journal)
 
 add_library(consensus INTERFACE)

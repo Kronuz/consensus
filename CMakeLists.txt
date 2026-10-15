@@ -89,6 +89,10 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	endif()
 
 	# Transport tests; they check with assert, so NDEBUG stays off.
+	# The fixture's certificates come from the openssl beside the linked library: macOS's
+	# /usr/bin/openssl is LibreSSL, whose certificates OpenSSL 3 rejects.
+	get_filename_component(CONSENSUS_OPENSSL_PREFIX "${OPENSSL_INCLUDE_DIR}" DIRECTORY)
+	find_program(CONSENSUS_TEST_OPENSSL openssl HINTS "${CONSENSUS_OPENSSL_PREFIX}/bin" NO_DEFAULT_PATH)
 	find_program(CONSENSUS_TEST_OPENSSL openssl REQUIRED)
 	add_test(NAME consensus_tls_certificates COMMAND ${CMAKE_COMMAND} -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/tls-fixture
 		-DOPENSSL=${CONSENSUS_TEST_OPENSSL} -P ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/tls_certificates.cmake)

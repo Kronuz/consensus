@@ -616,6 +616,54 @@ void validators() {
 	check(change({{{1, 1, R::Voter}, {2, 2, R::Voter}, {3, 3, R::Voter}, {4, 4, R::Learner}}, 5, 3}), "a leaving voter needs a promotion beside it");
 }
 
+// M8: each peer's appends are capped by that peer's limits only. A member that reports
+// lower limits after a larger entry is in the log, or a learner added with them, holds back
+// no other member; it catches up by install once a checkpoint covers the entry.
+void per_peer_wire_limits() {
+	Limits wide; wide.command_bytes = 2 << 20; wide.rpc_bytes = 4 << 20;
+	Limits low; low.command_bytes = 512 * 1024; low.rpc_bytes = 1 << 20;
+	{
+		ProbeCluster c;
+		for (NodeId id : {1u, 2u, 3u}) { c.add_founding(id, 3, wide); }
+		c.now = 100; c.consume(1, c.core(1).step(Tick{c.now, 100})); c.run(400);
+		auto& leader = c.core(1);
+		check(c.leader() == 1u && c.commit_one("a"), "node 1 leads and commits");
+		c.cut = {{1, 2}, {1, 3}};
+		c.consume(1, leader.step(Propose{++c.request, std::string(1536 * 1024, 'x')})); c.run(100);
+		c.consume(1, leader.step(PeerLimits{2, low}));  // node 2 restarts with lower limits
+		c.cut.clear(); c.run(3000);
+		check(c.core(3).last_index() >= 3 && leader.committed() >= 3, "a member reporting lower limits holds back no other");
+		check(c.core(2).last_index() < 3 && c.commit_one(std::string(256 * 1024, 's')), "the group keeps committing while that member lags");
+		c.consume(1, leader.step(LocalCheckpoint{++c.request, 9, leader.applied(), leader.term(), founding_config(1).cluster, founding_config(1).configuration})); c.run(200);
+		auto& needed = c.nodes.at(1).snapshots;
+		check(std::any_of(needed.begin(), needed.end(), [](const SnapshotNeeded& n) { return n.peer == 2; }), "the lagging member catches up by install once a checkpoint covers the entry");
+	}
+	{
+		ProbeCluster c;
+		for (NodeId id : {1u, 2u, 3u}) { c.add_founding(id, 3, wide); }
+		c.now = 100; c.consume(1, c.core(1).step(Tick{c.now, 100})); c.run(400);
+		auto& leader = c.core(1);
+		check(c.leader() == 1u && c.commit_one("a"), "node 1 leads and commits");
+		c.cut = {{1, 2}, {1, 3}};
+		c.consume(1, leader.step(Propose{++c.request, std::string(1536 * 1024, 'x')})); c.run(100);
+		c.add_joiner(4, low); c.consume(1, leader.step(PeerLimits{4, low}));
+		Membership with4 = leader.membership(); with4.members.push_back({4, 4, MemberRole::Learner}); with4.next_incarnation = 5;
+		c.consume(1, leader.step(ChangeMembership{++c.request, with4}));
+		c.cut.clear(); c.run(3000);
+		check(leader.committed() >= 4 && find_member(leader.committed_membership(), 4), "a learner added with smaller limits holds back neither the entry nor its own addition");
+	}
+}
+
+// Condition 18: a node-limits report that fails validation is ignored.
+void invalid_peer_limits() {
+	auto c = founded();
+	auto& leader = c.core(1);
+	Limits empty; empty.rpc_entries = 0;
+	c.consume(1, leader.step(PeerLimits{2, empty}));
+	c.consume(1, leader.step(PeerLimits{3, empty}));
+	check(c.commit_one("after"), "an invalid report neither empties appends nor stops commits");
+}
+
 // Bounds past the fuzzer's input length, and the empty storage batch it never built.
 template <class F> bool corrupt(F&& f, std::string_view what) {
 	try { f(); return false; } catch (const kronuz::journal::Corruption& error) { return std::string_view(error.what()).find(what) != std::string_view::npos; }
@@ -666,6 +714,8 @@ int main() {
 		lowered_node_limits_reopen();
 		validators();
 		decoder_bounds();
+		per_peer_wire_limits();
+		invalid_peer_limits();
 	} catch (const std::exception& error) {
 		check(false, error.what());
 	}

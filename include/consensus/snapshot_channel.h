@@ -25,6 +25,8 @@
 #include "worker.h"
 #include "snapshot_transfer.h"
 
+#include <algorithm>
+
 namespace kronuz::consensus {
 
 // Supplied by an authenticated, reliable, ordered transport. Identities must
@@ -48,10 +50,19 @@ public:
 		auto channel = find(session.peer);
 		if (session.peer == 0 || session.peer == worker_.configuration().local || session.local == Identity{} || session.remote == Identity{}) { throw std::invalid_argument("invalid trusted snapshot session"); }
 		// A member added after founding, or any peer of a joiner, gets its channel when its
-		// session opens (D5), up to the node's member limit.
+		// session opens (D5). Open sessions count against the node's member limit; a closed
+		// channel of a peer no longer a member is reused (M9).
 		if (!channel) {
-			if (channels_.size() >= worker_.limits().members) { throw std::length_error("snapshot channel count exceeds the member limit"); }
-			channel = &channels_.emplace_back(session.peer);
+			auto open = std::count_if(channels_.begin(), channels_.end(), [](const Channel& c) { return c.session.has_value(); });
+			if (static_cast<std::size_t>(open) >= worker_.limits().members) { throw std::length_error("snapshot channel count exceeds the member limit"); }
+			auto membership = worker_.membership();
+			auto member = [&](NodeId peer) {
+				return membership && std::any_of(membership->members.begin(), membership->members.end(), [&](const Member& x) { return x.incarnation == peer; });
+			};
+			for (auto& c : channels_) {
+				if (!c.session && !c.control && !member(c.peer)) { c.peer = session.peer; c.used = 0; c.completed.reset(); channel = &c; break; }
+			}
+			if (!channel) { channel = &channels_.emplace_back(session.peer); }
 		}
 		if (channel->session) { session_closed(*channel->session); }
 		channel->session = session; channel->used = 0;

@@ -255,7 +255,7 @@ private:
 	struct Flight { Token rpc; Index previous, through; Token read_probe; std::uint64_t sent; bool keepalive = false; };
 	enum class SnapshotPhase { AwaitSource, Sending };
 	struct SnapshotFlight { SnapshotKey key; SnapshotPhase phase; std::uint64_t started; };
-	struct Peer { Index next = 1, matched = 0; std::optional<Flight> flight; std::uint64_t retry_after = 0; std::optional<SnapshotFlight> snapshot{}; std::optional<std::uint64_t> snapshot_retry_clock{}; };
+	struct Peer { Index next = 1, matched = 0; std::optional<Flight> flight; std::uint64_t retry_after = 0; std::optional<SnapshotFlight> snapshot{}; std::optional<std::uint64_t> snapshot_retry_clock{}; bool blocked = false; };
 	struct PendingRead { RequestId request; Token probe; Term term; Index index; std::set<NodeId> acknowledgements; };
 	struct Transfer { NodeId target; Token token; std::uint64_t until; bool sent = false; };
 	static constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
@@ -296,8 +296,8 @@ private:
 	// The limits a group applies: its newest configuration's, else the node's (R16).
 	const Limits& limits_of(const Membership& m) const { return m.limits ? *m.limits : limits_; }
 	const Limits& limits_in_force() const { return limits_of(membership()); }
-	// What a leader sends and admits: the group's command and RPC limits, within its own
-	// node's and every reported member's, so no member's transport or admission refuses it.
+	// What a leader admits: the group's command and RPC limits, within its own node's and
+	// every reported member's, so no member's transport or admission refuses a new command.
 	Limits wire_limits() const {
 		// Cached until the membership, the committed membership, or a report changes: a
 		// leader asks once per RPC, and the scan is over every member.
@@ -317,8 +317,24 @@ private:
 		wire_cache_ = out; wire_key_ = key;
 		return out;
 	}
+	// What a leader sends one peer: within the group's, its own node's, and that peer's
+	// limits only, so a member reporting lower limits holds back no other (M8). A peer below
+	// an entry it still needs catches up by install once a checkpoint covers it.
+	Limits peer_wire_limits(NodeId peer) const {
+		Limits out = limits_in_force();
+		auto cap = [&](const Limits& node) {
+			out.rpc_bytes = std::min(out.rpc_bytes, node.rpc_bytes);
+			out.rpc_entries = std::min(out.rpc_entries, node.rpc_entries);
+		};
+		cap(limits_);
+		if (auto found = peer_limits_.find(peer); found != peer_limits_.end()) { cap(found->second); }
+		return out;
+	}
+	// A report that fails validation is ignored: a zero limit would empty every RPC.
 	void handle(PeerLimits report, Actions&) {
-		if (report.incarnation && report.incarnation != configuration_.local) { peer_limits_[report.incarnation] = report.limits; ++membership_version_; }
+		if (!report.incarnation || report.incarnation == configuration_.local) { return; }
+		try { validate_limits(report.limits); } catch (const std::invalid_argument&) { return; }
+		peer_limits_[report.incarnation] = report.limits; ++membership_version_;
 	}
 	// Commands are bound by the command limit in force; a Configuration entry only by its
 	// encoding (maximum_membership_bytes), so lowering the limit cannot wedge a group (R16).
@@ -863,7 +879,8 @@ private:
 		if (flight.keepalive) { return; }
 		if (response.success) {
 			if (response.matched != flight.through) { return; }
-			peer.matched = std::max(peer.matched, response.matched); peer.next = peer.matched + 1; peer.retry_after = 0;
+			peer.matched = std::max(peer.matched, response.matched); peer.next = peer.matched + 1;
+			if (!peer.blocked) { peer.retry_after = 0; }
 			if (transfer_ && transfer_->target == source) { timeout_now(output); }
 			if (flight.read_probe) {
 				for (auto& read : reads_) { if (read.probe == flight.read_probe && read.term == hard_.term) { read.acknowledgements.insert(source); } }
@@ -1019,13 +1036,16 @@ private:
 		}
 		Index previous = peer.next - 1;
 		std::vector<Entry> batch; std::size_t bytes = 0;
-		const auto wire = wire_limits();
+		const auto wire = peer_wire_limits(id);
 		const auto rpc_entries = wire.rpc_entries, rpc_bytes = wire.rpc_bytes;
 		for (Index index = peer.next; index <= last_index() && batch.size() < rpc_entries; ++index) {
 			const auto& entry = log_entry(index);
 			if (entry.payload.size() > rpc_bytes - bytes) { break; }
 			bytes += entry.payload.size(); batch.push_back(entry);
 		}
+		// An entry above this peer's limits goes by install: until then it hears heartbeats.
+		peer.blocked = batch.empty() && peer.next <= last_index();
+		if (peer.blocked) { peer.retry_after = deadline(timing_.heartbeat); }
 		auto rpc = token();
 		peer.flight = Flight{rpc, previous, previous + batch.size(), probe, now_};
 		output.emplace_back(Send{id, AppendRequest{hard_.term, rpc, previous, log_term(previous), durable_.commit_index, probe, std::move(batch), data_matched()}});

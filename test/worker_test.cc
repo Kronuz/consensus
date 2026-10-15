@@ -1746,6 +1746,12 @@ void hostile_transfer_frames() {
 	bool limited = false;
 	for (NodeId peer = 3; peer < 3 + limits().members && !limited; ++peer) { limited = throws([&] { channel.register_session({peer, local, remote}); }); }
 	check(limited && channel.channel_count() == limits().members, "channels stop at the node's member limit");
+	for (NodeId peer = 3; peer < 3 + limits().members; ++peer) { channel.session_closed({peer, local, remote}); }
+	bool refused = false;
+	for (NodeId peer = 1000; peer < 1000 + 3 * limits().members && !refused; ++peer) {
+		refused = throws([&] { channel.register_session({peer, local, remote}); }); channel.session_closed({peer, local, remote});
+	}
+	check(!refused && channel.channel_count() <= limits().members, "peers that came and went release their channels to later ones (M9)");
 	channel.register_session(session); fixture.worker.close();
 	check(channel.receive(session, std::span<const char>(accepted.data(), accepted.size())).result == TransferReceive::Closed, "a closing worker's open session is closed");
 	channel.run_one({60, 100});

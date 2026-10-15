@@ -1788,6 +1788,8 @@ void worker_api_guards() {
 		worker.snapshot_activated(*id, 1) == ValidationAck::Stale && worker.snapshot_activation_failed(*id, 1) == ValidationAck::Stale &&
 		worker.cancel_snapshot(*id) == CancelResult::Stale && throws([&] { worker.offer_snapshot_chunk(*id, 0, "data", true); }), "another worker's snapshot id is stale");
 	check(worker.source_peer_failed(2) == ValidationAck::NotReady, "a peer with no source has nothing to fail");
+	check(worker.retained_log_bytes() == 0 && worker.retired_log_bytes() == 0 && worker.retired_log_entries() == 0 && worker.base_boundary() == LogBoundary{} && worker.ready(),
+		"an opened worker with an empty log reports none");
 	worker.applied({0}); worker.application_failed(0, "stale"); check(!worker.fenced(), "stale application reports change nothing");
 	check(!owner.worker.reserve_checkpoint(100), "one checkpoint or snapshot at a time");
 	if (auto checkpoint = worker.reserve_checkpoint(5)) {

@@ -42,7 +42,8 @@ struct WorkerLimits {
 // epoch: Worker::epoch() when the application state was captured; a repair since then makes
 // the capture stale, and the core rejects it.
 struct CaptureMetadata { RequestId request; Index through; Term term; std::uint64_t epoch = 0; };
-struct SnapshotLimits { std::uint32_t application_format; std::uint64_t application_bytes; };
+// window: 64 KiB chunks a source reads ahead and a channel keeps in flight (Track C, D18).
+struct SnapshotLimits { std::uint32_t application_format; std::uint64_t application_bytes; std::uint32_t window = 1; };
 struct SnapshotContext { NodeId authenticated_peer; Term leader_term; RequestId request; Token transfer; SnapshotDescriptor descriptor; };
 enum class ValidationAck { Accepted, Stale, NotReady, Fenced };
 enum class SnapshotReason { Canceled, InvalidImage, InvalidApplication, Rejected, Installed };
@@ -364,6 +365,7 @@ public:
 	CancelResult reject_snapshot_validation(const SnapshotId& id) { return cancel_snapshot(id, SnapshotReason::InvalidApplication); }
 	CancelResult cancel_snapshot(const SnapshotId& id) { return cancel_snapshot(id, SnapshotReason::Canceled); }
 	const SnapshotResult* pending_snapshot_result() const noexcept { return snapshot_result_ ? &*snapshot_result_ : nullptr; }
+	std::uint32_t snapshot_window() const noexcept { return snapshot_limits_ ? snapshot_limits_->window : 1; }
 	std::optional<SnapshotPolicy> snapshot_policy() const { return snapshot_limits_ ? std::optional<SnapshotPolicy>{{configuration_.cluster, configuration_.configuration, snapshot_limits_->application_format, snapshot_limits_->application_bytes}} : std::nullopt; }
 	const FixedConfiguration& configuration() const noexcept { return configuration_; }
 	const Limits& limits() const noexcept { return limits_; }
@@ -414,19 +416,22 @@ public:
 		if (closing_ || fenced() || !source_ || (source_->phase != SourcePhase::Streaming && source_->phase != SourcePhase::AwaitResult) || !core_->snapshot_sending(source_->peer, source_->key)) { return std::nullopt; }
 		return SourceInfo{SourceId(source_owner_, source_->token), source_->peer, source_->key, source_->descriptor};
 	}
-	std::optional<SourceChunk> source_chunk() const {
-		if (!snapshot_source() || !source_->view) { return std::nullopt; }
-		return SourceChunk{SourceId(source_owner_, source_->token), source_->view, source_->offset, std::span<const char>(source_->buffer.data(), source_->count), source_->final};
+	// The index-th chunk read ahead past the acknowledged offset, oldest first.
+	std::optional<SourceChunk> source_chunk(std::size_t index = 0) const {
+		if (!snapshot_source() || index >= source_->ready) { return std::nullopt; }
+		auto slot = (source_->head + index) % source_->slots.size(); auto& chunk = source_->slots[slot];
+		return SourceChunk{SourceId(source_owner_, source_->token), chunk.view, chunk.offset, std::span<const char>(source_->buffer.data() + slot * 65536, chunk.count), chunk.final};
 	}
 	ValidationAck consume_source(const SourceId& id, Token chunk) {
 		if (fenced()) { return ValidationAck::Fenced; }
 		refresh_source();
-		if (!source_ || id.owner_ != source_owner_ || id.token_ != source_->token || !source_->view || source_->view != chunk) { return ValidationAck::Stale; }
-		source_->offset += source_->count; source_->view = 0;
-		if (source_->final) { source_->phase = SourcePhase::AwaitResult; }
+		if (!source_ || id.owner_ != source_owner_ || id.token_ != source_->token || !source_->ready || source_->slots[source_->head].view != chunk) { return ValidationAck::Stale; }
+		auto& oldest = source_->slots[source_->head]; source_->offset += oldest.count; auto final = oldest.final; oldest = {};
+		source_->head = (source_->head + 1) % source_->slots.size(); --source_->ready;
+		if (final) { source_->phase = SourcePhase::AwaitResult; }
 		return ValidationAck::Accepted;
 	}
-	std::size_t snapshot_buffer_capacity() const noexcept { return (source_ ? 65536 : 0) + (checkpoint_ ? 65536 : 0); }
+	std::size_t snapshot_buffer_capacity() const noexcept { return (source_ ? source_->buffer.size() : 0) + (checkpoint_ ? 65536 : 0); }
 	ValidationAck source_peer_failed(NodeId peer) {
 		if (fenced()) { return ValidationAck::Fenced; }
 		refresh_source(); if (!source_ || source_->peer != peer) { return ValidationAck::NotReady; }
@@ -436,7 +441,7 @@ public:
 		if (fenced()) { return ValidationAck::Fenced; }
 		refresh_source();
 		if (!source_ || id.owner_ != source_owner_ || id.token_ != source_->token) { return ValidationAck::Stale; }
-		source_->verifier.reset(); source_->reader.reset(); source_->view = 0; source_->phase = SourcePhase::Failed;
+		source_->verifier.reset(); source_->reader.reset(); source_->ready = 0; source_->phase = SourcePhase::Failed;
 		return ValidationAck::Accepted;
 	}
 	TurnResult run_one(Tick current_time) {
@@ -681,15 +686,20 @@ private:
 	enum class SourcePhase { Opening, Verifying, Ready, Streaming, AwaitResult, Failed };
 	struct Publication { LogBoundary boundary; std::optional<std::uint32_t> format; std::uint64_t generation; };
 	struct Source {
-		Source(kronuz::journal::PublishedArtifactSelection selected, NodeId destination, SnapshotKey flight, Token identity, SnapshotDescriptor image)
-			: selection(std::move(selected)), peer(destination), key(flight), token(identity), descriptor(image) {}
+		Source(kronuz::journal::PublishedArtifactSelection selected, NodeId destination, SnapshotKey flight, Token identity, SnapshotDescriptor image, std::uint32_t window)
+			: selection(std::move(selected)), peer(destination), key(flight), token(identity), descriptor(image), buffer(std::size_t{window} * 65536), slots(window) {}
 		kronuz::journal::PublishedArtifactSelection selection;
 		NodeId peer; SnapshotKey key; Token token; SnapshotDescriptor descriptor;
 		SourcePhase phase = SourcePhase::Opening;
 		std::optional<kronuz::journal::ArtifactVerifier> verifier;
 		std::optional<kronuz::journal::ArtifactReader> reader;
-		std::array<char, 65536> buffer{};
-		Token view = 0; std::uint64_t offset = 0; std::size_t count = 0; bool final = false;
+		// A ring of read-ahead chunks: `head` is the oldest unacknowledged, `ready` are read.
+		struct Slot { Token view = 0; std::uint64_t offset = 0; std::size_t count = 0; bool final = false; };
+		std::vector<char> buffer; std::vector<Slot> slots;
+		std::size_t head = 0, ready = 0; std::uint64_t offset = 0, read = 0; bool read_final = false;
+		std::span<char> chunk(std::size_t slot) { return {buffer.data() + slot * 65536, 65536}; }
+		std::size_t tail() const noexcept { return (head + ready) % slots.size(); }
+		bool full() const noexcept { return ready == slots.size() || read_final; }
 	};
 	struct Incoming {
 		explicit Incoming(SnapshotContext value) : context(std::move(value)) {}
@@ -803,9 +813,9 @@ private:
 				if (kind == MaintenanceKind::SourceOpen) { source.verifier.emplace(std::static_pointer_cast<ArtifactOpen>(job)->take_verifier()); source.phase = SourcePhase::Verifying; }
 				else if (kind == MaintenanceKind::SourceVerify) { source.verifier->finish_read_next(std::static_pointer_cast<ArtifactRead>(job)); }
 				else {
-					auto bytes = std::static_pointer_cast<ArtifactRead>(job)->result(); std::copy(bytes.begin(), bytes.end(), source.buffer.begin()); source.count = bytes.size(); source.final = false;
+					auto bytes = std::static_pointer_cast<ArtifactRead>(job)->result(); auto slot = source.tail(); std::copy(bytes.begin(), bytes.end(), source.chunk(slot).begin());
 					if (next_source_chunk_ == std::numeric_limits<Token>::max()) { throw std::length_error("source chunk identity exhausted"); }
-					source.view = ++next_source_chunk_;
+					source.slots[slot] = {++next_source_chunk_, source.read, bytes.size(), false}; source.read += bytes.size(); ++source.ready;
 				}
 			}
 		} else if (kind != MaintenanceKind::Reclaim && checkpoint_ && checkpoint_->token == token) {
@@ -851,7 +861,7 @@ private:
 	bool source_runnable() const {
 		if (!snapshot_limits_ || !core_ || core_->role() != Role::Leader) { return false; }
 		if (source_) {
-			if (source_->phase == SourcePhase::AwaitResult || (source_->phase == SourcePhase::Streaming && source_->view)) { return false; }
+			if (source_->phase == SourcePhase::AwaitResult || (source_->phase == SourcePhase::Streaming && source_->full())) { return false; }
 			if (source_->phase == SourcePhase::Ready || source_->phase == SourcePhase::Failed) { return !core_->busy() && output_.empty() && !completion_ && !persist_ && !application_ && !cutover_debt_; }
 			return true;
 		}
@@ -870,7 +880,7 @@ private:
 				if (!published_ || !published_->format || *published_->format != snapshot_limits_->application_format || published_->boundary != key->boundary || core_->base_boundary() != key->boundary || !selected || selected->generation() != published_->generation || selected->descriptor().length > snapshot_limits_->application_bytes) { ingest(core_->step(SnapshotTransferFailed{peer, *key})); return; }
 				if (next_source_ == std::numeric_limits<Token>::max()) { throw std::length_error("source identity exhausted"); }
 				const auto& artifact = selected->descriptor(); SnapshotDescriptor descriptor{configuration_.cluster, configuration_.configuration, *published_->format, key->boundary.index, key->boundary.term, artifact.length, artifact.checksum, core_->snapshot_membership(peer)};
-				source_ = std::make_unique<Source>(std::move(*selected), peer, *key, ++next_source_, descriptor); return;
+				source_ = std::make_unique<Source>(std::move(*selected), peer, *key, ++next_source_, descriptor, snapshot_limits_->window); return;
 			}
 			return;
 		}
@@ -884,21 +894,19 @@ private:
 			source.verifier = store_.begin_published_verification(source.selection);
 			if (source.verifier) { source.phase = SourcePhase::Verifying; } else { source.phase = SourcePhase::Failed; }
 		} else if (source.phase == SourcePhase::Verifying) {
-			if (source.verifier->offset() < source.descriptor.application_bytes) { if (scheduling_.async_storage) { start_maintenance_io(source.verifier->begin_read_next(source.buffer.size()), MaintenanceKind::SourceVerify); } else { source.verifier->read_next(source.buffer); } }
+			if (source.verifier->offset() < source.descriptor.application_bytes) { if (scheduling_.async_storage) { start_maintenance_io(source.verifier->begin_read_next(65536), MaintenanceKind::SourceVerify); } else { source.verifier->read_next(source.chunk(0)); } }
 			else { source.reader.emplace(std::move(*source.verifier).finish()); source.verifier.reset(); source.phase = SourcePhase::Ready; }
 		} else if (source.phase == SourcePhase::Ready || source.phase == SourcePhase::Failed) {
 			if (core_->busy() || !output_.empty() || completion_ || persist_ || application_ || cutover_debt_) { return; }
 			if (source.phase == SourcePhase::Failed || source.selection.generation() != store_.frontier().generation || core_->base_boundary() != source.key.boundary) { auto peer = source.peer; auto key = source.key; source_.reset(); ingest(core_->step(SnapshotTransferFailed{peer, key})); }
 			else { source.phase = SourcePhase::Streaming; ingest(core_->step(SnapshotSourceReady{source.peer, source.key})); refresh_source(); }
-		} else if (source.phase == SourcePhase::Streaming && !source.view) {
+		} else if (source.phase == SourcePhase::Streaming && !source.full()) {
 			if (!core_->snapshot_sending(source.peer, source.key)) { return; }
 			if (next_source_chunk_ == std::numeric_limits<Token>::max()) { throw std::length_error("source chunk identity exhausted"); }
-			source.final = source.offset == source.descriptor.application_bytes;
-			if (scheduling_.async_storage && !source.final) {
-				start_maintenance_io(source.reader->begin_read_at(source.offset, static_cast<std::size_t>(std::min<std::uint64_t>(65536, source.descriptor.application_bytes - source.offset))), MaintenanceKind::SourceRead); return;
-			}
-			source.count = source.final ? 0 : source.reader->read_at(source.offset, std::span<char>(source.buffer.data(), static_cast<std::size_t>(std::min<std::uint64_t>(65536, source.descriptor.application_bytes - source.offset))));
-			source.view = ++next_source_chunk_;
+			auto final = source.read == source.descriptor.application_bytes; auto length = static_cast<std::size_t>(std::min<std::uint64_t>(65536, source.descriptor.application_bytes - source.read));
+			if (scheduling_.async_storage && !final) { start_maintenance_io(source.reader->begin_read_at(source.read, length), MaintenanceKind::SourceRead); return; }
+			auto slot = source.tail(); auto count = final ? 0 : source.reader->read_at(source.read, source.chunk(slot).first(length));
+			source.slots[slot] = {++next_source_chunk_, source.read, count, final}; source.read += count; source.read_final = final; ++source.ready;
 		}
 	}
 	void prepare_one() {
@@ -995,6 +1003,8 @@ private:
 		return std::max(encode_initialization(configuration).size(), storage_batch_size(true, true, entries, bytes));
 	}
 	static std::uint64_t artifact_limit(std::optional<SnapshotLimits> limits) {
+		// 256 chunks bounds a transfer's read-ahead at 16 MiB.
+		if (limits && (!limits->window || limits->window > 256)) { throw std::invalid_argument("invalid snapshot window"); }
 		return std::max(std::uint64_t{512ull * 1024 * 1024}, limits ? limits->application_bytes : 0);
 	}
 	bool maintenance_due() const noexcept { return foreground_ >= scheduling_.foreground_burst; }

@@ -26,6 +26,7 @@
 #include "snapshot_transfer.h"
 
 #include <algorithm>
+#include <deque>
 
 namespace kronuz::consensus {
 
@@ -127,7 +128,7 @@ public:
 			}
 		}
 		if (receiving_) {
-			if (receiving_->connected && now_ - receiving_->started >= timeout_) { session_closed(receiving_->session); }
+			if (receiving_->connected && !receiving_->final && now_ - receiving_->active >= timeout_) { session_closed(receiving_->session); }
 			if (worker_.snapshot_validated(receiving_->id)) { worker_.request_install(receiving_->id); }
 			if (auto result = worker_.pending_snapshot_result(); result && result->snapshot == receiving_->id) {
 				auto channel = find(receiving_->session.peer);
@@ -154,11 +155,12 @@ public:
 			auto policy = worker_.snapshot_policy(); if (!policy) { throw std::logic_error("source without snapshot policy"); }
 			control(*channel, TransferKind::Begin, source->key, encode_snapshot(source->descriptor, *policy)); sending_.emplace(*source); return;
 		}
-		if (sending_ && sending_->accepted && !sending_->waiting && !data_) {
-			auto chunk = worker_.source_chunk(); if (!chunk) { return; }
+		// Up to the window's chunks in flight; each Credit retires the oldest (D18).
+		if (sending_ && sending_->accepted && !sending_->final && !data_ && sending_->flights.size() < worker_.snapshot_window()) {
+			auto chunk = worker_.source_chunk(sending_->flights.size()); if (!chunk) { return; }
 			auto channel = find(sending_->info.peer); if (!channel->session) { return; }
 			data_.emplace(make_frame(*channel, TransferKind::Chunk, sending_->info.key, transfer_chunk_body(chunk->chunk, chunk->offset, std::string_view(chunk->bytes.data(), chunk->bytes.size()), chunk->final)));
-			sending_->waiting = chunk->chunk; sending_->next = chunk->offset + chunk->bytes.size(); sending_->final = chunk->final;
+			sending_->flights.push_back({chunk->chunk, data_->token, chunk->offset + chunk->bytes.size(), chunk->final}); sending_->final = chunk->final;
 		}
 	}
 	// After closing sessions, retain this adapter and service Worker/application
@@ -174,15 +176,17 @@ public:
 		for (const auto& channel : channels_) { result += channel.control ? channel.control->bytes.capacity() : 0; } return result;
 	}
 	std::size_t channel_count() const noexcept { return channels_.size(); }
+	std::size_t chunks_in_flight() const noexcept { return sending_ ? sending_->flights.size() : 0; }
 private:
-	struct Output { NodeId peer; Token token; std::string bytes; std::size_t offset = 0; };
+	struct Output { NodeId peer; Token token; std::string bytes; std::size_t offset = 0; TransferKind kind = TransferKind::Begin; };
 	struct Completed { SnapshotKey key; SnapshotDescriptor descriptor; std::string body; };
 	struct Channel {
 		explicit Channel(NodeId node) : peer(node) {}
 		NodeId peer; std::optional<TrustedSession> session; std::array<char, maximum_transfer_bytes> input{}; std::size_t used = 0; std::optional<Output> control; std::optional<Completed> completed;
 	};
-	struct Sending { explicit Sending(SourceInfo source) : info(std::move(source)) {} SourceInfo info; bool accepted = false, final = false; Token waiting = 0; std::uint64_t next = 0; };
-	struct Receiving { TrustedSession session; SnapshotId id; SnapshotKey key; SnapshotDescriptor descriptor; std::uint64_t offset, started; bool connected = true, final = false, canceling = false; };
+	struct Flight { Token chunk, output; std::uint64_t next; bool final; };
+	struct Sending { explicit Sending(SourceInfo source) : info(std::move(source)) {} SourceInfo info; bool accepted = false, final = false; std::deque<Flight> flights; };
+	struct Receiving { TrustedSession session; SnapshotId id; SnapshotKey key; SnapshotDescriptor descriptor; std::uint64_t offset, active; bool connected = true, final = false, canceling = false; };
 	void cancel_receiving() {
 		auto result = worker_.cancel_snapshot(receiving_->id);
 		if (result == CancelResult::Pending || result == CancelResult::Canceled) { receiving_->canceling = true; }
@@ -201,7 +205,7 @@ private:
 	Output make_frame(const Channel& channel, TransferKind kind, SnapshotKey key, std::string_view body) {
 		if (next_output_ == std::numeric_limits<Token>::max()) { throw std::length_error("transfer output token exhausted"); }
 		auto& configuration = worker_.configuration(); auto& session = *channel.session;
-		return {channel.peer, ++next_output_, encode_transfer(kind, {configuration.cluster, configuration.configuration, session.local, session.remote, configuration.local, channel.peer, key}, body)};
+		return {channel.peer, ++next_output_, encode_transfer(kind, {configuration.cluster, configuration.configuration, session.local, session.remote, configuration.local, channel.peer, key}, body), 0, kind};
 	}
 	void control(Channel& channel, TransferKind kind, SnapshotKey key, std::string_view body) { if (channel.control) { throw std::logic_error("transfer control output occupied"); } channel.control.emplace(make_frame(channel, kind, key, body)); }
 	Output* selected_frame() { if (data_ && data_->token == selected_) { return &*data_; } for (auto& channel : channels_) { if (channel.control && channel.control->token == selected_) { return &*channel.control; } } return nullptr; }
@@ -237,16 +241,23 @@ private:
 			auto body = frame.body; auto token = get64(body); auto offset = get64(body); auto count = get32(body); auto final = body[0] != 0; body.remove_prefix(4);
 			if (offset != receiving_->offset || count > receiving_->descriptor.application_bytes - offset || (!final && !count) || (final && offset + count != receiving_->descriptor.application_bytes)) { throw Corruption("invalid sequential Chunk"); }
 			if (receiving_->canceling) { receiving_->offset += count; receiving_->final = final; return true; }
-			if (channel.control) { return false; }
+			// Credits are cumulative: an unsent one is replaced by the next chunk's (D18).
+			auto replaces = channel.control && channel.control->kind == TransferKind::Credit && !channel.control->offset && selected_ != channel.control->token;
+			if (channel.control && !replaces) { return false; }
 			auto offered = worker_.offer_snapshot_chunk(receiving_->id, offset, body, final); if (offered.result == SubmitResult::Busy) { return false; }
 			if (offered.result != SubmitResult::Accepted) { throw Corruption("receiver cannot accept Chunk"); }
-			receiving_->offset = offered.next_offset; receiving_->final = final; control(channel, TransferKind::Credit, key, transfer_chunk_body(token, offered.next_offset, {}, final, true)); return true;
+			receiving_->offset = offered.next_offset; receiving_->final = final; receiving_->active = now_; if (replaces) { channel.control.reset(); } control(channel, TransferKind::Credit, key, transfer_chunk_body(token, offered.next_offset, {}, final, true)); return true;
 		}
 		case TransferKind::Credit: {
 			if (!sending_ || sending_->info.peer != session.peer || sending_->info.key != key) { return true; }
 			auto body = frame.body; auto token = get64(body); auto next = get64(body); get32(body); auto final = body[0] != 0;
-			if (!sending_->waiting || sending_->waiting != token || sending_->next != next || sending_->final != final || data_) { throw Corruption("unmatched Credit"); }
-			if (worker_.consume_source(sending_->info.source, token) != ValidationAck::Accepted) { return true; } sending_->waiting = 0; return true;
+			// A Credit retires every flight up to the chunk it names.
+			auto& flights = sending_->flights; auto credited = std::find_if(flights.begin(), flights.end(), [&](const Flight& f) { return f.chunk == token; });
+			if (credited == flights.end() || credited->next != next || credited->final != final || (data_ && data_->token == credited->output)) { throw Corruption("unmatched Credit"); }
+			for (auto retired = credited - flights.begin() + 1; retired; --retired) {
+				if (worker_.consume_source(sending_->info.source, flights.front().chunk) != ValidationAck::Accepted) { return true; } flights.pop_front();
+			}
+			return true;
 		}
 		case TransferKind::Result: {
 			auto outcome = static_cast<TransferOutcome>(static_cast<unsigned char>(frame.body[0])); auto body = frame.body.substr(8); auto term = get64(body);

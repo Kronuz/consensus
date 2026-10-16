@@ -1559,25 +1559,27 @@ void owned_snapshot_sources() {
 	}
 }
 
-void binary_transfer_integration(std::size_t length, unsigned mode = 0, bool measure = false, bool async = false) {
+// Returns the turns the leader held a snapshot source; window is D18's chunks in flight, and
+// rtt delivers the receiver's frames every rtt turns, modelling a round trip.
+unsigned binary_transfer_integration(std::size_t length, unsigned mode = 0, bool measure = false, bool async = false, std::uint32_t window = 1, std::uint64_t receiver_timeout = 60000, unsigned rtt = 1) {
 	using Clock = std::chrono::steady_clock;
 	struct Node {
 		SnapshotFixture::Directory directory; std::shared_ptr<FaultIO> owned_io; FaultIO& io; Worker worker; SnapshotChannel transfer;
 		std::deque<Receive> messages; std::string application, candidate; Token eof = 0;
-		Node(NodeId id, std::size_t size, unsigned mode, bool async) : directory("binary-" + std::to_string(size) + "-" + std::to_string(mode) + "-" + std::to_string(id)), owned_io(std::make_shared<FaultIO>(directory.path)), io(*owned_io),
-			worker(owned_io, [&] { auto fixed = SnapshotFixture::fixed(); fixed.local = id; return fixed; }(), {{1024ull * 1024 * 1024, 4096}, {16 * 1024, 3}, {256ull * 1024 * 1024, 4}, 8, 3}, limits(), compact, {4, 1, false, async}, SnapshotLimits{7, 128ull * 1024 * 1024}), transfer(worker) {
+		Node(NodeId id, std::size_t size, unsigned mode, bool async, std::uint32_t window, std::uint64_t timeout) : directory("binary-" + std::to_string(size) + "-" + std::to_string(mode) + (window > 1 ? "-w" + std::to_string(window) : "") + (async ? "-a" : "") + "-" + std::to_string(id)), owned_io(std::make_shared<FaultIO>(directory.path)), io(*owned_io),
+			worker(owned_io, [&] { auto fixed = SnapshotFixture::fixed(); fixed.local = id; return fixed; }(), {{1024ull * 1024 * 1024, 4096}, {16 * 1024, 3}, {256ull * 1024 * 1024, 4}, 8, 3}, limits(), compact, {4, 1, false, async}, SnapshotLimits{7, 128ull * 1024 * 1024, window}), transfer(worker, timeout) {
 			kronuz::journal::Identity identity{}; identity[0] = static_cast<char>(id); worker.create(identity);
 			for (unsigned turn = 0; turn < 100 && !worker.ready(); ++turn) { worker.run_one({0, 100}); if (auto job = worker.take_io_operation()) { kronuz::journal::drive_synchronously(*job); } }
 			worker.try_submit(Start{}); worker.take_actions();
 		}
 	};
-	Node leader(1, length, mode, async), receiver(2, length, mode, async), healthy(3, length, mode, async); std::array<Node*, 3> nodes{&leader, &receiver, &healthy};
+	Node leader(1, length, mode, async, window, 60000), receiver(2, length, mode, async, window, receiver_timeout), healthy(3, length, mode, async, window, 60000); std::array<Node*, 3> nodes{&leader, &receiver, &healthy};
 	std::string image(length, 'i'); leader.application = image; healthy.application = image;
 	Identity first{}, second{}; first[0] = 'a'; second[0] = 'b'; TrustedSession outgoing{2, first, second}, incoming{1, second, first};
 	leader.transfer.register_session(outgoing); receiver.transfer.register_session(incoming);
 	bool opened_peer = false, installed_result = false, suffix = false, proposed = false, disturbed = false;
 	std::uint64_t leader_offset = 0; std::string duplicate_begin; bool duplicated = false; std::optional<CheckpointId> capture;
-	std::size_t offered = 0, wire_bytes = 0, maximum_buffers = 0, allocated_buffers = 0, queue_peak = 0; std::uint64_t clock = 100;
+	std::size_t offered = 0, wire_bytes = 0, maximum_buffers = 0, allocated_buffers = 0, queue_peak = 0, peak_flights = 0; std::uint64_t clock = 100; unsigned sourcing = 0;
 	auto start = Clock::now(); auto cpu_start = std::clock(); Token observed_leader = 0, observed_receiver = 0;
 	auto drain = [&](Node& node) {
 		for (const auto& action : node.worker.take_actions()) {
@@ -1605,7 +1607,7 @@ void binary_transfer_integration(std::size_t length, unsigned mode = 0, bool mea
 		if (input.consumed) { from.transfer.consume_output(output->token, input.consumed); wire_bytes += input.consumed; }
 	};
 	for (unsigned turn = 0; turn < 100000; ++turn) {
-		clock = 100 + turn / 20;
+		clock = 100 + turn / 20; if (leader.worker.snapshot_source()) { ++sourcing; }
 		for (auto node : nodes) {
 			if (!node->messages.empty()) { auto result = node->worker.try_submit(node->messages.front()); if (result == SubmitResult::Accepted) { node->messages.pop_front(); } }
 			node->worker.run_one({node == &receiver && !opened_peer ? 0 : clock + (node == &leader ? leader_offset : 0), node == &leader ? 100u : 200u}); if (auto job = node->worker.take_io_operation()) { kronuz::journal::drive_synchronously(*job); } drain(*node);
@@ -1625,7 +1627,7 @@ void binary_transfer_integration(std::size_t length, unsigned mode = 0, bool mea
 			leader.transfer.register_session(outgoing); receiver.transfer.register_session(incoming); disturbed = true;
 		}
 		if (mode == 3) { if (auto result = receiver.worker.pending_snapshot_result(); result && result->reason == SnapshotReason::Installed) { installed_result = true; } }
-		wire(leader, receiver, incoming, observed_leader); wire(receiver, leader, outgoing, observed_receiver);
+		wire(leader, receiver, incoming, observed_leader); if (turn % rtt == 0) { wire(receiver, leader, outgoing, observed_receiver); }
 		if (!duplicated && !duplicate_begin.empty() && receiver.transfer.incoming_snapshot() && !receiver.transfer.outbound()) { auto repeated = receiver.transfer.receive(incoming, std::span<const char>(duplicate_begin.data(), duplicate_begin.size())); wire_bytes += repeated.consumed; check(repeated.consumed == duplicate_begin.size() && repeated.result == TransferReceive::Accepted, "duplicate Begin traverses active real Workers before transfer completion"); duplicated = true; }
 		if (auto view = receiver.worker.validation_chunk()) {
 			check(view->offset == receiver.candidate.size(), "binary receiver validates exact candidate offsets"); receiver.candidate.append(view->bytes.data(), view->bytes.size());
@@ -1643,9 +1645,9 @@ void binary_transfer_integration(std::size_t length, unsigned mode = 0, bool mea
 			check(receiver.worker.snapshot_activation_failed(activation->snapshot, activation->token) == ValidationAck::Accepted && receiver.worker.fenced(), "matching activation failure fences actual binary receiver");
 			receiver.transfer.run_one({clock, 200});
 			check(receiver.transfer.drained() && !receiver.transfer.incoming_snapshot() && !receiver.transfer.outbound() && !receiver.transfer.session_open(incoming) && receiver.transfer.retained_bytes() == 0, "fenced TooLate installation releases channel ownership without emitting a result");
-			leader.transfer.session_closed(outgoing); return;
+			leader.transfer.session_closed(outgoing); return sourcing;
 		} receiver.application = std::move(receiver.candidate); receiver.worker.snapshot_activated(activation->snapshot, activation->token); }
-		maximum_buffers = std::max(maximum_buffers, leader.transfer.retained_bytes() + receiver.transfer.retained_bytes());
+		maximum_buffers = std::max(maximum_buffers, leader.transfer.retained_bytes() + receiver.transfer.retained_bytes()); peak_flights = std::max(peak_flights, leader.transfer.chunks_in_flight());
 		allocated_buffers = std::max(allocated_buffers, leader.transfer.buffer_capacity() + receiver.transfer.buffer_capacity() + leader.worker.snapshot_buffer_capacity() + receiver.worker.snapshot_buffer_capacity());
 		if (installed_result && receiver.worker.applied_index() == 2 && leader.worker.applied_index() == 2 && healthy.worker.applied_index() == 2) { suffix = true; break; }
 		if (leader.worker.fenced() || receiver.worker.fenced() || healthy.worker.fenced()) { break; }
@@ -1653,10 +1655,30 @@ void binary_transfer_integration(std::size_t length, unsigned mode = 0, bool mea
 	if (!suffix) { std::cerr << "binary progress: bytes=" << wire_bytes << " capture=" << bool(capture) << " base=" << leader.worker.base_index() << " term=" << leader.worker.term() << " role=" << int(leader.worker.role()) << " commit=" << leader.worker.committed() << " receiver=" << receiver.worker.applied_index() << " healthy=" << healthy.worker.applied_index() << " source=" << bool(leader.worker.snapshot_source()) << "\n"; }
 	check(installed_result && suffix && receiver.application == image + "/tail" && leader.application == receiver.application && healthy.application == receiver.application && !leader.worker.snapshot_source(), "receiver-generated durable Installed result advances real sender flight and ordinary suffix produces exact application state");
 	check(queue_peak <= 64 && maximum_buffers <= maximum_transfer_bytes * 2 + 400, "binary stop-and-wait retains bounded frame storage independently of image size");
+	check(peak_flights <= window && (window == 1 || rtt == 1 || length < 4 * 65536 || peak_flights > 1), "a windowed sender keeps several chunks in flight, never more than its window");
 	auto elapsed = std::chrono::duration<double>(Clock::now() - start).count(); auto cpu = double(std::clock() - cpu_start) / CLOCKS_PER_SEC; rusage usage{}; getrusage(RUSAGE_SELF, &usage);
-	if (!measure) { return; }
+	if (!measure) { return sourcing; }
 	std::ofstream measurements(std::filesystem::current_path() / ".scratch" / "snapshot-transfer-benchmark.csv", std::ios::app);
 	measurements << length << ',' << elapsed << ',' << cpu << ',' << wire_bytes << ',' << maximum_buffers << ',' << allocated_buffers << ',' << usage.ru_maxrss << ',' << leader.io.payload_reads << ',' << receiver.io.payload_reads << '\n';
+	return sourcing;
+}
+
+// D18: a window of chunks in flight beats stop-and-wait, and the receiver's timeout
+// measures inactivity, so a transfer longer than the timeout completes.
+void windowed_snapshot_transfer() {
+	auto stop_and_wait = binary_transfer_integration(1048576, 0, false, false, 1, 60000, 8); auto windowed = binary_transfer_integration(1048576, 0, false, false, 16, 60000, 8);
+	check(windowed * 4 < stop_and_wait * 3, "over an 8-turn round trip, a 16-chunk window sends an image in under three quarters of stop-and-wait's turns");
+	binary_transfer_integration(1048576, 0, false, true, 16);
+	for (unsigned mode : {1u, 3u}) { binary_transfer_integration(1048576, mode, false, false, 16); }
+	binary_transfer_integration(4u << 20, 0, false, false, 1, 4);
+	SnapshotFixture::Directory directory("snapshot-window-bounds");
+	for (std::uint32_t window : {0u, 257u}) {
+		bool rejected = false;
+		try { FaultIO io(directory.path); Worker worker(io, SnapshotFixture::fixed(), SnapshotFixture::quota(), limits(), compact, {4, 1}, SnapshotLimits{7, 100000, window}); }
+		catch (const std::invalid_argument&) { rejected = true; }
+		check(rejected, "a snapshot window outside 1..256 chunks is rejected");
+	}
+	std::cout << "windowed snapshots: " << windowed << " turns against " << stop_and_wait << " stop-and-wait\n";
 }
 
 void checkpoint_format_recovery() {
@@ -2148,6 +2170,7 @@ int main(int argc, char** argv) {
 		follower_batching();
 		completion_appends(); completion_storage(); completion_channel_cancellation(); completion_snapshot_readback(); retired_completion_worker(); for (unsigned mode : {0u, 1u, 3u}) { binary_transfer_integration(65553, mode, false, true); } checkpoint_format_recovery(); legacy_source_export_rejection(); binary_channel_validation(); hostile_transfer_frames(); receiving_protocol(); worker_api_guards(); channel_dispatch_and_unstarted_result(); binary_transfer_codec(); for (std::size_t length : {std::size_t{0}, std::size_t{9}, std::size_t{65553}, std::size_t{1048576}}) { binary_transfer_integration(length); }
 		for (unsigned mode : {1u, 2u, 3u, 5u}) { binary_transfer_integration(65553, mode); }
+		windowed_snapshot_transfer();
 		owned_snapshot_sources(); snapshot_reception_and_validation(); snapshot_policy_and_rejection(); snapshot_cancellation_phases(); snapshot_read_faults(); snapshot_restart_cleanup(); snapshot_protocol_progress(); snapshot_installation(); snapshot_rejection_branches(); snapshot_old_application(); snapshot_install_reopening(); snapshot_install_admission(); snapshot_publication_faults(); maintenance_preserves_protocol_timers(); real_worker(); partial_control_pack(); failures_and_multi_action_output(); interrupted_initialization(); checkpoint_crash_and_progress(); preparation_preserves_protocol_timers(); checkpoint_cancellation_and_completion(); checkpoint_faults(); worker_repair(); } catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " worker checks, " << failures << " failures\n"; return failures ? 1 : 0;
 }

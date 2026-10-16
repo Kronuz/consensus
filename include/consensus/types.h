@@ -116,6 +116,13 @@ struct Timing {
 	std::uint64_t snapshot_timeout = 60000;
 };
 
+// Pipelined replication (Track C, D15): Append RPCs and bytes in flight per peer. One
+// flight by default, today's behavior; a membership group's host raises it (D15: 4).
+struct Flow {
+	std::uint32_t pipeline = 1;
+	std::uint64_t window_bytes = 4 << 20;
+};
+
 // transfer: sent on TimeoutNow (Track C, D6); it bypasses the leader-contact guard.
 struct VoteRequest { Term term; Index last_index; Term last_term; bool transfer = false; };
 struct VoteResponse { Term term; bool granted; };

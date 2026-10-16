@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <limits>
 #include <map>
+#include <deque>
 #include <set>
 #include <stdexcept>
 #include <type_traits>
@@ -41,9 +42,11 @@ namespace kronuz::consensus {
 class Core {
 	struct CaptureOwner { const Core* core; };
 public:
-	Core(FixedConfiguration configuration, RecoveredState recovered, Limits limits = {}, Timing timing = {})
+	Core(FixedConfiguration configuration, RecoveredState recovered, Limits limits = {}, Timing timing = {}, Flow flow = {})
 		: configuration_(std::move(configuration)), hard_(recovered.hard), durable_(hard_),
 		entries_(std::move(recovered.entries)), base_index_(recovered.base_index), base_term_(recovered.base_term), limits_(limits), timing_(timing), election_delay_(timing.election_min), applied_(recovered.applied_index) {
+		flow_ = flow;
+		if (flow_.pipeline == 0 || flow_.window_bytes == 0) { throw std::invalid_argument("invalid replication flow"); }
 		if (configuration_ != recovered.configuration || configuration_.local == 0 || limits.voters > 31) {
 			throw std::invalid_argument("invalid or mismatched fixed configuration");
 		}
@@ -254,10 +257,18 @@ private:
 		Actions deferred; bool retain_suffix, published = false;
 		std::optional<Membership> membership{};
 	};
-	struct Flight { Token rpc; Index previous, through; Token read_probe; std::uint64_t sent; bool keepalive = false; };
+	struct Flight { Token rpc; Index previous, through; Token read_probe; std::uint64_t sent; bool keepalive = false; std::uint64_t bytes = 0; };
 	enum class SnapshotPhase { AwaitSource, Sending };
 	struct SnapshotFlight { SnapshotKey key; SnapshotPhase phase; std::uint64_t started; };
-	struct Peer { Index next = 1, matched = 0; std::optional<Flight> flight; std::uint64_t retry_after = 0; std::optional<SnapshotFlight> snapshot{}; std::optional<std::uint64_t> snapshot_retry_clock{}; bool blocked = false; };
+	// Up to `pipeline` Append RPCs and `window_bytes` in flight (D15), oldest first, `next`
+	// past the last; one flight at verified progress until a first success, and after a
+	// failure or timeout. A snapshot's keepalive flies outside the window.
+	struct Peer {
+		Index next = 1, matched = 0; std::deque<Flight> flights; std::uint64_t retry_after = 0; std::optional<SnapshotFlight> snapshot{}; std::optional<std::uint64_t> snapshot_retry_clock{}; bool blocked = false;
+		std::optional<Flight> keepalive{}; bool verified = false; std::uint64_t window = 0;
+		// Back to one flight, resuming at `from` (the oldest flight's start: nothing before it is in doubt).
+		void reset_flights(Index from) { flights.clear(); window = 0; verified = false; next = std::max(matched + 1, from); }
+	};
 	struct PendingRead { RequestId request; Token probe; Term term; Index index; std::set<NodeId> acknowledgements; };
 	struct Transfer { NodeId target; Token token; std::uint64_t until; bool sent = false; };
 	static constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
@@ -517,7 +528,7 @@ private:
 	}
 	void release_snapshot(NodeId id, Peer& peer, SnapshotReleaseReason reason, Actions& output, bool probe = false) {
 		auto key = peer.snapshot->key; output.emplace_back(SnapshotReleased{id, key, reason}); peer.snapshot.reset();
-		if (peer.flight && peer.flight->keepalive) { peer.flight.reset(); }
+		peer.keepalive.reset();
 		peer.retry_after = deadline(timing_.rpc_timeout); peer.snapshot_retry_clock = now_;
 		if (probe) { peer.next = std::max(peer.matched + 1, key.boundary.index + 1); }
 	}
@@ -715,7 +726,7 @@ private:
 		// pending probe; each quorum observation must follow its admission.
 		for (auto& [id, peer] : peers_) {
 			auto needed = needed_probe(id);
-			if (!peer.flight && needed) { replicate(id, peer, output, needed); }
+			if (peer.flights.empty() && needed) { replicate(id, peer, output, needed); }
 		}
 		ready_reads(output);
 	}
@@ -877,15 +888,21 @@ private:
 		auto found = peers_.find(source);
 		if (found == peers_.end()) { return; }
 		auto& peer = found->second;
-		if (!peer.flight || peer.flight->rpc != response.rpc) { return; }
-		auto flight = *peer.flight;
-		if (response.read_probe != flight.read_probe) { return; }
-		// Preserve its send time across replies so fixed-time callbacks cannot
+		// Preserve a keepalive's send time across replies so fixed-time callbacks cannot
 		// turn independent snapshot contact into an immediate request loop.
-		if (flight.keepalive) { return; }
+		if (peer.keepalive && peer.keepalive->rpc == response.rpc) { return; }
+		auto at = std::find_if(peer.flights.begin(), peer.flights.end(), [&](const Flight& f) { return f.rpc == response.rpc; });
+		if (at == peer.flights.end()) { return; }
+		auto flight = *at;
+		if (response.read_probe != flight.read_probe) { return; }
 		if (response.success) {
 			if (response.matched != flight.through) { return; }
-			peer.matched = std::max(peer.matched, response.matched); peer.next = peer.matched + 1;
+			peer.matched = std::max(peer.matched, response.matched);
+			// It and every older flight are matched (log matching); later ones stay in flight.
+			const auto done = std::size_t(at - peer.flights.begin()) + 1;
+			for (std::size_t i = 0; i < done; ++i) { peer.window -= peer.flights.front().bytes; peer.flights.pop_front(); }
+			peer.verified = true;
+			if (peer.flights.empty()) { peer.next = peer.matched + 1; }
 			if (!peer.blocked) { peer.retry_after = 0; }
 			if (transfer_ && transfer_->target == source) { timeout_now(output); }
 			if (flight.read_probe) {
@@ -894,6 +911,7 @@ private:
 		} else {
 			// A stale failure cannot reach this path. Durable peers cannot lose a
 			// matched prefix on restart; never rewind below verified progress.
+			peer.next = flight.previous + 1;  // where this flight started, not the pipeline's tip
 			auto previous_next = peer.next;
 			if (response.compacted && response.compacted->index >= base_index_) {
 				auto boundary = *response.compacted;
@@ -908,8 +926,8 @@ private:
 			// Capacity rejection or an unusable hint must not form an immediate
 			// request/response loop. Retry on a later monotonic tick.
 			peer.retry_after = peer.next < previous_next ? 0 : deadline(timing_.rpc_timeout);
+			peer.reset_flights(peer.next);  // later flights carry a failed prefix
 		}
-		peer.flight.reset();
 		auto needed = needed_probe(source);
 		if (peer.next <= last_index() || needed) {
 			replicate(source, peer, output, needed);
@@ -925,7 +943,7 @@ private:
 		if (response.result == SnapshotReply::Installed) {
 			auto boundary = peer.snapshot->key.boundary;
 			output.emplace_back(SnapshotReleased{source, response.key, SnapshotReleaseReason::Installed}); peer.snapshot.reset();
-			if (peer.flight && peer.flight->keepalive) { peer.flight.reset(); }
+			peer.keepalive.reset(); peer.flights.clear(); peer.window = 0;
 			peer.matched = std::max(peer.matched, boundary.index); peer.next = peer.matched + 1; peer.retry_after = 0; peer.snapshot_retry_clock.reset();
 			replicate(source, peer, output, needed_probe(source));
 		} else { release_snapshot(source, peer, response.result == SnapshotReply::CaughtUp ? SnapshotReleaseReason::CaughtUp : SnapshotReleaseReason::Rejected, output, response.result == SnapshotReply::CaughtUp); }
@@ -992,8 +1010,9 @@ private:
 		for (auto& [id, peer] : peers_) {
 			if (peer.snapshot && peer.snapshot->phase == SnapshotPhase::AwaitSource && peer.snapshot->key.boundary != LogBoundary{base_index_, base_term_}) { release_snapshot(id, peer, SnapshotReleaseReason::Stale, output); }
 			if (peer.snapshot && now_ - peer.snapshot->started >= timing_.snapshot_timeout) { release_snapshot(id, peer, SnapshotReleaseReason::TimedOut, output, true); }
-			if (peer.flight && !peer.flight->keepalive && now_ - peer.flight->sent >= timing_.rpc_timeout) { peer.flight.reset(); }
-			if (peer.snapshot || (!peer.flight && (heartbeat || peer.next <= last_index()))) {
+			// A timed-out flight returns the peer to one flight at its verified progress.
+			if (!peer.flights.empty() && now_ - peer.flights.front().sent >= timing_.rpc_timeout) { peer.reset_flights(peer.flights.front().previous + 1); }
+			if (peer.snapshot || (peer.flights.empty() && heartbeat) || peer.next <= last_index()) {
 				auto probe = needed_probe(id);
 				replicate(id, peer, output, probe);
 			}
@@ -1027,15 +1046,20 @@ private:
 		heartbeat_deadline_ = now_;
 	}
 	void snapshot_keepalive(NodeId id, Peer& peer, Actions& output) {
-		if (peer.flight && (!peer.flight->keepalive || now_ - peer.flight->sent < timing_.heartbeat)) { return; }
-		auto rpc = token(); peer.flight = Flight{rpc, 0, 0, 0, now_, true};
+		if (peer.keepalive && now_ - peer.keepalive->sent < timing_.heartbeat) { return; }
+		auto rpc = token(); peer.keepalive = Flight{rpc, 0, 0, 0, now_, true};
 		output.emplace_back(Send{id, AppendRequest{hard_.term, rpc, 0, 0, 0, 0, {}}});
 	}
 
 	void replicate(NodeId id, Peer& peer, Actions& output, Token probe) {
 		if (peer.snapshot) { snapshot_keepalive(id, peer, output); return; }
-		if (peer.flight || now_ < peer.retry_after || (peer.snapshot_retry_clock && now_ <= *peer.snapshot_retry_clock)) { return; }
+		if (now_ < peer.retry_after || (peer.snapshot_retry_clock && now_ <= *peer.snapshot_retry_clock)) { return; }
+		// D15: more flights only past verified progress, within the pipeline and the window;
+		// with flights out, only to send entries (heartbeats go when none is).
+		const std::size_t depth = peer.verified ? flow_.pipeline : 1;
+		if (peer.flights.size() >= depth || (!peer.flights.empty() && (peer.next > last_index() || peer.window >= flow_.window_bytes))) { return; }
 		if (peer.next <= base_index_) {
+			if (!peer.flights.empty()) { return; }  // an install starts once nothing is in flight
 			SnapshotKey key{durable_.term, token(), {base_index_, base_term_}};
 			peer.snapshot.emplace(SnapshotFlight{key, SnapshotPhase::AwaitSource, now_}); peer.snapshot_retry_clock.reset();
 			output.emplace_back(SnapshotNeeded{id, key}); snapshot_keepalive(id, peer, output); return;
@@ -1056,8 +1080,12 @@ private:
 		peer.blocked = batch.empty() && peer.next <= last_index();
 		if (peer.blocked) { peer.retry_after = deadline(timing_.heartbeat); ++held_back_; }
 		auto rpc = token();
-		peer.flight = Flight{rpc, previous, previous + batch.size(), probe, now_};
+		peer.flights.push_back(Flight{rpc, previous, previous + batch.size(), probe, now_, false, bytes});
+		peer.window += bytes;
+		peer.next = previous + batch.size() + 1;  // optimistic (Raft §10.2.1)
 		output.emplace_back(Send{id, AppendRequest{hard_.term, rpc, previous, log_term(previous), durable_.commit_index, probe, std::move(batch), data_matched()}});
+		// Fill the pipeline: further flights carry entries only, never the same probe again.
+		if (!peer.blocked && peer.next <= last_index()) { replicate(id, peer, output, 0); }
 	}
 	// D9: the least index every data voter of the membership in force has matched.
 	Index data_matched() const {
@@ -1115,6 +1143,7 @@ private:
 	Term base_term_ = 0;
 	Limits limits_;
 	Timing timing_;
+	Flow flow_;
 	Role role_ = Role::Follower;
 	NodeId leader_ = 0;
 	std::size_t log_bytes_ = 0;

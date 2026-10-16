@@ -171,7 +171,10 @@ struct Start {};
 // The host supplies absolute monotonic time and a fresh randomized election
 // delay within Timing's bounds. Deliver a Tick before completions after I/O.
 struct Tick { std::uint64_t now; std::uint64_t election_delay; };
-struct Receive { NodeId authenticated_peer; Message message; };
+// `more`: further Append requests from the same peer, each starting where the one before
+// ended, received while a batch persisted (D15); one storage batch takes them all, and each
+// is answered with its own token once it is durable.
+struct Receive { NodeId authenticated_peer; Message message; std::vector<AppendRequest> more{}; };
 struct Propose { RequestId request; std::string command; };
 struct Read { RequestId request; };
 struct Persisted { Token token; };

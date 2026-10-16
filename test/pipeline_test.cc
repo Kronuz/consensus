@@ -233,9 +233,47 @@ void converge() {
 	}
 }
 
+// A follower steps contiguous appends received while a batch persisted as one Receive:
+// one storage batch holds all their entries, and each RPC is answered with its own token
+// and the index it reached, once that batch is durable.
+void follower_batch() {
+	RecoveredState state; state.configuration = config_of(2);
+	Core follower(config_of(2), std::move(state), Limits{}, compact);
+	(void)follower.step(Tick{0, 100});
+	(void)follower.step(Start{});
+	auto entries = [](Index from, Index to) {
+		std::vector<Entry> out;
+		for (Index i = from; i <= to; ++i) { out.push_back(Entry{i, 1, EntryKind::Command, "e" + std::to_string(i)}); }
+		return out;
+	};
+	AppendRequest a{1, 11, 0, 0, 0, 0, entries(1, 2), 0};
+	AppendRequest b{1, 12, 2, 1, 0, 0, entries(3, 5), 0};
+	AppendRequest c{1, 13, 5, 1, 0, 0, entries(6, 6), 0};
+	auto actions = follower.step(Receive{1, a, {b, c}});
+	std::size_t persists = 0, staged = 0;
+	Token token = 0;
+	for (const auto& x : actions) {
+		if (auto p = std::get_if<Persist>(&x)) {
+			++persists;
+			token = p->token;
+			if (p->batch.log) { staged = p->batch.log->entries.size(); }
+		}
+	}
+	check(persists == 1 && staged == 6, "one storage batch holds all three appends' entries");
+	std::map<Token, Index> answered;
+	for (const auto& x : follower.step(Persisted{token})) {
+		if (auto s = std::get_if<Send>(&x)) {
+			if (auto r = std::get_if<AppendResponse>(&s->message); r && r->success) { answered[r->rpc] = r->matched; }
+		}
+	}
+	check(answered == std::map<Token, Index>{{11, 2}, {12, 5}, {13, 6}}, "each RPC answered with its own token and reach");
+	check(follower.last_index() == 6, "the log holds them all");
+}
+
 }  // namespace
 
 int main() {
+	follower_batch();
 	depth();
 	lost_response();
 	unverified();

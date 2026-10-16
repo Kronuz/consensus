@@ -751,7 +751,13 @@ private:
 			hard_.term = incoming_term; hard_.voted_for.reset(); follower(0, deferred);
 		}
 		StorageBatch batch;
+		const bool append = std::holds_alternative<AppendRequest>(receive.message);
 		std::visit([&](auto&& message) { receive_message(receive.authenticated_peer, std::move(message), batch, deferred); }, std::move(receive.message));
+		// D15: merged appends from the same leader, staged into the same batch.
+		for (auto& more : receive.more) {
+			if (!append || !valid(more) || more.term != hard_.term) { break; }
+			receive_message(receive.authenticated_peer, std::move(more), batch, deferred);
+		}
 		if (changed || hard_ != durable_) { batch.hard = hard_; }
 		if (batch.hard || batch.log) { persist(std::move(batch), std::move(deferred), output); }
 		else {
@@ -873,7 +879,7 @@ private:
 			std::vector<Entry> suffix(request.entries.begin() + static_cast<std::ptrdiff_t>(first), request.entries.end());
 			entries_.resize(static_cast<std::size_t>(replace_from - base_index_ - 1)); note_truncate(replace_from);
 			for (const auto& entry : suffix) { entries_.push_back(entry); note_append(entry); } log_bytes_ = retained_bytes;
-			batch.log = LogMutation{replace_from, std::move(suffix)};
+			stage(batch, replace_from, std::move(suffix));
 		}
 		auto verified = request.previous + request.entries.size();
 		// The current leader's report, within what this witness verified and the leader
@@ -881,6 +887,19 @@ private:
 		witness_bound_ = std::min({request.data_matched, verified, request.commit});
 		hard_.commit_index = std::max(hard_.commit_index, std::min(request.commit, verified));
 		output.emplace_back(Send{source, AppendResponse{hard_.term, request.rpc, true, verified, verified + 1, request.read_probe}});
+	}
+	// Adds a log mutation to a step's batch: a later one starts within or right after the
+	// entries already staged (the log in memory includes them), and replaces from there.
+	static void stage(StorageBatch& batch, Index replace_from, std::vector<Entry> suffix) {
+		if (!batch.log || replace_from <= batch.log->replace_from) {
+			batch.log = LogMutation{replace_from, std::move(suffix)};
+			return;
+		}
+		auto& log = *batch.log;
+		const auto keep = static_cast<std::size_t>(replace_from - log.replace_from);
+		if (keep > log.entries.size()) { throw std::logic_error("staged appends must be contiguous"); }
+		log.entries.resize(keep);
+		for (auto& e : suffix) { log.entries.push_back(std::move(e)); }
 	}
 	void receive_message(NodeId source, AppendResponse response, StorageBatch&, Actions& output) {
 		if (role_ != Role::Leader || response.term != hard_.term) { return; }

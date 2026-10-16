@@ -1,0 +1,38 @@
+# consensus: a deterministic Raft core, its Worker, and the pieces around it.
+# Render: d2 --layout elk --sketch --theme 302 docs/consensus.d2 docs/consensus.svg
+direction: right
+
+host: Host {
+  label: "host\nticks · proposals · reads"
+}
+
+worker: Worker {
+  core: Core {
+    label: "Core\ndeterministic Raft\nno I/O, no clock"
+  }
+  label: "Worker\nadmission · persistence · checkpoints"
+}
+
+journal: journal {
+  label: "journal\nper-group or shared turn log"
+}
+
+channel: SnapshotChannel {
+  label: "SnapshotChannel\nwindowed chunks"
+}
+
+transport: Peers {
+  label: "transport (optional)\nTLS · control first · DTC2"
+}
+
+peers: Other voters {
+  style.multiple: true
+}
+
+host -> worker: "Event"
+worker -> host: "Committed · ReadReady"
+worker -> journal: "Persist"
+worker -> channel
+channel -> transport
+worker -> transport: "Send"
+transport -> peers

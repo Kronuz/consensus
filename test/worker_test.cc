@@ -1254,6 +1254,47 @@ void snapshot_installation() {
 	check(accepted >= 3 && worker.accounting()->outstanding.logical_bytes == 0, "canceling accepted install clears debt and all reservation ownership");
 }
 
+// Track C, D15: appends a follower receives while a batch persists are held and stepped as
+// one Receive, so they take one storage append; every RPC is still answered.
+std::pair<std::uint64_t, std::set<Token>> follower_appends(std::size_t batch_bytes) {
+	SnapshotFixture::Directory directory("follower-batch-" + std::to_string(batch_bytes));
+	auto io = std::make_shared<FaultIO>(directory.path);
+	WorkerLimits scheduling{4, 1, false, false};
+	scheduling.follower_batch_bytes = batch_bytes;
+	scheduling.follower_batch_entries = batch_bytes ? 64 : 0;
+	Worker worker(io, SnapshotFixture::fixed(), SnapshotFixture::quota(), limits(), compact, scheduling);
+	kronuz::journal::Identity identity{}; identity[0] = 'B'; worker.create(identity);
+	for (unsigned turn = 0; turn < 100 && !worker.ready(); ++turn) { worker.run_one({0, 100}); if (auto job = worker.take_io_operation()) { kronuz::journal::drive_synchronously(*job); } }
+	worker.try_submit(Start{});
+	std::set<Token> answered;
+	auto drain = [&] {
+		for (const auto& action : worker.take_actions()) {
+			if (auto send = std::get_if<Send>(&action)) {
+				if (auto r = std::get_if<AppendResponse>(&send->message); r && r->success) { answered.insert(r->rpc); }
+			}
+			if (auto range = std::get_if<Committed>(&action)) { worker.applied({range->entries.back().index}); }
+		}
+	};
+	drain();
+	Receive a{2, AppendRequest{1, 41, 0, 0, 0, 0, {{1, 1, EntryKind::Command, "a"}}}};
+	Receive b{2, AppendRequest{1, 42, 1, 1, 0, 0, {{2, 1, EntryKind::Command, "b"}}}};
+	Receive c{2, AppendRequest{1, 43, 2, 1, 0, 0, {{3, 1, EntryKind::Command, "c"}}}};
+	const auto before = worker.storage_frontier().sequence;
+	check(worker.try_submit(a) == SubmitResult::Accepted && worker.busy(), "the first append persists");
+	for (Receive* next : {&b, &c}) {
+		for (unsigned turn = 0; turn < 100 && worker.try_submit(*next) != SubmitResult::Accepted; ++turn) { worker.run_one({100, 100}); drain(); }
+	}
+	for (unsigned turn = 0; turn < 100 && answered.size() < 3; ++turn) { worker.run_one({100, 100}); drain(); }
+	return {worker.storage_frontier().sequence - before, answered};
+}
+void follower_batching() {
+	const auto [held, held_answers] = follower_appends(1 << 20);
+	const auto [plain, plain_answers] = follower_appends(0);
+	const std::set<Token> all{41, 42, 43};
+	check(held_answers == all && plain_answers == all, "every append is answered, held or not");
+	check(held < plain, "held appends take fewer storage appends");
+}
+
 void snapshot_rejection_branches() {
 	for (unsigned branch = 0; branch < 3; ++branch) {
 		SnapshotFixture fixture("install-reject-" + std::to_string(branch)); auto& worker = fixture.worker;
@@ -2104,6 +2145,7 @@ int main(int argc, char** argv) {
 		if (argc == 2 && std::string_view(argv[1]) == "--completion-regressions") { completion_appends(); completion_storage(); completion_channel_cancellation(); completion_snapshot_readback(); retired_completion_worker(); for (unsigned mode : {0u, 1u, 3u}) { binary_transfer_integration(65553, mode, false, true); } std::cout << checks << " completion checks, " << failures << " failures\n"; return failures ? 1 : 0; }
 		if (argc == 2 && std::string_view(argv[1]) == "--review-regressions") { channel_dispatch_and_unstarted_result(); binary_transfer_integration(65553); binary_transfer_integration(65553, 5); owned_snapshot_sources(); std::cout << checks << " review checks, " << failures << " failures\n"; return failures ? 1 : 0; }
 		if (argc == 2 && std::string_view(argv[1]) == "--transfer-benchmark") { std::ofstream(std::filesystem::current_path() / ".scratch" / "snapshot-transfer-benchmark.csv") << "image_bytes,wall_s,cpu_s,wire_bytes,retained_frame_bytes,payload_buffer_capacity,process_maxrss_native,sender_payload_reads,receiver_payload_reads\n"; binary_transfer_integration(1048576, 0, true); binary_transfer_integration(67108864, 0, true); std::cout << checks << " benchmark checks, " << failures << " failures\n"; return failures ? 1 : 0; }
+		follower_batching();
 		completion_appends(); completion_storage(); completion_channel_cancellation(); completion_snapshot_readback(); retired_completion_worker(); for (unsigned mode : {0u, 1u, 3u}) { binary_transfer_integration(65553, mode, false, true); } checkpoint_format_recovery(); legacy_source_export_rejection(); binary_channel_validation(); hostile_transfer_frames(); receiving_protocol(); worker_api_guards(); channel_dispatch_and_unstarted_result(); binary_transfer_codec(); for (std::size_t length : {std::size_t{0}, std::size_t{9}, std::size_t{65553}, std::size_t{1048576}}) { binary_transfer_integration(length); }
 		for (unsigned mode : {1u, 2u, 3u, 5u}) { binary_transfer_integration(65553, mode); }
 		owned_snapshot_sources(); snapshot_reception_and_validation(); snapshot_policy_and_rejection(); snapshot_cancellation_phases(); snapshot_read_faults(); snapshot_restart_cleanup(); snapshot_protocol_progress(); snapshot_installation(); snapshot_rejection_branches(); snapshot_old_application(); snapshot_install_reopening(); snapshot_install_admission(); snapshot_publication_faults(); maintenance_preserves_protocol_timers(); real_worker(); partial_control_pack(); failures_and_multi_action_output(); interrupted_initialization(); checkpoint_crash_and_progress(); preparation_preserves_protocol_timers(); checkpoint_cancellation_and_completion(); checkpoint_faults(); worker_repair(); } catch (const std::exception& error) { check(false, error.what()); }

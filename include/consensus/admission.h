@@ -63,20 +63,28 @@ inline EventAdmissionPlan plan_event(const Event& event, bool busy, Limits limit
 				add(AdmissionClass::Control, hard);
 			}
 		} else if constexpr (std::is_same_v<T, Receive>) {
+			if (!value.more.empty() && !std::holds_alternative<AppendRequest>(value.message)) { throw std::invalid_argument("only appends merge"); }
 			std::visit([&](const auto& message) {
 				using M = std::decay_t<decltype(message)>;
 				if constexpr (std::is_same_v<M, AppendRequest>) {
-					if (message.entries.size() > limits.rpc_entries) { throw std::length_error("RPC entry admission bound"); }
-					std::size_t payload = 0;
+					// Each request within the RPC bounds; merged ones (D15) persist as one batch.
+					std::size_t entries = 0, total = 0;
 					bool command = false;
-					for (const auto& entry : message.entries) {
-						if (entry.payload.size() > limits.command_bytes || payload > limits.rpc_bytes || entry.payload.size() > limits.rpc_bytes - payload ||
-							(entry.kind != EntryKind::Command && entry.kind != EntryKind::Configuration && (entry.kind != EntryKind::NoOp || !entry.payload.empty()))) {
-							throw std::length_error("RPC payload admission bound");
+					auto admit = [&](const AppendRequest& request) {
+						if (request.entries.size() > limits.rpc_entries) { throw std::length_error("RPC entry admission bound"); }
+						std::size_t payload = 0;
+						for (const auto& entry : request.entries) {
+							if (entry.payload.size() > limits.command_bytes || payload > limits.rpc_bytes || entry.payload.size() > limits.rpc_bytes - payload ||
+								(entry.kind != EntryKind::Command && entry.kind != EntryKind::Configuration && (entry.kind != EntryKind::NoOp || !entry.payload.empty()))) {
+								throw std::length_error("RPC payload admission bound");
+							}
+							payload += entry.payload.size(); command |= entry.kind == EntryKind::Command;
 						}
-						payload += entry.payload.size(); command |= entry.kind == EntryKind::Command;
-					}
-					if (!busy) { add(command ? AdmissionClass::Normal : AdmissionClass::Control, storage_batch_size(true, true, message.entries.size(), payload)); }
+						entries += request.entries.size(); total += payload;
+					};
+					admit(message);
+					for (const auto& more : value.more) { admit(more); }
+					if (!busy) { add(command ? AdmissionClass::Normal : AdmissionClass::Control, storage_batch_size(true, true, entries, total)); }
 				} else if constexpr (std::is_same_v<M, PreVoteResponse>) {
 					// A pre-vote quorum starts the campaign: ballot, no-op, and commit continuation.
 					if (!busy) { add(AdmissionClass::Control, hard); add(AdmissionClass::Control, noop); add(AdmissionClass::Control, hard); }

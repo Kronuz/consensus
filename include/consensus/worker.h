@@ -33,7 +33,12 @@ namespace kronuz::consensus {
 
 enum class SubmitResult { Accepted, Busy, Pressure, Fenced };
 enum class TurnResult { Idle, Blocked, Pressure, Inventory, Stored, Completed, Maintenance, Fenced, IOPending };
-struct WorkerLimits { std::size_t foreground_burst = 16, scan_entries = 128; bool async_appends = false, async_storage = false; };
+// follower_batch_*: while a batch persists, a follower holds the group's next Append
+// requests up to these bounds and steps them as one Receive (Track C, D15); 0 holds none.
+struct WorkerLimits {
+	std::size_t foreground_burst = 16, scan_entries = 128; bool async_appends = false, async_storage = false;
+	std::size_t follower_batch_bytes = 0, follower_batch_entries = 0;
+};
 // epoch: Worker::epoch() when the application state was captured; a repair since then makes
 // the capture stale, and the core rejects it.
 struct CaptureMetadata { RequestId request; Index through; Term term; std::uint64_t epoch = 0; };
@@ -89,14 +94,14 @@ public:
 	Worker(kronuz::journal::IO& io, FixedConfiguration configuration, kronuz::journal::AdmissionLimits admission,
 		Limits limits = {}, Timing timing = {}, WorkerLimits scheduling = {}, std::optional<SnapshotLimits> snapshots = {})
 		: configuration_(std::move(configuration)), limits_(limits), timing_(timing), scheduling_(scheduling),
-		snapshot_limits_(snapshots), store_(io, admission, batch_limit(configuration_, limits), artifact_limit(snapshots)) {
+		snapshot_limits_(snapshots), store_(io, admission, batch_limit(configuration_, limits, scheduling), artifact_limit(snapshots)) {
 		if (scheduling_.async_appends || scheduling_.async_storage) { throw std::invalid_argument("completion storage requires owned worker IO"); }
 		validate_configuration(admission);
 	}
 	Worker(std::shared_ptr<kronuz::journal::IO> io, FixedConfiguration configuration, kronuz::journal::AdmissionLimits admission,
 		Limits limits = {}, Timing timing = {}, WorkerLimits scheduling = {}, std::optional<SnapshotLimits> snapshots = {})
 		: configuration_(std::move(configuration)), limits_(limits), timing_(timing), scheduling_(scheduling),
-		snapshot_limits_(snapshots), store_(std::move(io), admission, batch_limit(configuration_, limits), artifact_limit(snapshots)) {
+		snapshot_limits_(snapshots), store_(std::move(io), admission, batch_limit(configuration_, limits, scheduling), artifact_limit(snapshots)) {
 		if (scheduling_.async_storage) { scheduling_.async_appends = true; }
 		validate_configuration(admission);
 	}
@@ -105,7 +110,7 @@ public:
 	Worker(std::shared_ptr<kronuz::journal::IO> io, kronuz::journal::TurnDriver& turns, std::uint64_t group, FixedConfiguration configuration,
 		kronuz::journal::AdmissionLimits admission, Limits limits = {}, Timing timing = {}, WorkerLimits scheduling = {}, std::optional<SnapshotLimits> snapshots = {})
 		: configuration_(std::move(configuration)), limits_(limits), timing_(timing), scheduling_(scheduling),
-		snapshot_limits_(snapshots), store_(std::move(io), turns, group, admission, batch_limit(configuration_, limits), artifact_limit(snapshots)) {
+		snapshot_limits_(snapshots), store_(std::move(io), turns, group, admission, batch_limit(configuration_, limits, scheduling), artifact_limit(snapshots)) {
 		scheduling_.async_appends = scheduling_.async_storage = true;
 		validate_configuration(admission);
 	}
@@ -529,12 +534,42 @@ public:
 				}
 				maintenance(); return fenced() ? TurnResult::Fenced : maintenance_io_ ? TurnResult::IOPending : TurnResult::Maintenance;
 			}
+			if (!held_.empty()) { return submit_held(); }
 			auto result = try_submit(current_time);
 			return result == SubmitResult::Accepted ? TurnResult::Idle : result == SubmitResult::Pressure ? TurnResult::Pressure :
 				result == SubmitResult::Fenced ? TurnResult::Fenced : TurnResult::Blocked;
 		} catch (const std::exception& error) { fail(error.what()); return TurnResult::Fenced; }
 	}
 private:
+	// D15: while a batch persists, holds a follower's next Append request when it continues
+	// the held chain from the same leader within the bounds; plan_event validated it.
+	bool hold(Event& event) {
+		if (!scheduling_.follower_batch_bytes || !scheduling_.follower_batch_entries || !ready() || !core_->busy()) { return false; }
+		auto receive = std::get_if<Receive>(&event);
+		auto append = receive && receive->more.empty() ? std::get_if<AppendRequest>(&receive->message) : nullptr;
+		if (!append || append->entries.empty()) { return false; }
+		if (!held_.empty()) {
+			const auto& last = held_.back();
+			if (receive->authenticated_peer != held_peer_ || append->term != last.term || append->previous != last.previous + last.entries.size()) { return false; }
+		}
+		std::size_t bytes = 0;
+		for (const auto& e : append->entries) { bytes += e.payload.size(); }
+		if (held_entries_ + append->entries.size() > scheduling_.follower_batch_entries || held_bytes_ + bytes > scheduling_.follower_batch_bytes) { return false; }
+		held_peer_ = receive->authenticated_peer; held_bytes_ += bytes; held_entries_ += append->entries.size();
+		held_.push_back(std::move(*append));
+		return true;
+	}
+	// Steps the held appends as one Receive. Refused, they are dropped: the leader resends
+	// what it hears nothing about.
+	TurnResult submit_held() {
+		Receive merged{held_peer_, std::move(held_.front()), {}};
+		for (std::size_t i = 1; i < held_.size(); ++i) { merged.more.push_back(std::move(held_[i])); }
+		held_.clear(); held_bytes_ = held_entries_ = 0;
+		Event event = std::move(merged);
+		const auto result = submit_retained(event, false);
+		return result == SubmitResult::Accepted ? TurnResult::Idle : result == SubmitResult::Pressure ? TurnResult::Pressure :
+			result == SubmitResult::Fenced ? TurnResult::Fenced : TurnResult::Blocked;
+	}
 	TurnResult retirement_turn() {
 		try {
 			if (maintenance_io_) {
@@ -620,6 +655,7 @@ private:
 		if (core_ && core_->role() == Role::Leader && std::holds_alternative<Tick>(event)) { plan.count = 0; }
 		if (store_.fenced() && !failed_) { fail("storage fenced outside worker"); }
 		if (fenced()) { return SubmitResult::Fenced; }
+		if (!maintenance_tick && hold(event)) { return SubmitResult::Accepted; }
 		if (!ready() || !output_.empty() || ((maintenance_due() || timer_blocked_) && !maintenance_tick) || cutover_debt_ || core_->busy() || completion_ || application_) { return SubmitResult::Busy; }
 		// A repair waits for a checkpoint in flight, whose capture predates it.
 		if (std::holds_alternative<Repair>(event) && (checkpoint_ || delivered_)) { return SubmitResult::Busy; }
@@ -952,8 +988,11 @@ private:
 		if (left && right > std::numeric_limits<std::size_t>::max() / left) { throw std::length_error("worker bound overflow"); }
 		return left * right;
 	}
-	static std::size_t batch_limit(const FixedConfiguration& configuration, Limits limits) {
-		return std::max(encode_initialization(configuration).size(), storage_batch_size(true, true, limits.rpc_entries, limits.rpc_bytes));
+	static std::size_t batch_limit(const FixedConfiguration& configuration, Limits limits, const WorkerLimits& scheduling = {}) {
+		// A merged follower batch (D15) may exceed one RPC.
+		const auto entries = std::max(limits.rpc_entries, scheduling.follower_batch_entries);
+		const auto bytes = std::max(limits.rpc_bytes, scheduling.follower_batch_bytes);
+		return std::max(encode_initialization(configuration).size(), storage_batch_size(true, true, entries, bytes));
 	}
 	static std::uint64_t artifact_limit(std::optional<SnapshotLimits> limits) {
 		return std::max(std::uint64_t{512ull * 1024 * 1024}, limits ? limits->application_bytes : 0);
@@ -1071,6 +1110,9 @@ private:
 	std::optional<Persist> persist_;
 	std::optional<Persisted> completion_;
 	std::optional<Applied> application_;
+	std::vector<AppendRequest> held_;  // D15: appends received while a batch persisted
+	NodeId held_peer_ = 0;
+	std::size_t held_bytes_ = 0, held_entries_ = 0;
 	std::optional<InstallActivated> activation_completion_;
 	std::optional<Fenced> terminal_;
 	std::shared_ptr<char> checkpoint_owner_ = std::make_shared<char>();

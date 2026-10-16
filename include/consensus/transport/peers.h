@@ -31,6 +31,9 @@ struct PeerOptions {
 	std::map<kronuz::consensus::NodeId, Fingerprint> pins;
 	std::size_t incoming_bytes = 16 * 1024 * 1024, outgoing_bytes = 16 * 1024 * 1024;
 	std::size_t queued_messages = 4, handshakes = 2;
+	// Appends carrying entries queue apart from control frames (Track C, D15, R19): at most
+	// a pipeline of frames and a window of bytes, and every control frame goes first.
+	std::size_t pipeline_frames = 4, window_bytes = 4 * 1024 * 1024;
 	std::chrono::milliseconds deadline{5000};
 };
 struct PeerStats {
@@ -42,7 +45,7 @@ struct PeerStats {
 struct PeerOccupancy {
 	std::size_t incoming_bytes = 0, outgoing_bytes = 0;
 	std::size_t incoming_high_water = 0, outgoing_high_water = 0;
-	std::size_t connections = 0, handshakes = 0, queued_control = 0, retained_inputs = 0;
+	std::size_t connections = 0, handshakes = 0, queued_control = 0, retained_inputs = 0, queued_data = 0;
 };
 // All calls and completions run on the authority owner executor. start()/stop()
 // are admission boundaries; retain this object until drained() becomes true.
@@ -56,7 +59,7 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 		  context_(std::make_shared<asio::ssl::context>(asio::ssl::context::tls)),
 		  incoming_(std::make_shared<ByteBudget>(options_.incoming_bytes)),
 		  outgoing_(std::make_shared<ByteBudget>(options_.outgoing_bytes)), acceptor_(executor) {
-		if (!node_ || !options_.queued_messages || !options_.handshakes ||
+		if (!node_ || !options_.queued_messages || !options_.handshakes || !options_.pipeline_frames || !options_.window_bytes ||
 			options_.deadline <= std::chrono::milliseconds::zero())
 			throw std::invalid_argument("peer bounds");
 		reactor::tls::configure(*context_, options_.tls, reactor::tls::Role::Peer);
@@ -113,6 +116,7 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 		for (const auto &connection : connections_) {
 			result.handshakes += !connection->ready && !connection->closing;
 			result.queued_control += connection->queue.size();
+			result.queued_data += connection->data.size();
 			result.retained_inputs += connection->input.has_value();
 		}
 		return result;
@@ -120,7 +124,10 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 	asio::ip::tcp::endpoint local_endpoint() const { return acceptor_.local_endpoint(); }
 	void send(kronuz::consensus::Send action) {
 		auto connection = find(action.peer, Lane::Control);
-		if (stopping_ || !connection || connection->queue.size() >= options_.queued_messages) {
+		auto request = std::get_if<kronuz::consensus::AppendRequest>(&action.message);
+		const bool data = request && !request->entries.empty();
+		if (stopping_ || !connection || (!data && connection->queue.size() >= options_.queued_messages) ||
+			(data && connection->data.size() >= options_.pipeline_frames)) {
 			++stats_.dropped;
 			return;
 		}
@@ -128,10 +135,20 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 			ByteCredit credit(outgoing_, control_frame_bound(configuration_.consensus));
 			auto bytes = encode(action.message, configuration_.consensus);
 			std::optional<kronuz::consensus::AppendRequest> observation;
-			if (auto request = std::get_if<kronuz::consensus::AppendRequest>(&action.message))
+			if (request)
 				observation.emplace(kronuz::consensus::AppendRequest{
 					request->term, request->rpc, 0, 0, 0, request->read_probe, {}});
-			connection->queue.push_back({Frame(std::move(credit), std::move(bytes)), std::move(observation)});
+			if (data) {
+				// The first queued append always fits; others only within the window.
+				if (!connection->data.empty() && connection->data_bytes + bytes.size() > options_.window_bytes) {
+					++stats_.dropped;
+					return;
+				}
+				connection->data_bytes += bytes.size();
+				connection->data.push_back({Frame(std::move(credit), std::move(bytes)), std::move(observation)});
+			} else {
+				connection->queue.push_back({Frame(std::move(credit), std::move(bytes)), std::move(observation)});
+			}
 			connection->wake.cancel();
 		} catch (const std::runtime_error &) {
 			++stats_.dropped;
@@ -199,7 +216,9 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 		asio::steady_timer admission_wake;
 		std::optional<kronuz::consensus::Event> input;
 		std::chrono::steady_clock::time_point received_at;
-		std::deque<ControlFrame> queue;
+		std::deque<ControlFrame> queue;  // control frames: votes, heartbeats, responses
+		std::deque<ControlFrame> data;   // appends carrying entries
+		std::size_t data_bytes = 0;
 		AppendObservation append;
 		kronuz::consensus::NodeId peer = 0;
 		Lane lane = Lane::Control;
@@ -400,9 +419,13 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 	asio::awaitable<void> writer(std::shared_ptr<Connection> connection) {
 		try {
 			while (!stopping_ && !connection->closing) {
-				if (connection->lane == Lane::Control && !connection->queue.empty()) {
-					auto frame = std::move(connection->queue.front());
-					connection->queue.pop_front();
+				if (connection->lane == Lane::Control && (!connection->queue.empty() || !connection->data.empty())) {
+					// Control first (R19): a data frame goes only when no control frame waits.
+					const bool control = !connection->queue.empty();
+					auto& from = control ? connection->queue : connection->data;
+					auto frame = std::move(from.front());
+					from.pop_front();
+					if (!control) { connection->data_bytes -= frame.frame.bytes().size(); }
 					auto generation =
 						frame.observation
 							? connection->append.emit(*frame.observation, std::chrono::steady_clock::now(),

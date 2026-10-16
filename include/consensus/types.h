@@ -118,9 +118,12 @@ struct Timing {
 
 // Pipelined replication (Track C, D15): Append RPCs and bytes in flight per peer. One
 // flight by default, today's behavior; a membership group's host raises it (D15: 4).
+// frame_bytes caps an append's payload below rpc_bytes, or one entry when larger, so a
+// control frame waits behind at most one such frame (R19: 256 KiB); 0 leaves rpc_bytes.
 struct Flow {
 	std::uint32_t pipeline = 1;
 	std::uint64_t window_bytes = 4 << 20;
+	std::size_t frame_bytes = 0;
 };
 
 // transfer: sent on TimeoutNow (Track C, D6); it bypasses the leader-contact guard.

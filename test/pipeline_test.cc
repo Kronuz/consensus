@@ -75,6 +75,7 @@ public:
 	bool reorder = false;  // deliver in a random order
 	std::size_t drop_append_responses = 0;  // the next this many Append responses are lost
 	std::map<std::pair<NodeId, NodeId>, std::size_t> appends;  // non-empty Append RPCs sent
+	std::size_t largest = 0;  // the largest Append payload sent, in bytes
 
 	Cluster(std::size_t voters, Limits limits, Flow flow) {
 		for (NodeId id = 1; id <= voters; ++id) {
@@ -93,7 +94,11 @@ public:
 			if (auto p = std::get_if<Persist>(&a)) {
 				consume(id, n.core->step(Persisted{p->token}));
 			} else if (auto s = std::get_if<Send>(&a)) {
-				if (auto r = std::get_if<AppendRequest>(&s->message); r && !r->entries.empty()) { ++appends[{id, s->peer}]; }
+				if (auto r = std::get_if<AppendRequest>(&s->message); r && !r->entries.empty()) {
+					++appends[{id, s->peer}];
+					std::size_t bytes = 0; for (const auto& e : r->entries) { bytes += e.payload.size(); }
+					largest = std::max(largest, bytes);
+				}
 				wire.push_back({id, s->peer, s->message});
 			} else if (auto c = std::get_if<Committed>(&a)) {
 				for (const auto& e : c->entries) { if (e.kind == EntryKind::Command) { n.applied.push_back(e.payload); } }
@@ -208,6 +213,27 @@ void window() {
 	check(c.appends[{1, 2}] == 2, "two 1 MiB RPCs fill a 2 MiB window");
 }
 
+// R19: frame_bytes caps an append at 256 KiB, an entry above it goes alone, and without
+// the cap the same backlog goes in frames of up to rpc_bytes.
+void frame_split() {
+	Limits limits;
+	for (std::size_t cap : {std::size_t{256} << 10, std::size_t{0}}) {
+		Cluster c(3, limits, Flow{4, 64 << 20, cap});
+		c.propose("warm"); c.run(100);
+		c.largest = 0;
+		for (int i = 0; i < 20; ++i) { c.propose(std::string(100 << 10, char('a' + i))); }
+		c.run(200);
+		if (cap) {
+			check(c.largest <= cap, "appends stay within frame_bytes");
+			c.propose(std::string(512 << 10, 'z')); c.run(200);
+			check(c.largest == std::size_t{512} << 10, "an entry above frame_bytes goes alone");
+		} else {
+			check(c.largest > std::size_t{256} << 10, "without frame_bytes a backlog goes in frames up to rpc_bytes");
+		}
+		for (auto& [id, n] : c.nodes) { check(n.applied.size() == (cap ? 22u : 21u), "every node applies the backlog"); }
+	}
+}
+
 // Pipelining through loss and reordering converges: every node applies the same log.
 void converge() {
 	for (std::uint64_t seed = 1; seed <= 20; ++seed) {
@@ -278,6 +304,7 @@ int main() {
 	lost_response();
 	unverified();
 	window();
+	frame_split();
 	converge();
 	std::printf("pipeline_test: %d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;

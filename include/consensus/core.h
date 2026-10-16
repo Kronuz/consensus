@@ -1088,7 +1088,7 @@ private:
 		// Node limits bound each entry; the group's limits in force, and the nodes', bound the
 		// batch, which always takes a first entry that fits the nodes.
 		const auto wire = peer_wire_limits(id); const auto& group = limits_in_force();
-		const auto rpc_entries = std::min(wire.rpc_entries, group.rpc_entries), rpc_bytes = std::min(wire.rpc_bytes, group.rpc_bytes);
+		const auto rpc_entries = std::min(wire.rpc_entries, group.rpc_entries), rpc_bytes = std::min({wire.rpc_bytes, group.rpc_bytes, flow_.frame_bytes ? flow_.frame_bytes : wire.rpc_bytes});
 		for (Index index = peer.next; index <= last_index() && batch.size() < rpc_entries; ++index) {
 			const auto& entry = log_entry(index);
 			if (!fits(entry, wire) || entry.payload.size() > wire.rpc_bytes) { break; }

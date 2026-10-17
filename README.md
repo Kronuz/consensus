@@ -83,7 +83,7 @@ while (!work.empty()) {
 creation and recovery. Real deployments use `Worker`, which owns this loop with
 admission, checkpoints, and completion-driven I/O.
 
-Checkpoint encoding and recovery share retained-entry validation. Lowering current operating limits does not invalidate existing retained history; configuration entries use their membership encoding bound. Incremental encoding validates entries within each call's record budget. Hosts still need enough replacement capacity for the retained suffix when lowering log limits.
+Checkpoint encoding and recovery share retained-entry validation. Lowering current operating limits does not invalidate existing retained history; configuration entries use their membership encoding bound. Incremental encoding validates entries within each call's record budget. Hosts still need enough replacement capacity for the retained suffix when lowering log limits. Committed delivery emits an oversized historical entry on its own when the current RPC byte limit is lower.
 
 ## 🎯 When to use it
 

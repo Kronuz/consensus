@@ -1138,7 +1138,7 @@ private:
 		std::vector<Entry> batch; std::size_t bytes = 0;
 		for (Index index = applied_ + 1; index <= durable_.commit_index && batch.size() < limits_.rpc_entries; ++index) {
 			const auto& entry = log_entry(index);
-			if (!batch.empty() && entry.payload.size() > limits_.rpc_bytes - bytes) { break; }  // one entry always fits
+			if (!batch.empty() && (bytes > limits_.rpc_bytes || entry.payload.size() > limits_.rpc_bytes - bytes)) { break; }  // one historical entry may exceed the limit
 			bytes += entry.payload.size(); batch.push_back(entry);
 		}
 		delivered_through_ = batch.back().index;

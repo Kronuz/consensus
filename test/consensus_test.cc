@@ -1909,8 +1909,34 @@ void learner_install_and_promotion() {
 	check(votes_in(now_in, 6) && !find_member(now_in, 3) && voter_count(now_in) == 3, "the learner is promoted and the replaced voter removed");
 }
 
+void recovered_delivery_byte_bound() {
+	for (std::size_t payload : {std::size_t{8192}, std::size_t{4096}, std::size_t{4095}}) {
+		Limits narrow;
+		narrow.command_bytes = narrow.rpc_bytes = 4096;
+		validate_limits(narrow);
+		auto state = empty(1);
+		state.hard = {1, {}, 3};
+		state.entries = {{1, 1, EntryKind::Command, std::string(payload, 'x')},
+			{2, 1, EntryKind::Command, {}}, {3, 1, EntryKind::Command, "y"}};
+		Core core(state.configuration, state, narrow);
+		auto actions = core.step(Start{});
+		auto delivery = find<Committed>(actions);
+		const std::size_t expected = payload > narrow.rpc_bytes ? 1 : payload == narrow.rpc_bytes ? 2 : 3;
+		check(delivery && delivery->first == 1 && delivery->entries.size() == expected,
+			"recovered delivery emits an oversized historical entry alone");
+		if (!delivery) { continue; }
+		auto through = delivery->entries.back().index;
+		if (through < 3) {
+			auto next = core.step(Applied{through});
+			auto remaining = find<Committed>(next);
+			check(remaining && remaining->first == through + 1 && remaining->entries.back().index == 3,
+				"the following delivery preserves all remaining entries");
+		}
+	}
+}
+
 int main() {
-	try { terminal_retirement(); snapshot_sender_maximum_fanout(); snapshot_sender_lost_ack_and_terms(); snapshot_sender_receiver_contact(); snapshot_sender_restart_clock_and_admission(); snapshot_sender_correlation(); snapshot_sender_keepalive_pacing(); snapshot_sender_retries_and_retention(); snapshot_timeout_retries(); portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); repair_at_or_below_commit(); prevote_guard_checkquorum(); membership_scripts(); membership_formats(); leadership_transfer(); witnesses(); checkpoint_with_configuration_suffix(); founding_records(); limits_by_position(); learner_install_and_promotion(); }
+	try { recovered_delivery_byte_bound(); terminal_retirement(); snapshot_sender_maximum_fanout(); snapshot_sender_lost_ack_and_terms(); snapshot_sender_receiver_contact(); snapshot_sender_restart_clock_and_admission(); snapshot_sender_correlation(); snapshot_sender_keepalive_pacing(); snapshot_sender_retries_and_retention(); snapshot_timeout_retries(); portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); repair_at_or_below_commit(); prevote_guard_checkquorum(); membership_scripts(); membership_formats(); leadership_transfer(); witnesses(); checkpoint_with_configuration_suffix(); founding_records(); limits_by_position(); learner_install_and_promotion(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " consensus checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

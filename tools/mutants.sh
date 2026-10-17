@@ -20,6 +20,7 @@ compile_membership=$(ninja -C "$build" -t commands consensus_membership_test | g
 # it in the same RPC, so the fault cannot be observed until coalesced heartbeats (Track C,
 # D12) carry a commit without entries; it joins this list with them.
 mutants=(
+	$'recovered delivery byte accounting underflows\tbytes > limits_.rpc_bytes || \t'
 	$'sends before durability\tif (batch.hard || batch.log) { persist(std::move(batch), std::move(deferred), output); }\tif (batch.hard || batch.log) { for (auto& a : deferred) { output.push_back(a); } persist(std::move(batch), {}, output); }'
 	$'votes and pre-votes without the log check\treturn term > log_term(last_index()) || (term == log_term(last_index()) && index >= last_index());\treturn true;'
 	$'repair with a delivery outstanding\tif (!started_ || busy() || delivered_through_) { reject(RejectReason::Busy); return; }\tif (!started_ || busy()) { reject(RejectReason::Busy); return; }'

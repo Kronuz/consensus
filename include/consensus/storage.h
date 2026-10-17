@@ -57,6 +57,19 @@ inline bool flag(std::string_view& bytes) {
 	bool result = bytes[0] != 0; bytes.remove_prefix(1); return result;
 }
 inline void end(std::string_view bytes) { if (!bytes.empty()) { throw Corruption("trailing consensus storage bytes"); } }
+// Retained entries survive reductions to current operating limits.
+inline void validate_checkpoint_entry(const RecoveredState& state, const Entry& entry,
+	std::size_t position, Term& previous, std::size_t& payload_bytes) {
+	const auto maximum_payload = entry.kind == EntryKind::Configuration ? maximum_membership_bytes : ceilings.command_bytes;
+	if (entry.index != state.base_index + position + 1 || entry.term == 0 || entry.term < previous || entry.term > state.hard.term ||
+		entry.payload.size() > maximum_payload || payload_bytes > ceilings.log_bytes || entry.payload.size() > ceilings.log_bytes - payload_bytes ||
+		static_cast<unsigned>(entry.kind) > static_cast<unsigned>(EntryKind::Configuration) || (entry.kind == EntryKind::NoOp && !entry.payload.empty())) {
+		throw Corruption("invalid consensus checkpoint suffix");
+	}
+	if (entry.kind == EntryKind::Configuration) { (void)decode_membership(entry.payload); }
+	previous = entry.term;
+	payload_bytes += entry.payload.size();
+}
 } // namespace storage_detail
 
 // The founding record. RFTINIT2 is written only when a founding member is not a voter or
@@ -162,13 +175,7 @@ public:
 		Term previous = state.base_term; std::size_t bytes = 0;
 		for (std::size_t i = 0; i < state.entries.size(); ++i) {
 			const auto& entry = state.entries[i];
-			if (entry.index != state.base_index + i + 1 || entry.term == 0 || entry.term < previous || entry.term > state.hard.term ||
-				entry.payload.size() > ceilings.command_bytes || entry.payload.size() > ceilings.log_bytes - bytes ||
-				static_cast<unsigned>(entry.kind) > static_cast<unsigned>(EntryKind::Configuration) || (entry.kind == EntryKind::NoOp && !entry.payload.empty())) {
-				throw storage_detail::Corruption("invalid consensus checkpoint suffix");
-			}
-			if (entry.kind == EntryKind::Configuration) { (void)decode_membership(entry.payload); }  // throws Corruption
-			previous = entry.term; bytes += entry.payload.size();
+			storage_detail::validate_checkpoint_entry(state, entry, i, previous, bytes);
 		}
 		return bytes;
 	}

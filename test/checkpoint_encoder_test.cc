@@ -185,6 +185,59 @@ void frozen_capabilities() {
 	require(rejected, "destroyed owner invalidates escaped capture without dangling access");
 }
 
+void lowered_operating_limits() {
+	auto state = fixture(8, 1024);
+	Limits narrow;
+	narrow.command_bytes = 64;
+	narrow.rpc_bytes = 4096;
+	narrow.log_bytes = 4096;
+	narrow.log_entries = 4;
+	narrow.control_entries = 1;
+	validate_limits(narrow);
+	kronuz::journal::ArtifactDescriptor application{{}, 17, 123};
+	auto bytes = encode_checkpoint(state, 7, application);
+	auto recovered = decode_checkpoint(bytes, state.configuration, 7, application, narrow);
+	Core core(state.configuration, recovered.state, narrow);
+	require(core.retained_log_bytes() == 8192, "lower limits preserve retained history");
+	std::size_t accesses = 0;
+	IncrementalCheckpointEncoder encoder(CountedSource{&recovered.state, &accesses}, 7, application, narrow);
+	require(accesses == 0, "lower-limit checkpoint construction remains bounded");
+	std::array<char, 113> buffer{};
+	std::string actual;
+	while (!encoder.done()) {
+		auto before = accesses;
+		auto count = encoder.next(buffer, 1);
+		require(count > 0 && accesses - before <= 2, "lower-limit encoding honors its record budget");
+		actual.append(buffer.data(), count);
+	}
+	require(actual == bytes, "lower operating limits preserve checkpoint bytes");
+	require(encode_checkpoint(recovered.state, 7, application, narrow) == bytes,
+			"materializing encoder shares retained-state validation");
+	auto roundtrip = decode_checkpoint(actual, state.configuration, 7, application, narrow);
+	require(roundtrip.state.entries == state.entries, "lower-limit checkpoint round trip preserves history");
+}
+
+void configuration_payload_validation() {
+	auto state = fixture(1, 0);
+	state.entries[0].kind = EntryKind::Configuration;
+	state.entries[0].payload = encode_membership(fixed_membership(state.configuration));
+	Limits narrow;
+	narrow.command_bytes = 1;
+	kronuz::journal::ArtifactDescriptor application{{}, 17, 123};
+	auto bytes = encode_checkpoint(state, 7, application, narrow);
+	auto decoded = decode_checkpoint(bytes, state.configuration, 7, application, narrow);
+	Core core(state.configuration, decoded.state, narrow);
+	require(decoded.state.entries == state.entries, "configuration payload has its own bound");
+	state.entries[0].payload = "invalid membership";
+	IncrementalCheckpointEncoder encoder(BorrowedCheckpointState{&state}, 7, application, narrow);
+	std::array<char, 1024> buffer{};
+	bool refused = false;
+	try {
+		while (!encoder.done()) { encoder.next(buffer); }
+	} catch (const storage_detail::Corruption&) { refused = true; }
+	require(refused, "incremental encoding rejects malformed configuration payloads");
+}
+
 void invalid_suffix() {
 	auto state = fixture(20, 0);
 	state.entries.back().index++;
@@ -234,9 +287,10 @@ void encoder_guards() {
 	require(rejects(edited([](RecoveredState &s) { s.entries[1].kind = EntryKind::NoOp; })), "a NoOp carries no payload");
 	Limits small;
 	small.command_bytes = 1;
-	require(rejects(fixture(3, 2), small), "a suffix payload stays within the command limit");
-	small.command_bytes = small.rpc_bytes = small.log_bytes = 5;
-	require(rejects(fixture(3, 2), small), "the suffix stays within the retained log's bytes");
+	require(!rejects(fixture(3, 2), small), "retained payloads survive a lower command limit");
+	small.command_bytes = small.rpc_bytes = small.log_bytes = 4096;
+	validate_limits(small);
+	require(!rejects(fixture(3, 2048), small), "retained payloads survive a lower operating byte limit");
 	bool refused = false;
 	try {
 		auto state = fixture(1, 1);
@@ -282,6 +336,8 @@ int main() {
 			}
 			compare(1, 1024 * 1024, 65536, format);
 		}
+		lowered_operating_limits();
+		configuration_payload_validation();
 		invalid_suffix();
 		encoder_guards();
 		frozen_capabilities();

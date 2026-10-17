@@ -42,7 +42,7 @@ template <class Source> class IncrementalCheckpointEncoder {
 	IncrementalCheckpointEncoder(Source source, std::uint64_t sequence,
 								 const kronuz::journal::ArtifactDescriptor &application, Limits limits = {},
 								 std::optional<std::uint32_t> format = {})
-		: source_(std::move(source)), limits_(limits), maximum_(checkpoint_detail::maximum_size()) {
+		: source_(std::move(source)), maximum_(checkpoint_detail::maximum_size()) {
 		using namespace storage_detail;
 		if (!sequence) {
 			throw Corruption("invalid checkpoint storage sequence");
@@ -123,17 +123,7 @@ template <class Source> class IncrementalCheckpointEncoder {
 				const auto &entry = source_.entry(index_);
 				if (!active_) {
 					++records;
-					if (entry.index != state.base_index + index_ + 1 || !entry.term ||
-						entry.term < previous_ || entry.term > state.hard.term ||
-						entry.payload.size() > limits_.command_bytes ||
-						entry.payload.size() > limits_.log_bytes - payload_bytes_ ||
-						entry.payload.size() > std::numeric_limits<std::uint32_t>::max() ||
-						(entry.kind != EntryKind::Command && entry.kind != EntryKind::NoOp && entry.kind != EntryKind::Configuration) ||
-						(entry.kind == EntryKind::NoOp && !entry.payload.empty())) {
-						throw storage_detail::Corruption("invalid consensus checkpoint suffix");
-					}
-					payload_bytes_ += entry.payload.size();
-					previous_ = entry.term;
+					storage_detail::validate_checkpoint_entry(state, entry, index_, previous_, payload_bytes_);
 					storage_detail::put64(record_, entry.index);
 					storage_detail::put64(record_, entry.term);
 					record_.push_back(static_cast<char>(entry.kind));
@@ -164,7 +154,6 @@ template <class Source> class IncrementalCheckpointEncoder {
 
   private:
 	Source source_;
-	Limits limits_;
 	std::size_t maximum_, count_ = 0, index_ = 0, payload_bytes_ = 0, emitted_ = 0;
 	Term previous_ = 0;
 	std::string header_, record_;

@@ -85,6 +85,8 @@ admission, checkpoints, and completion-driven I/O.
 
 Checkpoint encoding and recovery share retained-entry validation. Lowering current operating limits does not invalidate existing retained history; configuration entries use their membership encoding bound. Incremental encoding validates entries within each call's record budget. Hosts still need enough replacement capacity for the retained suffix when lowering log limits. Committed delivery emits an oversized historical entry on its own when the current RPC byte limit is lower.
 
+Retirement shares one budget across retained entries and pending output cleanup. A first historical payload larger than a fresh nonzero byte budget may retire alone, saturating remaining bytes to zero. Zero-byte predecessors consume units and defer oversized work to a fresh budget. Lowering command limits therefore preserves finite shutdown without raising every cleanup budget to the maximum payload size.
+
 ## 🎯 When to use it
 
 - ✅ Replicating a state machine across three or five voters, where you need to

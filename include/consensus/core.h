@@ -132,9 +132,7 @@ public:
 			if (!budget.consume()) { return false; }
 			grants_.erase(grants_.begin());
 		}
-		auto before = entries_.retired_bytes();
-		budget.units -= entries_.retire(budget.units, budget.bytes);
-		budget.bytes -= before - entries_.retired_bytes();
+		entries_.retire(budget);
 		return retirement_drained();
 	}
 	bool retirement_drained() const noexcept {

@@ -27,16 +27,18 @@
 #include <type_traits>
 
 namespace kronuz::consensus::detail {
-// One maximum legal payload fits a fresh budget. Counts bound empty entries
-// and actions too; callers retain unfinished containers between owner turns.
+// A first oversized item consumes a fresh nonzero byte budget by itself.
+// Share the budget across containers; zero-byte work consumes units too.
 struct RetirementBudget {
 	std::size_t units = 256, bytes = 1024 * 1024;
+	bool started = false;
 	bool consume(std::size_t payload = 0) noexcept {
-		if (!units || payload > bytes) {
+		if (!units || (payload > bytes && (started || !bytes))) {
 			return false;
 		}
 		--units;
-		bytes -= payload;
+		bytes = payload > bytes ? 0 : bytes - payload;
+		started = true;
 		return true;
 	}
 };

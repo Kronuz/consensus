@@ -23,6 +23,7 @@
 #pragma once
 
 #include "types.h"
+#include "retirement.h"
 #include <algorithm>
 #include <memory>
 #include <stdexcept>
@@ -223,18 +224,18 @@ class RetainedLog {
 	}
 	void clear() noexcept { retain_for_retirement(std::move(root_)); }
 	std::size_t retire(std::size_t budget, std::size_t byte_budget) noexcept {
-		std::size_t reclaimed = 0, reclaimed_bytes = 0;
-		while (retired_ && reclaimed < budget) {
-			if (retired_->entry.payload.size() > byte_budget - reclaimed_bytes) {
-				break;
-			}
+		RetirementBudget shared{budget, byte_budget};
+		return retire(shared);
+	}
+	std::size_t retire(RetirementBudget& budget) noexcept {
+		std::size_t reclaimed = 0;
+		while (retired_ && budget.consume(retired_->entry.payload.size())) {
 			auto node = std::move(retired_);
 			retired_ = std::move(node->retired_next);
 			push_retired(std::move(node->left));
 			push_retired(std::move(node->right));
 			--retired_count_;
 			retired_bytes_ -= node->entry.payload.size();
-			reclaimed_bytes += node->entry.payload.size();
 			++reclaimed;
 		}
 		return reclaimed;

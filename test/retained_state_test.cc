@@ -27,20 +27,37 @@
 #include <iostream>
 #include <new>
 
+#if defined(__SANITIZE_THREAD__)
+#define CONSENSUS_TEST_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define CONSENSUS_TEST_TSAN 1
+#endif
+#endif
+
 namespace {
-bool allocation_guard = false;
-std::size_t allocations = 0, allocated_bytes = 0;
+thread_local bool allocation_guard = false, allocation_exceeded = false;
+thread_local std::size_t allocations = 0, allocated_bytes = 0;
+void observe_allocation(std::size_t size) noexcept {
+	if (!allocation_guard) { return; }
+	if (allocations >= 16 || size > 16384 - allocated_bytes) { allocation_exceeded = true; return; }
+	++allocations; allocated_bytes += size;
 }
+}
+#ifdef CONSENSUS_TEST_TSAN
+extern "C" void __sanitizer_malloc_hook(const volatile void*, std::size_t size) {
+	observe_allocation(size);
+}
+#else
 void* operator new(std::size_t size) {
-	if (allocation_guard) {
-		if (allocations >= 16 || size > 16384 - allocated_bytes) { throw std::bad_alloc(); }
-		++allocations; allocated_bytes += size;
-	}
+	observe_allocation(size);
+	if (allocation_guard && allocation_exceeded) { throw std::bad_alloc(); }
 	if (auto* result = std::malloc(size ? size : 1)) { return result; }
 	throw std::bad_alloc();
 }
 void operator delete(void* pointer) noexcept { std::free(pointer); }
 void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); }
+#endif
 
 using namespace kronuz::consensus;
 namespace {
@@ -109,6 +126,10 @@ void lowered_limits() {
 		"aggregate payload above policy is rejected");
 }
 void invalid_typed_state() {
+	allocations = allocated_bytes = 0; allocation_exceeded = false; allocation_guard = true;
+	auto* probe = ::operator new(32); static_cast<volatile char*>(probe)[0] = 1;
+	allocation_guard = false; ::operator delete(probe);
+	require(allocations && allocated_bytes >= 32, "allocation probe observes real allocations");
 	RetainedStatePolicy policy{8, 8192, 4096, 4096, 64};
 	Limits limits; limits.command_bytes = 8; limits.rpc_bytes = 4096; limits.log_bytes = 8192;
 	limits.log_entries = 4096; limits.rpc_entries = 64; limits.members = limits.voters = 1;
@@ -117,12 +138,12 @@ void invalid_typed_state() {
 		if (!count) { state.entries.back().payload = std::string(9, 'x'); }
 		auto expected = state.configuration;
 		bool rejected = false, allocated = false;
-		allocations = allocated_bytes = 0; allocation_guard = true;
+		allocations = allocated_bytes = 0; allocation_exceeded = false; allocation_guard = true;
 		try { Core core(std::move(expected), std::move(state), limits, {}, {}, policy); }
 		catch (const std::invalid_argument&) { rejected = true; }
 		catch (const std::bad_alloc&) { allocated = true; }
 		allocation_guard = false;
-		require(rejected && !allocated, "invalid typed history is rejected before per-entry allocation");
+		require(rejected && !allocated && !allocation_exceeded, "invalid typed history is rejected before per-entry allocation");
 	}
 }
 void historical_membership() {

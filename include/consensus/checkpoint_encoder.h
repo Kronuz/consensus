@@ -41,20 +41,20 @@ template <class Source> class IncrementalCheckpointEncoder {
   public:
 	IncrementalCheckpointEncoder(Source source, std::uint64_t sequence,
 								 const kronuz::journal::ArtifactDescriptor &application, Limits limits = {},
-								 std::optional<std::uint32_t> format = {})
-		: source_(std::move(source)), maximum_(checkpoint_detail::maximum_size()) {
+								 std::optional<std::uint32_t> format = {}, RetainedStatePolicy retained = {})
+		: source_(std::move(source)), maximum_(checkpoint_detail::encoded_bound({retained.log_entries, retained.log_bytes})) {
 		using namespace storage_detail;
 		if (!sequence) {
 			throw Corruption("invalid checkpoint storage sequence");
 		}
 		const auto &state = source_.metadata();
 		count_ = source_.size();
-		Recovery validator(state.configuration, limits);
+		Recovery validator(state.configuration, limits, retained);
 		validator.validate_checkpoint_metadata(state, count_);
 		if (count_ > std::numeric_limits<std::uint32_t>::max()) {
 			throw std::length_error("checkpoint entry count overflow");
 		}
-		previous_ = state.base_term;
+		cursor_.emplace(state.base_index, state.base_term, state.hard.term, retained);
 		auto initialization = encode_initialization(state.configuration);
 		if (state.membership) {
 			put64(header_, checkpoint_detail::magic_v3);
@@ -116,14 +116,14 @@ template <class Source> class IncrementalCheckpointEncoder {
 				header_.clear();
 			}
 			while (copied < destination.size() && index_ < count_) {
-				const auto &state = source_.metadata();
+				(void)source_.metadata();
 				if (!active_ && records == record_budget) {
 					break;
 				}
 				const auto &entry = source_.entry(index_);
 				if (!active_) {
 					++records;
-					storage_detail::validate_checkpoint_entry(state, entry, index_, previous_, payload_bytes_);
+					if (!cursor_->accept(entry.index, entry.term, entry.kind, entry.payload)) { throw storage_detail::Corruption("invalid consensus checkpoint suffix"); }
 					storage_detail::put64(record_, entry.index);
 					storage_detail::put64(record_, entry.term);
 					record_.push_back(static_cast<char>(entry.kind));
@@ -154,8 +154,8 @@ template <class Source> class IncrementalCheckpointEncoder {
 
   private:
 	Source source_;
-	std::size_t maximum_, count_ = 0, index_ = 0, payload_bytes_ = 0, emitted_ = 0;
-	Term previous_ = 0;
+	std::size_t maximum_, count_ = 0, index_ = 0, emitted_ = 0;
+	std::optional<retained_detail::Cursor> cursor_;
 	std::string header_, record_;
 	std::size_t header_offset_ = 0, record_offset_ = 0, payload_offset_ = 0;
 	bool active_ = false, failed_ = false;

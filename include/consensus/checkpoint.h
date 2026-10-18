@@ -32,12 +32,12 @@ struct CheckpointBundle {
 	std::optional<std::uint32_t> application_format{};
 };
 inline std::string encode_checkpoint(const RecoveredState& state, std::uint64_t storage_sequence,
-	const kronuz::journal::ArtifactDescriptor& application, Limits limits = {}, std::optional<std::uint32_t> application_format = {}) {
+	const kronuz::journal::ArtifactDescriptor& application, Limits limits = {}, std::optional<std::uint32_t> application_format = {}, RetainedStatePolicy retained = {}) {
 	using namespace storage_detail;
 	// Validate the typed state before producing storage bytes.
-	auto maximum = checkpoint_detail::maximum_size();
+	auto maximum = checkpoint_detail::encoded_bound({retained.log_entries, retained.log_bytes});
 	if (storage_sequence == 0) { throw Corruption("invalid checkpoint storage sequence"); }
-	Recovery validator(state.configuration, limits); auto payload_bytes = validator.validate_checkpoint_state(state);
+	Recovery validator(state.configuration, limits, retained); auto payload_bytes = validator.validate_checkpoint_state(state);
 	if (state.entries.size() > std::numeric_limits<std::uint32_t>::max()) { throw std::length_error("checkpoint entry count overflow"); }
 	auto initialization = encode_initialization(state.configuration);
 	for (const auto& entry : state.entries) {
@@ -47,7 +47,7 @@ inline std::string encode_checkpoint(const RecoveredState& state, std::uint64_t 
 	if (state.membership) { encoded_size += 8 + encode_membership(*state.membership).size(); }
 	if (encoded_size > maximum) { throw std::length_error("checkpoint exceeds encoded bound"); }
 	std::string result; result.reserve(encoded_size);
-	IncrementalCheckpointEncoder encoder(BorrowedCheckpointState{&state}, storage_sequence, application, limits, application_format);
+	IncrementalCheckpointEncoder encoder(BorrowedCheckpointState{&state}, storage_sequence, application, limits, application_format, retained);
 	std::array<char, 65536> buffer{};
 	while (!encoder.done()) {
 		auto count = encoder.next(buffer);
@@ -57,15 +57,16 @@ inline std::string encode_checkpoint(const RecoveredState& state, std::uint64_t 
 	if (result.size() != encoded_size) { throw std::length_error("checkpoint exceeds encoded bound"); }
 	return result;
 }
-inline std::string encode_checkpoint(const CheckpointBundle& bundle, Limits limits = {}) {
-	return encode_checkpoint(bundle.state, bundle.storage_sequence, bundle.application, limits, bundle.application_format);
+inline std::string encode_checkpoint(const CheckpointBundle& bundle, Limits limits = {}, RetainedStatePolicy retained = {}) {
+	return encode_checkpoint(bundle.state, bundle.storage_sequence, bundle.application, limits, bundle.application_format, retained);
 }
 // Decode only into unpublished state. The caller also verifies the enclosing
 // journal frontier and the application artifact before activating either.
 inline CheckpointBundle decode_checkpoint(std::string_view bytes, const FixedConfiguration& expected, std::uint64_t covered_sequence,
-	const kronuz::journal::ArtifactDescriptor& application, Limits limits = {}) {
+	const kronuz::journal::ArtifactDescriptor& application, Limits limits = {}, RetainedStatePolicy retained = {}) {
 	using namespace storage_detail;
-	if (bytes.size() > checkpoint_detail::maximum_size()) { throw Corruption("oversized checkpoint bundle"); }
+	retained_detail::validate_policy(retained, limits);
+	if (bytes.size() > checkpoint_detail::encoded_bound({retained.log_entries, retained.log_bytes})) { throw Corruption("oversized checkpoint bundle"); }
 	auto magic = get64(bytes);
 	if (magic != checkpoint_detail::magic && magic != checkpoint_detail::magic_v2 && magic != checkpoint_detail::magic_v3) {
 		throw Corruption("unsupported or oversized checkpoint bundle");
@@ -95,19 +96,22 @@ inline CheckpointBundle decode_checkpoint(std::string_view bytes, const FixedCon
 	bundle.state.base_index = get64(bytes); bundle.state.base_term = get64(bytes); bundle.state.applied_index = bundle.state.base_index;
 	bundle.state.hard.term = get64(bytes); auto vote = get64(bytes); if (vote) { bundle.state.hard.voted_for = vote; }
 	bundle.state.hard.commit_index = get64(bytes); auto count = get32(bytes);
-	if (count > ceilings.log_entries || count > bytes.size() / 21) { throw Corruption("checkpoint suffix count exceeds bound"); }
+	if (count > retained.log_entries || count > bytes.size() / 21) { throw Corruption("checkpoint suffix count exceeds bound"); }
+	Recovery validator(expected, limits, retained);
+	validator.validate_checkpoint_metadata(bundle.state, count);
+	retained_detail::Cursor cursor(bundle.state.base_index, bundle.state.base_term, bundle.state.hard.term, retained);
+	bundle.state.entries.reserve(count);
 	std::size_t payload = 0;
 	for (std::uint32_t i = 0; i < count; ++i) {
 		Entry entry; entry.index = get64(bytes); entry.term = get64(bytes);
 		if (bytes.empty() || static_cast<unsigned char>(bytes[0]) > static_cast<unsigned char>(EntryKind::Configuration)) { throw Corruption("checkpoint entry kind invalid"); }
 		entry.kind = static_cast<EntryKind>(bytes[0]); bytes.remove_prefix(1); auto size = get32(bytes);
-		if (size > ceilings.command_bytes || size > ceilings.log_bytes - payload || size > bytes.size()) { throw Corruption("checkpoint payload exceeds bound"); }
+		if (!retained_detail::payload_fits(entry.kind, size, retained.command_bytes) || payload > retained.log_bytes || size > retained.log_bytes - payload || size > bytes.size()) { throw Corruption("checkpoint payload exceeds bound"); }
+		if (!cursor.accept(entry.index, entry.term, entry.kind, bytes.substr(0, size))) { throw Corruption("invalid consensus checkpoint suffix"); }
 		entry.payload.assign(bytes.substr(0, size)); bytes.remove_prefix(size); payload += size;
-		if (entry.kind == EntryKind::Configuration) { (void)decode_membership(entry.payload); }
 		bundle.state.entries.push_back(std::move(entry));
 	}
 	end(bytes);
-	Recovery validator(expected, limits); validator.validate_checkpoint_state(bundle.state);
 	return bundle;
 }
 } // namespace kronuz::consensus

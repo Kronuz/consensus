@@ -1,7 +1,7 @@
 #pragma once
 #include <algorithm>
 #include <consensus/types.h>
-#include <consensus/membership.h>
+#include <consensus/retained_state.h>
 #include <journal/codec.h>
 #include <limits>
 #include <type_traits>
@@ -80,8 +80,8 @@ inline std::string encode(const kronuz::consensus::Message &message,
 					number(entry.index);
 					number(entry.term);
 					number(static_cast<unsigned>(entry.kind));
-					if (entry.payload.size() > limits.command_bytes ||
-						entry.payload.size() > limits.rpc_bytes - payload_bytes)
+					if (!retained_detail::payload_fits(entry.kind, entry.payload.size(), limits.command_bytes) ||
+						payload_bytes > limits.rpc_bytes || entry.payload.size() > limits.rpc_bytes - payload_bytes)
 						throw std::invalid_argument("command bound");
 					number(entry.payload.size());
 					payload_bytes += entry.payload.size();
@@ -167,8 +167,9 @@ inline kronuz::consensus::Message decode(std::string_view bytes, kronuz::consens
 		for (std::uint64_t i = 0; i < count; ++i) {
 			auto index = get64(bytes), entry_term = get64(bytes), entry_kind = get64(bytes),
 				 size = get64(bytes);
-			if (entry_kind > static_cast<unsigned>(EntryKind::Configuration) || size > limits.command_bytes ||
-				size > bytes.size() || size > limits.rpc_bytes - payload_bytes)
+			if (entry_kind > static_cast<unsigned>(EntryKind::Configuration) ||
+				!retained_detail::payload_fits(static_cast<EntryKind>(entry_kind), size, limits.command_bytes) ||
+				size > bytes.size() || payload_bytes > limits.rpc_bytes || size > limits.rpc_bytes - payload_bytes)
 				throw Corruption("invalid control entry");
 			auto payload = bytes.substr(0, static_cast<std::size_t>(size));
 			payload_bytes += payload.size();

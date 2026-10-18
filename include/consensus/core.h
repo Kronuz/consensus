@@ -23,7 +23,7 @@
 #pragma once
 
 #include "types.h"
-#include "membership.h"
+#include "retained_state.h"
 #include "retained_log.h"
 #include "retirement.h"
 #include <algorithm>
@@ -42,9 +42,11 @@ namespace kronuz::consensus {
 class Core {
 	struct CaptureOwner { const Core* core; };
 public:
-	Core(FixedConfiguration configuration, RecoveredState recovered, Limits limits = {}, Timing timing = {}, Flow flow = {})
+	Core(FixedConfiguration configuration, RecoveredState recovered, Limits limits = {}, Timing timing = {}, Flow flow = {}, RetainedStatePolicy retained = {})
 		: configuration_(std::move(configuration)), hard_(recovered.hard), durable_(hard_),
-		entries_(std::move(recovered.entries)), base_index_(recovered.base_index), base_term_(recovered.base_term), limits_(limits), timing_(timing), election_delay_(timing.election_min), applied_(recovered.applied_index) {
+		base_index_(recovered.base_index), base_term_(recovered.base_term), limits_(limits), retained_(retained), timing_(timing), election_delay_(timing.election_min), applied_(recovered.applied_index) {
+		retained_detail::validate_policy(retained_, limits_);
+		if (!retained_detail::metadata_valid(recovered, recovered.entries.size(), retained_)) { throw std::invalid_argument("invalid recovered retained state"); }
 		flow_ = flow;
 		if (flow_.pipeline == 0 || flow_.window_bytes == 0) { throw std::invalid_argument("invalid replication flow"); }
 		if (configuration_ != recovered.configuration || configuration_.local == 0 || limits.voters > 31) {
@@ -53,8 +55,8 @@ public:
 		if (recovered.membership) {
 			// A joining node (Track C, D5) starts with no membership; it learns one from the log.
 			base_membership_ = *recovered.membership;
-			if (!base_membership_.members.empty()) { validate_membership(base_membership_, limits); }
 		} else {
+			if (configuration_.voters.size() > limits.voters) { throw std::invalid_argument("invalid voters"); }
 			std::set<NodeId> voters(configuration_.voters.begin(), configuration_.voters.end());
 			if (configuration_.voters.empty() || configuration_.voters.size() > limits.voters || voters.size() != configuration_.voters.size() ||
 				voters.contains(0) || !voters.contains(configuration_.local)) {
@@ -67,21 +69,14 @@ public:
 			limits.command_bytes > limits.rpc_bytes || limits.rpc_bytes > limits.log_bytes ||
 			timing.heartbeat == 0 || timing.rpc_timeout == 0 || timing.snapshot_timeout == 0 || timing.election_min <= timing.heartbeat ||
 			timing.election_max < timing.election_min) { throw std::invalid_argument("invalid consensus limits or timing"); }
-		if (base_index_ >= maximum || ((base_index_ == 0) != (base_term_ == 0)) || base_term_ > hard_.term ||
-			entries_.size() >= maximum - base_index_ || recovered.applied_index != base_index_ || hard_.commit_index < base_index_) {
-			throw std::invalid_argument("invalid recovered checkpoint boundary");
-		}
-		if (hard_.voted_for && *hard_.voted_for == 0) { throw std::invalid_argument("recovered ballot names no incarnation"); }
-		if (hard_.term == 0 && hard_.voted_for) { throw std::invalid_argument("term zero cannot contain a ballot"); }
-		if (entries_.size() > ceilings.log_entries || hard_.commit_index > last_index()) { throw std::invalid_argument("invalid recovered log bounds"); }
-		Term previous_term = base_term_;
-		for (std::size_t i = 0; i < entries_.size(); ++i) {
-			const auto& entry = entries_[i];
-			if (entry.index != base_index_ + i + 1 || !valid_entry(entry) || entry.term > hard_.term || entry.term < previous_term ||
-				!fits(entry, recovered_limits(entry.index)) || entry.payload.size() > ceilings.log_bytes - log_bytes_) { throw std::invalid_argument("invalid recovered entry"); }
-			log_bytes_ += entry.payload.size(); previous_term = entry.term;
+		retained_detail::Cursor validator(base_index_, base_term_, hard_.term, retained_);
+		for (const auto& entry : recovered.entries) {
+			if (!validator.accept(entry.index, entry.term, entry.kind, entry.payload) ||
+				!fits(entry, recovered_limits(entry.index))) { throw std::invalid_argument("invalid recovered entry"); }
 			note_append(entry);
 		}
+		log_bytes_ = validator.usage().payload_bytes;
+		for (auto& entry : recovered.entries) { entries_.push_back(std::move(entry)); }
 	}
 	~Core() { capture_owner_->core = nullptr; }
 	Core(const Core&) = delete;
@@ -174,6 +169,20 @@ public:
 	std::optional<Membership> snapshot_membership(NodeId peer) const {
 		const bool founding = std::find(configuration_.voters.begin(), configuration_.voters.end(), peer) != configuration_.voters.end();
 		return founding ? base_membership() : std::optional<Membership>(base_membership_);
+	}
+	std::optional<RetainedUsage> retained_suffix(LogBoundary boundary) const {
+		if (!boundary.index || !boundary.term || boundary.index < base_index_ || boundary.index >= maximum) { return std::nullopt; }
+		if (!retains_suffix(boundary)) { return RetainedUsage{}; }
+		return RetainedUsage{static_cast<std::size_t>(last_index() - boundary.index),
+			entries_.suffix_bytes(static_cast<std::size_t>(boundary.index - base_index_))};
+	}
+	std::optional<RetainedUsage> capture_usage(const LocalCheckpoint& request) const {
+		if (checkpoint_rejection(request)) { return std::nullopt; }
+		return retained_suffix({request.through, request.term});
+	}
+	std::optional<RetainedUsage> capture_usage(const InstallPrepared& request) const {
+		if (install_rejection(request)) { return std::nullopt; }
+		return retained_suffix(request.boundary);
 	}
 	Index witness_bound() const noexcept { return witness_bound_; }
 	const HardState& durable_hard_state() const noexcept { return durable_; }
@@ -354,7 +363,7 @@ private:
 	// Commands are bound by the command limit in force; a Configuration entry only by its
 	// encoding (maximum_membership_bytes), so lowering the limit cannot wedge a group (R16).
 	static bool fits(const Entry& entry, const Limits& limits) {
-		return entry.kind == EntryKind::Command ? entry.payload.size() <= limits.command_bytes : entry.payload.size() <= maximum_membership_bytes;
+		return retained_detail::payload_fits(entry.kind, entry.payload.size(), limits.command_bytes);
 	}
 	// What a recovered entry is checked against: the group's limits at its position, or the
 	// ceilings where the group set none. A node's own limits govern what it admits from now
@@ -387,18 +396,12 @@ private:
 	}
 	const Entry& log_entry(Index index) const { return entries_.at(log_offset(index)); }
 	Term log_term(Index index) const { return index == base_index_ ? base_term_ : log_entry(index).term; }
+	bool retains_suffix(LogBoundary boundary) const {
+		return boundary.index >= base_index_ && boundary.index <= last_index() && log_term(boundary.index) == boundary.term;
+	}
 	bool valid_entry(const Entry& entry) const {
-		if (entry.index == 0 || entry.index == maximum || entry.term == 0 || entry.payload.size() > ceilings.command_bytes) { return false; }
-		if (entry.kind == EntryKind::NoOp) { return entry.payload.empty(); }
-		if (entry.kind == EntryKind::Configuration) {
-			try {
-				(void)decode_membership(entry.payload);
-			} catch (const std::exception&) {
-				return false;
-			}
-			return true;
-		}
-		return entry.kind == EntryKind::Command;
+		return entry.index != 0 && entry.index != maximum && entry.term != 0 &&
+			retained_detail::payload_valid(entry.kind, entry.payload, retained_.command_bytes);
 	}
 	std::uint64_t deadline(std::uint64_t delay) const { return delay > maximum - now_ ? maximum : now_ + delay; }
 	void reset_election() { election_deadline_ = deadline(election_delay_); }
@@ -471,27 +474,36 @@ private:
 		}
 	}
 	void handle(StorageFault failure, Actions& output) { fence(std::move(failure.error), output); }
-	void handle(InstallPrepared request, Actions& output) {
-		auto reject = [&](InstallRejectReason reason) { output.emplace_back(InstallRejected{request.request, request.prepared, reason}); };
-		if (!started_ || busy()) { reject(InstallRejectReason::Busy); return; }
+	std::optional<InstallRejectReason> install_rejection(const InstallPrepared& request) const {
+		if (!started_ || busy()) { return InstallRejectReason::Busy; }
 		if (request.request == 0 || request.prepared == 0 || request.authenticated_peer == configuration_.local || request.authenticated_peer == 0 ||
 			request.cluster != configuration_.cluster || request.configuration != configuration_.configuration ||
 			request.leader_term == 0 || request.boundary.index == 0 || request.boundary.index == maximum ||
-			request.boundary.term == 0 || request.boundary.term > request.leader_term) { reject(InstallRejectReason::Invalid); return; }
-		if (request.leader_term < hard_.term) { reject(InstallRejectReason::StaleTerm); return; }
+			request.boundary.term == 0 || request.boundary.term > request.leader_term) { return InstallRejectReason::Invalid; }
+		if (request.leader_term < hard_.term) { return InstallRejectReason::StaleTerm; }
+		if (request.boundary.index <= durable_.commit_index) { return InstallRejectReason::CaughtUp; }
 		// A joiner knows no founding membership, so an install must name its base (D5).
 		const bool unnamed = !request.membership && configuration_.voters.empty();
+		if (unnamed && (!retains_suffix(request.boundary) || membership_at(request.boundary.index).members.empty())) {
+			return InstallRejectReason::Invalid;
+		}
+		return std::nullopt;
+	}
+	void handle(InstallPrepared request, Actions& output) {
+		auto rejection = install_rejection(request);
+		if (rejection && *rejection != InstallRejectReason::CaughtUp) {
+			output.emplace_back(InstallRejected{request.request, request.prepared, *rejection}); return;
+		}
 		auto next_hard = durable_;
 		if (request.leader_term > next_hard.term) { next_hard.term = request.leader_term; next_hard.voted_for.reset(); }
-		if (request.boundary.index <= durable_.commit_index) {
+		if (rejection) {
 			Actions deferred; hard_ = next_hard; follower(request.authenticated_peer, deferred); leader_contact_ = now_;
 			deferred.emplace_back(InstallRejected{request.request, request.prepared, InstallRejectReason::CaughtUp});
 			if (hard_ != durable_) { persist(StorageBatch{hard_, std::nullopt}, std::move(deferred), output); }
 			else { output = std::move(deferred); }
 			return;
 		}
-		bool retain = request.boundary.index <= last_index() && log_term(request.boundary.index) == request.boundary.term;
-		if (unnamed && (!retain || membership_at(request.boundary.index).members.empty())) { reject(InstallRejectReason::Invalid); return; }
+		bool retain = retains_suffix(request.boundary);
 		next_hard.commit_index = request.boundary.index;
 		RecoveredState state{configuration_, next_hard, request.boundary.index, request.boundary.term, {}, request.boundary.index};
 		// A joiner that retains its log below the entry naming its membership takes the
@@ -544,17 +556,23 @@ private:
 		release_snapshot(failure.peer, found->second, SnapshotReleaseReason::Unavailable, output, probe);
 	}
 
-	void handle(LocalCheckpoint request, Actions& output) {
-		if (!started_ || busy()) { output.emplace_back(Reject{request.request, RejectReason::Busy}); return; }
+	std::optional<RejectReason> checkpoint_rejection(const LocalCheckpoint& request) const {
+		if (!started_ || busy()) { return RejectReason::Busy; }
 		if (request.capture == 0 || request.epoch != epoch_ || request.cluster != configuration_.cluster || request.configuration != configuration_.configuration ||
 			request.through <= base_index_ || request.through > applied_ || applied_ > durable_.commit_index ||
 			(witness_self() && request.through > witness_bound_) ||
 			log_term(request.through) != request.term || membership_at(request.through).members.empty()) {
 			// A joiner cannot checkpoint below the entry that first names its membership.
-			output.emplace_back(Reject{request.request, RejectReason::InvalidCheckpoint}); return;
+			return RejectReason::InvalidCheckpoint;
 		}
 		for (const auto& [id, peer] : peers_) {
-			if (peer.snapshot && peer.snapshot->phase == SnapshotPhase::Sending && request.through > peer.snapshot->key.boundary.index) { output.emplace_back(Reject{request.request, RejectReason::Busy}); return; }
+			if (peer.snapshot && peer.snapshot->phase == SnapshotPhase::Sending && request.through > peer.snapshot->key.boundary.index) { return RejectReason::Busy; }
+		}
+		return std::nullopt;
+	}
+	void handle(LocalCheckpoint request, Actions& output) {
+		if (auto rejection = checkpoint_rejection(request)) {
+			output.emplace_back(Reject{request.request, *rejection}); return;
 		}
 		RecoveredState state{configuration_, durable_, request.through, request.term, {}, request.through};
 		state.membership = retain_base_membership(membership_at(request.through));
@@ -635,11 +653,16 @@ private:
 		propose_membership(change.request, change.next, output);
 	}
 	void propose_membership(RequestId request, const Membership& next, Actions& output) {
-		if (last_index() >= maximum - 1 || entries_.charged_entries() >= limits_in_force().log_entries) {
+		if (last_index() >= maximum - 1 || entries_.charged_entries() >= std::min(limits_in_force().log_entries, retained_.log_entries)) {
 			if (request) { output.emplace_back(Reject{request, RejectReason::LogFull}); }
 			return;
 		}
 		Entry entry{last_index() + 1, hard_.term, EntryKind::Configuration, encode_membership(next)};
+		auto byte_cap = retained_.log_bytes;
+		if (entries_.charged_bytes() > byte_cap || entry.payload.size() > byte_cap - entries_.charged_bytes()) {
+			if (request) { output.emplace_back(Reject{request, RejectReason::LogFull}); }
+			return;
+		}
 		log_bytes_ += entry.payload.size(); entries_.push_back(entry); note_append(entry);
 		for (NodeId replica : replicas()) {
 			if (!peers_.contains(replica)) { peers_.emplace(replica, Peer{last_index(), 0, {}}); }
@@ -700,7 +723,9 @@ private:
 			output.emplace_back(Reject{proposal.request, RejectReason::Busy}); return;
 		}
 		// A lowered retained-log limit blocks proposals until checkpoints bring usage under it.
-		if (last_index() >= maximum - 1 || entries_.charged_entries() >= limits.log_entries - limits.control_entries || entries_.charged_bytes() > limits.log_bytes || proposal.command.size() > limits.log_bytes - entries_.charged_bytes()) {
+		auto entry_cap = std::min(limits.log_entries, retained_.log_entries);
+		auto byte_cap = std::min(limits.log_bytes, retained_.log_bytes);
+		if (last_index() >= maximum - 1 || limits.control_entries >= entry_cap || entries_.charged_entries() >= entry_cap - limits.control_entries || entries_.charged_bytes() > byte_cap || proposal.command.size() > byte_cap - entries_.charged_bytes()) {
 			output.emplace_back(Reject{proposal.request, RejectReason::LogFull}); return;
 		}
 		Entry entry{last_index() + 1, hard_.term, EntryKind::Command, std::move(proposal.command)};
@@ -732,6 +757,7 @@ private:
 		// Any authenticated incarnation of the group (D5): a follower can lag the membership
 		// that made its sender leader; terms and the log comparison decide.
 		if (!started_ || busy() || receive.authenticated_peer == configuration_.local || receive.authenticated_peer == 0) { return; }
+		if (!retained_detail::receive_usage(receive, retained_)) { return; }
 		if (!std::visit([&](const auto& message) { return valid(message); }, receive.message)) { return; }
 		// A pre-vote request names the term its sender would campaign at: answered without
 		// changing this node's term or ballot (Track C, D7).
@@ -784,12 +810,12 @@ private:
 	}
 	bool valid(const AppendRequest& request) const {
 		if (request.term == 0 || request.rpc == 0 || request.previous >= maximum || request.previous_term > request.term ||
-			((request.previous == 0) != (request.previous_term == 0)) || request.entries.size() > ceilings.rpc_entries ||
+			((request.previous == 0) != (request.previous_term == 0)) || request.entries.size() > retained_.batch_entries ||
 			request.entries.size() >= maximum - request.previous) { return false; }
 		Index index = request.previous; Term term = request.previous_term; std::size_t bytes = 0;
 		for (const auto& entry : request.entries) {
 			if (!valid_entry(entry) || entry.index != ++index || entry.term < term || entry.term > request.term ||
-				entry.payload.size() > ceilings.rpc_bytes - bytes) { return false; }
+				entry.payload.size() > retained_.batch_bytes - bytes) { return false; }
 			bytes += entry.payload.size(); term = entry.term;
 		}
 		return true;
@@ -858,11 +884,13 @@ private:
 					widest.log_entries = std::max(widest.log_entries, running.log_entries); widest.log_bytes = std::max(widest.log_bytes, running.log_bytes);
 				}
 			}
+			widest.log_entries = std::min(widest.log_entries, retained_.log_entries);
+			widest.log_bytes = std::min(widest.log_bytes, retained_.log_bytes);
 			if (replace_from - base_index_ - 1 > widest.log_entries || additional > widest.log_entries - (replace_from - base_index_ - 1)) {
 				output.emplace_back(Send{source, AppendResponse{hard_.term, request.rpc, false, 0, replace_from, request.read_probe}}); return;
 			}
 			for (std::size_t i = first; i < request.entries.size(); ++i) {
-				if (request.entries[i].payload.size() > widest.log_bytes - retained_bytes) {
+				if (retained_bytes > widest.log_bytes || request.entries[i].payload.size() > widest.log_bytes - retained_bytes) {
 					output.emplace_back(Send{source, AppendResponse{hard_.term, request.rpc, false, 0, replace_from, request.read_probe}}); return;
 				}
 				retained_bytes += request.entries[i].payload.size();
@@ -870,8 +898,8 @@ private:
 			std::size_t incoming_bytes = 0;
 			for (std::size_t i = first; i < request.entries.size(); ++i) { incoming_bytes += request.entries[i].payload.size(); }
 			// Overflow-free charged bounds include one reserved replacement RPC.
-			if (entries_.charged_entries() > widest.log_entries || additional > ceilings.rpc_entries ||
-				entries_.charged_bytes() > widest.log_bytes || incoming_bytes > ceilings.rpc_bytes) {
+			if (entries_.charged_entries() > retained_.log_entries || additional > retained_.batch_entries ||
+				entries_.charged_bytes() > retained_.log_bytes || incoming_bytes > retained_.batch_bytes) {
 				output.emplace_back(Send{source, AppendResponse{hard_.term, request.rpc, false, 0, replace_from, request.read_probe}}); return;
 			}
 			std::vector<Entry> suffix(request.entries.begin() + static_cast<std::ptrdiff_t>(first), request.entries.end());
@@ -1048,7 +1076,7 @@ private:
 	}
 	void become_leader(Actions& output) {
 		if (busy()) { throw std::logic_error("leader election before vote persistence"); }
-		if (last_index() >= maximum - 1 || entries_.charged_entries() >= limits_in_force().log_entries) {
+		if (last_index() >= maximum - 1 || entries_.charged_entries() >= std::min(limits_in_force().log_entries, retained_.log_entries)) {
 			follower(0, output); return; // Control reserve exhausted: fail closed.
 		}
 		role_ = Role::Leader; leader_ = configuration_.local; peers_.clear(); grants_.clear(); answered_.clear(); transfer_.reset();
@@ -1159,6 +1187,7 @@ private:
 	Index base_index_ = 0;
 	Term base_term_ = 0;
 	Limits limits_;
+	RetainedStatePolicy retained_;
 	Timing timing_;
 	Flow flow_;
 	Role role_ = Role::Follower;

@@ -75,9 +75,11 @@ int main(int argc, char** argv) {
 			}
 		};
 		enqueue(core.step(Start{})); pump();
-		// Logical ticks make this example deterministic. A service supplies its
-		// actual monotonic time and randomized election delays instead.
-		enqueue(core.step(Tick{100, 100})); pump();
+		// Logical ticks make this example deterministic: a Tick at the minimum
+		// election delay (Timing::election_min, 1000) starts the lone voter's
+		// election. A service supplies its actual monotonic time and randomized
+		// election delays instead.
+		enqueue(core.step(Tick{1000, 1000})); pump();
 		if (argc == 4) { enqueue(core.step(Propose{1, argv[3]})); pump(); }
 		std::cout << "durable commit=" << core.committed() << ", applied=" << core.applied()
 			<< ", commands=" << command_count << ", latest=" << latest << '\n';

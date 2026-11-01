@@ -128,6 +128,36 @@ Not for:
 - Lowering log limits without the journal capacity for the history already retained
   ([docs/RETAINED-STATE.md](docs/RETAINED-STATE.md)).
 
+## ⚡ Performance
+
+`consensus_worker_checkpoint_bench` recovers a one-voter `Worker` whose log retains 64, 4,096
+or 65,535 commands of 1 KiB, then takes one checkpoint with a 1 MiB application image. *Whole
+checkpoint* runs from streaming the image to the published checkpoint; *core freeze* from the
+capture turn to the publication; *longest frozen turn* is the longest single `run_one()` turn
+during the freeze, the pause an election timer has to absorb. Milliseconds, the range over three
+runs on the Intel Core i9-9980HK:
+
+| Retained commands | whole checkpoint (ms) | core freeze (ms) | longest frozen turn (ms) |
+|---:|---:|---:|---:|
+| 64 | 217 to 238 | 148 to 169 | 84 to 86 |
+| 4,096 | 228 to 230 | 162 | 84 to 85 |
+| 65,535 | 339 to 409 | 272 to 342 | 87 to 88 |
+
+On the Apple M4 Pro the same runs did not repeat (the core freeze at 65,535 commands took 126
+to 757 ms, its longest frozen turn 13 to 158 ms), so it has no row. There is no comparator:
+other Raft libraries persist through their own log stores and snapshot formats, so their
+checkpoints do different durability work. [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md) has the
+other benchmarks and the qualification log.
+
+Intel Core i9-9980HK (x86_64), macOS 15.8.1, internal SSD, Apple clang 17.0.0, `-O3 -DNDEBUG`, at
+`6e2b73f`; run it from the repository root (it writes under `.scratch/`):
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target consensus_worker_checkpoint_bench
+./build/consensus_worker_checkpoint_bench
+```
+
 ## 📚 Documentation
 
 - [ARCHITECTURE.md](ARCHITECTURE.md): the host contract, membership, elections, replication,

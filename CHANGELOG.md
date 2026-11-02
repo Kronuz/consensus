@@ -6,6 +6,13 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#consensus) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-02
+
+### Changed
+
+- Pins journal at `c38f708`, its head, which pins completion at `e2c6474` (completion's
+  metrics and allocators pins at their heads).
+
 ## 2026-11-01
 
 The library's code is unchanged; its journal and reactor pins move, the demo commits its

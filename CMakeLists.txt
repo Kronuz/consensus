@@ -4,7 +4,7 @@ project(consensus LANGUAGES CXX)
 # Strict durable Raft: a deterministic Core, a Worker over journal storage, checkpoints,
 # and snapshot transfer, plus an optional authenticated peer transport. Header-only.
 include(FetchContent)
-FetchContent_Declare(journal GIT_REPOSITORY https://github.com/Kronuz/journal.git GIT_TAG eb99e703cd0cb3b66de1a52f8916dc976b4e7d0c)
+FetchContent_Declare(journal GIT_REPOSITORY https://github.com/Kronuz/journal.git GIT_TAG f2fe49fc93f3de86375422cfee92c01554e45dc0)
 FetchContent_MakeAvailable(journal)
 
 add_library(consensus INTERFACE)
@@ -20,7 +20,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	set(CONSENSUS_TRANSPORT ON)
 endif()
 if(CONSENSUS_TRANSPORT)
-	FetchContent_Declare(reactor GIT_REPOSITORY https://github.com/Kronuz/reactor.git GIT_TAG c6b2c3e5743d59a71bae4ad25010f8f66e8c093e)
+	FetchContent_Declare(reactor GIT_REPOSITORY https://github.com/Kronuz/reactor.git GIT_TAG ade618dd5d24bd7580c71d4a977430f367815334)
 	FetchContent_MakeAvailable(reactor)
 	if(NOT TARGET reactor::tls)
 		message(FATAL_ERROR "consensus::transport needs OpenSSL 3 (reactor::tls)")

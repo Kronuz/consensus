@@ -10,6 +10,14 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 
 ### Changed
 
+- The completion test and bench await completion's driver as `task::task<void>`: `AsioCompletionDriver`
+  now takes a `task::asio_scheduler&` and its `run()` returns `task::task<void>` (completion's
+  `phase/task-driver`). The test's coroutines, sockets and timers move to `task::await_asio`, and its
+  cancel request (10 ms into a 100 ms held drive) is a `task::cancel_token` the drive still outlives.
+  The two targets link `completion::asio`, and the standalone build sets `COMPLETION_ASIO`. The
+  library headers are unchanged.
+- Pins journal at `836c98b`, the head of its `phase/task-driver` branch, which pins completion at
+  `bf69026`, the head of completion's branch. Re-pin both to `main` when completion lands.
 - Pins journal at `c38f708`, its head, which pins completion at `e2c6474` (completion's
   metrics and allocators pins at their heads).
 

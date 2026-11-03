@@ -4,7 +4,11 @@ project(consensus LANGUAGES CXX)
 # Strict durable Raft: a deterministic Core, a Worker over journal storage, checkpoints,
 # and snapshot transfer, plus an optional authenticated peer transport. Header-only.
 include(FetchContent)
-FetchContent_Declare(journal GIT_REPOSITORY https://github.com/Kronuz/journal.git GIT_TAG c38f708aedcc447ad56c445c60c950e094813aa5)
+# The standalone build's completion test and bench use completion's task driver.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+	set(COMPLETION_ASIO ON CACHE BOOL "completion::asio, the task::task driver")
+endif()
+FetchContent_Declare(journal GIT_REPOSITORY https://github.com/Kronuz/journal.git GIT_TAG 836c98b3909c9323c550a3ce94779426ed18b5c1)
 FetchContent_MakeAvailable(journal)
 
 add_library(consensus INTERFACE)
@@ -91,11 +95,11 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 
 	if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD" OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
 		add_executable(consensus_completion_asio_test test/completion_asio_test.cc)
-		target_link_libraries(consensus_completion_asio_test PRIVATE consensus::consensus reactor::reactor)
+		target_link_libraries(consensus_completion_asio_test PRIVATE consensus::consensus completion::asio reactor::reactor)
 		add_test(NAME consensus_completion_asio COMMAND consensus_completion_asio_test)
 		set_tests_properties(consensus_completion_asio PROPERTIES TIMEOUT 30)
 		add_executable(consensus_worker_completion_bench EXCLUDE_FROM_ALL bench/worker_completion_bench.cc)
-		target_link_libraries(consensus_worker_completion_bench PRIVATE consensus::consensus reactor::reactor)
+		target_link_libraries(consensus_worker_completion_bench PRIVATE consensus::consensus completion::asio reactor::reactor)
 	endif()
 
 	# Transport tests; they check with assert, so NDEBUG stays off.

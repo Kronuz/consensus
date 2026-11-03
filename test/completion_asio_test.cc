@@ -25,12 +25,34 @@
 #include "completion/asio_completion.h"
 #include "journal/journal.h"
 #include "completion/native_completion.h"
+#include <asio/ip/udp.hpp>
 #include <filesystem>
 #include <iostream>
 
 using namespace kronuz::journal;
 using Clock = std::chrono::steady_clock;
 namespace {
+task::task<void> wait(asio::steady_timer &timer) {
+	auto error = co_await task::await_asio<void(asio::error_code)>(
+		[&](auto handler) { timer.async_wait(std::move(handler)); });
+	if (error) {
+		throw std::system_error(error);
+	}
+}
+task::task<void> send_to(asio::ip::udp::socket &socket, const char *data, asio::ip::udp::endpoint endpoint) {
+	auto [error, sent] = co_await task::await_asio<void(asio::error_code, std::size_t)>(
+		[&](auto handler) { socket.async_send_to(asio::buffer(data, 1), endpoint, std::move(handler)); });
+	if (error || sent != 1) {
+		throw std::runtime_error("reactor socket send failed");
+	}
+}
+task::task<void> receive(asio::ip::udp::socket &socket, char *data) {
+	auto [error, received] = co_await task::await_asio<void(asio::error_code, std::size_t)>(
+		[&](auto handler) { socket.async_receive(asio::buffer(data, 1), std::move(handler)); });
+	if (error || received != 1) {
+		throw std::runtime_error("reactor socket receive failed");
+	}
+}
 // Hold the first reaped primitive for 100 ms to prove executor progress and
 // delayed frontier settlement independently of local drive flush latency.
 class DelayedQueue {
@@ -64,12 +86,14 @@ class DelayedQueue {
 	std::optional<OwnedCompletion> held_;
 	Clock::time_point release_;
 };
-asio::awaitable<void> exercise(Journal &journal,
-							   const std::shared_ptr<AsioCompletionDriver<DelayedQueue>> &driver, bool &done,
-							   std::size_t &ticks) {
-	auto executor = co_await asio::this_coro::executor;
+task::task<void> exercise(Journal &journal,
+						  const std::shared_ptr<AsioCompletionDriver<DelayedQueue>> &driver, bool &done,
+						  std::size_t &ticks, task::cancel_token cancellation) {
 	auto operation = journal.begin_append("native coroutine append");
 	co_await driver->run(operation);
+	if (!cancellation.requested()) {
+		throw std::runtime_error("the cancel request did not arrive during the drive");
+	}
 	if (ticks < 20 || journal.frontier().sequence != 0) {
 		throw std::runtime_error("owner executor stalled or acknowledged early");
 	}
@@ -78,32 +102,32 @@ asio::awaitable<void> exercise(Journal &journal,
 	}
 	done = true;
 }
-asio::awaitable<void> observe(Journal &journal, bool &done, std::size_t &ticks) {
-	auto executor = co_await asio::this_coro::executor;
+task::task<void> observe(task::asio_scheduler &scheduler, Journal &journal, bool &done, std::size_t &ticks) {
+	auto executor = scheduler.executor();
 	asio::steady_timer timer(executor);
 	asio::ip::udp::socket socket(executor, asio::ip::udp::endpoint(asio::ip::address_v4::loopback(), 0));
 	const char ping = 'p';
 	char reply = 0;
 	auto endpoint = socket.local_endpoint();
 	while (!done) {
-		co_await socket.async_send_to(asio::buffer(&ping, 1), endpoint, asio::use_awaitable);
-		co_await socket.async_receive(asio::buffer(&reply, 1), asio::use_awaitable);
+		co_await send_to(socket, &ping, endpoint);
+		co_await receive(socket, &reply);
 		if (reply != ping) {
 			throw std::runtime_error("reactor socket progress failed");
 		}
 		timer.expires_after(std::chrono::milliseconds(1));
-		co_await timer.async_wait(asio::use_awaitable);
+		co_await wait(timer);
 		++ticks;
 		if (ticks == 20 && journal.frontier().sequence != 0) {
 			throw std::runtime_error("delayed completion published early");
 		}
 	}
 }
-asio::awaitable<void> worker_exercise(kronuz::consensus::Worker &worker,
-									  const std::shared_ptr<AsioCompletionDriver<DelayedQueue>> &driver,
-									  const std::shared_ptr<DelayedQueue> &queue) {
+task::task<void> worker_exercise(task::asio_scheduler &scheduler, kronuz::consensus::Worker &worker,
+								 const std::shared_ptr<AsioCompletionDriver<DelayedQueue>> &driver,
+								 const std::shared_ptr<DelayedQueue> &queue) {
 	using namespace kronuz::consensus;
-	auto executor = co_await asio::this_coro::executor;
+	auto executor = scheduler.executor();
 	asio::steady_timer timer(executor);
 	asio::ip::udp::socket socket(executor, asio::ip::udp::endpoint(asio::ip::address_v4::loopback(), 0));
 	std::optional<CheckpointId> capture;
@@ -123,13 +147,14 @@ asio::awaitable<void> worker_exercise(kronuz::consensus::Worker &worker,
 					delayed = true;
 				}
 				active = true;
-				asio::co_spawn(executor, driver->run(job), [&, job](std::exception_ptr error) {
-					if (error) {
-						io_error = error;
-						worker.storage_operation_failed(job, "native Worker driver failed");
-					}
-					active = false;
-				});
+				task::spawn(task::scheduler_ref::of(scheduler), driver->run(job),
+							[&, job](std::exception_ptr error) {
+								if (error) {
+									io_error = error;
+									worker.storage_operation_failed(job, "native Worker driver failed");
+								}
+								active = false;
+							});
 			}
 			for (const auto &action : worker.take_actions()) {
 				if (auto batch = std::get_if<Committed>(&action)) {
@@ -161,23 +186,22 @@ asio::awaitable<void> worker_exercise(kronuz::consensus::Worker &worker,
 			if (delayed && active && pending_ticks < 20) {
 				const char sent = 'w';
 				char received = 0;
-				co_await socket.async_send_to(asio::buffer(&sent, 1), socket.local_endpoint(),
-											  asio::use_awaitable);
-				co_await socket.async_receive(asio::buffer(&received, 1), asio::use_awaitable);
+				co_await send_to(socket, &sent, socket.local_endpoint());
+				co_await receive(socket, &received);
 				if (received != sent || worker.base_index() != 0) {
 					throw std::runtime_error("held Worker IO stalled sockets or published early");
 				}
 				++pending_ticks;
 			}
 			timer.expires_after(std::chrono::milliseconds(1));
-			co_await timer.async_wait(asio::use_awaitable);
+			co_await wait(timer);
 		}
 	} catch (...) {
 		failure = std::current_exception();
 	}
 	while (active) {
 		timer.expires_after(std::chrono::milliseconds(1));
-		co_await timer.async_wait(asio::use_awaitable);
+		co_await wait(timer);
 	}
 	if (failure) {
 		std::rethrow_exception(failure);
@@ -216,10 +240,12 @@ void native_worker(const std::filesystem::path &directory) {
 	identity[0] = 'W';
 	worker.create(identity);
 	asio::io_context context;
+	task::asio_scheduler scheduler(context.get_executor());
 	auto queue = std::make_shared<DelayedQueue>();
-	auto driver = std::make_shared<AsioCompletionDriver<DelayedQueue>>(context.get_executor(), queue, true);
+	auto driver = std::make_shared<AsioCompletionDriver<DelayedQueue>>(scheduler, queue, true);
 	std::exception_ptr error;
-	asio::co_spawn(context, worker_exercise(worker, driver, queue), [&](std::exception_ptr e) { error = e; });
+	task::spawn(task::scheduler_ref::of(scheduler), worker_exercise(scheduler, worker, driver, queue),
+				[&](std::exception_ptr e) { error = e; });
 	context.run();
 	if (error) {
 		std::rethrow_exception(error);
@@ -246,28 +272,31 @@ int main() {
 		id[0] = 'c';
 		journal.create(id);
 		asio::io_context context;
+		task::asio_scheduler scheduler(context.get_executor());
 		auto queue = std::make_shared<DelayedQueue>();
-		auto driver =
-			std::make_shared<AsioCompletionDriver<DelayedQueue>>(context.get_executor(), queue, true);
+		auto driver = std::make_shared<AsioCompletionDriver<DelayedQueue>>(scheduler, queue, true);
 		bool done = false;
 		std::size_t ticks = 0;
 		std::exception_ptr error;
-		asio::cancellation_signal cancellation;
+		// A request 10 ms into the 100 ms held drive must not end it.
+		task::cancel_source cancellation;
 		asio::steady_timer cancel(context, std::chrono::milliseconds(10));
-		cancel.async_wait([&](asio::error_code) { cancellation.emit(asio::cancellation_type::terminal); });
-		asio::co_spawn(context, exercise(journal, driver, done, ticks),
-					   asio::bind_cancellation_slot(cancellation.slot(), [&](std::exception_ptr failure) {
-						   error = failure;
-						   if (failure) {
-							   done = true;
-						   }
-					   }));
-		asio::co_spawn(context, observe(journal, done, ticks), [&](std::exception_ptr failure) {
-			if (failure) {
-				error = failure;
-				done = true;
-			}
-		});
+		cancel.async_wait([&](asio::error_code) { cancellation.request(); });
+		task::spawn(task::scheduler_ref::of(scheduler),
+					exercise(journal, driver, done, ticks, cancellation.token()),
+					[&](std::exception_ptr failure) {
+						error = failure;
+						if (failure) {
+							done = true;
+						}
+					});
+		task::spawn(task::scheduler_ref::of(scheduler), observe(scheduler, journal, done, ticks),
+					[&](std::exception_ptr failure) {
+						if (failure) {
+							error = failure;
+							done = true;
+						}
+					});
 		context.run();
 		if (error) {
 			std::rethrow_exception(error);

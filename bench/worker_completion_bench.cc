@@ -93,6 +93,7 @@ void run(std::size_t count) {
 		}
 	}
 	asio::io_context executor(1);
+	task::asio_scheduler scheduler(executor.get_executor());
 	auto io = std::make_shared<kronuz::journal::PosixIO>(directory);
 	Worker worker(io, configuration,
 				  {{512ull * 1024 * 1024, 4096}, {16 * 1024, 3}, {80ull * 1024 * 1024, 4}, 8, 3}, {}, {},
@@ -101,7 +102,7 @@ void run(std::size_t count) {
 	auto queue = std::make_shared<kronuz::journal::NativeCompletionQueue>();
 	auto driver =
 		std::make_shared<kronuz::journal::AsioCompletionDriver<kronuz::journal::NativeCompletionQueue>>(
-			executor.get_executor(), queue, true);
+			scheduler, queue, true);
 	bool active = false, finished = false, started = false;
 	std::exception_ptr failure;
 	std::optional<CheckpointId> checkpoint;
@@ -112,76 +113,76 @@ void run(std::size_t count) {
 	std::size_t observed_callbacks = 0;
 	bool measuring = false, freezing = false;
 	auto deadline = Clock::now() + std::chrono::minutes(3);
-	asio::co_spawn(
-		executor,
-		[&]() -> asio::awaitable<void> {
-			for (;;) {
-				require(Clock::now() < deadline, "benchmark deadline");
-				worker.run_one({0, 100});
-				require(!worker.fenced(), "benchmark worker fenced");
-				if (!active)
-					if (auto operation = worker.take_io_operation()) {
-						require(!active, "overlapping original IO");
-						active = true;
-						asio::co_spawn(executor, driver->run(operation), [&](std::exception_ptr error) {
-							active = false;
-							if (error)
-								failure = error;
-						});
-					}
-				if (failure)
-					std::rethrow_exception(failure);
-				if (worker.ready() && !started) {
-					require(worker.try_submit(Start{}) == SubmitResult::Accepted, "start admission");
-					started = true;
+	auto loop = [&]() -> task::task<void> {
+		for (;;) {
+			require(Clock::now() < deadline, "benchmark deadline");
+			worker.run_one({0, 100});
+			require(!worker.fenced(), "benchmark worker fenced");
+			if (!active)
+				if (auto operation = worker.take_io_operation()) {
+					require(!active, "overlapping original IO");
+					active = true;
+					task::spawn(task::scheduler_ref::of(scheduler), driver->run(operation),
+								[&](std::exception_ptr error) {
+									active = false;
+									if (error)
+										failure = error;
+								});
 				}
-				for (const auto &action : worker.take_actions()) {
-					if (auto range = std::get_if<Committed>(&action))
-						worker.applied({range->entries.back().index});
-					if (std::holds_alternative<CheckpointPublished>(action)) {
-						++publications;
-						checkpoint.reset();
-						offset = 0;
-					}
-				}
-				if (!checkpoint && worker.ready() && worker.applied_index() == count + 1 &&
-					publications < 2) {
-					checkpoint = worker.reserve_checkpoint(image.size());
-					if (checkpoint) {
-						worker.attach_capture(*checkpoint,
-											  {publications + 1, publications ? count + 1 : 1, 1});
-						if (!measuring) {
-							measured_start = Clock::now();
-							measured_cpu = thread_cpu();
-							measuring = true;
-						}
-					}
-				}
-				if (checkpoint && offset < image.size()) {
-					auto size = std::min(image.size() - offset, std::size_t{65536});
-					if (worker.offer_application_chunk(
-							*checkpoint, std::string_view(image).substr(offset, size),
-							offset + size == image.size()) == SubmitResult::Accepted)
-						offset += size;
-				}
-				if (measuring && worker.busy() && !freezing) {
-					freezing = true;
-					freeze_start = Clock::now();
-				}
-				if (publications == 2 && !active && !worker.retired_log_entries()) {
-					require(worker.base_index() == count + 1, "prefix did not compact");
-					finished = true;
-					co_return;
-				}
-				asio::steady_timer timer(executor);
-				timer.expires_after(std::chrono::milliseconds(1));
-				co_await timer.async_wait(asio::use_awaitable);
+			if (failure)
+				std::rethrow_exception(failure);
+			if (worker.ready() && !started) {
+				require(worker.try_submit(Start{}) == SubmitResult::Accepted, "start admission");
+				started = true;
 			}
-		},
-		[&](std::exception_ptr error) {
-			if (error)
-				failure = error;
-		});
+			for (const auto &action : worker.take_actions()) {
+				if (auto range = std::get_if<Committed>(&action))
+					worker.applied({range->entries.back().index});
+				if (std::holds_alternative<CheckpointPublished>(action)) {
+					++publications;
+					checkpoint.reset();
+					offset = 0;
+				}
+			}
+			if (!checkpoint && worker.ready() && worker.applied_index() == count + 1 &&
+				publications < 2) {
+				checkpoint = worker.reserve_checkpoint(image.size());
+				if (checkpoint) {
+					worker.attach_capture(*checkpoint,
+										  {publications + 1, publications ? count + 1 : 1, 1});
+					if (!measuring) {
+						measured_start = Clock::now();
+						measured_cpu = thread_cpu();
+						measuring = true;
+					}
+				}
+			}
+			if (checkpoint && offset < image.size()) {
+				auto size = std::min(image.size() - offset, std::size_t{65536});
+				if (worker.offer_application_chunk(
+						*checkpoint, std::string_view(image).substr(offset, size),
+						offset + size == image.size()) == SubmitResult::Accepted)
+					offset += size;
+			}
+			if (measuring && worker.busy() && !freezing) {
+				freezing = true;
+				freeze_start = Clock::now();
+			}
+			if (publications == 2 && !active && !worker.retired_log_entries()) {
+				require(worker.base_index() == count + 1, "prefix did not compact");
+				finished = true;
+				co_return;
+			}
+			asio::steady_timer timer(executor);
+			timer.expires_after(std::chrono::milliseconds(1));
+			co_await task::await_asio<void(asio::error_code)>(
+				[&](auto handler) { timer.async_wait(std::move(handler)); });
+		}
+	};
+	task::spawn(task::scheduler_ref::of(scheduler), loop(), [&](std::exception_ptr error) {
+		if (error)
+			failure = error;
+	});
 	while (!finished && !failure) {
 		const auto before = Clock::now();
 		const auto cpu = thread_cpu();

@@ -90,6 +90,8 @@ task::task<void> exercise(Journal &journal,
 						  const std::shared_ptr<AsioCompletionDriver<DelayedQueue>> &driver, bool &done,
 						  std::size_t &ticks, task::cancel_token cancellation) {
 	auto operation = journal.begin_append("native coroutine append");
+	// run() takes no cancel token: the request below cannot reach the drive, which completes;
+	// this only checks the request arrived while it ran (completion's review CR1).
 	co_await driver->run(operation);
 	if (!cancellation.requested()) {
 		throw std::runtime_error("the cancel request did not arrive during the drive");

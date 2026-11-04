@@ -62,6 +62,10 @@ public:
 	auto scan_directory() -> std::unique_ptr<kronuz::journal::DirectoryCursor> override { ++scans; return backend.scan_directory(); }
 	auto entry_footprint(std::string_view name) -> std::optional<kronuz::journal::EntryFootprint> override { return backend.entry_footprint(name); }
 	auto open_reclaim_candidate(std::string_view name) -> std::unique_ptr<kronuz::journal::File> override { return backend.open_reclaim_candidate(name); }
+	auto open_existing_read_only(std::string_view name) -> std::unique_ptr<kronuz::journal::File> override { return backend.open_existing_read_only(name); }
+	auto open_reclaim_candidate_read_only(std::string_view name) -> std::unique_ptr<kronuz::journal::File> override { return backend.open_reclaim_candidate_read_only(name); }
+	void open_existing_read_only_into(std::string_view name, kronuz::journal::File& destination) override { backend.open_existing_read_only_into(name, destination); }
+	bool open_reclaim_candidate_read_only_into(std::string_view name, kronuz::journal::File& destination) override { return backend.open_reclaim_candidate_read_only_into(name, destination); }
 	void sync_directory() override { if (fail_sync || (syncs_until_failure && --syncs_until_failure == 0)) { fail_sync = false; throw std::runtime_error("injected worker directory barrier failure"); } backend.sync_directory(); ++directory_syncs; }
 private:
 	class ReadFile final : public kronuz::journal::File {

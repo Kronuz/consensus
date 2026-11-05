@@ -8,7 +8,7 @@ include(FetchContent)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	set(COMPLETION_ASIO ON CACHE BOOL "completion::asio, the task::task driver")
 endif()
-FetchContent_Declare(journal GIT_REPOSITORY https://github.com/Kronuz/journal.git GIT_TAG bfad97f3d101dc69530fa782795138769099a0e0)
+FetchContent_Declare(journal GIT_REPOSITORY https://github.com/Kronuz/journal.git GIT_TAG e5f6ff1cfe85d388ee2e243427328f5016508fbd)
 FetchContent_MakeAvailable(journal)
 
 add_library(consensus INTERFACE)

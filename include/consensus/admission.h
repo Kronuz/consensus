@@ -42,7 +42,8 @@ struct EventAdmissionPlan {
 // Conservative continuation packs for the Tick-only campaign Core. Planning
 // neither reserves storage nor changes protocol state. The worker rejects
 // external completions and owns checkpoint capture through a separate API.
-inline EventAdmissionPlan plan_event(const Event& event, bool busy, Limits limits = {}) {
+inline EventAdmissionPlan plan_event(const Event& event, bool busy, Limits limits = {}, RetainedStatePolicy retained = {}) {
+	retained_detail::validate_policy(retained, limits);
 	using kronuz::journal::AdmissionClass;
 	EventAdmissionPlan plan;
 	auto add = [&](AdmissionClass kind, std::size_t bytes) { plan.appends.at(plan.count++) = {kind, bytes}; };
@@ -68,19 +69,20 @@ inline EventAdmissionPlan plan_event(const Event& event, bool busy, Limits limit
 				using M = std::decay_t<decltype(message)>;
 				if constexpr (std::is_same_v<M, AppendRequest>) {
 					// Each request within the RPC bounds; merged ones (D15) persist as one batch.
-					std::size_t entries = 0, total = 0;
+					auto usage = retained_detail::receive_usage(value, retained);
+					if (!usage) { throw std::length_error("merged RPC resource bound"); }
+					const auto entries = usage->entries, total = usage->payload_bytes;
 					bool command = false;
 					auto admit = [&](const AppendRequest& request) {
 						if (request.entries.size() > limits.rpc_entries) { throw std::length_error("RPC entry admission bound"); }
 						std::size_t payload = 0;
 						for (const auto& entry : request.entries) {
-							if (entry.payload.size() > limits.command_bytes || payload > limits.rpc_bytes || entry.payload.size() > limits.rpc_bytes - payload ||
+							if (!retained_detail::payload_fits(entry.kind, entry.payload.size(), limits.command_bytes) || payload > limits.rpc_bytes || entry.payload.size() > limits.rpc_bytes - payload ||
 								(entry.kind != EntryKind::Command && entry.kind != EntryKind::Configuration && (entry.kind != EntryKind::NoOp || !entry.payload.empty()))) {
 								throw std::length_error("RPC payload admission bound");
 							}
 							payload += entry.payload.size(); command |= entry.kind == EntryKind::Command;
 						}
-						entries += request.entries.size(); total += payload;
 					};
 					admit(message);
 					for (const auto& more : value.more) { admit(more); }

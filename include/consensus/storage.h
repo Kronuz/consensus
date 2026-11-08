@@ -23,7 +23,7 @@
 #pragma once
 
 #include "types.h"
-#include "membership.h"
+#include "retained_state.h"
 #include "journal/codec.h"
 #include <algorithm>
 #include <limits>
@@ -46,6 +46,7 @@ constexpr std::uint64_t join_magic = 0x314e494f4a544652ull;
 constexpr std::uint64_t batch_magic = 0x3148435442544652ull;
 // A batch holding a Configuration entry (Track C, D1), so a reader before it refuses it.
 constexpr std::uint64_t membership_batch_magic = 0x3248435442544652ull;
+constexpr std::size_t maximum_initialization_size = 52 + 31 * 8 + 4 + membership_bytes(31);
 inline void identity(std::string& bytes, Identity value) { bytes.append(value.data(), value.size()); }
 inline Identity identity(std::string_view& bytes) {
 	if (bytes.size() < 16) { throw Corruption("truncated consensus identity"); }
@@ -57,19 +58,6 @@ inline bool flag(std::string_view& bytes) {
 	bool result = bytes[0] != 0; bytes.remove_prefix(1); return result;
 }
 inline void end(std::string_view bytes) { if (!bytes.empty()) { throw Corruption("trailing consensus storage bytes"); } }
-// Retained entries survive reductions to current operating limits.
-inline void validate_checkpoint_entry(const RecoveredState& state, const Entry& entry,
-	std::size_t position, Term& previous, std::size_t& payload_bytes) {
-	const auto maximum_payload = entry.kind == EntryKind::Configuration ? maximum_membership_bytes : ceilings.command_bytes;
-	if (entry.index != state.base_index + position + 1 || entry.term == 0 || entry.term < previous || entry.term > state.hard.term ||
-		entry.payload.size() > maximum_payload || payload_bytes > ceilings.log_bytes || entry.payload.size() > ceilings.log_bytes - payload_bytes ||
-		static_cast<unsigned>(entry.kind) > static_cast<unsigned>(EntryKind::Configuration) || (entry.kind == EntryKind::NoOp && !entry.payload.empty())) {
-		throw Corruption("invalid consensus checkpoint suffix");
-	}
-	if (entry.kind == EntryKind::Configuration) { (void)decode_membership(entry.payload); }
-	previous = entry.term;
-	payload_bytes += entry.payload.size();
-}
 } // namespace storage_detail
 
 // The founding record. RFTINIT2 is written only when a founding member is not a voter or
@@ -149,7 +137,9 @@ inline std::string encode_storage_batch(const StorageBatch& batch) {
 // successfully returned the exact verified storage sequence.
 class Recovery {
 public:
-	Recovery(FixedConfiguration configuration, Limits limits = {}) : expected_(std::move(configuration)), limits_(limits) {
+	Recovery(FixedConfiguration configuration, Limits limits = {}, RetainedStatePolicy retained = {}) : expected_(std::move(configuration)), limits_(limits), retained_(retained) {
+		retained_detail::validate_policy(retained_, limits_);
+		if (expected_.voters.size() > limits.voters) { throw std::invalid_argument("invalid storage voters"); }
 		std::set<NodeId> voters(expected_.voters.begin(), expected_.voters.end());
 		// No voters: a joiner, recovered from its join record (D5).
 		if (expected_.local == 0 || voters.contains(0) || (!voters.empty() && !voters.contains(expected_.local)) ||
@@ -162,22 +152,19 @@ public:
 	// Return aggregate payload bytes without copying the retained suffix.
 	void validate_checkpoint_metadata(const RecoveredState& state, std::size_t entry_count) const {
 		if (state.configuration != expected_ || state.base_index == 0 ||
-			state.base_index >= std::numeric_limits<Index>::max() || state.base_term == 0 || state.base_term > state.hard.term ||
-			state.applied_index != state.base_index || state.hard.commit_index < state.base_index ||
-			entry_count > ceilings.log_entries || entry_count >= std::numeric_limits<Index>::max() - state.base_index ||
-			state.hard.commit_index > state.base_index + entry_count ||
-			(state.hard.voted_for && *state.hard.voted_for == 0)) {
+			!retained_detail::metadata_valid(state, entry_count, retained_)) {
 			throw storage_detail::Corruption("invalid consensus checkpoint state");
 		}
 	}
 	std::size_t validate_checkpoint_state(const RecoveredState& state) const {
 		validate_checkpoint_metadata(state, state.entries.size());
-		Term previous = state.base_term; std::size_t bytes = 0;
-		for (std::size_t i = 0; i < state.entries.size(); ++i) {
-			const auto& entry = state.entries[i];
-			storage_detail::validate_checkpoint_entry(state, entry, i, previous, bytes);
+		retained_detail::Cursor cursor(state.base_index, state.base_term, state.hard.term, retained_);
+		for (const auto& entry : state.entries) {
+			if (!cursor.accept(entry.index, entry.term, entry.kind, entry.payload)) {
+				throw storage_detail::Corruption("invalid consensus checkpoint suffix");
+			}
 		}
-		return bytes;
+		return cursor.usage().payload_bytes;
 	}
 	// Only the checkpoint adapter supplies this state, after validating the
 	// bundle's storage sequence and explicit application dependency.
@@ -207,7 +194,7 @@ public:
 private:
 	void initialization(std::string_view bytes) {
 		using namespace storage_detail;
-		const auto bound = 52 + 31 * 8 + 4 + 36 + 24 * std::size_t(ceilings.members);  // RFTINIT2 with its largest membership
+		const auto bound = maximum_initialization_size;
 		if (bytes.size() > bound) { throw Corruption("invalid consensus initialization"); }
 		const auto magic = get64(bytes);
 		if (magic != initial_magic && magic != initial_magic_v2 && magic != join_magic) { throw Corruption("invalid consensus initialization"); }
@@ -245,9 +232,9 @@ private:
 	StorageBatch decode(std::string_view bytes) {
 		using namespace storage_detail;
 		// Metadata has its own bound; payload accounting below is independent.
-		if (ceilings.rpc_entries > (std::numeric_limits<std::size_t>::max() - 46) / 21 ||
-			ceilings.rpc_bytes > std::numeric_limits<std::size_t>::max() - 46 - ceilings.rpc_entries * 21 ||
-			bytes.size() > 46 + ceilings.rpc_entries * 21 + ceilings.rpc_bytes) {
+		if (retained_.batch_entries > (std::numeric_limits<std::size_t>::max() - 46) / 21 ||
+			retained_.batch_bytes > std::numeric_limits<std::size_t>::max() - 46 - retained_.batch_entries * 21 ||
+			bytes.size() > 46 + retained_.batch_entries * 21 + retained_.batch_bytes) {
 			throw Corruption("invalid consensus storage batch size or version");
 		}
 		const auto magic = get64(bytes);
@@ -258,18 +245,36 @@ private:
 			HardState hard; hard.term = get64(bytes); auto vote = get64(bytes); hard.commit_index = get64(bytes);
 			if (vote) { hard.voted_for = vote; } batch.hard = hard;
 		}
+		validate_hard(batch.hard.value_or(state_.hard));
 		if (flag(bytes)) {
 			LogMutation mutation; mutation.replace_from = get64(bytes); auto count = get32(bytes);
-			if (count > ceilings.rpc_entries || count > bytes.size() / 21) { throw Corruption("storage entry count exceeds bound"); }
+			if (count > retained_.batch_entries || count > bytes.size() / 21) { throw Corruption("storage entry count exceeds bound"); }
+			auto from = mutation.replace_from;
+			if (!from || from <= state_.hard.commit_index || from <= state_.base_index ||
+				from - state_.base_index - 1 > state_.entries.size()) { throw Corruption("invalid logical log replacement"); }
+			auto prefix = static_cast<std::size_t>(from - state_.base_index - 1);
+			if (prefix > retained_.log_entries || count > retained_.log_entries - prefix ||
+				count >= std::numeric_limits<Index>::max() - state_.base_index - prefix) { throw Corruption("storage retained count exceeds bound"); }
+			if (batch.hard.value_or(state_.hard).commit_index > state_.base_index + prefix + count) { throw Corruption("commit beyond recovered log"); }
+			auto prefix_bytes = bytes_;
+			for (std::size_t i = prefix; i < state_.entries.size(); ++i) { prefix_bytes -= state_.entries[i].payload.size(); }
+			auto payload_size = bytes.size() - std::size_t(count) * 21;
+			if (payload_size > retained_.batch_bytes) { throw Corruption("storage payload exceeds bound"); }
+			if (prefix_bytes > retained_.log_bytes || payload_size > retained_.log_bytes - prefix_bytes) {
+				throw Corruption("storage retained payload exceeds bound");
+			}
+			auto previous = prefix ? state_.entries[prefix - 1].term : state_.base_term;
+			retained_detail::Cursor cursor(from - 1, previous, batch.hard.value_or(state_.hard).term, retained_);
+			mutation.entries.reserve(count);
 			std::size_t total = 0;
 			for (std::uint32_t i = 0; i < count; ++i) {
 				Entry entry; entry.index = get64(bytes); entry.term = get64(bytes);
 				if (bytes.empty() || static_cast<unsigned char>(bytes[0]) > static_cast<unsigned char>(highest_kind)) { throw Corruption("invalid storage entry kind"); }
 				entry.kind = static_cast<EntryKind>(bytes[0]); bytes.remove_prefix(1);
 				auto length = get32(bytes);
-				if (length > ceilings.command_bytes || length > ceilings.rpc_bytes - total || length > bytes.size()) { throw Corruption("storage payload exceeds bound"); }
+				if (!retained_detail::payload_fits(entry.kind, length, retained_.command_bytes) || total > retained_.batch_bytes || length > retained_.batch_bytes - total || length > bytes.size()) { throw Corruption("storage payload exceeds bound"); }
+				if (!cursor.accept(entry.index, entry.term, entry.kind, bytes.substr(0, length))) { throw Corruption("invalid storage retained entry"); }
 				entry.payload.assign(bytes.substr(0, length)); bytes.remove_prefix(length); total += length;
-				if (entry.kind == EntryKind::Configuration) { (void)decode_membership(entry.payload); }
 				mutation.entries.push_back(std::move(entry));
 			}
 			batch.log = std::move(mutation);
@@ -278,37 +283,41 @@ private:
 		if (!batch.hard && !batch.log) { throw Corruption("empty consensus storage operation"); }
 		return batch;
 	}
-	void apply(StorageBatch batch) {
+	void validate_hard(const HardState& hard) const {
 		using storage_detail::Corruption;
-		auto hard = batch.hard.value_or(state_.hard);
 		if (hard.term < state_.hard.term || hard.commit_index < state_.hard.commit_index ||
 			(hard.voted_for && *hard.voted_for == 0) ||  // a ballot may name any incarnation (Track C, R2)
 			(hard.term == 0 && hard.voted_for) ||
 			(hard.term == state_.hard.term && state_.hard.voted_for && hard.voted_for != state_.hard.voted_for)) {
 			throw Corruption("invalid durable hard-state transition");
 		}
+	}
+	void apply(StorageBatch batch) {
+		using storage_detail::Corruption;
+		auto hard = batch.hard.value_or(state_.hard);
+		validate_hard(hard);
 		auto new_count = state_.entries.size(); auto new_bytes = bytes_;
 		if (batch.log) {
 			auto from = batch.log->replace_from;
 			if (from == 0 || from <= state_.hard.commit_index || from <= state_.base_index || from - state_.base_index - 1 > state_.entries.size() ||
-				batch.log->entries.size() > ceilings.log_entries - static_cast<std::size_t>(from - state_.base_index - 1)) { throw Corruption("invalid logical log replacement"); }
+				batch.log->entries.size() > retained_.log_entries - static_cast<std::size_t>(from - state_.base_index - 1)) { throw Corruption("invalid logical log replacement"); }
 			new_count = static_cast<std::size_t>(from - state_.base_index - 1) + batch.log->entries.size();
 			for (std::size_t i = static_cast<std::size_t>(from - state_.base_index - 1); i < state_.entries.size(); ++i) { new_bytes -= state_.entries[i].payload.size(); }
 			Term term = from == state_.base_index + 1 ? state_.base_term : state_.entries[from - state_.base_index - 2].term;
-			Index index = from;
+			retained_detail::Cursor cursor(from - 1, term, hard.term, retained_);
 			for (const auto& entry : batch.log->entries) {
-				if (entry.index != index++ || entry.index >= std::numeric_limits<Index>::max() || entry.term == 0 || entry.term < term ||
-					entry.term > hard.term || (entry.kind == EntryKind::NoOp && !entry.payload.empty()) ||
-					entry.payload.size() > ceilings.log_bytes - new_bytes) { throw Corruption("invalid logical replacement entry"); }
+				if (!cursor.accept(entry.index, entry.term, entry.kind, entry.payload) ||
+					new_bytes > retained_.log_bytes || entry.payload.size() > retained_.log_bytes - new_bytes) { throw Corruption("invalid logical replacement entry"); }
 				if (entry.index <= state_.base_index + state_.entries.size() && state_.entries[entry.index - state_.base_index - 1].term == entry.term && state_.entries[entry.index - state_.base_index - 1] != entry) {
 					throw Corruption("same-index same-term storage content conflict");
 				}
-				new_bytes += entry.payload.size(); term = entry.term;
+				new_bytes += entry.payload.size();
 			}
 		}
 		if (hard.commit_index > state_.base_index + new_count) { throw Corruption("commit beyond recovered log"); }
 		if (batch.log) {
 			state_.entries.resize(static_cast<std::size_t>(batch.log->replace_from - state_.base_index - 1));
+			state_.entries.reserve(new_count);
 			for (auto& entry : batch.log->entries) { state_.entries.push_back(std::move(entry)); }
 		}
 		state_.hard = hard; bytes_ = new_bytes;
@@ -316,6 +325,7 @@ private:
 
 	FixedConfiguration expected_;
 	Limits limits_;
+	RetainedStatePolicy retained_;
 	RecoveredState state_;
 	std::uint64_t sequence_ = 0;
 	std::size_t bytes_ = 0;

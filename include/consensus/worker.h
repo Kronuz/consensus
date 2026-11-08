@@ -38,6 +38,7 @@ enum class TurnResult { Idle, Blocked, Pressure, Inventory, Stored, Completed, M
 struct WorkerLimits {
 	std::size_t foreground_burst = 16, scan_entries = 128; bool async_appends = false, async_storage = false;
 	std::size_t follower_batch_bytes = 0, follower_batch_entries = 0;
+	RetainedStatePolicy retained{};
 };
 // epoch: Worker::epoch() when the application state was captured; a repair since then makes
 // the capture stale, and the core rejects it.
@@ -139,16 +140,16 @@ public:
 			// A new directory has only the bounded bootstrap names; a tiny
 			// configured scan budget can require several startup slices.
 			initialization_ = initial_record();
-			core_ = std::make_unique<Core>(configuration_, initial_state(), limits_, timing_);
+			core_ = std::make_unique<Core>(configuration_, initial_state(), limits_, timing_, Flow{}, scheduling_.retained);
 		} catch (const std::exception& error) { fail(error.what()); throw; }
 	}
 	template <class Restore> void recover(Restore restore_application) {
 		unopened();
 		try {
-			Recovery recovery(configuration_, limits_);
+			Recovery recovery(configuration_, limits_, scheduling_.retained);
 			auto replay = [&](auto sequence, auto bytes) { recovery.replay(sequence, bytes); };
 			auto restore = [&](const auto& selected, auto& bundle, auto dependencies) {
-					if (dependencies.size() != 1 || selected.dependencies.size() != 1 || bundle.descriptor().length > checkpoint_detail::maximum_size()) {
+					if (dependencies.size() != 1 || selected.dependencies.size() != 1 || bundle.descriptor().length > checkpoint_detail::encoded_bound({scheduling_.retained.log_entries, scheduling_.retained.log_bytes})) {
 						throw kronuz::journal::Corruption("invalid worker checkpoint dependencies or bundle bound");
 					}
 					std::string bytes(static_cast<std::size_t>(bundle.descriptor().length), '\0');
@@ -156,7 +157,7 @@ public:
 						auto count = std::min(bytes.size() - offset, std::size_t{65536});
 						offset += bundle.read_at(offset, std::span<char>(bytes.data() + offset, count));
 					}
-					auto decoded = decode_checkpoint(bytes, configuration_, selected.base_sequence, selected.dependencies[0], limits_);
+					auto decoded = decode_checkpoint(bytes, configuration_, selected.base_sequence, selected.dependencies[0], limits_, scheduling_.retained);
 					if (decoded.application_format && snapshot_limits_ && *decoded.application_format != snapshot_limits_->application_format) { throw kronuz::journal::Corruption("checkpoint application format conflicts with snapshot policy"); }
 					published_ = Publication{{decoded.state.base_index, decoded.state.base_term}, decoded.application_format, selected.generation};
 					recovery.restore(std::move(decoded.state), decoded.storage_sequence);
@@ -170,8 +171,8 @@ public:
 				// Generic bootstrap is already durable; typed initialization may
 				// have been queued when the previous process exited.
 				initialization_ = initial_record();
-				core_ = std::make_unique<Core>(configuration_, initial_state(), limits_, timing_);
-			} else { core_ = std::make_unique<Core>(configuration_, recovery.finish(frontier.sequence), limits_, timing_); }
+				core_ = std::make_unique<Core>(configuration_, initial_state(), limits_, timing_, Flow{}, scheduling_.retained);
+			} else { core_ = std::make_unique<Core>(configuration_, recovery.finish(frontier.sequence), limits_, timing_, Flow{}, scheduling_.retained); }
 		} catch (const std::exception& error) { fail(error.what()); throw; }
 	}
 	// R20: after a migrating recover, once the turn driver has made its records durable.
@@ -252,10 +253,10 @@ public:
 	std::optional<CheckpointId> reserve_checkpoint(std::uint64_t application_cap) {
 		if (!ready() || checkpoint_ || snapshot_result_) { return std::nullopt; }
 		if (next_checkpoint_ == std::numeric_limits<Token>::max()) { throw std::length_error("checkpoint identity exhausted"); }
-		auto replacement = store_.reserve_replacement(application_cap, checkpoint_detail::maximum_size(bundle_limits()));
+		auto replacement = store_.reserve_replacement(application_cap, checkpoint_detail::maximum_size(limits_));
 		if (!replacement) { return std::nullopt; }
 		auto token = ++next_checkpoint_;
-		try { checkpoint_ = std::make_unique<Checkpoint>(*replacement, token, application_cap); }
+		try { checkpoint_ = std::make_unique<Checkpoint>(*replacement, token, application_cap, checkpoint_detail::maximum_size(limits_)); }
 		catch (...) { store_.cancel_replacement(*replacement); throw; }
 		return CheckpointId(checkpoint_owner_, token);
 	}
@@ -299,11 +300,11 @@ public:
 			(core_ && context.leader_term < core_->term())) { throw std::invalid_argument("invalid snapshot sender context"); }
 		if (!ready() || checkpoint_ || snapshot_result_) { return std::nullopt; }
 		if (next_checkpoint_ == std::numeric_limits<Token>::max()) { throw std::length_error("snapshot identity exhausted"); }
-		auto replacement = store_.reserve_replacement(context.descriptor.application_bytes, checkpoint_detail::maximum_size(bundle_limits()));
+		auto replacement = store_.reserve_replacement(context.descriptor.application_bytes, checkpoint_detail::maximum_size(limits_));
 		if (!replacement) { return std::nullopt; }
 		auto token = ++next_checkpoint_;
 		try {
-			checkpoint_ = std::make_unique<Checkpoint>(*replacement, token, context.descriptor.application_bytes);
+			checkpoint_ = std::make_unique<Checkpoint>(*replacement, token, context.descriptor.application_bytes, checkpoint_detail::maximum_size(limits_));
 			checkpoint_->mode.emplace<Incoming>(std::move(context)); checkpoint_->phase = Phase::BeginApplication;
 		} catch (...) { checkpoint_.reset(); store_.cancel_replacement(*replacement); throw; }
 		return SnapshotId(checkpoint_owner_, token);
@@ -486,7 +487,7 @@ public:
 					if (result == SubmitResult::Accepted) { timer_due_ = false; return TurnResult::Idle; }
 					if (result == SubmitResult::Fenced) { return TurnResult::Fenced; }
 				}
-				maintenance(); return fenced() ? TurnResult::Fenced : maintenance_io_ ? TurnResult::IOPending : TurnResult::Maintenance;
+				maintenance(); return fenced() ? TurnResult::Fenced : maintenance_io_ ? TurnResult::IOPending : capture_funding_pressure_ ? TurnResult::Pressure : TurnResult::Maintenance;
 			}
 			if (persist_) {
 				auto encoded = encode_storage_batch(persist_->batch);
@@ -499,7 +500,7 @@ public:
 				completion_ = Persisted{persist_->token}; persist_.reset(); ++foreground_; return TurnResult::Stored;
 			}
 			if (!output_.empty()) {
-				if (preparation_runnable() || source_ || installation_waiting()) { maintenance(); return fenced() ? TurnResult::Fenced : maintenance_io_ ? TurnResult::IOPending : TurnResult::Maintenance; }
+				if (preparation_runnable() || source_ || installation_waiting()) { maintenance(); return fenced() ? TurnResult::Fenced : maintenance_io_ ? TurnResult::IOPending : capture_funding_pressure_ ? TurnResult::Pressure : TurnResult::Maintenance; }
 				return TurnResult::Blocked;
 			}
 			if (application_) {
@@ -522,12 +523,12 @@ public:
 				ingest(core_->step(current_time)); auto value = *activation_completion_; activation_completion_.reset();
 				ingest(core_->step(value)); ++foreground_; return TurnResult::Completed;
 			}
-			if (installation_waiting()) { maintenance(); return fenced() ? TurnResult::Fenced : maintenance_io_ ? TurnResult::IOPending : TurnResult::Maintenance; }
+			if (installation_waiting()) { maintenance(); return fenced() ? TurnResult::Fenced : maintenance_io_ ? TurnResult::IOPending : capture_funding_pressure_ ? TurnResult::Pressure : TurnResult::Maintenance; }
 			if (timer_blocked_ && !cutover_debt_) {
 				auto result = submit(current_time, true);
 				if (result == SubmitResult::Accepted) { timer_blocked_ = false; timer_due_ = true; return TurnResult::Idle; }
 				if (result == SubmitResult::Fenced) { return TurnResult::Fenced; }
-				maintenance(); return fenced() ? TurnResult::Fenced : maintenance_io_ ? TurnResult::IOPending : TurnResult::Maintenance;
+				maintenance(); return fenced() ? TurnResult::Fenced : maintenance_io_ ? TurnResult::IOPending : capture_funding_pressure_ ? TurnResult::Pressure : TurnResult::Maintenance;
 			}
 			if (preparation_runnable() || source_runnable()) {
 				// Before freeze, sustained preparation cannot postpone protocol
@@ -537,7 +538,7 @@ public:
 					if (result == SubmitResult::Accepted) { timer_due_ = false; return TurnResult::Idle; }
 					if (result == SubmitResult::Fenced) { return TurnResult::Fenced; }
 				}
-				maintenance(); return fenced() ? TurnResult::Fenced : maintenance_io_ ? TurnResult::IOPending : TurnResult::Maintenance;
+				maintenance(); return fenced() ? TurnResult::Fenced : maintenance_io_ ? TurnResult::IOPending : capture_funding_pressure_ ? TurnResult::Pressure : TurnResult::Maintenance;
 			}
 			if (!held_.empty()) { return submit_held(); }
 			auto result = try_submit(current_time);
@@ -559,7 +560,7 @@ private:
 		}
 		std::size_t bytes = 0;
 		for (const auto& e : append->entries) { bytes += e.payload.size(); }
-		if (held_entries_ + append->entries.size() > scheduling_.follower_batch_entries || held_bytes_ + bytes > scheduling_.follower_batch_bytes) { return false; }
+		if (held_entries_ > scheduling_.follower_batch_entries || append->entries.size() > scheduling_.follower_batch_entries - held_entries_ || held_bytes_ > scheduling_.follower_batch_bytes || bytes > scheduling_.follower_batch_bytes - held_bytes_) { return false; }
 		held_peer_ = receive->authenticated_peer; held_bytes_ += bytes; held_entries_ += append->entries.size();
 		held_.push_back(std::move(*append));
 		return true;
@@ -616,15 +617,7 @@ private:
 		}
 	}
 	enum class MaintenanceKind { Reclaim, BeginApplication, Application, SealApplication, OpenVerification, Readback, BeginBundle, Bundle, SealBundle, Publish, SourceOpen, SourceVerify, SourceRead };
-	// A bundle holds at most the retained log: the node's limits, widened by the group's (R16).
-	Limits bundle_limits() const {
-		Limits limits = limits_;
-		if (core_) {
-			limits.log_entries = std::max(limits.log_entries, core_->group_limits().log_entries);
-			limits.log_bytes = std::max(limits.log_bytes, core_->group_limits().log_bytes);
-		}
-		return limits;
-	}
+
 	std::string initial_record() const { return configuration_.voters.empty() ? encode_join(configuration_) : encode_initialization(configuration_, founding_); }
 	RecoveredState initial_state() const {
 		RecoveredState state{configuration_, {}, 0, 0, {}, 0};
@@ -633,10 +626,10 @@ private:
 		return state;
 	}
 	void validate_configuration(const kronuz::journal::AdmissionLimits& admission) {
-		Core validate(configuration_, initial_state(), limits_, timing_);
+		Core validate(configuration_, initial_state(), limits_, timing_, Flow{}, scheduling_.retained);
 		if (!scheduling_.foreground_burst || scheduling_.foreground_burst > 1048576 || !scheduling_.scan_entries || scheduling_.scan_entries > 4096 ||
 			admission.control_slots < 3 || admission.maximum_tickets < 5) { throw std::invalid_argument("invalid worker scheduling or control slots"); }
-		auto tick = plan_event(Tick{}, false, limits_);
+		auto tick = plan_event(Tick{}, false, limits_, scheduling_.retained);
 		kronuz::journal::StorageResources pack{};
 		for (std::size_t i = 0; i < tick.count; ++i) { pack = kronuz::journal::detail::resources_add(pack, kronuz::journal::Journal::append_footprint(tick.appends[i].encoded_bytes).peak); }
 		auto rpc = kronuz::journal::Journal::append_footprint(storage_batch_size(true, true, limits_.rpc_entries)).peak;
@@ -646,9 +639,9 @@ private:
 		// persistence and checkpoint actions. No unbounded output queue exists.
 		// A leader sends to every member, learners included; a group's limits stay within the
 		// node's (R16).
-		output_count_ = checked_add(checked_multiply(limits_.reads, 2), checked_add(checked_multiply(limits_.members, 4), 16));
-		output_payload_ = checked_add(limits_.log_bytes, checked_multiply(checked_add(limits_.members, 2), limits_.rpc_bytes));
-		output_entries_ = checked_add(limits_.log_entries, checked_multiply(checked_add(limits_.members, 2), limits_.rpc_entries));
+		output_count_ = checked_add(checked_multiply(limits_.reads, 2), checked_add(checked_multiply(ceilings.members, 4), checked_add(16, scheduling_.retained.batch_entries)));
+		output_payload_ = checked_add(scheduling_.retained.log_bytes, checked_multiply(checked_add(checked_multiply(ceilings.members, 2), 2), limits_.rpc_bytes));
+		output_entries_ = checked_add(scheduling_.retained.log_entries, checked_multiply(checked_add(checked_multiply(ceilings.members, 2), 2), limits_.rpc_entries));
 	}
 	SubmitResult submit(Event event, bool maintenance_tick) {
 		return submit_retained(event, maintenance_tick);
@@ -656,7 +649,7 @@ private:
 	SubmitResult submit_retained(Event& event, bool maintenance_tick) {
 		if (maintenance_tick && !std::holds_alternative<Tick>(event)) { throw std::logic_error("maintenance admission requires Tick"); }
 		// Validate even under backpressure; internal events never enter here.
-		auto plan = plan_event(event, core_ && core_->busy(), limits_);
+		auto plan = plan_event(event, core_ && core_->busy(), limits_, scheduling_.retained);
 		if (core_ && core_->role() == Role::Leader && std::holds_alternative<Tick>(event)) { plan.count = 0; }
 		if (store_.fenced() && !failed_) { fail("storage fenced outside worker"); }
 		if (fenced()) { return SubmitResult::Fenced; }
@@ -711,11 +704,11 @@ private:
 		std::optional<ActivateInstall> activation;
 	};
 	struct Checkpoint {
-		Checkpoint(kronuz::journal::ReplacementId id, Token identity, std::uint64_t cap)
-			: replacement(std::move(id)), token(identity), application_cap(cap) {}
+		Checkpoint(kronuz::journal::ReplacementId id, Token identity, std::uint64_t cap, std::uint64_t bundle_capacity)
+			: replacement(std::move(id)), token(identity), application_cap(cap), bundle_cap(bundle_capacity) {}
 		kronuz::journal::ReplacementId replacement;
 		Token token, persistence_token = 0;
-		std::uint64_t application_cap, offered_bytes = 0, sequence = 0;
+		std::uint64_t application_cap, bundle_cap, offered_bytes = 0, sequence = 0;
 		Phase phase = Phase::Reserved;
 		std::variant<Local, Incoming> mode;
 		std::optional<Chunk> chunk;
@@ -844,6 +837,7 @@ private:
 		foreground_ = 0; timer_blocked_ = maintenance_owed_timer_; timer_due_ = true;
 	}
 	void maintenance() {
+		capture_funding_pressure_ = false;
 		auto owed_timer = timer_due_;
 		for (unsigned attempt = 0; attempt < 3; ++attempt) {
 			auto kind = maintenance_next_; maintenance_next_ = (maintenance_next_ + 1) % 3;
@@ -909,6 +903,16 @@ private:
 			source.slots[slot] = {++next_source_chunk_, source.read, count, final}; source.read += count; source.read_final = final; ++source.ready;
 		}
 	}
+	bool fund_capture(Checkpoint& operation, std::optional<RetainedUsage> usage) {
+		if (!usage) { return true; } // Rejections require no capture funding.
+		auto required = checkpoint_detail::encoded_bound(*usage);
+		if (required <= operation.bundle_cap) { return true; }
+		if (!store_.grow_replacement(operation.replacement, required)) {
+			capture_funding_pressure_ = true; cutover_debt_ = false; return false;
+		}
+		operation.bundle_cap = required;
+		return true;
+	}
 	void prepare_one() {
 		auto& operation = *checkpoint_;
 		using kronuz::journal::ArtifactPart;
@@ -947,22 +951,28 @@ private:
 		}
 		case Phase::Cutover: {
 			if (auto incoming = std::get_if<Incoming>(&operation.mode)) {
+				auto context = incoming->context;
+				InstallPrepared request{context.request, operation.token, context.authenticated_peer, context.leader_term,
+					configuration_.cluster, configuration_.configuration, {context.descriptor.through, context.descriptor.term}, context.descriptor.membership};
+				if (!fund_capture(operation, core_->capture_usage(request))) { break; }
+				cutover_debt_ = true;
 				if (!incoming->cutover_permit || pack_count_) { throw std::logic_error("installation cutover lacks dedicated control permit"); }
 				pack_[0] = std::move(incoming->cutover_permit); incoming->cutover_permit.reset(); pack_count_ = 1; pack_next_ = 0;
-				auto context = incoming->context;
-				ingest_capture(core_->step_capture(InstallPrepared{context.request, operation.token, context.authenticated_peer, context.leader_term,
-					configuration_.cluster, configuration_.configuration, {context.descriptor.through, context.descriptor.term}, context.descriptor.membership}));
+				ingest_capture(core_->step_capture(std::move(request)));
 				break;
 			}
 			auto capture = *std::get<Local>(operation.mode).capture;
-			ingest_capture(core_->step_capture(LocalCheckpoint{capture.request, operation.token, capture.through, capture.term, configuration_.cluster, configuration_.configuration, capture.epoch}));
+			LocalCheckpoint request{capture.request, operation.token, capture.through, capture.term, configuration_.cluster, configuration_.configuration, capture.epoch};
+			if (!fund_capture(operation, core_->capture_usage(request))) { break; }
+			cutover_debt_ = true;
+			ingest_capture(core_->step_capture(std::move(request)));
 			if (fenced()) { break; }
 			if (!core_->busy()) { store_.cancel_replacement(operation.replacement); checkpoint_.reset(); cutover_debt_ = false; }
 			break;
 		}
 		case Phase::EncodeBundle:
 			if (!operation.frozen) { throw std::logic_error("checkpoint lacks frozen capture"); }
-			operation.encoder.emplace(std::move(*operation.frozen), operation.sequence, *operation.application, limits_, std::holds_alternative<Incoming>(operation.mode) ? std::optional<std::uint32_t>{std::get<Incoming>(operation.mode).context.descriptor.application_format} : (snapshot_limits_ ? std::optional<std::uint32_t>{snapshot_limits_->application_format} : std::nullopt));
+			operation.encoder.emplace(std::move(*operation.frozen), operation.sequence, *operation.application, limits_, std::holds_alternative<Incoming>(operation.mode) ? std::optional<std::uint32_t>{std::get<Incoming>(operation.mode).context.descriptor.application_format} : (snapshot_limits_ ? std::optional<std::uint32_t>{snapshot_limits_->application_format} : std::nullopt), scheduling_.retained);
 			operation.frozen.reset(); operation.phase = Phase::BeginBundle; break;
 		case Phase::BeginBundle:
 			if (scheduling_.async_storage) { start_maintenance_io(store_.begin_artifact_operation(operation.replacement, ArtifactPart::Bundle), MaintenanceKind::BeginBundle); break; }
@@ -997,10 +1007,12 @@ private:
 		return left * right;
 	}
 	static std::size_t batch_limit(const FixedConfiguration& configuration, Limits limits, const WorkerLimits& scheduling = {}) {
-		// A merged follower batch (D15) may exceed one RPC.
-		const auto entries = std::max(limits.rpc_entries, scheduling.follower_batch_entries);
-		const auto bytes = std::max(limits.rpc_bytes, scheduling.follower_batch_bytes);
-		return std::max(encode_initialization(configuration).size(), storage_batch_size(true, true, entries, bytes));
+		retained_detail::validate_policy(scheduling.retained, limits);
+		if (scheduling.follower_batch_entries > scheduling.retained.batch_entries ||
+			scheduling.follower_batch_bytes > scheduling.retained.batch_bytes) { throw std::invalid_argument("follower batching exceeds retained resources"); }
+		if (configuration.voters.size() > 31) { throw std::invalid_argument("invalid founding voters"); }
+		return std::max(storage_detail::maximum_initialization_size,
+			storage_batch_size(true, true, scheduling.retained.batch_entries, scheduling.retained.batch_bytes));
 	}
 	static std::uint64_t artifact_limit(std::optional<SnapshotLimits> limits) {
 		// 256 chunks bounds a transfer's read-ahead at 16 MiB.
@@ -1137,7 +1149,7 @@ private:
 	std::unique_ptr<Source> source_;
 	Token next_source_ = 0, next_source_chunk_ = 0;
 	std::size_t source_next_ = 0; unsigned maintenance_next_ = 1;
-	bool failed_ = false, cutover_debt_ = false, timer_due_ = true, timer_blocked_ = false, closing_ = false;
+	bool failed_ = false, capture_funding_pressure_ = false, cutover_debt_ = false, timer_due_ = true, timer_blocked_ = false, closing_ = false;
 };
 
 } // namespace kronuz::consensus

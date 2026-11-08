@@ -1,0 +1,29 @@
+# journal: Store over two backends, driven synchronously or by completion I/O.
+# Render: d2 --layout elk --sketch --theme 302 docs/journal.d2 docs/journal.svg
+direction: down
+
+host: Host (consensus Worker) {
+  label: "host\nappend · checkpoint · recover"
+}
+
+store: Store {
+  label: "Store\nadmission · inventory · one replacement cycle"
+}
+
+per_group: Per-group journal {
+  label: "per-group journal\nmanifest frontier + artifacts"
+}
+
+turn_log: Shared turn log {
+  label: "shared turn log (RFTW0001)\none barrier per turn, every group"
+}
+
+io: completion I/O {
+  label: "completion\nPOSIX · BSD AIO · io_uring"
+}
+
+host -> store
+store -> per_group
+store -> turn_log: "TurnDriver"
+per_group -> io
+turn_log -> io

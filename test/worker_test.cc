@@ -726,6 +726,180 @@ void checkpoint_cancellation_and_completion() {
 	}
 	check(proposal == SubmitResult::Accepted && committed && worker.committed() == 2 && worker.applied_index() == 2 && !worker.fenced(), "first proposal in the replacement generation persists, commits, and applies");
 }
+void retained_checkpoint_funding() {
+	auto directory = std::filesystem::current_path() / ".scratch" / ("worker-retained-funding-" + std::to_string(::getpid()));
+	std::filesystem::create_directories(directory); ::chmod(directory.c_str(), 0700);
+	struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
+	for (unsigned mode : {0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 10u, 11u, 12u}) {
+		bool rejected = mode >= 3 && mode <= 7, pressure = mode == 1 || rejected, growing = mode == 2;
+		auto path = directory / std::to_string(mode); std::filesystem::create_directories(path); ::chmod(path.c_str(), 0700);
+		FaultIO io(path);
+		auto fixed = configuration(); if (growing || (mode >= 5 && mode <= 7) || mode == 12) { fixed.voters = {1, 2, 3}; }
+		kronuz::journal::AdmissionLimits quota{{512 * 1024, 4096}, {16 * 1024, 3}, {pressure ? 12000u : 128 * 1024u, 4}, 8, 3};
+		{
+			kronuz::journal::Store store(io, quota, 65536); Identity identity{}; identity[0] = 'F'; store.create(identity);
+			while (!store.inventory_step(1).complete) {}
+			std::optional<Membership> founding;
+			if (growing) { founding = fixed_membership(fixed); founding->limits = limits(); founding->limits->log_bytes = 16384; }
+			auto initialization = encode_initialization(fixed, founding);
+			auto initial = store.reserve_append(kronuz::journal::AdmissionClass::Control, initialization.size());
+			check(bool(initial), "funding fixture reserves initialization"); if (!initial) { continue; } store.append(*initial, initialization);
+			std::vector<Entry> entries{{1, 1, EntryKind::NoOp, {}}};
+			for (Index index = 2; index <= 9; ++index) { entries.push_back({index, 1, EntryKind::Command, std::string(1024, 'x')}); }
+			auto encoded = encode_storage_batch({HardState{1, {}, mode == 12 ? 0u : 9u}, LogMutation{1, std::move(entries)}});
+			auto append = store.reserve_append(kronuz::journal::AdmissionClass::Control, encoded.size());
+			check(bool(append), "funding fixture reserves historical batch"); if (!append) { continue; } store.append(*append, encoded);
+			if (mode == 12) {
+				std::vector<Entry> extra;
+				for (Index index = 10; index <= 13; ++index) { extra.push_back({index, 1, EntryKind::Command, std::string(1024, 'x')}); }
+				auto tail = encode_storage_batch({std::nullopt, LogMutation{10, std::move(extra)}});
+				auto permit = store.reserve_append(kronuz::journal::AdmissionClass::Control, tail.size());
+				check(bool(permit), "incoming funding fixture reserves additional historical suffix");
+				if (!permit) { continue; } store.append(*permit, tail);
+			}
+		}
+		auto narrow = limits(); narrow.command_bytes = 64; narrow.log_entries = 4; narrow.control_entries = 1;
+		if (mode >= 8 && mode <= 11) {
+			narrow = limits(); narrow.command_bytes = 2048; narrow.rpc_bytes = 4096; narrow.log_bytes = 16384;
+			if (mode == 8) { narrow.command_bytes = 64; }
+			if (mode == 9) { narrow.rpc_bytes = 2048; }
+			if (mode == 10) { narrow.log_bytes = 4096; }
+			if (mode == 11) { narrow.log_entries = 4; narrow.control_entries = 1; }
+		}
+		WorkerLimits scheduling; scheduling.retained = {2048, 16384, 64, 8192, 16};
+		{
+		Worker worker(io, fixed, quota, narrow, compact, scheduling, SnapshotLimits{7, 100000});
+		worker.recover([](auto&) {});
+		for (unsigned turn = 0; turn < 100 && !worker.ready(); ++turn) { worker.run_one({0, 100}); }
+		check(worker.ready(), "lowered-limit worker replays historical storage batches");
+		worker.try_submit(Start{});
+		auto delivered = mode == 12 ? 0u : 9u;
+		for (unsigned turn = 0; turn < 100 && worker.applied_index() < delivered; ++turn) {
+			worker.run_one({0, 100});
+			for (const auto& action : worker.take_actions()) { if (auto batch = std::get_if<Committed>(&action)) { worker.applied({batch->entries.back().index}); } }
+		}
+		check(worker.applied_index() == delivered, "historical entries reach the application before capture");
+		if ((mode >= 5 && mode <= 7) || mode == 12) {
+			SnapshotContext context{2, mode == 7 ? 2u : 1u, 71, 17,
+				{fixed.cluster, fixed.configuration, 7, 1, 1, 5, kronuz::journal::crc32c("image")}};
+			auto incoming = worker.reserve_snapshot(context);
+			check(bool(incoming), "pressure rejection reserves incoming candidate");
+			if (!incoming) { continue; }
+			bool sent = false; Token eof = 0;
+			for (unsigned turn = 0; turn < 1000 && !eof; ++turn) {
+				if (!sent) { sent = worker.offer_snapshot_chunk(*incoming, 0, "image", true).result == SubmitResult::Accepted; }
+				worker.run_one({0, 100}); worker.take_actions();
+				if (auto view = worker.validation_chunk()) {
+					if (view->verified_eof) { eof = view->chunk; }
+					worker.consume_validation(*incoming, view->chunk);
+				}
+			}
+			check(eof && worker.validation_succeeded(*incoming, eof) == ValidationAck::Accepted,
+				"pressure rejection validates complete incoming image");
+			if (mode == 5) {
+				Receive newer{2, AppendRequest{2, 72, 9, 1, 9, 0, {}}};
+				bool submitted = false;
+				for (unsigned turn = 0; turn < 1000 && (!submitted || worker.busy() || worker.term() != 2); ++turn) {
+					if (!submitted) { submitted = worker.try_submit(newer) == SubmitResult::Accepted; }
+					worker.run_one({0, 100}); worker.take_actions();
+				}
+				check(submitted && worker.term() == 2 && !worker.busy(), "stale incoming fixture advances durable term");
+			}
+			auto before = worker.storage_frontier();
+			check(worker.request_install(*incoming) == SubmitResult::Accepted, "pressure rejection admits installation");
+			std::optional<SnapshotResult> result;
+			for (unsigned turn = 0; turn < 1000 && !result && !worker.fenced(); ++turn) {
+				worker.run_one({0, 100}); worker.take_actions();
+				if (mode == 12) {
+					if (auto activation = worker.snapshot_activation()) {
+						check(worker.snapshot_activated(*incoming, activation->token) == ValidationAck::Accepted,
+							"funded historical incoming image activates after publication");
+					}
+				}
+				result = worker.take_snapshot_result();
+			}
+			if (mode == 12) {
+				check(result && result->reason == SnapshotReason::Installed && !worker.fenced() && worker.base_index() == 1 && worker.retained_log_bytes() == 12288,
+					"incoming capture grows funding before preserving an oversized historical suffix");
+				check(worker.storage_frontier().generation == before.generation + 1,
+					"funded incoming capture publishes its replacement generation");
+			} else {
+			check(result && result->reason == SnapshotReason::Rejected && result->rejection == (mode == 5 ? InstallRejectReason::StaleTerm : InstallRejectReason::CaughtUp) &&
+				result->receiver_term == (mode == 6 ? 1u : 2u) && !worker.fenced() && worker.base_index() == 0,
+				"incoming rejection bypasses unavailable historical suffix funding");
+			check(worker.storage_frontier().generation == before.generation && worker.storage_frontier().sequence == before.sequence + (mode == 7 ? 1 : 0),
+				"higher-term rejection persists hard state without replacement publication");
+			}
+			worker.close();
+			for (unsigned turn = 0; turn < 1000 && !worker.drained(); ++turn) { worker.run_one({0, 100}); }
+			check(worker.drained(), "pressure-rejected incoming candidate drains");
+			continue;
+		}
+		auto capture = worker.reserve_checkpoint(5);
+		check(bool(capture), "operating-capacity reservation fits without reserving retained maxima"); if (!capture) { continue; }
+		worker.attach_capture(*capture, {70, 1, mode == 4 ? 2u : 1u, mode == 3 ? 1u : 0u});
+		if (growing) {
+			worker.offer_application_chunk(*capture, "i");
+			for (Index through = 13; through <= 25; through += 4) {
+				AppendRequest request{1, through, through - 4, 1, through, 0, {}};
+				for (Index index = through - 3; index <= through; ++index) { request.entries.push_back({index, 1, EntryKind::Command, std::string(64, 'g')}); }
+				bool accepted = false;
+				for (unsigned turn = 0; turn < 1000 && worker.applied_index() < through; ++turn) {
+					if (!accepted) { accepted = worker.try_submit(Receive{2, request}) == SubmitResult::Accepted; }
+					worker.run_one({0, 100});
+					for (const auto& action : worker.take_actions()) { if (auto batch = std::get_if<Committed>(&action)) { worker.applied({batch->entries.back().index}); } }
+				}
+				check(accepted && worker.applied_index() == through, "retained history grows during application preparation");
+			}
+			bool sealed = false;
+			for (unsigned turn = 0; turn < 1000 && !sealed; ++turn) {
+				sealed = worker.offer_application_chunk(*capture, "mage", true) == SubmitResult::Accepted;
+				if (!sealed) {
+					worker.run_one({0, 100});
+					for (const auto& action : worker.take_actions()) { if (auto batch = std::get_if<Committed>(&action)) { worker.applied({batch->entries.back().index}); } }
+				}
+			}
+			check(sealed, "growing capture seals after concurrent protocol progress");
+		} else { worker.offer_application_chunk(*capture, "image", true); }
+		bool published = false, refused = false, invalid = false;
+		for (unsigned turn = 0; turn < 1000 && !published && !refused && !invalid && !worker.fenced(); ++turn) {
+			refused = worker.run_one({0, 100}) == TurnResult::Pressure;
+			for (const auto& action : worker.take_actions()) {
+				published |= std::holds_alternative<CheckpointPublished>(action);
+				if (auto rejection = std::get_if<Reject>(&action)) { invalid |= rejection->request == 70 && rejection->reason == RejectReason::InvalidCheckpoint; }
+			}
+		}
+		if (rejected) {
+			check(invalid && !refused && !published && !worker.fenced() && worker.base_index() == 0,
+				"invalid and stale-epoch captures reject without historical suffix funding");
+		} else if (pressure) {
+			check(refused && !worker.fenced() && worker.base_index() == 0 && worker.checkpoint_active(*capture),
+				"funding refusal preserves the candidate and unfrozen Core");
+			check(worker.cancel_checkpoint(*capture) == CancelResult::Canceled, "unfunded capture remains cancelable");
+		} else {
+			check(published && !worker.fenced() && worker.base_index() == 1 && worker.retained_log_bytes() == (growing ? 9216 : 8192),
+				"funded capture publishes a suffix larger than operating capacity");
+		}
+		worker.close();
+		for (unsigned turn = 0; turn < 1000 && !worker.drained(); ++turn) { worker.run_one({0, 100}); }
+		check(worker.drained(), "lowered-limit historical retirement makes bounded shutdown progress");
+		}
+		if (!pressure) {
+			Worker reopened(io, fixed, quota, narrow, compact, scheduling);
+			std::string image;
+			reopened.recover([&](auto& reader) {
+				image.resize(static_cast<std::size_t>(reader.descriptor().length));
+				reader.read_at(0, std::span<char>(image.data(), image.size()));
+			});
+			for (unsigned turn = 0; turn < 1000 && !reopened.ready() && !reopened.fenced(); ++turn) { reopened.run_one({0, 100}); }
+			check(reopened.ready() && image == "image" && reopened.base_index() == 1 && reopened.retained_log_bytes() == (growing ? 9216 : 8192),
+				"grown checkpoint reopens with its complete historical suffix and application image");
+			reopened.close();
+			for (unsigned turn = 0; turn < 1000 && !reopened.drained(); ++turn) { reopened.run_one({0, 100}); }
+			check(reopened.drained(), "reopened grown checkpoint drains historical retirement");
+		}
+	}
+}
 // Track C, D10 through the Worker: a repair rewinds and redelivers; a capture taken before
 // it is rejected even when attached after it (R21); a repair waits for a checkpoint in flight.
 void worker_repair() {
@@ -2026,6 +2200,27 @@ void founding_and_join_records() {
  Membership leaving{{{1, 1, MemberRole::Voter}, {2, 2, MemberRole::Voter}, {3, 3, MemberRole::Witness}}, 4, 3};
  check(throws([&] { bad.found(moved); }) && throws([&] { bad.found(learner); }) && throws([&] { bad.found(leaving); }),
   "founding members are first incarnations, none a learner, none leaving");
+ {
+  auto path = directory / "maximum-founders"; std::filesystem::create_directories(path); ::chmod(path.c_str(), 0700);
+  auto io = std::make_shared<kronuz::journal::PosixIO>(path);
+  auto fixed = configuration(); fixed.voters.clear();
+  for (NodeId id = 1; id <= 31; ++id) { fixed.voters.push_back(id); }
+  auto small = limits(); small.voters = small.members = 31;
+  small.command_bytes = 1; small.rpc_bytes = membership_bytes(31); small.log_bytes = 2048;
+  small.log_entries = 2; small.control_entries = small.rpc_entries = 1;
+  auto founding = fixed_membership(fixed); founding.limits = small;
+  WorkerLimits scheduling; scheduling.retained = {1, 2048, 2, small.rpc_bytes, 1};
+  check(encode_initialization(fixed, founding).size() == storage_detail::maximum_initialization_size,
+   "maximum founding record includes configuration and membership framing");
+  for (bool reopen : {false, true}) {
+   Worker worker(io, fixed, admission(), small, compact, scheduling);
+   if (reopen) { worker.recover([](auto&) {}); }
+   else { worker.found(founding); Identity identity{}; identity[0] = 'M'; worker.create(identity); }
+   for (unsigned turn = 0; turn < 100 && !worker.ready() && !worker.fenced(); ++turn) { worker.run_one({turn, 100}); }
+   check(worker.ready() && !worker.fenced(), "founding record survives an RPC-sized retained batch envelope");
+   worker.close(); while (!worker.drained()) { worker.run_one({0, 100}); }
+  }
+ }
 }
 
 // Track C, D5 (review M3): any authenticated incarnation of the group may send a snapshot,
@@ -2160,8 +2355,9 @@ void worker_rejoin_by_install() {
 
 int main(int argc, char** argv) {
 	try {
+		if (argc == 2 && std::string_view(argv[1]) == "--retained-regressions") { founding_and_join_records(); retained_checkpoint_funding(); std::cout << checks << " retained Worker checks, " << failures << " failures\n"; return failures ? 1 : 0; }
 		if (argc == 2 && std::string_view(argv[1]) == "--terminal-regressions") { terminal_original_settlement(); terminal_checkpoint_originals(); terminal_output_and_dispatch_failure(); terminal_snapshot_readback(); terminal_published_activation(); terminal_reclamation_original(); std::cout << checks << " terminal checks, " << failures << " failures\n"; return failures ? 1 : 0; }
-		terminal_original_settlement(); terminal_checkpoint_originals(); terminal_output_and_dispatch_failure(); terminal_snapshot_readback(); terminal_published_activation(); terminal_reclamation_original(); founding_and_join_records(); snapshot_senders(); worker_rejoin_by_install();
+		terminal_original_settlement(); terminal_checkpoint_originals(); terminal_output_and_dispatch_failure(); terminal_snapshot_readback(); terminal_published_activation(); terminal_reclamation_original(); founding_and_join_records(); retained_checkpoint_funding(); snapshot_senders(); worker_rejoin_by_install();
 		if (argc == 2 && std::string_view(argv[1]) == "--retained-admission-benchmark") { admission_benchmark = true; real_worker(); return failures ? 1 : 0; }
 		if (argc == 2 && std::string_view(argv[1]) == "--source-regressions") { owned_snapshot_sources(); std::cout << checks << " source checks, " << failures << " failures\n"; return failures ? 1 : 0; }
 		if (argc == 2 && std::string_view(argv[1]) == "--completion-regressions") { completion_appends(); completion_storage(); completion_channel_cancellation(); completion_snapshot_readback(); retired_completion_worker(); for (unsigned mode : {0u, 1u, 3u}) { binary_transfer_integration(65553, mode, false, true); } std::cout << checks << " completion checks, " << failures << " failures\n"; return failures ? 1 : 0; }

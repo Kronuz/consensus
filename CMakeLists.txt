@@ -4,7 +4,8 @@ project(consensus LANGUAGES CXX)
 # Strict durable Raft: a deterministic Core, a Worker over journal storage, checkpoints,
 # and snapshot transfer, plus an optional authenticated peer transport. Header-only.
 include(FetchContent)
-FetchContent_Declare(journal GIT_REPOSITORY https://github.com/Kronuz/journal.git GIT_TAG 3dccf50a688a625b3c6cc53679b872746f743f88)
+set(FETCHCONTENT_SOURCE_DIR_JOURNAL "${CMAKE_CURRENT_SOURCE_DIR}/qualification-journal")
+FetchContent_Declare(journal GIT_REPOSITORY https://github.com/Kronuz/journal.git GIT_TAG cb66f3d4e644ee5f3c3e86cd61a8c83d2b36be62)
 FetchContent_MakeAvailable(journal)
 
 add_library(consensus INTERFACE)
@@ -33,7 +34,7 @@ endif()
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	enable_testing()
 	file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/.scratch")  # the tests' state
-	foreach(t consensus checkpoint_encoder retained_log retirement simulation membership pipeline)
+	foreach(t consensus checkpoint_encoder retained_log retirement simulation membership pipeline retained_state)
 		add_executable(consensus_${t}_test test/${t}_test.cc)
 		target_link_libraries(consensus_${t}_test PRIVATE consensus::consensus)
 		add_test(NAME consensus_${t} COMMAND consensus_${t}_test)

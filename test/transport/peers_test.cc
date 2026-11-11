@@ -1,7 +1,8 @@
 // Peers over real TLS sockets between three consensus Workers, with voters named by host:
 // lookups through an injected resolver (answering, failing, throwing or hanging on cue) and
 // through the system resolver, the resolve deadline and the cache, staggered dials over
-// several addresses, and the certificate pin refusing a name that reaches the wrong voter
+// several addresses, the certificate pin refusing a name that reaches the wrong voter and the
+// next dial starting past it, a slow resolver behind the cache, and the spacing of lookups
 // (docs/mechanisms/peer-dns.md). Peers is also instantiated over a minimal host.
 #include "consensus/transport/peers.h"
 #include "consensus/transport/profile.h"
@@ -109,10 +110,12 @@ struct Certificates {
 	}
 };
 
-// A resolver scripted per name. Hung calls park until release(); `active` counts the calls
-// still inside, so a scenario can wait for every lookup thread to return before it ends.
+// A resolver scripted per name. Hung calls park until release(), slow ones answer after
+// `slow`; `active` counts the calls still inside, so a scenario can wait for every lookup
+// thread to return before it ends.
 struct FakeDns {
-	enum class Mode { Answer, Empty, Throw, Hang };
+	enum class Mode { Answer, Empty, Throw, Hang, Slow };
+	Clock::duration slow{};
 	std::mutex mutex;
 	std::condition_variable wake;
 	bool released = false;
@@ -137,6 +140,9 @@ struct FakeDns {
 			throw std::runtime_error("SERVFAIL");
 		case Mode::Hang:
 			wake.wait(lock, [&] { return released; });
+			return answers[host];
+		case Mode::Slow:
+			wake.wait_for(lock, slow, [&] { return released; });
 			return answers[host];
 		}
 		return {};
@@ -510,16 +516,18 @@ asio::awaitable<void> hung_resolver(asio::io_context &io, const Certificates &ce
 	CHECK(cluster.peers[0]->stats().reconnects >= 4);
 	CHECK(dns[0]->count("two") == 1 && cluster.peers[0]->occupancy().lookups == 1);
 
+	CHECK(cluster.peers[0]->stats().lookup_timeouts >= 4); // its uncached dials found it late
+
 	// Voter one has "three" cached; its next lookup hangs, and voter three restarts.
 	dns[0]->set("three", FakeDns::Mode::Hang);
-	const auto timeouts = cluster.peers[0]->stats().lookup_timeouts;
+	const auto lookups = dns[0]->count("three");
 	cluster.restart(2);
 	const auto bounced = Clock::now();
 	CHECK(co_await cluster.until([&] { return cluster.connections(2) == 4; }, 3s));
 	const auto redial = ms(Clock::now() - bounced);
 	std::printf("  hung lookup of a cached name: redialed in %lld ms (resolve deadline 200 ms)\n", redial);
 	CHECK(redial < 200 + 800);
-	CHECK(cluster.peers[0]->stats().lookup_timeouts > timeouts);
+	CHECK(dns[0]->count("three") == lookups + 1 && cluster.peers[0]->occupancy().lookups == 2);
 	CHECK(co_await cluster.commit("still quorum", {0, 2}, 5s));
 
 	const auto stopping = Clock::now();
@@ -625,6 +633,121 @@ asio::awaitable<void> wrong_node(asio::io_context &io, const Certificates &certi
 		resolver->quiesce();
 }
 
+// N1: on voter one, "two" answers {voter three's address, voter two's address}. Three's
+// connects first and the pin refuses it; the next dial starts past it and reaches voter two.
+asio::awaitable<void> refused_first(asio::io_context &io, const Certificates &certificates) {
+	Cluster cluster(io, certificates);
+	const auto other = alternate_loopback(io);
+	const auto shared = shared_port(io, loopback, other);
+	const std::array<std::uint16_t, 3> ports{free_port(io, loopback), shared, shared};
+	cluster.name_peers(ports);
+	auto dns = answering(cluster, loopback);
+	for (auto &resolver : dns)
+		resolver->set("three", FakeDns::Mode::Answer, {other});
+	dns[0]->set("two", FakeDns::Mode::Answer, {other, loopback});
+	cluster.options[0].listen = {loopback, ports[0]};
+	cluster.options[1].listen = {loopback, shared};
+	cluster.options[2].listen = {other, shared};
+	for (unsigned i = 0; i != 3; ++i)
+		cluster.start(i);
+	const auto started = Clock::now();
+	CHECK(co_await cluster.until([&] { return cluster.connections(1) == 4; }, 3s));
+	const auto reached = ms(Clock::now() - started);
+	std::printf("  wrong address first: reached voter two in %lld ms (%llu refusals)\n", reached,
+				static_cast<unsigned long long>(cluster.peers[0]->stats().rejected));
+	CHECK(cluster.peers[0]->stats().rejected >= 1 && reached < 1000); // within a few backoffs
+	CHECK(co_await cluster.commit("past the wrong address", {0, 1, 2}, 5s));
+	CHECK(co_await cluster.stop_all(500ms));
+	for (auto &resolver : dns)
+		resolver->quiesce();
+}
+
+// N3: every lookup of "three" answers after 1.5 s, past the 1 s resolve deadline. Once the
+// name is cached, a redial goes to the cache at once and the slow lookup refreshes it behind.
+asio::awaitable<void> slow_resolver(asio::io_context &io, const Certificates &certificates) {
+	Cluster cluster(io, certificates);
+	const std::array<std::uint16_t, 3> ports{free_port(io, loopback), free_port(io, loopback),
+											 free_port(io, loopback)};
+	cluster.name_peers(ports);
+	auto dns = answering(cluster, loopback);
+	for (unsigned i = 0; i != 3; ++i) {
+		cluster.options[i].listen = {loopback, ports[i]};
+		cluster.options[i].resolve_deadline = 1000ms;
+		dns[i]->slow = 1500ms;
+		dns[i]->set("three", FakeDns::Mode::Slow);
+	}
+	for (unsigned i = 0; i != 3; ++i)
+		cluster.start(i);
+	CHECK(co_await cluster.until([&] { return cluster.connections(2) == 4; }, 5s));
+	CHECK(co_await cluster.commit("slow dns", {0, 1, 2}, 5s));
+	co_await cluster.idle(1600ms); // past any lookup in flight, so the redial starts one
+	const auto lookups = dns[0]->count("three") + dns[1]->count("three");
+	cluster.restart(2);
+	const auto bounced = Clock::now();
+	CHECK(co_await cluster.until([&] { return cluster.connections(2) == 4; }, 3s));
+	const auto redial = ms(Clock::now() - bounced);
+	std::printf("  slow lookup (1500 ms) of a cached name: redialed in %lld ms (resolve deadline 1000 ms)\n", redial);
+	CHECK(redial < 700);
+	CHECK(dns[0]->count("three") + dns[1]->count("three") > lookups);
+	CHECK(co_await cluster.stop_all(500ms));
+	for (auto &resolver : dns)
+		resolver->quiesce();
+}
+
+// N4: voter three is down but its name resolves. Voters one and two keep redialing it after
+// 100-199 ms of backoff per lane, and look its name up at most once per resolve deadline.
+asio::awaitable<void> lookup_spacing(asio::io_context &io, const Certificates &certificates) {
+	Cluster cluster(io, certificates);
+	const std::array<std::uint16_t, 3> ports{free_port(io, loopback), free_port(io, loopback),
+											 free_port(io, loopback)};
+	cluster.name_peers(ports);
+	auto dns = answering(cluster, loopback);
+	for (unsigned i = 0; i != 3; ++i)
+		cluster.options[i].listen = {loopback, ports[i]};
+	cluster.start(0);
+	cluster.start(1);
+	CHECK(co_await cluster.commit("without three", {0, 1}, 5s));
+	const auto lookups = dns[0]->count("three");
+	const auto reconnects = cluster.peers[0]->stats().reconnects;
+	const auto begun = Clock::now();
+	co_await cluster.idle(1200ms);
+	const auto window = ms(Clock::now() - begun);
+	const auto looked = dns[0]->count("three") - lookups;
+	const auto redials = cluster.peers[0]->stats().reconnects - reconnects;
+	std::printf("  down peer: %llu redials, %u lookups in %lld ms (resolve deadline 200 ms)\n",
+				static_cast<unsigned long long>(redials), looked, window);
+	CHECK(looked >= 2 && static_cast<long long>(looked) <= window / 200 + 1);
+	CHECK(redials > looked);
+	CHECK(co_await cluster.stop_all(500ms));
+	for (auto &resolver : dns)
+		resolver->quiesce();
+}
+
+// N6: the constructor takes addresses for exactly the other voters.
+asio::awaitable<void> membership(asio::io_context &io, const Certificates &certificates) {
+	Cluster cluster(io, certificates);
+	cluster.name_peers({free_port(io, loopback), free_port(io, loopback), free_port(io, loopback)});
+	cluster.options[0].listen = {loopback, 0};
+	const auto rejects = [&](std::map<NodeId, PeerAddress> addresses) {
+		auto options = cluster.options[0];
+		options.addresses = std::move(addresses);
+		PeerConfiguration configuration{fixed(1), limits(), {}, {}, {}, {}};
+		try {
+			Peers<Node> peers(io.get_executor(), cluster.nodes[0], configuration, options);
+		} catch (const std::invalid_argument &) {
+			return true;
+		}
+		return false;
+	};
+	const PeerAddress somewhere{"two", 1};
+	CHECK(!rejects({{2, somewhere}, {3, somewhere}}));
+	CHECK(rejects({{2, somewhere}, {4, somewhere}}));             // a non-voter for a voter
+	CHECK(rejects({{2, somewhere}, {3, somewhere}, {4, somewhere}})); // a non-voter besides
+	CHECK(rejects({{1, somewhere}, {2, somewhere}}));             // itself for a voter
+	CHECK(rejects({{1, somewhere}, {2, somewhere}, {3, somewhere}}));
+	co_return;
+}
+
 // Whether a connect to `endpoint` neither completes nor fails within 300 ms.
 bool hangs(Tcp::endpoint endpoint) {
 	asio::io_context probe;
@@ -687,10 +810,18 @@ asio::awaitable<void> several_addresses(asio::io_context &io, const Certificates
 	CHECK(co_await cluster.commit("two of three", {0, 1}, 5s));
 	full.reset();
 
-	// "two" now answers both loopback addresses; voter two restarts and is redialed.
+	// "two" now answers both loopback addresses; voter two restarts and is redialed, and the
+	// lookup behind the redial (past the lookup spacing) caches the new set.
 	dns->set("two", FakeDns::Mode::Answer, {loopback, other});
+	co_await cluster.idle(250ms);
+	const auto lookups = dns->count("two");
 	cluster.restart(1);
-	CHECK(co_await cluster.until([&] { return cluster.connections(1) == 2; }, 4s));
+	CHECK(co_await cluster.until(
+		[&] {
+			return cluster.connections(1) == 2 && dns->count("two") > lookups &&
+				   cluster.peers[0]->occupancy().lookups == 0;
+		},
+		4s));
 	// An outage, and voter two moves to the set's other address.
 	dns->set("two", FakeDns::Mode::Empty);
 	cluster.stop(1);
@@ -722,6 +853,8 @@ int main(int argc, char **argv) {
 		{"names-and-moves", names_and_moves}, {"system-localhost", system_localhost},
 		{"hung-resolver", hung_resolver},     {"outage", outage},
 		{"wrong-node", wrong_node},           {"several-addresses", several_addresses},
+		{"refused-first", refused_first},     {"slow-resolver", slow_resolver},
+		{"lookup-spacing", lookup_spacing},   {"membership", membership},
 	};
 	for (const auto &[name, scenario] : scenarios)
 		if (only.empty() || only == name)

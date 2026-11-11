@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Seeds one fault into a copy of the transport headers, rebuilds the peers test against it
 # and runs it: exits 0 when the test catches the fault (fails or hangs), 1 when it passes.
-#   test/transport/dns_mutants.sh BUILD_DIR no-deadline|shared-thread
+#   test/transport/dns_mutants.sh BUILD_DIR no-deadline|shared-thread|no-skip|wait-cached|lookup-per-dial
 # BUILD_DIR is a configured Ninja build of this repository with the peers test built.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -16,6 +16,15 @@ shared-thread) # every lookup queues on one shared resolver thread, as asio's as
 	file=resolve.h
 	edits=($'#include <thread>\n\t#include <thread>\n#include <asio/post.hpp>\n#include <asio/thread_pool.hpp>\n'
 		$'std::thread(std::move(work)).detach();\tstatic asio::thread_pool shared(1); asio::post(shared, std::move(work));') ;;
+no-skip) # a dial refused by the pin does not move the next dial past that address (N1)
+	file=peers.h
+	edits=($'skip_past(peer, dialed->endpoint);\t(void)0;') ;;
+wait-cached) # a dial of a cached name waits for its lookup (N3)
+	file=peers.h
+	edits=($'if (!route.endpoints.empty() || !route.lookup)\tif (!route.lookup)') ;;
+lookup-per-dial) # every dial starts a lookup, however recent the last (N4)
+	file=peers.h
+	edits=($'if (!route.lookup && route.answer_by <= now) {\tif (!route.lookup) {') ;;
 *) echo "unknown mutant: $name" >&2; exit 2 ;;
 esac
 work="$build/dns-mutants/$name"

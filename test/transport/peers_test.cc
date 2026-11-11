@@ -601,8 +601,15 @@ asio::awaitable<void> outage(asio::io_context &io, const Certificates &certifica
 		admitted[i] = cluster.peers[i]->stats().admitted;
 	CHECK(co_await cluster.commit("during outage", {0, 1, 2}, 5s));
 	co_await cluster.idle(500ms);
+	bool steady = true;
 	for (unsigned i = 0; i != 3; ++i)
-		CHECK(cluster.connections(i) == 4 && cluster.peers[i]->stats().admitted == admitted[i]);
+		steady = steady && cluster.connections(i) == 4 && cluster.peers[i]->stats().admitted == admitted[i];
+	if (!steady) {
+		std::fprintf(stderr, "  admitted before the outage: %llu %llu %llu\n", (unsigned long long)admitted[0],
+					 (unsigned long long)admitted[1], (unsigned long long)admitted[2]);
+		cluster.report();
+	}
+	CHECK(steady);
 
 	// Voter three restarts: one and two redial it through a hung lookup, at the cached address.
 	cluster.restart(2);

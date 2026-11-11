@@ -7,7 +7,6 @@
 #include "consensus/transport/profile.h"
 
 #include <array>
-#include <completion/posix.h>
 #include <condition_variable>
 #include <csignal>
 #include <cstdio>
@@ -15,9 +14,9 @@
 #include <filesystem>
 #include <functional>
 #include <journal/journal.h>
+#include <journal/memory_io.h>
 #include <openssl/pem.h>
 #include <openssl/x509v3.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 using namespace kronuz::consensus;
@@ -192,14 +191,15 @@ FixedConfiguration fixed(NodeId local) {
 	return result;
 }
 
-// The transport's host: a Worker over posix storage and its snapshot channel.
+// The transport's host: a Worker over in-memory storage and its snapshot channel.
 struct Node {
-	kronuz::journal::PosixIO io;
+	kronuz::journal::testing::Disk disk;
+	kronuz::journal::testing::MemoryIO io{disk};
 	Worker worker_;
 	SnapshotChannel channel_;
 	std::vector<std::string> commands;
-	Node(const std::filesystem::path &path, NodeId local)
-		: io(path),
+	explicit Node(NodeId local)
+		: 
 		  worker_(io, fixed(local), {{512 * 1024, 4096}, {16 * 1024, 3}, {128 * 1024, 4}, 8, 3}, limits(), compact,
 				  {4, 1, false, false}),
 		  channel_(worker_) {}
@@ -245,7 +245,6 @@ std::uint16_t shared_port(asio::io_context &io, asio::ip::address a, asio::ip::a
 struct Cluster {
 	asio::io_context &io;
 	const Certificates &certificates;
-	std::filesystem::path directory;
 	std::array<std::shared_ptr<Node>, 3> nodes;
 	std::array<std::shared_ptr<Peers<Node>>, 3> peers;
 	std::array<PeerOptions, 3> options;
@@ -254,16 +253,9 @@ struct Cluster {
 	Clock::time_point origin = Clock::now();
 	RequestId request = 0;
 
-	Cluster(asio::io_context &context, const Certificates &certs, const std::string &name)
-		: io(context), certificates(certs),
-		  directory(std::filesystem::current_path() / ".scratch" /
-					("peers-dns-" + name + "-" + std::to_string(::getpid()))) {
-		std::filesystem::remove_all(directory);
+	Cluster(asio::io_context &context, const Certificates &certs) : io(context), certificates(certs) {
 		for (unsigned i = 0; i != 3; ++i) {
-			auto path = directory / names[i];
-			std::filesystem::create_directories(path);
-			CHECK(::chmod(path.c_str(), 0700) == 0);
-			nodes[i] = std::make_shared<Node>(path, i + 1);
+			nodes[i] = std::make_shared<Node>(i + 1);
 			Identity identity{};
 			identity[0] = static_cast<char>('a' + i);
 			nodes[i]->worker().create(identity);
@@ -277,12 +269,6 @@ struct Cluster {
 			options[i].resolve_deadline = 200ms;
 			options[i].stagger = 100ms;
 		}
-	}
-	~Cluster() {
-		peers = {};
-		retired.clear();
-		nodes = {};
-		std::filesystem::remove_all(directory);
 	}
 	void name_peers(const std::array<std::uint16_t, 3> &ports, const std::array<std::string, 3> &hosts = names) {
 		for (unsigned i = 0; i != 3; ++i) {
@@ -348,10 +334,31 @@ struct Cluster {
 			timer.expires_after(1ms);
 			co_await timer.async_wait(asio::use_awaitable);
 		}
+		if (verbose)
+			report();
 		co_return false;
 	}
+	bool verbose = true;
+	// Each voter's state, printed when a wait times out.
+	void report() const {
+		for (unsigned i = 0; i != 3; ++i) {
+			const auto &worker = nodes[i]->worker_;
+			std::fprintf(stderr, "  voter %u: role %d term %llu committed %llu commands %zu", i + 1,
+						 static_cast<int>(worker.role()), static_cast<unsigned long long>(worker.term()),
+						 static_cast<unsigned long long>(worker.committed()), nodes[i]->commands.size());
+			if (running[i]) {
+				const auto &stats = peers[i]->stats();
+				std::fprintf(stderr, " connections %zu admitted %llu rejected %llu reconnects %llu lookups %llu", connections(i),
+							 static_cast<unsigned long long>(stats.admitted), static_cast<unsigned long long>(stats.rejected),
+							 static_cast<unsigned long long>(stats.reconnects), static_cast<unsigned long long>(stats.lookups));
+			}
+			std::fprintf(stderr, "\n");
+		}
+	}
 	asio::awaitable<void> idle(Clock::duration duration) {
+		verbose = false;
 		(void)co_await until([] { return false; }, duration);
+		verbose = true;
 	}
 	std::optional<unsigned> leader() const {
 		for (unsigned i = 0; i != 3; ++i)
@@ -382,8 +389,13 @@ struct Cluster {
 			},
 			limit);
 	}
-	// A voter's connections: two lanes per connected peer.
-	std::size_t connections(unsigned i) const { return running[i] ? peers[i]->occupancy().connections : 0; }
+	// A voter's authenticated connections: two lanes per connected peer.
+	std::size_t connections(unsigned i) const {
+		if (!running[i])
+			return 0;
+		const auto occupancy = peers[i]->occupancy();
+		return occupancy.connections - occupancy.handshakes;
+	}
 	asio::awaitable<bool> stop_all(Clock::duration limit) {
 		for (unsigned i = 0; i != 3; ++i)
 			if (running[i])
@@ -427,7 +439,7 @@ std::array<std::shared_ptr<FakeDns>, 3> answering(Cluster &cluster, asio::ip::ad
 // A1: voters named by host find each other through the resolver and serve; a voter whose
 // name moves to another address is redialed there.
 asio::awaitable<void> names_and_moves(asio::io_context &io, const Certificates &certificates) {
-	Cluster cluster(io, certificates, "move");
+	Cluster cluster(io, certificates);
 	const auto other = alternate_loopback(io);
 	const std::array<std::uint16_t, 3> ports{free_port(io, loopback), shared_port(io, loopback, other),
 											 free_port(io, loopback)};
@@ -459,7 +471,7 @@ asio::awaitable<void> names_and_moves(asio::io_context &io, const Certificates &
 
 // A1 over the system resolver: every voter is "localhost".
 asio::awaitable<void> system_localhost(asio::io_context &io, const Certificates &certificates) {
-	Cluster cluster(io, certificates, "localhost");
+	Cluster cluster(io, certificates);
 	const std::array<std::uint16_t, 3> ports{free_port(io, loopback), free_port(io, loopback),
 											 free_port(io, loopback)};
 	cluster.name_peers(ports, {"localhost", "localhost", "localhost"});
@@ -477,7 +489,7 @@ asio::awaitable<void> system_localhost(asio::io_context &io, const Certificates 
 // quorum and pays one parked lookup however often it redials, a hung lookup of a cached
 // name redials the cached address within the resolve deadline, and stop() returns at once.
 asio::awaitable<void> hung_resolver(asio::io_context &io, const Certificates &certificates) {
-	Cluster cluster(io, certificates, "hung");
+	Cluster cluster(io, certificates);
 	const std::array<std::uint16_t, 3> ports{free_port(io, loopback), free_port(io, loopback),
 											 free_port(io, loopback)};
 	cluster.name_peers(ports);
@@ -485,12 +497,15 @@ asio::awaitable<void> hung_resolver(asio::io_context &io, const Certificates &ce
 	for (unsigned i = 0; i != 3; ++i)
 		cluster.options[i].listen = {loopback, ports[i]};
 	dns[0]->set("two", FakeDns::Mode::Hang);
-	for (unsigned i = 0; i != 3; ++i)
-		cluster.start(i);
-	const auto started = Clock::now();
-	CHECK(co_await cluster.until([&] { return cluster.connections(0) == 2 && cluster.connections(2) == 4; }, 3s));
-	std::printf("  with a hung lookup, the other peers connected in %lld ms\n", ms(Clock::now() - started));
+	// One and three form quorum first, so that the leader reaches both (it is not two).
+	cluster.start(0);
+	cluster.start(2);
 	CHECK(co_await cluster.commit("quorum", {0, 2}, 5s));
+	cluster.start(1);
+	const auto started = Clock::now();
+	CHECK(co_await cluster.until([&] { return cluster.connections(1) == 2 && cluster.connections(2) == 4; }, 3s));
+	std::printf("  with a hung lookup, the other peers connected in %lld ms\n", ms(Clock::now() - started));
+	CHECK(cluster.connections(0) == 2);
 	co_await cluster.idle(1s);
 	CHECK(cluster.peers[0]->stats().reconnects >= 4);
 	CHECK(dns[0]->count("two") == 1 && cluster.peers[0]->occupancy().lookups == 1);
@@ -508,7 +523,7 @@ asio::awaitable<void> hung_resolver(asio::io_context &io, const Certificates &ce
 	CHECK(co_await cluster.commit("still quorum", {0, 2}, 5s));
 
 	const auto stopping = Clock::now();
-	CHECK(co_await cluster.stop_all(500ms));
+	CHECK(co_await cluster.stop_all(100ms));
 	std::printf("  stop() with two hung lookups drained in %lld ms\n", ms(Clock::now() - stopping));
 	for (auto &resolver : dns)
 		resolver->quiesce();
@@ -518,7 +533,7 @@ asio::awaitable<void> hung_resolver(asio::io_context &io, const Certificates &ce
 // others form quorum. Once the cluster formed, every lookup fails (NXDOMAIN, SERVFAIL,
 // timeout): connections stay, and a restarted voter is redialed at its cached address.
 asio::awaitable<void> outage(asio::io_context &io, const Certificates &certificates) {
-	Cluster cluster(io, certificates, "outage");
+	Cluster cluster(io, certificates);
 	const std::array<std::uint16_t, 3> ports{free_port(io, loopback), free_port(io, loopback),
 											 free_port(io, loopback)};
 	cluster.name_peers(ports);
@@ -526,10 +541,11 @@ asio::awaitable<void> outage(asio::io_context &io, const Certificates &certifica
 	for (unsigned i = 0; i != 3; ++i)
 		cluster.options[i].listen = {loopback, ports[i]};
 	dns[0]->set("two", FakeDns::Mode::Empty);
-	for (unsigned i = 0; i != 3; ++i)
-		cluster.start(i);
 	const auto started = Clock::now();
-	CHECK(co_await cluster.commit("without two's name", {0, 1, 2}, 5s));
+	cluster.start(0);
+	cluster.start(2);
+	CHECK(co_await cluster.commit("without two's name", {0, 2}, 5s));
+	cluster.start(1);
 	co_await cluster.idle(1s);
 	const auto elapsed = ms(Clock::now() - started);
 	const auto attempts = dns[0]->count("two");
@@ -563,9 +579,12 @@ asio::awaitable<void> outage(asio::io_context &io, const Certificates &certifica
 	std::printf("  outage: restarted voter redialed at its cached address in %lld ms\n",
 				ms(Clock::now() - bounced));
 	// Voter two restarts: voter one's lookup of "two" throws, and it dials the cached address.
+	// The new Peers of voter two has no cache, so it cannot dial "three" until DNS returns.
 	cluster.restart(1);
-	CHECK(co_await cluster.until([&] { return cluster.connections(0) == 4; }, 5s));
-	CHECK(co_await cluster.commit("after outage", {0, 1, 2}, 5s));
+	CHECK(co_await cluster.until([&] { return cluster.connections(1) == 2; }, 5s));
+	CHECK(co_await cluster.commit("after outage", {0, 2}, 5s));
+	co_await cluster.idle(500ms);
+	CHECK(cluster.connections(0) == 4 && cluster.connections(1) == 2);
 	CHECK(co_await cluster.stop_all(500ms));
 	for (auto &resolver : dns)
 		resolver->quiesce();
@@ -575,7 +594,7 @@ asio::awaitable<void> outage(asio::io_context &io, const Certificates &certifica
 // The certificate pin refuses that dial at the handshake, voter three admits nothing from
 // it, and voter one retries until the name is right.
 asio::awaitable<void> wrong_node(asio::io_context &io, const Certificates &certificates) {
-	Cluster cluster(io, certificates, "wrong");
+	Cluster cluster(io, certificates);
 	const auto other = alternate_loopback(io);
 	const auto shared = shared_port(io, loopback, other);
 	const std::array<std::uint16_t, 3> ports{free_port(io, loopback), shared, shared};
@@ -587,9 +606,10 @@ asio::awaitable<void> wrong_node(asio::io_context &io, const Certificates &certi
 	cluster.options[0].listen = {loopback, ports[0]};
 	cluster.options[1].listen = {loopback, shared};
 	cluster.options[2].listen = {other, shared};
-	for (unsigned i = 0; i != 3; ++i)
-		cluster.start(i);
+	cluster.start(0);
+	cluster.start(2);
 	CHECK(co_await cluster.commit("despite a wrong name", {0, 2}, 5s));
+	cluster.start(1);
 	co_await cluster.idle(1s);
 	CHECK(cluster.connections(0) == 2 && cluster.connections(1) == 2 && cluster.connections(2) == 4);
 	CHECK(cluster.peers[0]->stats().reconnects >= 4 && cluster.peers[0]->stats().rejected >= 4);
@@ -630,7 +650,7 @@ asio::awaitable<void> several_addresses(asio::io_context &io, const Certificates
 		CHECK(ordered[i].address().to_string() == expected[i] && ordered[i].port() == 7);
 	CHECK(interleave({}, 7).empty());
 
-	Cluster cluster(io, certificates, "stagger");
+	Cluster cluster(io, certificates);
 	const auto other = alternate_loopback(io);
 	const auto port = shared_port(io, loopback, other);
 	// The black hole: TEST-NET-1 where this host routes it into the void, else `other` with

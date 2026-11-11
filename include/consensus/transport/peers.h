@@ -288,6 +288,8 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 		}
 	}
 	asio::awaitable<void> pause(std::chrono::milliseconds duration) {
+		if (stopping_)
+			co_return;  // stop() cancels only the timers that exist when it runs
 		auto timer = std::make_shared<asio::steady_timer>(executor_, duration);
 		const auto id = ++retry_id_;
 		retries_.emplace(id, timer);

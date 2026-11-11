@@ -588,6 +588,19 @@ asio::awaitable<void> outage(asio::io_context &io, const Certificates &certifica
 	CHECK(attempts >= 4 && attempts <= 2 * (elapsed / 100 + 1));
 	CHECK(cluster.connections(0) == 2 && cluster.peers[0]->stats().lookup_failures + 1 >= attempts);
 	dns[0]->set("two", FakeDns::Mode::Answer);
+	{
+		// PROBE (temporary): voters one and three when voter two first holds four.
+		CHECK(co_await cluster.until([&] { return cluster.connections(1) == 4; }, 3s));
+		const auto first = Clock::now();
+		std::fprintf(stderr, "PROBE at voter two 4: connections %zu %zu %zu admitted %llu %llu %llu\n",
+					 cluster.connections(0), cluster.connections(1), cluster.connections(2),
+					 (unsigned long long)cluster.peers[0]->stats().admitted,
+					 (unsigned long long)cluster.peers[1]->stats().admitted,
+					 (unsigned long long)cluster.peers[2]->stats().admitted);
+		CHECK(co_await cluster.until([&] { return cluster.connections(0) == 4 && cluster.connections(2) == 4; }, 3s));
+		std::fprintf(stderr, "PROBE all four after %lld ms\n", ms(Clock::now() - first));
+		std::abort();
+	}
 	// A lane counts on each end as its own handshake completes, so wait for every voter.
 	CHECK(co_await cluster.until(
 		[&] { return cluster.connections(0) == 4 && cluster.connections(1) == 4 && cluster.connections(2) == 4; },

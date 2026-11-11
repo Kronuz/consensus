@@ -475,6 +475,32 @@ asio::awaitable<void> names_and_moves(asio::io_context &io, const Certificates &
 		resolver->quiesce();
 }
 
+// A voter listening on `::` serves an IPv4 peer and an IPv6 peer from one socket: voter one
+// dials voter three at 127.0.0.1 and voter two dials it at ::1.
+asio::awaitable<void> dual_stack(asio::io_context &io, const Certificates &certificates) {
+	const auto v6 = asio::ip::make_address("::1");
+	if (!bindable(io, {v6, 0})) {
+		std::printf("dual-stack: skipped, no ::1\n");
+		co_return;
+	}
+	Cluster cluster(io, certificates);
+	const std::array<std::uint16_t, 3> ports{free_port(io, loopback), free_port(io, loopback),
+											 free_port(io, asio::ip::address_v6::any())};
+	cluster.name_peers(ports);
+	auto dns = answering(cluster, loopback);
+	dns[1]->set("three", FakeDns::Mode::Answer, {v6});
+	cluster.options[0].listen = {loopback, ports[0]};
+	cluster.options[1].listen = {loopback, ports[1]};
+	cluster.options[2].listen = {asio::ip::address_v6::any(), ports[2]};
+	for (unsigned i = 0; i != 3; ++i)
+		cluster.start(i);
+	CHECK(co_await cluster.commit("dual stack", {0, 1, 2}, 5s));
+	CHECK(cluster.connections(0) == 4 && cluster.connections(1) == 4 && cluster.connections(2) == 4);
+	CHECK(co_await cluster.stop_all(2s));
+	for (auto &resolver : dns)
+		resolver->quiesce();
+}
+
 // A1 over the system resolver: every voter is "localhost".
 asio::awaitable<void> system_localhost(asio::io_context &io, const Certificates &certificates) {
 	Cluster cluster(io, certificates);
@@ -855,6 +881,7 @@ int main(int argc, char **argv) {
 		{"wrong-node", wrong_node},           {"several-addresses", several_addresses},
 		{"refused-first", refused_first},     {"slow-resolver", slow_resolver},
 		{"lookup-spacing", lookup_spacing},   {"membership", membership},
+		{"dual-stack", dual_stack},
 	};
 	for (const auto &[name, scenario] : scenarios)
 		if (only.empty() || only == name)

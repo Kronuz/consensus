@@ -10,6 +10,9 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 
 ### Changed
 
+- A `Peers` whose `PeerOptions::listen` is `::` opens its acceptor with `v6_only` off, so one
+  socket serves IPv4 and IPv6 peers on every OS, FreeBSD's v6-only default included. Other listen
+  addresses bind as before.
 - `PeerOptions::addresses` maps each peer to a `PeerAddress{host, port}`: an IP literal, or a
   host name looked up on a lookup thread of its own (`resolve.h`). A dial of a cached name goes
   to the cached addresses at once while a lookup refreshes them; only a name with none waits, up

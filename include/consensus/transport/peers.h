@@ -100,6 +100,9 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 		prototype_.epoch = configuration_.epoch;
 		prototype_.profile = configuration_.profile;
 		acceptor_.open(options_.listen.protocol());
+		// `::` serves IPv4 too, whatever the OS default (FreeBSD is v6-only).
+		if (options_.listen.address() == asio::ip::address_v6::any())
+			acceptor_.set_option(asio::ip::v6_only(false));
 		acceptor_.set_option(asio::socket_base::reuse_address(true));
 		acceptor_.bind(options_.listen);
 		acceptor_.listen();

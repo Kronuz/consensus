@@ -402,6 +402,12 @@ struct Cluster {
 		const auto occupancy = peers[i]->occupancy();
 		return occupancy.connections - occupancy.handshakes;
 	}
+	// Every voter's two lanes to each peer; a lane counts on each end as that end's handshake
+	// completes, so a voter holding four does not mean the others do.
+	asio::awaitable<bool> fully_connected(Clock::duration limit) {
+		co_return co_await until(
+			[&] { return connections(0) == 4 && connections(1) == 4 && connections(2) == 4; }, limit);
+	}
 	asio::awaitable<bool> stop_all(Clock::duration limit) {
 		for (unsigned i = 0; i != 3; ++i)
 			if (running[i])
@@ -456,7 +462,7 @@ asio::awaitable<void> names_and_moves(asio::io_context &io, const Certificates &
 	for (unsigned i = 0; i != 3; ++i)
 		cluster.start(i);
 	CHECK(co_await cluster.commit("named", {0, 1, 2}, 5s));
-	CHECK(cluster.connections(0) == 4 && cluster.connections(1) == 4 && cluster.connections(2) == 4);
+	CHECK(co_await cluster.fully_connected(3s));
 	CHECK(dns[0]->count("two") >= 1 && dns[0]->count("three") >= 1 && dns[1]->count("three") >= 1);
 	CHECK(dns[1]->count("one") == 0 && dns[2]->count("one") == 0); // the lower id dials
 
@@ -495,7 +501,7 @@ asio::awaitable<void> dual_stack(asio::io_context &io, const Certificates &certi
 	for (unsigned i = 0; i != 3; ++i)
 		cluster.start(i);
 	CHECK(co_await cluster.commit("dual stack", {0, 1, 2}, 5s));
-	CHECK(cluster.connections(0) == 4 && cluster.connections(1) == 4 && cluster.connections(2) == 4);
+	CHECK(co_await cluster.fully_connected(3s));
 	CHECK(co_await cluster.stop_all(2s));
 	for (auto &resolver : dns)
 		resolver->quiesce();
@@ -512,7 +518,7 @@ asio::awaitable<void> system_localhost(asio::io_context &io, const Certificates 
 	for (unsigned i = 0; i != 3; ++i)
 		cluster.start(i);
 	CHECK(co_await cluster.commit("localhost", {0, 1, 2}, 5s));
-	CHECK(cluster.connections(0) == 4 && cluster.connections(1) == 4 && cluster.connections(2) == 4);
+	CHECK(co_await cluster.fully_connected(3s));
 	CHECK(cluster.peers[0]->stats().lookups >= 1 && cluster.peers[1]->stats().lookups >= 1);
 	CHECK(co_await cluster.stop_all(2s));
 }
@@ -588,10 +594,7 @@ asio::awaitable<void> outage(asio::io_context &io, const Certificates &certifica
 	CHECK(attempts >= 4 && attempts <= 2 * (elapsed / 100 + 1));
 	CHECK(cluster.connections(0) == 2 && cluster.peers[0]->stats().lookup_failures + 1 >= attempts);
 	dns[0]->set("two", FakeDns::Mode::Answer);
-	// A lane counts on each end as its own handshake completes, so wait for every voter.
-	CHECK(co_await cluster.until(
-		[&] { return cluster.connections(0) == 4 && cluster.connections(1) == 4 && cluster.connections(2) == 4; },
-		3s));
+	CHECK(co_await cluster.fully_connected(3s));
 
 	// The outage: NXDOMAIN, SERVFAIL and timeouts for every name, on every voter.
 	for (auto &resolver : dns) {

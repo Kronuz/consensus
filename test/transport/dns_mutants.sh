@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Seeds one fault into a copy of the transport headers, rebuilds the peers test against it
 # and runs it: exits 0 when the test catches the fault (fails or hangs), 1 when it passes.
-#   test/transport/dns_mutants.sh BUILD_DIR no-deadline|shared-thread|no-skip|wait-cached|lookup-per-dial
+#   test/transport/dns_mutants.sh BUILD_DIR no-deadline|shared-thread|no-skip|wait-cached|lookup-per-dial|v6-only
 # BUILD_DIR is a configured Ninja build of this repository with the peers test built.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -25,6 +25,9 @@ wait-cached) # a dial of a cached name waits for its lookup (N3)
 lookup-per-dial) # every dial starts a lookup, however recent the last (N4)
 	file=peers.h
 	edits=($'if (!route.lookup && route.answer_by <= now) {\tif (!route.lookup) {') ;;
+v6-only) # the acceptor on :: is v6-only, as on FreeBSD by default (D63)
+	file=peers.h
+	edits=($'asio::ip::v6_only(false)\tasio::ip::v6_only(true)') ;;
 *) echo "unknown mutant: $name" >&2; exit 2 ;;
 esac
 work="$build/dns-mutants/$name"

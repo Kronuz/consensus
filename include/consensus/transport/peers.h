@@ -1,6 +1,7 @@
 #pragma once
 #include "codec.h"
 #include "hello.h"
+#include "resolve.h"
 #include "consensus/snapshot_channel.h"
 #include "consensus/worker.h"
 #include "rpc_observation.h"
@@ -27,7 +28,8 @@ concept PeerHost = requires(Host& host) {
 struct PeerOptions {
 	reactor::tls::Options tls;
 	asio::ip::tcp::endpoint listen;
-	std::map<kronuz::consensus::NodeId, asio::ip::tcp::endpoint> addresses;
+	// Each peer by host name or IP literal; a dial resolves a name first (resolve.h).
+	std::map<kronuz::consensus::NodeId, PeerAddress> addresses;
 	std::map<kronuz::consensus::NodeId, Fingerprint> pins;
 	std::size_t incoming_bytes = 16 * 1024 * 1024, outgoing_bytes = 16 * 1024 * 1024;
 	std::size_t queued_messages = 4, handshakes = 2;
@@ -35,10 +37,16 @@ struct PeerOptions {
 	// a pipeline of frames and a window of bytes, and every control frame goes first.
 	std::size_t pipeline_frames = 4, window_bytes = 4 * 1024 * 1024;
 	std::chrono::milliseconds deadline{5000};
+	// A dial waits up to resolve_deadline for a lookup, then dials the last addresses that
+	// resolved; it starts each further address a stagger after the one before (RFC 8305).
+	std::chrono::milliseconds resolve_deadline{1000}, stagger{250};
+	PeerResolver resolver = system_resolver;
 };
 struct PeerStats {
 	std::uint64_t admitted = 0, rejected = 0, dropped = 0, reconnects = 0;
 	std::uint64_t received = 0, accepted = 0, maximum_admission_wait_us = 0;
+	// Lookups started, answered with no address, and dials that went ahead without an answer.
+	std::uint64_t lookups = 0, lookup_failures = 0, lookup_timeouts = 0;
 	kronuz::metrics::DurationHistogram<> decoded_to_admitted;
 	AppendTimings append;
 };
@@ -46,6 +54,7 @@ struct PeerOccupancy {
 	std::size_t incoming_bytes = 0, outgoing_bytes = 0;
 	std::size_t incoming_high_water = 0, outgoing_high_water = 0;
 	std::size_t connections = 0, handshakes = 0, queued_control = 0, retained_inputs = 0, queued_data = 0;
+	std::size_t lookups = 0;  // in flight: at most one per peer name
 };
 // All calls and completions run on the authority owner executor. start()/stop()
 // are admission boundaries; retain this object until drained() becomes true.
@@ -60,7 +69,9 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 		  incoming_(std::make_shared<ByteBudget>(options_.incoming_bytes)),
 		  outgoing_(std::make_shared<ByteBudget>(options_.outgoing_bytes)), acceptor_(executor) {
 		if (!node_ || !options_.queued_messages || !options_.handshakes || !options_.pipeline_frames || !options_.window_bytes ||
-			options_.deadline <= std::chrono::milliseconds::zero())
+			options_.deadline <= std::chrono::milliseconds::zero() ||
+			options_.resolve_deadline <= std::chrono::milliseconds::zero() ||
+			options_.stagger <= std::chrono::milliseconds::zero())
 			throw std::invalid_argument("peer bounds");
 		reactor::tls::configure(*context_, options_.tls, reactor::tls::Role::Peer);
 		validate_peer_identity(*context_, configuration_.configuration, options_.pins);
@@ -69,8 +80,18 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 		for (auto voter : configuration_.configuration.voters) {
 			if (voter == configuration_.configuration.local)
 				continue;
-			if (!options_.addresses.contains(voter) || !options_.addresses.at(voter).port())
+			if (!options_.addresses.contains(voter) || !options_.addresses.at(voter).port ||
+				options_.addresses.at(voter).host.empty())
 				throw std::invalid_argument("missing peer address");
+			auto &route = routes_[voter];
+			const auto &address = options_.addresses.at(voter);
+			asio::error_code error;
+			const auto literal = asio::ip::make_address(address.host, error);
+			route.literal = !error;
+			if (route.literal)
+				route.endpoints.emplace_back(literal, address.port);
+			else if (!options_.resolver)
+				throw std::invalid_argument("missing peer resolver");
 		}
 		prototype_.node = configuration_.configuration.local;
 		prototype_.cluster = configuration_.cluster;
@@ -90,7 +111,7 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 		for (const auto &[peer, address] : options_.addresses) {
 			if (prototype_.node < peer)
 				for (auto lane : {Lane::Control, Lane::Bulk})
-					launch(connect(peer, lane, address));
+					launch(connect(peer, lane));
 		}
 	}
 	void stop() noexcept {
@@ -103,7 +124,9 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 			close(connection);
 		for (auto &[id, timer] : retries_)
 			timer->cancel();
+		abandon_lookups();
 	}
+	~Peers() { abandon_lookups(); }
 	bool drained() const noexcept { return tasks_ == 0; }
 	const PeerStats &stats() const noexcept { return stats_; }
 	PeerOccupancy occupancy() const noexcept {
@@ -113,6 +136,8 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 		result.incoming_high_water = incoming_->high_water();
 		result.outgoing_high_water = outgoing_->high_water();
 		result.connections = connections_.size();
+		for (const auto &[peer, route] : routes_)
+			result.lookups += route.lookup != nullptr;
 		for (const auto &connection : connections_) {
 			result.handshakes += !connection->ready && !connection->closing;
 			result.queued_control += connection->queue.size();
@@ -307,22 +332,12 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 		connections_.push_back(connection);
 		return connection;
 	}
-	asio::awaitable<void> connect(kronuz::consensus::NodeId peer, Lane lane,
-								  asio::ip::tcp::endpoint address) {
+	asio::awaitable<void> connect(kronuz::consensus::NodeId peer, Lane lane) {
 		while (!stopping_) {
-			auto socket = std::make_shared<asio::ip::tcp::socket>(executor_);
-			const auto attempt = ++retry_id_;
-			connecting_.emplace(attempt, socket);
-			asio::steady_timer timer(executor_, options_.deadline);
-			asio::error_code error, timeout_error;
-			using namespace asio::experimental::awaitable_operators;
-			auto result =
-				co_await (socket->async_connect(address, asio::redirect_error(asio::use_awaitable, error)) ||
-						  timer.async_wait(asio::redirect_error(asio::use_awaitable, timeout_error)));
-			connecting_.erase(attempt);
+			co_await resolve(peer);
 			if (stopping_)
 				co_return;
-			if (result.index() == 0 && !error) {
+			if (auto socket = co_await dial(routes_.at(peer).endpoints)) {
 				auto connection = make(std::move(*socket), lane);
 				co_await run(connection, false, peer);
 			}
@@ -330,6 +345,110 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 			co_await pause(std::chrono::milliseconds(
 				100 + (peer * 17 + static_cast<unsigned>(lane) * 31 + stats_.reconnects * 13) % 100));
 		}
+	}
+	// Starts a lookup unless one is in flight, and waits for its answer until its deadline.
+	// Without an answer the dial goes to the last addresses that resolved.
+	asio::awaitable<void> resolve(kronuz::consensus::NodeId peer) {
+		auto &route = routes_.at(peer);
+		if (route.literal)
+			co_return;
+		if (!route.lookup) {
+			++stats_.lookups;
+			route.answer_by = std::chrono::steady_clock::now() + options_.resolve_deadline;
+			try {
+				route.lookup = Lookup::start(
+					options_.resolver, options_.addresses.at(peer).host,
+					[executor = executor_, owner = this->weak_from_this(), peer](auto found) {
+						asio::post(executor, [owner, peer, found = std::move(found)]() mutable {
+							if (auto self = owner.lock())
+								self->resolved(peer, std::move(found));
+						});
+					});
+			} catch (const std::system_error &) {
+				++stats_.lookup_failures;
+				co_return;
+			}
+		}
+		if (route.answer_by <= std::chrono::steady_clock::now()) {
+			++stats_.lookup_timeouts;
+			co_return;
+		}
+		auto timer = std::make_shared<asio::steady_timer>(executor_, route.answer_by);
+		route.waiting.push_back(timer);
+		asio::error_code error;
+		co_await timer->async_wait(asio::redirect_error(asio::use_awaitable, error));
+		std::erase(route.waiting, timer);
+		if (!error)
+			++stats_.lookup_timeouts;
+	}
+	// A lookup's answer, on the executor, however late: it replaces the cached addresses
+	// unless empty, and wakes the dials waiting for it.
+	void resolved(kronuz::consensus::NodeId peer, std::vector<asio::ip::address> found) {
+		auto &route = routes_.at(peer);
+		route.lookup.reset();
+		if (found.empty())
+			++stats_.lookup_failures;
+		else
+			route.endpoints = interleave(found, options_.addresses.at(peer).port);
+		for (auto &timer : route.waiting)
+			timer->cancel();
+	}
+	void abandon_lookups() noexcept {
+		for (auto &[peer, route] : routes_) {
+			if (route.lookup)
+				route.lookup->abandon();
+			for (auto &timer : route.waiting)
+				timer->cancel();
+		}
+	}
+	// Dials the addresses in turn, starting the next a stagger after the one before or as
+	// soon as every started attempt failed, all within one deadline; the first to connect wins.
+	asio::awaitable<std::optional<asio::ip::tcp::socket>> dial(std::vector<asio::ip::tcp::endpoint> endpoints) {
+		struct Race {
+			explicit Race(asio::any_io_executor executor) : wake(executor) {}
+			asio::steady_timer wake;
+			std::vector<std::shared_ptr<asio::ip::tcp::socket>> sockets;
+			std::optional<std::size_t> winner;
+			std::size_t pending = 0;
+		};
+		auto race = std::make_shared<Race>(executor_);
+		const auto now = std::chrono::steady_clock::now();
+		const auto deadline = now + options_.deadline;
+		auto next_start = now;
+		while (!stopping_ && !race->winner && std::chrono::steady_clock::now() < deadline) {
+			const auto started = race->sockets.size();
+			if (started < endpoints.size() && (!race->pending || std::chrono::steady_clock::now() >= next_start)) {
+				auto socket = std::make_shared<asio::ip::tcp::socket>(executor_);
+				const auto attempt = ++retry_id_;
+				connecting_.emplace(attempt, socket);
+				race->sockets.push_back(socket);
+				++race->pending;
+				++tasks_;
+				socket->async_connect(endpoints[started], [owner = this->shared_from_this(), race, started,
+															 attempt](asio::error_code error) {
+					--owner->tasks_;
+					--race->pending;
+					owner->connecting_.erase(attempt);
+					if (!error && !race->winner)
+						race->winner = started;
+					race->wake.cancel();
+				});
+				next_start = std::chrono::steady_clock::now() + options_.stagger;
+				continue;
+			}
+			if (!race->pending)
+				break;
+			race->wake.expires_at(started < endpoints.size() ? std::min(next_start, deadline) : deadline);
+			asio::error_code error;
+			co_await race->wake.async_wait(asio::redirect_error(asio::use_awaitable, error));
+		}
+		asio::error_code ignored;
+		for (std::size_t i = 0; i != race->sockets.size(); ++i)
+			if (i != race->winner)
+				race->sockets[i]->close(ignored);
+		if (stopping_ || !race->winner)
+			co_return std::nullopt;
+		co_return std::move(*race->sockets[*race->winner]);
 	}
 	asio::awaitable<void> incoming(std::shared_ptr<Connection> connection) {
 		co_await run(connection, true, 0);
@@ -340,7 +459,12 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 			auto local = prototype_;
 			local.lane = connection->lane;
 			local.connection = fresh_connection_identity();
-			auto remote = co_await connection->session->authenticate(server, local, options_.pins, server);
+			// A dial pins only the peer it dialed: an address that reaches another voter fails
+			// at the handshake, before either end admits a hello.
+			auto pins = server ? options_.pins
+							   : std::map<kronuz::consensus::NodeId, Fingerprint>{
+									 {local.node, options_.pins.at(local.node)}, {expected, options_.pins.at(expected)}};
+			auto remote = co_await connection->session->authenticate(server, local, std::move(pins), server);
 			if (stopping_ || (expected && remote.node != expected) || (server && remote.node >= local.node) ||
 				find(remote.node, remote.lane))
 				throw std::invalid_argument("peer dial ownership or duplicate lane");
@@ -471,6 +595,16 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 	std::vector<std::shared_ptr<Connection>> connections_;
 	std::map<std::uint64_t, std::shared_ptr<asio::steady_timer>> retries_;
 	std::map<std::uint64_t, std::shared_ptr<asio::ip::tcp::socket>> connecting_;
+	// Per peer: its endpoints (the IP literal's, or the last lookup's that answered), and
+	// its lookup in flight with the dials waiting for it.
+	struct Route {
+		std::vector<asio::ip::tcp::endpoint> endpoints;
+		bool literal = false;
+		std::shared_ptr<Lookup> lookup;
+		std::chrono::steady_clock::time_point answer_by;
+		std::vector<std::shared_ptr<asio::steady_timer>> waiting;
+	};
+	std::map<kronuz::consensus::NodeId, Route> routes_;
 	std::size_t tasks_ = 0;
 	std::size_t admission_cursor_ = 0;
 	std::uint64_t retry_id_ = 0;

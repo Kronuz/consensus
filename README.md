@@ -166,6 +166,8 @@ cmake --build build --target consensus_worker_checkpoint_bench
   and funded across checkpoints.
 - [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md): checkpoint and transfer measurements, and the
   qualification log.
+- [docs/mechanisms/peer-dns.md](docs/mechanisms/peer-dns.md): how the transport resolves peer
+  host names without blocking consensus.
 - [AGENTS.md](AGENTS.md): repository map and the rules for changing protocol code.
 - [Catalog entry](https://github.com/Kronuz/cpp-libraries/blob/main/AGENTS.md#consensus):
   include lines, targets, dependencies and key API.

@@ -6,6 +6,24 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#consensus) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-11
+
+### Changed
+
+- `PeerOptions::addresses` maps each peer to a `PeerAddress{host, port}`: an IP literal, or a
+  host name that every dial resolves on a lookup thread of its own (`resolve.h`). A dial waits
+  up to `resolve_deadline` (1 s) for the answer, else dials the last addresses that resolved; a
+  hung resolver parks one thread per name and blocks nothing else. `resolver` (default
+  `system_resolver`, `getaddrinfo`) is injectable. Callers that set endpoints pass
+  `{address.to_string(), port}`.
+- A dial tries every resolved address, IPv6 and IPv4 interleaved, starting the next one
+  `stagger` (250 ms) after the one before (RFC 8305); the first to connect wins.
+- A dial pins only the peer it dialed, so an address that reaches another voter is refused at
+  the handshake before either end admits a hello.
+- `PeerStats` counts `lookups`, `lookup_failures` and `lookup_timeouts`;
+  `PeerOccupancy::lookups` counts lookups in flight. See
+  [docs/mechanisms/peer-dns.md](docs/mechanisms/peer-dns.md).
+
 ## 2026-11-02
 
 ### Changed

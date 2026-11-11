@@ -588,7 +588,10 @@ asio::awaitable<void> outage(asio::io_context &io, const Certificates &certifica
 	CHECK(attempts >= 4 && attempts <= 2 * (elapsed / 100 + 1));
 	CHECK(cluster.connections(0) == 2 && cluster.peers[0]->stats().lookup_failures + 1 >= attempts);
 	dns[0]->set("two", FakeDns::Mode::Answer);
-	CHECK(co_await cluster.until([&] { return cluster.connections(1) == 4; }, 3s));
+	// A lane counts on each end as its own handshake completes, so wait for every voter.
+	CHECK(co_await cluster.until(
+		[&] { return cluster.connections(0) == 4 && cluster.connections(1) == 4 && cluster.connections(2) == 4; },
+		3s));
 
 	// The outage: NXDOMAIN, SERVFAIL and timeouts for every name, on every voter.
 	for (auto &resolver : dns) {

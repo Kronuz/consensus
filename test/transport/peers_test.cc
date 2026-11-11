@@ -876,12 +876,12 @@ int main(int argc, char **argv) {
 		~Cleanup() { std::filesystem::remove_all(path); }
 	} cleanup{certificates.directory};
 	const std::pair<const char *, Scenario> scenarios[] = {
+		{"dual-stack", dual_stack},
 		{"names-and-moves", names_and_moves}, {"system-localhost", system_localhost},
 		{"hung-resolver", hung_resolver},     {"outage", outage},
 		{"wrong-node", wrong_node},           {"several-addresses", several_addresses},
 		{"refused-first", refused_first},     {"slow-resolver", slow_resolver},
 		{"lookup-spacing", lookup_spacing},   {"membership", membership},
-		{"dual-stack", dual_stack},
 	};
 	for (const auto &[name, scenario] : scenarios)
 		if (only.empty() || only == name)

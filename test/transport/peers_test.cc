@@ -1210,7 +1210,7 @@ asio::awaitable<void> fetch_failures(asio::io_context &io, const Certificates &c
 	CHECK(co_await cluster.stop_all(2s));
 }
 
-// F4: voter two hangs for good as its reply starts, and voter one allows one fetch per peer.
+// F4: voter two hangs for good, and voter one allows one fetch per peer.
 // The fetch fails at its deadline and holds the slot; a deadline later voter one closes the
 // bulk lane, so the next fetch fails with not_connected rather than being refused for as long
 // as the lane stays open. A local stop() fails a fetch it leaves pending. Once voter two
@@ -1220,13 +1220,6 @@ asio::awaitable<void> fetch_hung_peer(asio::io_context &io, const Certificates &
 	cluster.aside = 1;
 	auto files = serving(cluster, io);
 	(*files[1])["history/table"] = pattern(1024 * 1024, 30);
-	bool freeze = false;
-	cluster.options[1].reader = reader(files[1], [&](std::string_view) {
-		if (std::exchange(freeze, false)) {
-			cluster.frozen = true;
-			cluster.side.stop();
-		}
-	});
 	cluster.options[0].fetches = 1;
 	cluster.options[0].fetch_deadline = 300ms;
 	for (unsigned i = 0; i != 3; ++i)
@@ -1234,7 +1227,9 @@ asio::awaitable<void> fetch_hung_peer(asio::io_context &io, const Certificates &
 	CHECK(co_await cluster.commit("before", {0, 1, 2}, 5s));
 	CHECK(co_await cluster.fully_connected(3s));
 
-	freeze = true;
+	// Voter two hangs before the request reaches it, so no part of a reply is on the wire (a
+	// partial frame would meet the frame deadline instead).
+	cluster.frozen = true;
 	auto stalled = fetch(cluster, 0, 2, "history/table");
 	CHECK(co_await cluster.until([&] { return stalled->done; }, 2s));
 	CHECK(cluster.frozen && stalled->error == std::errc::timed_out);

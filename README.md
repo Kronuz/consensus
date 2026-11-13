@@ -168,6 +168,8 @@ cmake --build build --target consensus_worker_checkpoint_bench
   qualification log.
 - [docs/mechanisms/peer-dns.md](docs/mechanisms/peer-dns.md): how the transport resolves peer
   host names without blocking consensus.
+- [docs/mechanisms/peer-fetch.md](docs/mechanisms/peer-fetch.md): how a voter fetches a named
+  file from a peer over the bulk lane.
 - [AGENTS.md](AGENTS.md): repository map and the rules for changing protocol code.
 - [Catalog entry](https://github.com/Kronuz/cpp-libraries/blob/main/AGENTS.md#consensus):
   include lines, targets, dependencies and key API.

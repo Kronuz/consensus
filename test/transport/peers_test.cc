@@ -3,7 +3,9 @@
 // through the system resolver, the resolve deadline and the cache, staggered dials over
 // several addresses, the certificate pin refusing a name that reaches the wrong voter and the
 // next dial starting past it, a slow resolver behind the cache, and the spacing of lookups
-// (docs/mechanisms/peer-dns.md). Peers is also instantiated over a minimal host.
+// (docs/mechanisms/peer-dns.md). The fetch lane: exact bytes, not-found and errors between
+// voters, fetches alongside consensus through small budgets, and a peer freezing or closing
+// mid-fetch (docs/mechanisms/peer-fetch.md). Peers is also instantiated over a minimal host.
 #include "consensus/transport/peers.h"
 #include "consensus/transport/profile.h"
 
@@ -247,9 +249,13 @@ std::uint16_t shared_port(asio::io_context &io, asio::ip::address a, asio::ip::a
 }
 
 // Three Workers, each with its Peers. A scenario sets listen endpoints, peer addresses and
-// resolvers, and may stop one voter's Peers and start another for the same Worker.
+// resolvers, and may stop one voter's Peers and start another for the same Worker. A voter
+// `aside` runs on its own context, which `frozen` stops polling, as if its process hung.
 struct Cluster {
 	asio::io_context &io;
+	asio::io_context side;
+	std::optional<unsigned> aside;
+	bool frozen = false;
 	const Certificates &certificates;
 	std::array<std::shared_ptr<Node>, 3> nodes;
 	std::array<std::shared_ptr<Peers<Node>>, 3> peers;
@@ -292,10 +298,12 @@ struct Cluster {
 		configuration.epoch[0] = 'e';
 		configuration.profile =
 			profile_fingerprint("peers-dns", configuration.configuration, configuration.consensus);
-		peers[i] = std::make_shared<Peers<Node>>(io.get_executor(), nodes[i], configuration, options[i]);
+		peers[i] = std::make_shared<Peers<Node>>(executor(i), nodes[i], configuration, options[i]);
 		peers[i]->start();
 		running[i] = true;
 	}
+	asio::io_context &context(unsigned i) { return aside == i ? side : io; }
+	asio::any_io_executor executor(unsigned i) { return context(i).get_executor(); }
 	void stop(unsigned i) {
 		peers[i]->stop();
 		retired.push_back(peers[i]);
@@ -307,7 +315,13 @@ struct Cluster {
 	}
 	void pump() {
 		const auto now = static_cast<std::uint64_t>(ms(Clock::now() - origin));
+		if (!frozen) {
+			side.restart();
+			side.poll();
+		}
 		for (unsigned i = 0; i != 3; ++i) {
+			if (frozen && aside == i)
+				continue;
 			auto &node = *nodes[i];
 			if (running[i])
 				peers[i]->admit();
@@ -368,7 +382,7 @@ struct Cluster {
 	}
 	std::optional<unsigned> leader() const {
 		for (unsigned i = 0; i != 3; ++i)
-			if (nodes[i]->worker().role() == Role::Leader)
+			if (nodes[i]->worker().role() == Role::Leader && !(frozen && aside == i))
 				return i;
 		return std::nullopt;
 	}
@@ -874,6 +888,310 @@ asio::awaitable<void> several_addresses(asio::io_context &io, const Certificates
 	CHECK(co_await cluster.stop_all(500ms));
 	dns->quiesce();
 }
+
+// Deterministic bytes, distinct per seed, so a fetched copy compares exactly.
+std::string pattern(std::size_t size, unsigned seed) {
+	std::string bytes(size, '\0');
+	std::uint64_t state = 0x9e3779b97f4a7c15ull * (seed + 1);
+	for (auto &byte : bytes) {
+		state ^= state << 13;
+		state ^= state >> 7;
+		state ^= state << 17;
+		byte = static_cast<char>(state);
+	}
+	return bytes;
+}
+using Files = std::map<std::string, std::string, std::less<>>;
+// A voter's reader over its files; the name "throws" throws, and `hook` sees every read.
+FetchReader reader(std::shared_ptr<Files> files, std::function<void(std::string_view)> hook = {}) {
+	return [files, hook](std::string_view name) -> std::optional<std::string> {
+		if (hook)
+			hook(name);
+		if (name == "throws")
+			throw std::runtime_error("unreadable");
+		auto found = files->find(name);
+		return found == files->end() ? std::nullopt : std::optional<std::string>(found->second);
+	};
+}
+struct Fetched {
+	bool done = false;
+	std::error_code error;
+	std::optional<std::string> bytes;
+	Clock::time_point asked = Clock::now(), answered;
+};
+// Voter `from` asks `peer` for `name`. The completion must run once, on the voter's executor,
+// and never within fetch().
+std::shared_ptr<Fetched> fetch(Cluster &cluster, unsigned from, NodeId peer, std::string name) {
+	auto result = std::make_shared<Fetched>();
+	auto returned = std::make_shared<bool>(false);
+	cluster.peers[from]->fetch(peer, std::move(name),
+							   [result, returned, executor = cluster.context(from).get_executor()](std::error_code error,
+																					  std::optional<std::string> bytes) {
+								   CHECK(*returned && !result->done && executor.running_in_this_thread());
+								   result->done = true;
+								   result->error = error;
+								   result->bytes = std::move(bytes);
+								   result->answered = Clock::now();
+							   });
+	*returned = true;
+	return result;
+}
+bool all_done(const std::vector<std::shared_ptr<Fetched>> &fetches) {
+	return std::all_of(fetches.begin(), fetches.end(), [](const auto &fetched) { return fetched->done; });
+}
+// Voters at IP literals on loopback, each serving its files.
+std::array<std::shared_ptr<Files>, 3> serving(Cluster &cluster, asio::io_context &io) {
+	const std::array<std::uint16_t, 3> ports{free_port(io, loopback), free_port(io, loopback), free_port(io, loopback)};
+	cluster.name_peers(ports, {"127.0.0.1", "127.0.0.1", "127.0.0.1"});
+	std::array<std::shared_ptr<Files>, 3> files;
+	for (unsigned i = 0; i != 3; ++i) {
+		cluster.options[i].listen = {loopback, ports[i]};
+		files[i] = std::make_shared<Files>();
+		cluster.options[i].reader = reader(files[i]);
+	}
+	return files;
+}
+
+// F1: every voter asks both others, at once, for bytes they hold (larger than a lane frame),
+// a name they lack, an empty file and one their reader cannot read; a fifth fetch past the
+// bound, and one before any bulk lane, fail at once. Completions run on the owner executor.
+asio::awaitable<void> fetch_exact(asio::io_context &io, const Certificates &certificates) {
+	Cluster cluster(io, certificates);
+	auto files = serving(cluster, io);
+	for (unsigned i = 0; i != 3; ++i)
+		*files[i] = {{"history/seal-7", pattern(3 * fetch_chunk_bytes + 5, i)}, {"history/empty", ""}};
+	for (unsigned i = 0; i != 3; ++i)
+		cluster.start(i);
+	auto early = fetch(cluster, 0, 2, "history/seal-7");
+	bool refused = false;
+	try {
+		cluster.peers[0]->fetch(2, "", [](std::error_code, std::optional<std::string>) {});
+	} catch (const std::invalid_argument &) {
+		refused = true;
+	}
+	CHECK(refused && !early->done);
+	CHECK(co_await cluster.until([&] { return early->done; }, 1s));
+	CHECK(early->error == std::errc::not_connected && !early->bytes);
+	CHECK(co_await cluster.commit("serving", {0, 1, 2}, 5s));
+	CHECK(co_await cluster.fully_connected(3s));
+
+	const std::array<std::string, 4> names{"history/seal-7", "history/missing", "history/empty", "throws"};
+	struct Asked {
+		unsigned from;
+		NodeId peer;
+		std::string name;
+		std::shared_ptr<Fetched> result;
+	};
+	std::vector<Asked> asked;
+	std::vector<std::shared_ptr<Fetched>> busy;
+	const auto started = Clock::now();
+	for (unsigned i = 0; i != 3; ++i)
+		for (NodeId peer = 1; peer <= 3; ++peer) {
+			if (peer == i + 1)
+				continue;
+			for (const auto &name : names)
+				asked.push_back({i, peer, name, fetch(cluster, i, peer, name)});
+			busy.push_back(fetch(cluster, i, peer, "history/seal-7"));
+		}
+	std::vector<std::shared_ptr<Fetched>> results;
+	for (const auto &fetched : asked)
+		results.push_back(fetched.result);
+	results.insert(results.end(), busy.begin(), busy.end());
+	CHECK(co_await cluster.until([&] { return all_done(results); }, 3s));
+	std::printf("  %zu concurrent fetches between three voters answered in %lld ms\n", asked.size(),
+				ms(Clock::now() - started));
+	for (const auto &[from, peer, name, result] : asked) {
+		const auto &held = *files[peer - 1];
+		if (name == "throws")
+			CHECK(result->error == std::errc::io_error && !result->bytes);
+		else if (auto found = held.find(name); found != held.end())
+			CHECK(!result->error && result->bytes == found->second);
+		else
+			CHECK(!result->error && !result->bytes);
+	}
+	for (const auto &result : busy)
+		CHECK(result->error == std::errc::resource_unavailable_try_again && !result->bytes);
+	for (unsigned i = 0; i != 3; ++i) {
+		const auto &stats = cluster.peers[i]->stats();
+		const auto occupancy = cluster.peers[i]->occupancy();
+		CHECK(stats.served == 8 && stats.fetched == 6 && stats.fetch_failures == 4 + (i == 0));
+		CHECK(occupancy.fetches == 0 && occupancy.serving == 0 && cluster.connections(i) == 4);
+	}
+	CHECK(co_await cluster.stop_all(2s));
+}
+
+// The append round trips every voter observed since `before`: how many, how many timed out,
+// and the bound of the slowest one's histogram bucket.
+struct RoundTrips {
+	std::uint64_t count = 0, timeouts = 0, slowest_ns = 0;
+};
+using AppendSnapshots = std::array<std::pair<kronuz::metrics::DurationSnapshot, kronuz::metrics::DurationSnapshot>, 3>;
+AppendSnapshots appends(const Cluster &cluster) {
+	AppendSnapshots result;
+	for (unsigned i = 0; i != 3; ++i)
+		result[i] = {cluster.peers[i]->stats().append.response.snapshot(),
+					 cluster.peers[i]->stats().append.timeout.snapshot()};
+	return result;
+}
+RoundTrips since(const Cluster &cluster, const AppendSnapshots &before) {
+	RoundTrips result;
+	const auto now = appends(cluster);
+	for (unsigned i = 0; i != 3; ++i) {
+		result.count += now[i].first.count - before[i].first.count;
+		result.timeouts += now[i].second.count - before[i].second.count;
+		for (std::size_t bucket = 0; bucket != now[i].first.buckets.size(); ++bucket)
+			if (now[i].first.buckets[bucket] != before[i].first.buckets[bucket])
+				result.slowest_ns = std::max(result.slowest_ns, bucket < kronuz::metrics::duration_bounds_ns.size()
+																	? kronuz::metrics::duration_bounds_ns[bucket]
+																	: ~std::uint64_t{0});
+	}
+	return result;
+}
+
+// F2: rounds of four 8 MiB fetches at once, both ways between voters one and three, through 1 MiB
+// byte budgets every lane shares. Consensus keeps committing: no append round trip times out
+// or lands past 64 ms (below the 100 ms election minimum), and the leader keeps its term.
+asio::awaitable<void> fetch_alongside_consensus(asio::io_context &io, const Certificates &certificates) {
+	constexpr std::size_t size = 8 * 1024 * 1024, budget = 1024 * 1024;
+	Cluster cluster(io, certificates);
+	auto files = serving(cluster, io);
+	for (unsigned i = 0; i != 3; ++i) {
+		(*files[i])["history/table"] = pattern(size, 10 + i);
+		cluster.options[i].incoming_bytes = cluster.options[i].outgoing_bytes = budget;
+	}
+	for (unsigned i = 0; i != 3; ++i)
+		cluster.start(i);
+	CHECK(co_await cluster.commit("before", {0, 1, 2}, 5s));
+	CHECK(co_await cluster.fully_connected(3s));
+	co_await cluster.idle(200ms);
+	const auto leader = cluster.leader();
+	CHECK(leader);
+	const auto term = cluster.nodes[*leader]->worker().term();
+
+	// Commits a command every 20 ms while `busy()` holds, at most eight (the log holds 32
+	// entries), then waits out `busy()`; returns the commits and the slowest, in ms.
+	unsigned command = 0;
+	auto commits = [&](std::function<bool()> busy, Clock::duration limit) -> asio::awaitable<std::pair<unsigned, long long>> {
+		unsigned count = 0;
+		long long slowest = 0;
+		const auto end = Clock::now() + limit;
+		while (busy() && count != 8) {
+			const auto begun = Clock::now();
+			CHECK(co_await cluster.commit("command " + std::to_string(++command), {0, 1, 2}, 2s));
+			slowest = std::max(slowest, ms(Clock::now() - begun));
+			++count;
+			cluster.verbose = false;
+			(void)co_await cluster.until([&] { return !busy(); }, 20ms);
+			cluster.verbose = true;
+		}
+		(void)co_await cluster.until([&] { return !busy(); }, end - Clock::now());
+		co_return std::make_pair(count, slowest);
+	};
+	auto before = appends(cluster);
+	const auto quiet_end = Clock::now() + 500ms;
+	const auto [quiet_commits, quiet_slowest] = co_await commits([&] { return Clock::now() < quiet_end; }, 1s);
+	const auto quiet = since(cluster, before);
+
+	// Rounds of four fetches, each round once the last one's bytes checked out.
+	before = appends(cluster);
+	const auto started = Clock::now();
+	const std::vector<std::pair<unsigned, NodeId>> pairs{{0, 2}, {0, 3}, {2, 1}, {1, 3}};
+	constexpr unsigned rounds = 4;
+	unsigned round = 0;
+	std::vector<std::shared_ptr<Fetched>> fetches;
+	auto fetching = [&] {
+		if (!all_done(fetches))
+			return true;
+		for (std::size_t i = 0; i != fetches.size(); ++i)
+			CHECK(!fetches[i]->error && fetches[i]->bytes == (*files[pairs[i].second - 1])["history/table"]);
+		fetches.clear();
+		if (round == rounds)
+			return false;
+		++round;
+		for (const auto &[from, peer] : pairs)
+			fetches.push_back(fetch(cluster, from, peer, "history/table"));
+		return true;
+	};
+	const auto [busy_commits, busy_slowest] = co_await commits(fetching, 20s);
+	const auto elapsed = ms(Clock::now() - started);
+	const auto busy = since(cluster, before);
+	CHECK(round == rounds && fetches.empty());
+	std::size_t high_water = 0;
+	for (unsigned i = 0; i != 3; ++i) {
+		const auto occupancy = cluster.peers[i]->occupancy();
+		high_water = std::max({high_water, occupancy.outgoing_high_water, occupancy.incoming_high_water});
+	}
+	std::printf("  %u rounds of %zu x 8 MiB fetched in %lld ms through 1 MiB budgets (high water %zu KiB)\n", rounds,
+				pairs.size(), elapsed, high_water / 1024);
+	std::printf("  quiet: %u commits, slowest %lld ms; %llu round trips, slowest bucket <= %llu us, %llu timeouts\n",
+				quiet_commits, quiet_slowest, (unsigned long long)quiet.count,
+				(unsigned long long)(quiet.slowest_ns / 1000), (unsigned long long)quiet.timeouts);
+	std::printf("  fetching: %u commits, slowest %lld ms; %llu round trips, slowest bucket <= %llu us, %llu timeouts\n",
+				busy_commits, busy_slowest, (unsigned long long)busy.count, (unsigned long long)(busy.slowest_ns / 1000),
+				(unsigned long long)busy.timeouts);
+	CHECK(busy_commits >= 1 && busy.count >= 10 && busy.timeouts == 0 && busy.slowest_ns <= 64'000'000);
+	CHECK(cluster.leader() == leader && cluster.nodes[*leader]->worker().term() == term);
+	CHECK(co_await cluster.stop_all(2s));
+}
+
+// F3: voter two hangs as its reply starts. Voter one's fetch fails at its deadline, the
+// same lanes carry consensus, the late reply drains into the failed fetch, and the next fetch
+// succeeds. Then voter two closes as its reply starts: the fetch fails at once, and the other
+// two keep committing.
+asio::awaitable<void> fetch_failures(asio::io_context &io, const Certificates &certificates) {
+	constexpr std::size_t size = 8 * 1024 * 1024;
+	Cluster cluster(io, certificates);
+	cluster.aside = 1;
+	auto files = serving(cluster, io);
+	(*files[1])["history/table"] = pattern(size, 20);
+	enum class Then { Serve, Freeze, Close } then = Then::Serve;
+	cluster.options[1].reader = reader(files[1], [&](std::string_view) {
+		if (then == Then::Freeze) {
+			cluster.frozen = true;
+			cluster.side.stop();
+		} else if (then == Then::Close)
+			asio::post(io, [&] { cluster.stop(1); });
+		then = Then::Serve;
+	});
+	cluster.options[0].fetch_deadline = 300ms;
+	for (unsigned i = 0; i != 3; ++i)
+		cluster.start(i);
+	CHECK(co_await cluster.commit("before", {0, 1, 2}, 5s));
+	CHECK(co_await cluster.fully_connected(3s));
+	const auto admitted = cluster.peers[0]->stats().admitted;
+
+	then = Then::Freeze;
+	auto stalled = fetch(cluster, 0, 2, "history/table");
+	CHECK(co_await cluster.until([&] { return stalled->done; }, 2s));
+	const auto waited = ms(stalled->answered - stalled->asked);
+	std::printf("  frozen peer: fetch failed after %lld ms (deadline 300 ms)\n", waited);
+	CHECK(cluster.frozen && stalled->error == std::errc::timed_out && !stalled->bytes && waited >= 300);
+	CHECK(cluster.peers[0]->occupancy().fetches == 1); // the failed fetch keeps its slot until its reply ends
+	CHECK(co_await cluster.commit("while two hangs", {0, 2}, 5s));
+	cluster.frozen = false;
+	CHECK(co_await cluster.until([&] { return cluster.peers[0]->occupancy().fetches == 0; }, 3s));
+	auto retried = fetch(cluster, 0, 2, "history/table");
+	CHECK(co_await cluster.until([&] { return retried->done; }, 3s));
+	CHECK(!retried->error && retried->bytes == (*files[1])["history/table"]);
+	CHECK(cluster.peers[0]->stats().admitted == admitted && cluster.connections(0) == 4); // the same lanes
+	CHECK(co_await cluster.commit("after the hang", {0, 1, 2}, 5s));
+
+	then = Then::Close;
+	auto closed = fetch(cluster, 0, 2, "history/table");
+	CHECK(co_await cluster.until([&] { return closed->done; }, 2s));
+	const auto failed = ms(closed->answered - closed->asked);
+	std::printf("  closed peer: fetch failed after %lld ms\n", failed);
+	CHECK(!cluster.running[1] && closed->error == std::errc::connection_aborted && !closed->bytes);
+	CHECK(cluster.peers[0]->occupancy().fetches == 0);
+	CHECK(co_await cluster.commit("without two", {0, 2}, 5s));
+	cluster.start(1);
+	CHECK(co_await cluster.fully_connected(3s));
+	auto reopened = fetch(cluster, 0, 2, "history/table");
+	CHECK(co_await cluster.until([&] { return reopened->done; }, 3s));
+	CHECK(!reopened->error && reopened->bytes == (*files[1])["history/table"]);
+	CHECK(co_await cluster.commit("with two again", {0, 1, 2}, 5s));
+	CHECK(co_await cluster.stop_all(2s));
+}
 } // namespace
 
 static_assert(PeerHost<MinimalHost> && PeerHost<Node>);
@@ -895,6 +1213,8 @@ int main(int argc, char **argv) {
 		{"wrong-node", wrong_node},           {"several-addresses", several_addresses},
 		{"refused-first", refused_first},     {"slow-resolver", slow_resolver},
 		{"lookup-spacing", lookup_spacing},   {"membership", membership},
+		{"fetch-exact", fetch_exact},         {"fetch-alongside-consensus", fetch_alongside_consensus},
+		{"fetch-failures", fetch_failures},
 	};
 	for (const auto &[name, scenario] : scenarios)
 		if (only.empty() || only == name)

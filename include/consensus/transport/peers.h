@@ -1,5 +1,6 @@
 #pragma once
 #include "codec.h"
+#include "fetch.h"
 #include "hello.h"
 #include "resolve.h"
 #include "consensus/snapshot_channel.h"
@@ -42,12 +43,20 @@ struct PeerOptions {
 	// further address a stagger after the one before (RFC 8305).
 	std::chrono::milliseconds resolve_deadline{1000}, stagger{250};
 	PeerResolver resolver = system_resolver;
+	// The fetch lane (fetch.h): `reader` serves this voter's names (none answers not-found). At
+	// most `fetches` of a voter's fetches await each peer, and as many of the peer's wait here,
+	// so voters agree on it; a reply holds at most fetch_bytes and arrives within fetch_deadline.
+	FetchReader reader;
+	std::size_t fetches = 4, fetch_bytes = 64 * 1024 * 1024;
+	std::chrono::milliseconds fetch_deadline{30000};
 };
 struct PeerStats {
 	std::uint64_t admitted = 0, rejected = 0, dropped = 0, reconnects = 0;
 	std::uint64_t received = 0, accepted = 0, maximum_admission_wait_us = 0;
 	// Lookups started, answered with no address, and uncached dials whose lookup was late.
 	std::uint64_t lookups = 0, lookup_failures = 0, lookup_timeouts = 0;
+	// Fetches answered (bytes or not-found) and failed, and replies served to peers.
+	std::uint64_t fetched = 0, fetch_failures = 0, served = 0;
 	kronuz::metrics::DurationHistogram<> decoded_to_admitted;
 	AppendTimings append;
 };
@@ -56,6 +65,7 @@ struct PeerOccupancy {
 	std::size_t incoming_high_water = 0, outgoing_high_water = 0;
 	std::size_t connections = 0, handshakes = 0, queued_control = 0, retained_inputs = 0, queued_data = 0;
 	std::size_t lookups = 0;  // in flight: at most one per peer name
+	std::size_t fetches = 0, serving = 0;  // this voter's awaiting replies, and peers' awaiting ours
 };
 // All calls and completions run on the authority owner executor. start()/stop()
 // are admission boundaries; retain this object until drained() becomes true.
@@ -72,7 +82,8 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 		if (!node_ || !options_.queued_messages || !options_.handshakes || !options_.pipeline_frames || !options_.window_bytes ||
 			options_.deadline <= std::chrono::milliseconds::zero() ||
 			options_.resolve_deadline <= std::chrono::milliseconds::zero() ||
-			options_.stagger <= std::chrono::milliseconds::zero())
+			options_.stagger <= std::chrono::milliseconds::zero() || !options_.fetches || !options_.fetch_bytes ||
+			options_.fetch_deadline <= std::chrono::milliseconds::zero())
 			throw std::invalid_argument("peer bounds");
 		reactor::tls::configure(*context_, options_.tls, reactor::tls::Role::Peer);
 		validate_peer_identity(*context_, configuration_.configuration, options_.pins);
@@ -147,6 +158,8 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 			result.queued_control += connection->queue.size();
 			result.queued_data += connection->data.size();
 			result.retained_inputs += connection->input.has_value();
+			result.fetches += connection->fetching.size();
+			result.serving += connection->serving.size();
 		}
 		return result;
 	}
@@ -191,6 +204,33 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 			if (connection && !connection->writing && connection->trusted == output->session)
 				connection->wake.cancel();
 		}
+	}
+	// Asks `peer` for `name` over the bulk lane. `done` runs once, on the executor and never
+	// within this call; it fails at once without a bulk lane to the peer, or with `fetches` of
+	// this voter's awaiting it.
+	void fetch(kronuz::consensus::NodeId peer, std::string name, FetchDone done) {
+		if (!done || name.empty() || name.size() > fetch_chunk_bytes)
+			throw std::invalid_argument("invalid fetch");
+		auto connection = stopping_ ? nullptr : find(peer, Lane::Bulk);
+		if (!connection || connection->fetching.size() >= options_.fetches) {
+			complete(std::move(done),
+					 std::make_error_code(connection ? std::errc::resource_unavailable_try_again : std::errc::not_connected),
+					 std::nullopt);
+			return;
+		}
+		const auto id = ++fetch_id_;
+		connection->requests.push_back(encode_fetch({FetchKind::Request, id, 0, name}));
+		auto timer = std::make_shared<asio::steady_timer>(executor_, options_.fetch_deadline);
+		connection->fetching.emplace(id, Fetching{std::move(done), timer});
+		++tasks_;
+		timer->async_wait([owner = this->shared_from_this(), weak = std::weak_ptr<Connection>(connection),
+						   id](asio::error_code error) {
+			--owner->tasks_;
+			if (auto connection = weak.lock(); connection && !error)
+				if (auto found = connection->fetching.find(id); found != connection->fetching.end())
+					owner->fail(found->second, std::errc::timed_out);
+		});
+		connection->wake.cancel();
 	}
 	// One bounded owner pass before Node.service. Original readers retain their
 	// frame and decoded credit until this scheduler admits their event.
@@ -239,6 +279,22 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 		Frame frame;
 		std::optional<kronuz::consensus::AppendRequest> observation;
 	};
+	// One of this voter's fetches awaiting its reply. A failed one (deadline, size) has no `done`
+	// and absorbs the rest of its reply, so a peer never holds more than `fetches` of ours.
+	struct Fetching {
+		FetchDone done;
+		std::shared_ptr<asio::steady_timer> timer;
+		std::string bytes;
+		std::uint64_t total = 0, received = 0;
+		bool started = false;
+	};
+	// A peer's request, answered in order; the reader runs as its reply starts.
+	struct Serving {
+		std::uint64_t id = 0;
+		std::string name, bytes;
+		std::size_t offset = 0;
+		std::optional<FetchKind> kind;
+	};
 	struct Connection {
 		std::shared_ptr<Session> session;
 		asio::steady_timer wake;
@@ -252,7 +308,11 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 		kronuz::consensus::NodeId peer = 0;
 		Lane lane = Lane::Control;
 		std::optional<kronuz::consensus::TrustedSession> trusted;
+		std::map<std::uint64_t, Fetching> fetching;  // bulk: this voter's fetches, by id
+		std::deque<std::string> requests;           // bulk: their encoded requests, not yet written
+		std::deque<Serving> serving;                // bulk: the peer's fetches
 		bool ready = false, closing = false, writing = false, incoming = false, notified = false;
+		bool fetch_turn = false;  // bulk: fetch and snapshot frames alternate while both wait
 		Connection(asio::any_io_executor executor, std::shared_ptr<Session> stream)
 			: session(std::move(stream)), wake(executor), admission_wake(executor) {}
 		void close() noexcept {
@@ -268,6 +328,101 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 		if (connection->trusted && !connection->notified) {
 			connection->notified = true;
 			node_->channel().session_closed(*connection->trusted);
+		}
+		for (auto &[id, fetching] : connection->fetching) {
+			fetching.timer->cancel();
+			fail(fetching, std::errc::connection_aborted);
+		}
+		connection->fetching.clear();
+		connection->requests.clear();
+		connection->serving.clear();
+	}
+	void complete(FetchDone done, std::error_code error, std::optional<std::string> bytes) {
+		++(error ? stats_.fetch_failures : stats_.fetched);
+		asio::post(executor_, [done = std::move(done), error, bytes = std::move(bytes)]() mutable {
+			done(error, std::move(bytes));
+		});
+	}
+	void fail(Fetching &fetching, std::errc error) {
+		if (!fetching.done)
+			return;
+		complete(std::exchange(fetching.done, nullptr), std::make_error_code(error), std::nullopt);
+		std::string().swap(fetching.bytes);
+	}
+	// A fetch frame from the peer: a request to serve, or the next frame of one of our replies.
+	// A frame outside the protocol throws, which closes the bulk lane.
+	void received(Connection &connection, const FetchFrame &frame) {
+		if (frame.kind == FetchKind::Request) {
+			if (connection.serving.size() >= options_.fetches)
+				throw std::length_error("peer fetch bound");
+			connection.serving.push_back({frame.id, std::string(frame.body)});
+			connection.wake.cancel();
+			return;
+		}
+		auto found = connection.fetching.find(frame.id);
+		if (found == connection.fetching.end())
+			throw std::invalid_argument("unrequested fetch reply");
+		auto &fetching = found->second;
+		if (frame.kind == FetchKind::Data) {
+			if (!fetching.started) {
+				fetching.started = true;
+				fetching.total = frame.total;
+				if (frame.total > options_.fetch_bytes)
+					fail(fetching, std::errc::message_size);
+				else if (fetching.done)
+					fetching.bytes.reserve(frame.total);
+			}
+			if (frame.total != fetching.total || frame.body.size() > fetching.total - fetching.received)
+				throw std::invalid_argument("fetch reply framing");
+			fetching.received += frame.body.size();
+			if (fetching.done)
+				fetching.bytes.append(frame.body);
+			if (fetching.received != fetching.total)
+				return;
+		} else if (fetching.started)
+			throw std::invalid_argument("fetch reply framing");
+		fetching.timer->cancel();
+		if (fetching.done) {
+			std::optional<std::string> bytes;
+			if (frame.kind == FetchKind::Data)
+				bytes = std::move(fetching.bytes);
+			complete(std::move(fetching.done),
+					 frame.kind == FetchKind::Failed ? std::make_error_code(std::errc::io_error) : std::error_code{},
+					 std::move(bytes));
+		}
+		connection.fetching.erase(found);
+	}
+	// The bulk lane's next fetch frame: a request first, else the next frame of the oldest reply.
+	std::string next_fetch(Connection &connection) {
+		if (!connection.requests.empty()) {
+			auto bytes = std::move(connection.requests.front());
+			connection.requests.pop_front();
+			return bytes;
+		}
+		auto &reply = connection.serving.front();
+		if (!reply.kind)
+			reply.kind = answer(reply);
+		const auto chunk = std::min(fetch_chunk_bytes, reply.bytes.size() - reply.offset);
+		auto bytes = encode_fetch({*reply.kind, reply.id, *reply.kind == FetchKind::Data ? reply.bytes.size() : 0,
+								   std::string_view(reply.bytes).substr(reply.offset, chunk)});
+		reply.offset += chunk;
+		if (reply.offset == reply.bytes.size()) {
+			connection.serving.pop_front();
+			++stats_.served;
+		}
+		return bytes;
+	}
+	FetchKind answer(Serving &reply) {
+		try {
+			auto bytes = options_.reader ? options_.reader(reply.name) : std::nullopt;
+			if (!bytes)
+				return FetchKind::Missing;
+			if (bytes->size() > options_.fetch_bytes)
+				return FetchKind::Failed;
+			reply.bytes = std::move(*bytes);
+			return FetchKind::Data;
+		} catch (const std::exception &) {
+			return FetchKind::Failed;
 		}
 	}
 	std::shared_ptr<Connection> find(kronuz::consensus::NodeId peer, Lane lane) const {
@@ -546,6 +701,8 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 						co_await connection->admission_wake.async_wait(
 							asio::redirect_error(asio::use_awaitable, error));
 					}
+				} else if (is_fetch_frame(frame.bytes())) {
+					received(*connection, decode_fetch(frame.bytes()));
 				} else {
 					if (frame.bytes().size() > kronuz::consensus::maximum_transfer_bytes)
 						throw std::invalid_argument("bulk frame bound");
@@ -594,9 +751,20 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 					}
 					continue;
 				}
-				if (connection->lane == Lane::Bulk)
-					if (auto output = node_->channel().outbound();
-						output && output->session == connection->trusted) {
+				if (connection->lane == Lane::Bulk) {
+					auto output = node_->channel().outbound();
+					const bool snapshot = output && output->session == connection->trusted;
+					if ((!connection->requests.empty() || !connection->serving.empty()) &&
+						(!snapshot || connection->fetch_turn)) {
+						// One frame's credit at a time, from the budget every lane shares.
+						connection->fetch_turn = false;
+						auto bytes = next_fetch(*connection);
+						ByteCredit credit(outgoing_, bytes.size());
+						co_await connection->session->send(Frame(std::move(credit), std::move(bytes)));
+						continue;
+					}
+					if (snapshot) {
+						connection->fetch_turn = true;
 						SnapshotWrite flight(*output, outgoing_);
 						connection->writing = true;
 						co_await connection->session->send(flight.take_frame());
@@ -604,6 +772,7 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 						flight.consume_if_current(node_->channel());
 						continue;
 					}
+				}
 				connection->wake.expires_at(std::chrono::steady_clock::time_point::max());
 				asio::error_code error;
 				co_await connection->wake.async_wait(asio::redirect_error(asio::use_awaitable, error));
@@ -639,7 +808,7 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 	std::map<kronuz::consensus::NodeId, Route> routes_;
 	std::size_t tasks_ = 0;
 	std::size_t admission_cursor_ = 0;
-	std::uint64_t retry_id_ = 0;
+	std::uint64_t retry_id_ = 0, fetch_id_ = 0;
 	bool started_ = false, stopping_ = false;
 };
 } // namespace kronuz::consensus::transport

@@ -1,4 +1,5 @@
 #include "consensus/transport/codec.h"
+#include "consensus/transport/fetch.h"
 #include "consensus/admission.h"
 #include "consensus/checkpoint.h"
 #include "consensus/core.h"
@@ -56,9 +57,59 @@ void configuration_entry_roundtrip() {
 	catch (const std::exception&) { rejected = true; }
 	require(rejected, "checkpoint rejects malformed membership payload");
 }
+// Fetch frames round-trip, tell themselves from transfer frames, and refuse every malformed field.
+void fetch_frames() {
+	using namespace kronuz::consensus::transport;
+	const std::string chunk(fetch_chunk_bytes, 'c'), oversized = chunk + 'c';
+	const FetchFrame frames[] = {{FetchKind::Request, 1, 0, "history/seal-7"},
+								 {FetchKind::Data, 2, chunk.size() + 1, chunk},
+								 {FetchKind::Data, 3, 0, {}},
+								 {FetchKind::Missing, 4, 0, {}},
+								 {FetchKind::Failed, 5, 0, {}}};
+	for (const auto &frame : frames) {
+		auto bytes = encode_fetch(frame);
+		assert(bytes.size() == fetch_header_bytes + frame.body.size() && bytes.size() <= maximum_transfer_bytes);
+		assert(is_fetch_frame(bytes) && !is_fetch_frame(bytes.substr(1)));
+		auto decoded = decode_fetch(bytes);
+		assert(decoded.kind == frame.kind && decoded.id == frame.id && decoded.total == frame.total &&
+			   decoded.body == frame.body);
+	}
+	const FetchFrame invalid[] = {{FetchKind::Request, 0, 0, "name"},		 // no id
+								  {FetchKind::Request, 1, 0, {}},			 // no name
+								  {FetchKind::Request, 1, 1, "name"},		 // a total
+								  {FetchKind::Data, 1, 1, {}},				 // an empty chunk of a reply
+								  {FetchKind::Data, 1, 1, "two"},			 // a chunk past the total
+								  {FetchKind::Missing, 1, 0, "body"},		 // a body
+								  {FetchKind::Failed, 1, 1, {}},			 // a total
+								  {FetchKind::Data, 1, oversized.size(), oversized}}; // past the frame bound
+	for (const auto &frame : invalid) {
+		bool refused = false;
+		try {
+			(void)encode_fetch(frame);
+		} catch (const std::invalid_argument &) {
+			refused = true;
+		}
+		assert(refused);
+	}
+	unsigned rejected = 0;
+	const auto good = encode_fetch(frames[0]);
+	for (auto bad : {good.substr(0, fetch_header_bytes - 1), std::string("DTFT0002") + good.substr(8),
+					 good.substr(0, 8) + '\5' + good.substr(9), good.substr(0, 8) + '\0' + good.substr(9),
+					 good.substr(0, 9) + '\1' + good.substr(10), good.substr(0, fetch_header_bytes)}) {
+		try {
+			(void)decode_fetch(bad);
+			assert(false);
+		} catch (const kronuz::journal::Corruption &) {
+			++rejected;
+		}
+	}
+	assert(rejected == 6);
+	std::cout << "fetch codec: " << std::size(frames) << " frames round-trip, " << rejected << " malformed rejected\n";
+}
 }
 int main() {
 	configuration_entry_roundtrip();
+	fetch_frames();
 	FixedConfiguration configuration;
 	configuration.cluster[0] = 'c';
 	configuration.configuration[0] = 'f';

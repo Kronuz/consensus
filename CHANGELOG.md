@@ -6,6 +6,22 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#consensus) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-13
+
+### Added
+
+- A fetch lane on `Peers`: `fetch(peer, name, done)` asks a peer for a named file and
+  `done(error, bytes)` gets its exact bytes, `nullopt` when the peer holds none, or an error
+  (`not_connected`, `timed_out`, `connection_aborted`, ...), once, on the owner executor. The
+  peer answers through `PeerOptions::reader`, a host function from a name to optional bytes.
+  Requests and replies are new `DTFT0001` frames on the bulk lane beside snapshot transfer
+  frames (`fetch.h`); a reply spans as many lane frames as it needs, each charged to the
+  shared byte budgets one frame at a time. `PeerOptions::fetches` (4) bounds a voter's fetches
+  awaiting one peer, `fetch_bytes` (64 MiB) a reply, and `fetch_deadline` (30 s) the wait.
+  A voter on an older consensus closes the bulk lane on a fetch frame. `PeerStats` counts
+  `fetched`, `fetch_failures` and `served`; `PeerOccupancy` counts `fetches` and `serving`.
+  See [docs/mechanisms/peer-fetch.md](docs/mechanisms/peer-fetch.md).
+
 ## 2026-11-11
 
 ### Changed

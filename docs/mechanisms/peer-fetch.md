@@ -69,12 +69,13 @@ between three voters, through 1 MiB budgets, while the leader commits.
 
 | Window | Append round trips | Slowest round trip | Timeouts | Slowest commit |
 |---|---|---|---|---|
-| Quiet, 500 ms | 64 | within 16 ms | 0 | 41 ms |
-| Fetching 128 MiB, 511 ms | 62 | within 16 ms | 0 | 46 ms |
+| Quiet, 500 ms | 64 | within 16 ms | 0 | 23 ms |
+| Fetching 128 MiB, 540 ms | 64 | within 16 ms | 0 | 41 ms |
 
 The budgets peaked at 133 KiB. The slowest round trip is bounded by its histogram bucket. The
-election minimum in that test is 100 ms, and the leader kept its term. These are single runs
-on an Intel i9-9980HK laptop (macOS, 16 threads), release build, under light background load.
+election minimum in that test is 100 ms, and the leader kept its term. This is one run, a
+release build on an Intel i9-9980HK laptop (macOS, 16 threads) shared with other jobs at low
+priority; a commit's time includes the test's 1 ms polling.
 
 ## Failures
 

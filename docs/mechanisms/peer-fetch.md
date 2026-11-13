@@ -74,12 +74,16 @@ between three voters, through 1 MiB budgets, while the leader commits.
 | Quiet, 500 ms | 64 | within 16 ms | 0 | 23 ms |
 | Fetching 128 MiB, 540 ms | 64 | within 16 ms | 0 | 41 ms |
 
-The budgets peaked at 133 KiB. The slowest round trip is bounded by its histogram bucket. The
-election minimum in that test is 100 ms, and the leader kept its term. This is one run, a
-release build on an Intel i9-9980HK laptop (macOS, 16 threads) shared with other jobs at low
-priority; a commit's time includes the test's 1 ms polling. Under TSan the slowest round trip
-lands in the (16, 64] ms bucket, so a TSan build asserts the next bucket and relies on the
-unchanged term.
+The budgets peaked at 133 KiB, and the leader kept its term. The slowest round trip is bounded
+by its histogram bucket. This is one run, a release build at consensus:6c3018e, on an Intel
+i9-9980HK laptop (macOS, 16 threads) shared with other jobs at low priority; a commit's time
+includes the test's 1 ms polling. Under TSan the slowest round trip lands in the (16, 64] ms
+bucket, so a TSan build asserts the next bucket and relies on the unchanged term.
+
+That run used the 40 ms RPC timeout of the other scenarios. On slow CI runners the three
+voters' TLS, all on the one test thread, pushes append round trips past 40 ms, and the Core
+never matches a late response, so no append completes. The scenario therefore runs with a
+200 ms RPC timeout and a 400 ms election minimum (D92), and keeps its 2 s commit bound.
 
 Memory outside the budgets: a requester assembles each reply in a buffer of its claimed total,
 reserved on the first chunk, so the bound is peers x `fetches` x `fetch_bytes` (1 GiB at the

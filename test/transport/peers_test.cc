@@ -180,6 +180,9 @@ struct FakeDns {
 };
 
 constexpr Timing compact{20, 40, 100, 200, 60000};
+// For a test that loads the one test thread: an append round trip past rpc_timeout is never
+// matched (consensus-late-append), and a slow runner under load exceeds compact's 40 ms.
+constexpr Timing loaded{20, 200, 400, 800, 60000};
 Limits limits() {
 	Limits result;
 	result.command_bytes = 1024;
@@ -206,9 +209,9 @@ struct Node {
 	Worker worker_;
 	SnapshotChannel channel_;
 	std::vector<std::string> commands;
-	explicit Node(NodeId local)
+	explicit Node(NodeId local, Timing timing = compact)
 		: 
-		  worker_(io, fixed(local), {{512 * 1024, 4096}, {16 * 1024, 3}, {128 * 1024, 4}, 8, 3}, limits(), compact,
+		  worker_(io, fixed(local), {{512 * 1024, 4096}, {16 * 1024, 3}, {128 * 1024, 4}, 8, 3}, limits(), timing,
 				  {4, 1, false, false}),
 		  channel_(worker_) {}
 	Worker &worker() { return worker_; }
@@ -264,10 +267,12 @@ struct Cluster {
 	std::vector<std::shared_ptr<Peers<Node>>> retired;
 	Clock::time_point origin = Clock::now();
 	RequestId request = 0;
+	Timing timing;
 
-	Cluster(asio::io_context &context, const Certificates &certs) : io(context), certificates(certs) {
+	Cluster(asio::io_context &context, const Certificates &certs, Timing timing = compact)
+		: io(context), certificates(certs), timing(timing) {
 		for (unsigned i = 0; i != 3; ++i) {
-			nodes[i] = std::make_shared<Node>(i + 1);
+			nodes[i] = std::make_shared<Node>(i + 1, timing);
 			Identity identity{};
 			identity[0] = static_cast<char>('a' + i);
 			nodes[i]->worker().create(identity);
@@ -325,7 +330,7 @@ struct Cluster {
 			auto &node = *nodes[i];
 			if (running[i])
 				peers[i]->admit();
-			const Tick tick{now, 100 + i * 40};
+			const Tick tick{now, timing.election_min + i * (timing.election_max - timing.election_min) * 2 / 5};
 			node.worker().run_one(tick);
 			for (auto &action : node.worker().take_actions()) {
 				if (auto send = std::get_if<Send>(&action)) {
@@ -1066,12 +1071,12 @@ constexpr std::uint64_t round_trip_bound_ns = 64'000'000;
 #endif
 
 // F2: rounds of four 8 MiB fetches at once, both ways between voters one and three, through 1 MiB
-// byte budgets every lane shares. Consensus keeps committing: no append round trip times out
-// or lands past 64 ms (below the 100 ms election minimum; 256 ms under TSan), and the leader
-// keeps its term.
+// byte budgets every lane shares, under the `loaded` timing (D92). Consensus keeps committing
+// within 2 s each: no append round trip times out or lands past 64 ms (256 ms under TSan), and
+// the leader keeps its term.
 asio::awaitable<void> fetch_alongside_consensus(asio::io_context &io, const Certificates &certificates) {
 	constexpr std::size_t size = 8 * 1024 * 1024, budget = 1024 * 1024;
-	Cluster cluster(io, certificates);
+	Cluster cluster(io, certificates, loaded);
 	auto files = serving(cluster, io);
 	for (unsigned i = 0; i != 3; ++i) {
 		(*files[i])["history/table"] = pattern(size, 10 + i);

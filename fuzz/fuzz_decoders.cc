@@ -31,6 +31,7 @@
 #include "consensus/snapshot_transfer.h"
 #include "consensus/storage.h"
 #include "consensus/transport/codec.h"
+#include "consensus/transport/fetch.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -64,7 +65,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
 	try {
 		// FUZZ_DECODER pins every input to one decoder, so each gets measured hours of its own.
 		static const int pinned = std::getenv("FUZZ_DECODER") ? std::atoi(std::getenv("FUZZ_DECODER")) : -1;
-		switch (pinned >= 0 ? pinned : data[0] % 8) {
+		switch (pinned >= 0 ? pinned : data[0] % 9) {
 		case 0: {
 			auto message = transport::decode(input);
 			require(transport::encode(message) == input);
@@ -109,9 +110,14 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
 			require(encode_transfer(frame.kind, frame.envelope, frame.body) == input);
 			break;
 		}
+		case 8: {
+			auto frame = transport::decode_fetch(input);
+			require(transport::encode_fetch(frame) == input);
+			break;
+		}
 		}
 	} catch (const std::exception& error) {
-		if (std::getenv("FUZZ_DEBUG")) { std::fprintf(stderr, "decoder %u: %s\n", data[0] % 8u, error.what()); }
+		if (std::getenv("FUZZ_DEBUG")) { std::fprintf(stderr, "decoder %u: %s\n", data[0] % 9u, error.what()); }
 	}
 	return 0;
 }

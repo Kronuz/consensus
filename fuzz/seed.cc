@@ -5,6 +5,7 @@
 #include "consensus/snapshot_transfer.h"
 #include "consensus/storage.h"
 #include "consensus/transport/codec.h"
+#include "consensus/transport/fetch.h"
 
 #include <cstdio>
 #include <fstream>
@@ -25,6 +26,9 @@ int main(int argc, char** argv) {
 	write(0, transport::encode(TimeoutNow{7, 11, 21}));
 	write(0, transport::encode(AppendRequest{7, 11, 9, 6, 8, 13, {{10, 7, EntryKind::Configuration, encode_membership(limited)}}, 9}));
 	write(0, transport::encode(VoteRequest{8, 9, 6, true}));
+	write(8, transport::encode_fetch({transport::FetchKind::Request, 1, 0, "history/blocks/0001"}));
+	write(8, transport::encode_fetch({transport::FetchKind::Data, 2, 5, "bytes"}));
+	write(8, transport::encode_fetch({transport::FetchKind::Missing, 3, 0, {}}));
 	write(1, encode_membership(witness));
 	write(1, encode_membership(limited));
 	write(2, encode_initialization(c));

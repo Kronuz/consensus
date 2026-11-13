@@ -220,16 +220,9 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 		}
 		const auto id = ++fetch_id_;
 		connection->requests.push_back(encode_fetch({FetchKind::Request, id, 0, name}));
-		auto timer = std::make_shared<asio::steady_timer>(executor_, options_.fetch_deadline);
+		auto timer = std::make_shared<asio::steady_timer>(executor_);
 		connection->fetching.emplace(id, Fetching{std::move(done), timer});
-		++tasks_;
-		timer->async_wait([owner = this->shared_from_this(), weak = std::weak_ptr<Connection>(connection),
-						   id](asio::error_code error) {
-			--owner->tasks_;
-			if (auto connection = weak.lock(); connection && !error)
-				if (auto found = connection->fetching.find(id); found != connection->fetching.end())
-					owner->fail(found->second, std::errc::timed_out);
-		});
+		await_reply(connection, id);
 		connection->wake.cancel();
 	}
 	// One bounded owner pass before Node.service. Original readers retain their
@@ -280,13 +273,14 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 		std::optional<kronuz::consensus::AppendRequest> observation;
 	};
 	// One of this voter's fetches awaiting its reply. A failed one (deadline, size) has no `done`
-	// and absorbs the rest of its reply, so a peer never holds more than `fetches` of ours.
+	// and absorbs the rest of its reply, so a peer never holds more than `fetches` of ours; a
+	// second deadline bounds that wait (await_reply).
 	struct Fetching {
 		FetchDone done;
 		std::shared_ptr<asio::steady_timer> timer;
 		std::string bytes;
 		std::uint64_t total = 0, received = 0;
-		bool started = false;
+		bool started = false, late = false;  // late: past its first deadline
 	};
 	// A peer's request, answered in order; the reader runs as its reply starts.
 	struct Serving {
@@ -336,6 +330,29 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 		connection->fetching.clear();
 		connection->requests.clear();
 		connection->serving.clear();
+	}
+	// A reply unfinished at fetch_deadline fails its fetch; one unfinished a deadline later
+	// closes the bulk lane, whose peer is hung or gone, which frees the fetch's slot.
+	void await_reply(const std::shared_ptr<Connection> &connection, std::uint64_t id) {
+		auto &timer = *connection->fetching.at(id).timer;
+		timer.expires_after(options_.fetch_deadline);
+		++tasks_;
+		timer.async_wait([owner = this->shared_from_this(), weak = std::weak_ptr<Connection>(connection),
+						  id](asio::error_code error) {
+			--owner->tasks_;
+			auto connection = weak.lock();
+			if (!connection || error)
+				return;
+			auto found = connection->fetching.find(id);
+			if (found == connection->fetching.end())
+				return;
+			if (std::exchange(found->second.late, true)) {
+				owner->close(connection);
+				return;
+			}
+			owner->fail(found->second, std::errc::timed_out);
+			owner->await_reply(connection, id);
+		});
 	}
 	void complete(FetchDone done, std::error_code error, std::optional<std::string> bytes) {
 		++(error ? stats_.fetch_failures : stats_.fetched);

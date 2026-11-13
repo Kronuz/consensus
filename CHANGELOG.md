@@ -17,7 +17,8 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
   Requests and replies are new `DTFT0001` frames on the bulk lane beside snapshot transfer
   frames (`fetch.h`); a reply spans as many lane frames as it needs, each charged to the
   shared byte budgets one frame at a time. `PeerOptions::fetches` (4) bounds a voter's fetches
-  awaiting one peer, `fetch_bytes` (64 MiB) a reply, and `fetch_deadline` (30 s) the wait.
+  awaiting one peer, `fetch_bytes` (64 MiB) a reply, and `fetch_deadline` (30 s) the wait; a reply still unfinished a deadline after its fetch failed
+  closes the bulk lane, since its peer is hung or gone.
   A voter on an older consensus closes the bulk lane on a fetch frame. `PeerStats` counts
   `fetched`, `fetch_failures` and `served`; `PeerOccupancy` counts `fetches` and `serving`.
   See [docs/mechanisms/peer-fetch.md](docs/mechanisms/peer-fetch.md).

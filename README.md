@@ -160,6 +160,8 @@ cmake --build build --target consensus_worker_checkpoint_bench
 
 ## 📚 Documentation
 
+- [Acknowledged Means Durable](https://kronuz.github.io/blog/consensus/):
+  the Familiars post on why it exists and how it works.
 - [ARCHITECTURE.md](ARCHITECTURE.md): the host contract, membership, elections, replication,
   the Worker, checkpoints, snapshots and the transport.
 - [docs/RETAINED-STATE.md](docs/RETAINED-STATE.md): how retained history is bounded, retired

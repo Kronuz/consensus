@@ -6,6 +6,18 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#consensus) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-16
+
+### Fixed
+
+- A peer lane's deadline (a frame's read once its first byte arrives, a write, the handshake)
+  no longer closes the lane when the process itself did not run past it. A timer that fires
+  late, as one does after the host deschedules or stops the process, extends by its
+  lateness once, so bytes the peer sent in time are read. Before, a voter stopped for longer
+  than `deadline` (a slow CI runner's VM, 2.1 s) closed every lane with a frame in flight on
+  resuming, and its fetches failed with `connection_aborted`. A peer that stays silent still
+  fails at the deadline plus at most that lateness. No API or wire change.
+
 ## 2026-11-15
 
 ### Fixed

@@ -14,12 +14,14 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
 #include <functional>
 #include <journal/journal.h>
 #include <journal/memory_io.h>
 #include <openssl/pem.h>
 #include <openssl/x509v3.h>
+#include <thread>
 #include <unistd.h>
 
 using namespace kronuz::consensus;
@@ -44,6 +46,13 @@ struct MinimalHost {
 
 long long ms(Clock::duration duration) {
 	return std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
+}
+// The CPU time this thread has used.
+Clock::duration thread_cpu() {
+	timespec now{};
+	clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now);
+	return std::chrono::duration_cast<Clock::duration>(std::chrono::seconds(now.tv_sec) +
+													  std::chrono::nanoseconds(now.tv_nsec));
 }
 
 // A CA and three EC voter leaves, written as PEM files for reactor::tls.
@@ -265,6 +274,9 @@ struct Cluster {
 	std::array<bool, 3> running{};
 	std::vector<std::shared_ptr<Peers<Node>>> retired;
 	Clock::time_point origin = Clock::now();
+	// Time the process lost while runnable or stopped (a slow runner's VM): ticks and limits
+	// leave it out, so they count the time the voters ran (until).
+	Clock::duration stalled{};
 	RequestId request = 0;
 	Timing timing;
 
@@ -318,7 +330,7 @@ struct Cluster {
 		start(i);
 	}
 	void pump() {
-		const auto now = static_cast<std::uint64_t>(ms(Clock::now() - origin));
+		const auto now = static_cast<std::uint64_t>(ms(Clock::now() - origin - stalled));
 		if (!frozen) {
 			side.restart();
 			side.poll();
@@ -347,16 +359,23 @@ struct Cluster {
 				peers[i]->pump();
 		}
 	}
-	// Pumps every millisecond until done() or the limit; returns whether done() held.
+	// Pumps every millisecond until done() or the limit; returns whether done() held. A wait
+	// that ends late by more than the CPU this thread used meanwhile was a stall: the limit
+	// moves out by it.
 	asio::awaitable<bool> until(std::function<bool()> done, Clock::duration limit) {
-		const auto end = Clock::now() + limit;
+		auto end = Clock::now() + limit;
 		asio::steady_timer timer(io);
 		while (Clock::now() < end) {
 			pump();
 			if (done())
 				co_return true;
+			const auto used = thread_cpu();
 			timer.expires_after(1ms);
 			co_await timer.async_wait(asio::use_awaitable);
+			if (const auto stall = Clock::now() - timer.expiry() - (thread_cpu() - used); stall > Clock::duration::zero()) {
+				stalled += stall;
+				end += stall;
+			}
 		}
 		if (verbose)
 			report();
@@ -1068,12 +1087,23 @@ constexpr std::uint64_t round_trip_bound_ns = 256'000'000;
 #else
 constexpr std::uint64_t round_trip_bound_ns = 64'000'000;
 #endif
+// The bound of the histogram bucket that holds `ns`.
+std::uint64_t bucket_bound(std::uint64_t ns) {
+	for (auto bound : kronuz::metrics::duration_bounds_ns)
+		if (ns <= bound)
+			return bound;
+	return ~std::uint64_t{0};
+}
 
 // F2: rounds of four 8 MiB fetches at once, both ways between voters one and three, through 1 MiB
 // byte budgets every lane shares, under the `loaded` timing (D92). Consensus keeps committing
 // within 2 s each: no append round trip times out or lands past 64 ms (256 ms under TSan), and
-// the leader keeps its term.
-asio::awaitable<void> fetch_alongside_consensus(asio::io_context &io, const Certificates &certificates) {
+// the leader keeps its term. Time the process stalled counts toward neither (Cluster::stalled).
+// With `stalls`, the thread sleeps past the lane deadline twice, as a slow runner's VM stops:
+// once with a command in flight, once mid-transfer.
+asio::awaitable<void> fetch_alongside(asio::io_context &io, const Certificates &certificates, bool stalls) {
+	const auto stall = 2100ms;  // past the 2 s lane deadline (Cluster)
+	auto freeze = [&io, stall] { asio::post(io, [stall] { std::this_thread::sleep_for(stall); }); };
 	constexpr std::size_t size = 8 * 1024 * 1024, budget = 1024 * 1024;
 	Cluster cluster(io, certificates, loaded);
 	auto files = serving(cluster, io);
@@ -1099,6 +1129,8 @@ asio::awaitable<void> fetch_alongside_consensus(asio::io_context &io, const Cert
 		const auto end = Clock::now() + limit;
 		while (busy() && count != 8) {
 			const auto begun = Clock::now();
+			if (stalls && command == 2)
+				freeze();  // runs once the commit proposes
 			CHECK(co_await cluster.commit("command " + std::to_string(++command), {0, 1, 2}, 2s));
 			slowest = std::max(slowest, ms(Clock::now() - begun));
 			++count;
@@ -1132,11 +1164,18 @@ asio::awaitable<void> fetch_alongside_consensus(asio::io_context &io, const Cert
 		++round;
 		for (const auto &[from, peer] : pairs)
 			fetches.push_back(fetch(cluster, from, peer, "history/table"));
+		if (stalls && round == 2) {
+			auto midway = std::make_shared<asio::steady_timer>(io, 20ms);
+			midway->async_wait([midway, freeze](asio::error_code) { freeze(); });
+		}
 		return true;
 	};
+	const auto stalled = cluster.stalled;
 	const auto [busy_commits, busy_slowest] = co_await commits(fetching, 20s);
 	const auto elapsed = ms(Clock::now() - started);
 	const auto busy = since(cluster, before);
+	const auto excused = static_cast<std::uint64_t>(std::chrono::nanoseconds(cluster.stalled - stalled).count());
+	const auto deadline = static_cast<std::uint64_t>(std::chrono::nanoseconds(cluster.options[0].deadline).count());
 	CHECK(round == rounds && fetches.empty());
 	std::size_t high_water = 0;
 	for (unsigned i = 0; i != 3; ++i) {
@@ -1148,12 +1187,21 @@ asio::awaitable<void> fetch_alongside_consensus(asio::io_context &io, const Cert
 	std::printf("  quiet: %u commits, slowest %lld ms; %llu round trips, slowest bucket <= %llu us, %llu timeouts\n",
 				quiet_commits, quiet_slowest, (unsigned long long)quiet.count,
 				(unsigned long long)(quiet.slowest_ns / 1000), (unsigned long long)quiet.timeouts);
-	std::printf("  fetching: %u commits, slowest %lld ms; %llu round trips, slowest bucket <= %llu us, %llu timeouts\n",
+	std::printf("  fetching: %u commits, slowest %lld ms; %llu round trips, slowest bucket <= %llu us, %llu timeouts; "
+				"stalled %lld ms\n",
 				busy_commits, busy_slowest, (unsigned long long)busy.count, (unsigned long long)(busy.slowest_ns / 1000),
-				(unsigned long long)busy.timeouts);
-	CHECK(busy_commits >= 1 && busy.count >= 10 && busy.timeouts == 0 && busy.slowest_ns <= round_trip_bound_ns);
+				(unsigned long long)busy.timeouts, (long long)(excused / 1'000'000));
+	CHECK(busy_commits >= 1 && busy.count >= 10);
+	CHECK(busy.timeouts == 0 || round_trip_bound_ns + excused >= deadline);
+	CHECK(busy.slowest_ns <= bucket_bound(round_trip_bound_ns + excused));
 	CHECK(cluster.leader() == leader && cluster.nodes[*leader]->worker().term() == term);
 	CHECK(co_await cluster.stop_all(2s));
+}
+asio::awaitable<void> fetch_alongside_consensus(asio::io_context &io, const Certificates &certificates) {
+	co_await fetch_alongside(io, certificates, false);
+}
+asio::awaitable<void> fetch_alongside_stalls(asio::io_context &io, const Certificates &certificates) {
+	co_await fetch_alongside(io, certificates, true);
 }
 
 // F3: voter two hangs as its reply starts. Voter one's fetch fails at its deadline; voter two
@@ -1326,6 +1374,7 @@ int main(int argc, char **argv) {
 		{"refused-first", refused_first},     {"slow-resolver", slow_resolver},
 		{"lookup-spacing", lookup_spacing},   {"membership", membership},
 		{"fetch-exact", fetch_exact},         {"fetch-alongside-consensus", fetch_alongside_consensus},
+		{"fetch-alongside-stalls", fetch_alongside_stalls},
 		{"fetch-failures", fetch_failures},   {"fetch-hung-peer", fetch_hung_peer},
 		{"late-append", late_append},
 	};

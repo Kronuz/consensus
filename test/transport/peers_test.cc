@@ -971,6 +971,21 @@ std::shared_ptr<Fetched> fetch(Cluster &cluster, unsigned from, NodeId peer, std
 	*returned = true;
 	return result;
 }
+// Voter `from` holds a usable bulk lane to `peer` within `limit`: a small fetch of "probe" succeeds.
+// A lane a deadline closed redials, and until then fetch() fails at once with not_connected (a
+// closing lane still counts in Cluster::connections).
+asio::awaitable<bool> bulk_ready(Cluster &cluster, unsigned from, NodeId peer, Clock::duration limit) {
+	for (const auto end = Clock::now() + limit;;) {
+		auto probe = fetch(cluster, from, peer, "probe");
+		if (!co_await cluster.until([&] { return probe->done; }, limit))
+			co_return false;
+		if (!probe->error)
+			co_return true;
+		if (probe->error != std::errc::not_connected || Clock::now() >= end)
+			co_return false;
+		co_await cluster.until([] { return false; }, 50ms);
+	}
+}
 bool all_done(const std::vector<std::shared_ptr<Fetched>> &fetches) {
 	return std::all_of(fetches.begin(), fetches.end(), [](const auto &fetched) { return fetched->done; });
 }
@@ -1237,6 +1252,7 @@ asio::awaitable<void> fetch_failures(asio::io_context &io, const Certificates &c
 	cluster.aside = 1;
 	auto files = serving(cluster, io);
 	(*files[1])["history/table"] = pattern(size, 20);
+	(*files[1])["probe"] = "probe";
 	enum class Then { Serve, Freeze, Close } then = Then::Serve;
 	cluster.options[1].reader = reader(files[1], [&](std::string_view) {
 		if (then == Then::Freeze) {
@@ -1265,18 +1281,21 @@ asio::awaitable<void> fetch_failures(asio::io_context &io, const Certificates &c
 	const auto resumed = Clock::now();
 	cluster.frozen = false;
 	CHECK(co_await cluster.until([&] { return cluster.peers[0]->occupancy().fetches == 0; }, 3s));
+	const auto drained = Clock::now() - resumed;
 	const auto deadline = cluster.options[0].fetch_deadline;
-	// The drain is the late reply's second deadline: an executor that needs all of it (a stop, or
-	// starvation under load the stall measure does not see) loses the bulk lane by design.
-	const bool lane_closed = cluster.connections(0) != 4 || cluster.peers[0]->stats().reconnects != reconnects;
-	std::printf("  drain: %lld ms, %s\n", ms(Clock::now() - resumed), lane_closed ? "the bulk lane closed at its deadline" : "lanes kept");
-	CHECK(!lane_closed || Clock::now() - resumed >= deadline - margin); // never early
+	const bool counted_closed = cluster.connections(0) != 4 || cluster.peers[0]->stats().reconnects != reconnects;
 	const Clock::duration pause = 2 * deadline + 100ms;
 	const auto asked = cluster.stalled;
 	auto retried = fetch(cluster, 0, 2, "history/table");
 	if (stalls)
 		asio::post(io, [pause] { std::this_thread::sleep_for(pause); });
 	CHECK(co_await cluster.until([&] { return retried->done; }, 3s));
+	// The drain ends one of two ways. The late reply finishes: the lanes are kept. Or it needs its
+	// whole second deadline (a stop, or starvation the stall measure does not see): the bulk lane
+	// closes by design, never early, and the retried fetch finds none (not_connected).
+	const bool lane_closed = counted_closed || retried->error == std::errc::not_connected;
+	std::printf("  drain: %lld ms, %s\n", ms(drained), lane_closed ? "the bulk lane closed at its deadline" : "lanes kept");
+	CHECK(!lane_closed || drained >= deadline - margin);
 	// What the process lost beyond the stop placed, since the peer resumed: covered when the
 	// extensions still leave the drain and the fetch their running time (an 8 MiB transfer takes up
 	// to ~210 ms of 500), else bounded.
@@ -1286,12 +1305,11 @@ asio::awaitable<void> fetch_failures(asio::io_context &io, const Certificates &c
 	std::printf("  retried fetch: %s in %lld ms (stopped %lld ms placed, %lld ms more: %s)\n",
 				retried->error ? retried->error.message().c_str() : "ok", ms(retried->answered - retried->asked),
 				stalls ? ms(pause) : 0, ms(extra), covered ? "covered, must succeed" : lane_closed ? "lane closed in the drain, bounded" : "beyond one extension, bounded");
-	if (covered)
+	if (covered) {
 		CHECK(!retried->error && retried->bytes == (*files[1])["history/table"]);
-	else
-		CHECK(retried->error ? !retried->bytes && ran <= deadline + margin : retried->bytes == (*files[1])["history/table"]);
-	if (covered) // a stop in the drain can end the late reply's second deadline: the lane closes by design
 		CHECK(cluster.peers[0]->stats().admitted == admitted && cluster.connections(0) == 4); // the same lanes
+	} else
+		CHECK(retried->error ? !retried->bytes && ran <= deadline + margin : retried->bytes == (*files[1])["history/table"]);
 	CHECK(co_await cluster.commit("after the hang", {0, 1, 2}, 5s));
 
 	if (stalls) { // 2100 ms stop, silent peer: the deadline is 1600 ms late, the extension its cap
@@ -1308,6 +1326,9 @@ asio::awaitable<void> fetch_failures(asio::io_context &io, const Certificates &c
 		CHECK(co_await cluster.until([&] { return cluster.peers[0]->occupancy().fetches == 0; }, 3s));
 	}
 
+	// Under either drain outcome the bulk lane is up again (a closed one redials) before voter two
+	// closes as its reply starts; then the fetch fails at once with connection_aborted.
+	CHECK(co_await bulk_ready(cluster, 0, 2, 3s));
 	then = Then::Close;
 	auto closed = fetch(cluster, 0, 2, "history/table");
 	CHECK(co_await cluster.until([&] { return closed->done; }, 2s));

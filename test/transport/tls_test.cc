@@ -1,5 +1,6 @@
 #include "async_pipe.h"
 #include "consensus/transport/session.h"
+#include <atomic>
 #include <cassert>
 #include <csignal>
 #include <cstdio>
@@ -9,6 +10,7 @@
 #include <openssl/pem.h>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 using namespace kronuz::consensus::transport;
@@ -333,6 +335,98 @@ void late_deadline(const std::filesystem::path &directory, bool silent) {
 	assert(budget->used() == 0);
 }
 
+// The reader stops 1000 ms (2.5 of its 400 ms timeouts) after a frame's deadline starts, and the
+// peer, on its own thread, sends the rest during the stop. Resuming, the bytes and the late
+// deadline are ready together: the read completes and cancels the deadline, which does not wait
+// out an extension. receive() returns within 150 ms of resuming (an extension is 400 ms).
+void completed_read_after_stop(const std::filesystem::path &directory) {
+	using Clock = std::chrono::steady_clock;
+	asio::io_context io, peer_io;
+	auto server_context = std::make_shared<asio::ssl::context>(asio::ssl::context::tls);
+	auto client_context = std::make_shared<asio::ssl::context>(asio::ssl::context::tls);
+	reactor::tls::configure(
+		*server_context,
+		{(directory / "one.pem").string(), (directory / "one.key").string(), (directory / "ca.pem").string()},
+		reactor::tls::Role::Peer);
+	reactor::tls::configure(
+		*client_context,
+		{(directory / "two.pem").string(), (directory / "two.key").string(), (directory / "ca.pem").string()},
+		reactor::tls::Role::Peer);
+	constexpr std::size_t size = 4096, head = 1024;
+	int first_fds[2], second_fds[2];
+	assert(::pipe(first_fds) == 0 && ::pipe(second_fds) == 0);
+	auto budget = std::make_shared<ByteBudget>(size);
+	BasicSession<AsyncPipe> server(AsyncPipe(io, first_fds[0], second_fds[1]), server_context, budget, size, 400ms);
+	asio::ssl::stream<AsyncPipe> client(AsyncPipe(peer_io, second_fds[0], first_fds[1]), *client_context);
+	std::map<kronuz::consensus::NodeId, Fingerprint> pins{{1, pin(directory / "one.pem")},
+														   {2, pin(directory / "two.pem")}};
+	auto first = hello(1), second = hello(2);
+	std::atomic<bool> stopping{false}, finished{false};
+	bool received = false;
+	asio::error_code failed;
+	Clock::time_point resumed, returned;
+	auto serve = [&]() -> asio::awaitable<void> {
+		(void)co_await server.authenticate(true, first, pins);
+		try {
+			auto frame = co_await server.receive();
+			received = frame.bytes() == std::string(size, 'x');
+		} catch (const asio::system_error &error) {
+			failed = error.code();
+		}
+		returned = Clock::now();
+		finished = true;
+	};
+	auto stopper = [&]() -> asio::awaitable<void> {
+		asio::steady_timer wait(io);
+		while (budget->used() == 0) { // the frame is admitted: its deadline runs
+			wait.expires_after(1ms);
+			co_await wait.async_wait(asio::use_awaitable);
+		}
+		stopping = true;
+		std::this_thread::sleep_for(1000ms);
+		resumed = Clock::now();
+	};
+	auto send = [&]() -> asio::awaitable<void> {
+		co_await client.async_handshake(asio::ssl::stream_base::client, asio::use_awaitable);
+		auto bytes = encode_hello(second);
+		co_await asio::async_write(client, asio::buffer(bytes), asio::use_awaitable);
+		std::array<char, hello_size> reply{};
+		co_await asio::async_read(client, asio::buffer(reply), asio::use_awaitable);
+		std::array<unsigned char, 4> header{};
+		for (unsigned i = 0; i != 4; ++i)
+			header[i] = static_cast<unsigned char>(size >> (i * 8));
+		const std::string body(size, 'x');
+		co_await asio::async_write(client, asio::buffer(header), asio::use_awaitable);
+		co_await asio::async_write(client, asio::buffer(body.data(), head), asio::use_awaitable);
+		asio::steady_timer wait(peer_io);
+		while (!stopping) {
+			wait.expires_after(1ms);
+			co_await wait.async_wait(asio::use_awaitable);
+		}
+		wait.expires_after(100ms);
+		co_await wait.async_wait(asio::use_awaitable);
+		co_await asio::async_write(client, asio::buffer(body.data() + head, size - head), asio::use_awaitable);
+		while (!finished) {
+			wait.expires_after(1ms);
+			co_await wait.async_wait(asio::use_awaitable);
+		}
+	};
+	auto b = asio::co_spawn(peer_io, send(), asio::use_future);
+	std::thread peer([&] { peer_io.run(); });
+	auto a = asio::co_spawn(io, serve(), asio::use_future);
+	auto c = asio::co_spawn(io, stopper(), asio::use_future);
+	io.run();
+	peer.join();
+	a.get();
+	c.get();
+	b.get();
+	const auto after = std::chrono::duration_cast<std::chrono::milliseconds>(returned - resumed).count();
+	if (!received || failed || after >= 150)
+		std::fprintf(stderr, "completed read after a stop: %s, returned %lld ms after resuming\n",
+					 failed ? failed.message().c_str() : "received", after);
+	assert(received && !failed && after < 150);
+}
+
 int main(int argc, char **argv) {
 	std::signal(SIGPIPE, SIG_IGN);
 	assert(argc == 2 || argc == 3);
@@ -347,6 +441,7 @@ int main(int argc, char **argv) {
 			malformed_frames(argv[1], mode);
 		late_deadline(argv[1], false);
 		late_deadline(argv[1], true);
+		completed_read_after_stop(argv[1]);
 	}
 	auto budget = std::make_shared<ByteBudget>(3);
 	{

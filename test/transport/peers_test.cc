@@ -1260,28 +1260,38 @@ asio::awaitable<void> fetch_failures(asio::io_context &io, const Certificates &c
 	std::printf("  frozen peer: fetch failed after %lld ms (deadline 500 ms)\n", waited);
 	CHECK(cluster.frozen && stalled->error == std::errc::timed_out && !stalled->bytes && waited >= 500);
 	CHECK(cluster.peers[0]->occupancy().fetches == 1); // the failed fetch keeps its slot until its reply ends
+	const auto lost = cluster.stalled; // from the peer's resuming: its late reply drains in the next deadline
+	const auto reconnects = cluster.peers[0]->stats().reconnects;
+	const auto resumed = Clock::now();
 	cluster.frozen = false;
 	CHECK(co_await cluster.until([&] { return cluster.peers[0]->occupancy().fetches == 0; }, 3s));
 	const auto deadline = cluster.options[0].fetch_deadline;
+	// The drain is the late reply's second deadline: an executor that needs all of it (a stop, or
+	// starvation under load the stall measure does not see) loses the bulk lane by design.
+	const bool lane_closed = cluster.connections(0) != 4 || cluster.peers[0]->stats().reconnects != reconnects;
+	std::printf("  drain: %lld ms, %s\n", ms(Clock::now() - resumed), lane_closed ? "the bulk lane closed at its deadline" : "lanes kept");
+	CHECK(!lane_closed || Clock::now() - resumed >= deadline - margin); // never early
 	const Clock::duration pause = 2 * deadline + 100ms;
-	const auto lost = cluster.stalled;
+	const auto asked = cluster.stalled;
 	auto retried = fetch(cluster, 0, 2, "history/table");
 	if (stalls)
 		asio::post(io, [pause] { std::this_thread::sleep_for(pause); });
 	CHECK(co_await cluster.until([&] { return retried->done; }, 3s));
-	// What the process lost beyond the stop placed: covered when the extension still leaves the
-	// fetch its running time (an 8 MiB fetch takes up to ~210 ms of 500), else bounded.
+	// What the process lost beyond the stop placed, since the peer resumed: covered when the
+	// extensions still leave the drain and the fetch their running time (an 8 MiB transfer takes up
+	// to ~210 ms of 500), else bounded.
 	const auto extra = std::max(cluster.stalled - lost - (stalls ? pause : Clock::duration::zero()), Clock::duration::zero());
-	const auto ran = retried->answered - retried->asked - (cluster.stalled - lost);
-	const bool covered = extra <= deadline / 4;
+	const auto ran = retried->answered - retried->asked - (cluster.stalled - asked);
+	const bool covered = !lane_closed && extra <= deadline / 4;
 	std::printf("  retried fetch: %s in %lld ms (stopped %lld ms placed, %lld ms more: %s)\n",
 				retried->error ? retried->error.message().c_str() : "ok", ms(retried->answered - retried->asked),
-				stalls ? ms(pause) : 0, ms(extra), covered ? "covered, must succeed" : "beyond one extension, bounded");
+				stalls ? ms(pause) : 0, ms(extra), covered ? "covered, must succeed" : lane_closed ? "lane closed in the drain, bounded" : "beyond one extension, bounded");
 	if (covered)
 		CHECK(!retried->error && retried->bytes == (*files[1])["history/table"]);
 	else
 		CHECK(retried->error ? !retried->bytes && ran <= deadline + margin : retried->bytes == (*files[1])["history/table"]);
-	CHECK(cluster.peers[0]->stats().admitted == admitted && cluster.connections(0) == 4); // the same lanes
+	if (covered) // a stop in the drain can end the late reply's second deadline: the lane closes by design
+		CHECK(cluster.peers[0]->stats().admitted == admitted && cluster.connections(0) == 4); // the same lanes
 	CHECK(co_await cluster.commit("after the hang", {0, 1, 2}, 5s));
 
 	if (stalls) { // 2100 ms stop, silent peer: the deadline is 1600 ms late, the extension its cap
@@ -1310,6 +1320,8 @@ asio::awaitable<void> fetch_failures(asio::io_context &io, const Certificates &c
 	CHECK(co_await cluster.fully_connected(3s));
 	auto reopened = fetch(cluster, 0, 2, "history/table");
 	CHECK(co_await cluster.until([&] { return reopened->done; }, 3s));
+	std::printf("  reopened: %s in %lld ms\n", reopened->error ? reopened->error.message().c_str() : "ok",
+				ms(reopened->answered - reopened->asked));
 	CHECK(!reopened->error && reopened->bytes == (*files[1])["history/table"]);
 	CHECK(co_await cluster.commit("with two again", {0, 1, 2}, 5s));
 	CHECK(co_await cluster.stop_all(2s));

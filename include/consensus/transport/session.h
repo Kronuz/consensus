@@ -106,21 +106,26 @@ inline std::chrono::steady_clock::duration owed(const asio::steady_timer &timer,
 					  cap);
 }
 // Waits for a peer deadline: once it fires, the wait extends by what the peer is owed (owed),
-// once. Completes with the wait's error, operation_aborted when cancelled.
+// once. The wait owns its timer, so an owner that drops the timer after it fired is safe.
+// Completes with the wait's error, operation_aborted when cancelled.
 template <class Token>
-auto async_deadline(asio::steady_timer &timer, std::chrono::steady_clock::duration cap, Token &&token) {
+auto async_deadline(std::shared_ptr<asio::steady_timer> timer, std::chrono::steady_clock::duration cap, Token &&token) {
+	const auto executor = timer->get_executor();
 	return asio::async_compose<Token, void(asio::error_code)>(
-		[&timer, cap, waits = 0](auto &self, asio::error_code error = {}) mutable {
+		[timer = std::move(timer), cap, waits = 0](auto &self, asio::error_code error = {}) mutable {
 			if (waits++ == 0)
-				return timer.async_wait(std::move(self));
-			if (!error && waits == 2)
-				if (const auto more = owed(timer, cap); more > std::chrono::steady_clock::duration::zero()) {
-					timer.expires_after(more);
-					return timer.async_wait(std::move(self));
+				return timer->async_wait(std::move(self));
+			if (!error && waits == 2) {
+				if (self.cancelled() != asio::cancellation_type::none)
+					return self.complete(asio::error::operation_aborted);
+				if (const auto more = owed(*timer, cap); more > std::chrono::steady_clock::duration::zero()) {
+					timer->expires_after(more);
+					return timer->async_wait(std::move(self));
 				}
+			}
 			self.complete(error);
 		},
-		token, timer);
+		token, executor);
 }
 } // namespace detail
 
@@ -262,16 +267,16 @@ template <class Socket> class BasicSession {
 	timed(asio::awaitable<asio::error_code> operation,
 		  std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) {
 		using namespace asio::experimental::awaitable_operators;
-		asio::steady_timer timer(co_await asio::this_coro::executor);
-		timer.expires_at(deadline == std::chrono::steady_clock::time_point::max()
-							 ? std::chrono::steady_clock::now() + timeout_
-							 : deadline);
+		auto timer = std::make_shared<asio::steady_timer>(co_await asio::this_coro::executor);
+		timer->expires_at(deadline == std::chrono::steady_clock::time_point::max()
+							  ? std::chrono::steady_clock::now() + timeout_
+							  : deadline);
 		// || cancels and reaps the losing original operation before returning.
 		// Errors are values so an I/O failure wins immediately, rather than waiting
 		// for the deadline because the combinator considers exceptions failures.
 		asio::error_code expired;
 		auto result = co_await (std::move(operation) ||
-								detail::async_deadline(timer, timeout_, asio::redirect_error(asio::use_awaitable, expired)));
+								detail::async_deadline(std::move(timer), timeout_, asio::redirect_error(asio::use_awaitable, expired)));
 		if (result.index() != 0) {
 			close();
 			throw asio::system_error(expired ? expired : asio::error::timed_out);

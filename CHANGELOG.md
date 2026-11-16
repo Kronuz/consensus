@@ -6,6 +6,18 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#consensus) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-15
+
+### Fixed
+
+- A leader counts a late append success: when a round trip outlasts `rpc_timeout` and the
+  flight is re-sent, the follower's answer to the superseded flight still advances its matched
+  index, since a success in the leader's term proves the follower holds the log through it.
+  Before, the late answer was dropped as unmatched, so a loaded event loop (5 ms of CPU per
+  cycle against a 40 ms `rpc_timeout`) re-sent forever and committed nothing. A late failure,
+  a success past the leader's log, and any answer from an older term still change nothing.
+  No API or wire change.
+
 ## 2026-11-13
 
 ### Added

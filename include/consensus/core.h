@@ -937,23 +937,21 @@ private:
 		// turn independent snapshot contact into an immediate request loop.
 		if (peer.keepalive && peer.keepalive->rpc == response.rpc) { return; }
 		auto at = std::find_if(peer.flights.begin(), peer.flights.end(), [&](const Flight& f) { return f.rpc == response.rpc; });
-		if (at == peer.flights.end()) { return; }
-		auto flight = *at;
-		if (response.read_probe != flight.read_probe) { return; }
-		if (response.success) {
-			if (response.matched != flight.through) { return; }
-			peer.matched = std::max(peer.matched, response.matched);
-			// It and every older flight are matched (log matching); later ones stay in flight.
-			const auto done = std::size_t(at - peer.flights.begin()) + 1;
-			for (std::size_t i = 0; i < done; ++i) { peer.window -= peer.flights.front().bytes; peer.flights.pop_front(); }
-			peer.verified = true;
-			if (peer.flights.empty()) { peer.next = peer.matched + 1; }
-			if (!peer.blocked) { peer.retry_after = 0; }
-			if (transfer_ && transfer_->target == source) { timeout_now(output); }
-			if (flight.read_probe) {
-				for (auto& read : reads_) { if (read.probe == flight.read_probe && read.term == hard_.term) { read.acknowledgements.insert(source); } }
-			}
+		if (at == peer.flights.end()) {
+			// A superseded flight's success in this term still proves the follower holds this
+			// log through `matched` (log matching); a late failure is stale.
+			if (!response.success || peer.snapshot || response.matched > last_index()) { return; }
+			acknowledge_read(source, response.read_probe);
+			if (response.matched <= peer.matched) { return; }
+			acknowledge(source, peer, response.matched, output);
+		} else if (response.read_probe != at->read_probe) {
+			return;
+		} else if (response.success) {
+			if (response.matched != at->through) { return; }
+			acknowledge_read(source, response.read_probe);
+			acknowledge(source, peer, response.matched, output);
 		} else {
+			auto flight = *at;
 			// A stale failure cannot reach this path. Durable peers cannot lose a
 			// matched prefix on restart; never rewind below verified progress.
 			peer.next = flight.previous + 1;  // where this flight started, not the pipeline's tip
@@ -977,6 +975,20 @@ private:
 		if (peer.next <= last_index() || needed) {
 			replicate(source, peer, output, needed);
 		}
+	}
+	// A success in this term: the follower holds this log through `matched`, so each flight
+	// ending there is done; later ones stay in flight.
+	void acknowledge(NodeId source, Peer& peer, Index matched, Actions& output) {
+		peer.matched = std::max(peer.matched, matched);
+		while (!peer.flights.empty() && peer.flights.front().through <= peer.matched) { peer.window -= peer.flights.front().bytes; peer.flights.pop_front(); }
+		peer.next = std::max(peer.next, peer.matched + 1);
+		if (peer.flights.empty() || peer.flights.front().previous <= peer.matched) { peer.verified = true; }
+		if (!peer.blocked) { peer.retry_after = 0; }
+		if (transfer_ && transfer_->target == source) { timeout_now(output); }
+	}
+	void acknowledge_read(NodeId source, Token probe) {
+		if (!probe) { return; }
+		for (auto& read : reads_) { if (read.probe == probe && read.term == hard_.term) { read.acknowledgements.insert(source); } }
 	}
 	void receive_message(NodeId source, SnapshotResponse response, StorageBatch&, Actions& output) {
 		if (role_ != Role::Leader || response.term != hard_.term || response.key.leader_term != durable_.term) { return; }

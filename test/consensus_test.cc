@@ -604,6 +604,85 @@ void stale_rpc_and_failure_transitions() {
 	}
 }
 
+// An append whose round trip outlasts rpc_timeout is re-sent; the follower's late success
+// still proves its log and commits, while a late failure, or a success past the leader's
+// log, changes nothing.
+void late_append_responses() {
+	Network cluster; cluster.start(); cluster.elect();
+	auto& leader = *cluster.host(1).core;
+	cluster.consume(1, leader.step(Propose{50, "late"}));
+	std::deque<Envelope> late; std::swap(late, cluster.network);
+	check(late.size() == 2, "the command goes to both followers");
+	cluster.consume(1, leader.step(Tick{140, 100}));
+	std::deque<Envelope> resent; std::swap(resent, cluster.network);
+	auto retried = [&](NodeId to) {
+		return std::any_of(resent.begin(), resent.end(), [&](const Envelope& e) {
+			auto request = std::get_if<AppendRequest>(&e.message);
+			return e.to == to && request && request->entries.size() == 1 && request->rpc != std::get<AppendRequest>(late[to - 2].message).rpc;
+		});
+	};
+	check(late.size() == 2 && late[0].to == 2 && late[1].to == 3 && retried(2) && retried(3), "past rpc_timeout both flights are re-sent");
+	if (late.size() != 2) { return; }
+	const auto three = std::get<AppendRequest>(late[1].message).rpc;
+	auto failure = leader.step(Receive{3, AppendResponse{1, three, false, 0, 1, 0}});
+	auto beyond = leader.step(Receive{3, AppendResponse{1, three, true, leader.last_index() + 1, leader.last_index() + 2, 0}});
+	check(failure.empty() && beyond.empty() && leader.progress(3) == Index{0}, "a late failure, or a success past the leader's log, is stale");
+	for (auto& envelope : late) { cluster.consume(envelope.to, cluster.host(envelope.to).core->step(Receive{1, std::move(envelope.message)})); }
+	std::deque<Envelope> answers; std::swap(answers, cluster.network);
+	check(answers.size() == 2, "both followers answer the superseded request");
+	for (auto& answer : answers) {
+		if (answer.from != 2) { continue; }
+		cluster.consume(1, leader.step(Receive{2, std::move(answer.message)}));
+	}
+	check(leader.progress(2) == Index{2} && leader.committed() == 2, "the late success matches voter two and commits the command");
+	for (auto& answer : answers) { if (answer.from == 3) { cluster.network.push_back(std::move(answer)); } }
+	for (auto& envelope : resent) { cluster.network.push_back(std::move(envelope)); }
+	cluster.pump(); cluster.tick(160); cluster.pump();
+	check(leader.progress(3) == Index{2} && leader.committed() == 2, "the re-sent flights' answers change nothing further");
+	for (NodeId id : {1u, 2u, 3u}) { check(cluster.host(id).applied_commands == std::vector<std::string>{"late"}, "each voter applies the late command once"); }
+}
+
+// A success from an older term never counts, though the follower held those entries then:
+// here a later leader has truncated them, and counting it would commit index 4 on two voters.
+void stale_append_responses() {
+	Network cluster(5); cluster.start(); cluster.elect();
+	auto& one = *cluster.host(1).core;
+	for (RequestId request : {60u, 61u, 62u}) { cluster.consume(1, one.step(Propose{request, "doomed"})); }
+	// Only voter two takes indexes 2 to 4 in term 1; its acknowledgement is held back.
+	std::deque<Envelope> sent; std::swap(sent, cluster.network);
+	for (auto& envelope : sent) {
+		if (envelope.to == 2) { cluster.consume(2, cluster.host(2).core->step(Receive{1, std::move(envelope.message)})); }
+	}
+	std::optional<AppendResponse> stale;
+	for (const auto& envelope : cluster.network) {
+		auto response = std::get_if<AppendResponse>(&envelope.message);
+		if (response && response->success && (!stale || response->matched > stale->matched)) { stale = *response; }
+	}
+	cluster.network.clear();
+	check(stale && stale->term == 1 && stale->matched == 4 && cluster.host(2).core->last_index() == 4, "voter two acknowledges indexes 2 to 4 in term 1");
+	if (!stale) { return; }
+	// Voter three leads term 2 without one and two, then replaces their indexes 2 to 4.
+	cluster.isolated = {1, 2};
+	cluster.now = 250; cluster.consume(3, cluster.host(3).core->step(Tick{250, 140})); cluster.pump();
+	check(cluster.host(3).core->role() == Role::Leader && cluster.host(3).core->term() == 2, "voter three leads term 2 with four and five");
+	cluster.isolated = {1};
+	cluster.now = 300; cluster.consume(3, cluster.host(3).core->step(Tick{300, 140})); cluster.pump();
+	cluster.isolated.clear();
+	cluster.now = 340; cluster.consume(3, cluster.host(3).core->step(Tick{340, 140})); cluster.pump();
+	check(cluster.host(1).core->last_index() == 2 && cluster.host(2).core->last_index() == 2 && cluster.host(2).core->term() == 2,
+		"term 2 truncates voters one and two to index 2");
+	// Voter one leads term 3 with four and five; only four takes indexes 4 and 5.
+	cluster.isolated = {2, 3};
+	cluster.now = 450; cluster.consume(1, one.step(Tick{450, 100})); cluster.pump();
+	check(one.role() == Role::Leader && one.term() == 3 && one.committed() == 3, "voter one leads term 3 and commits its no-op");
+	cluster.isolated = {2, 3, 5};
+	for (RequestId request : {63u, 64u}) { cluster.consume(1, one.step(Propose{request, "current"})); cluster.pump(); }
+	check(one.last_index() == 5 && one.progress(4) == Index{5} && one.committed() == 3, "two of five voters cannot commit index 4");
+	auto output = one.step(Receive{2, *stale});
+	check(output.empty() && one.progress(2) == Index{0} && one.committed() == 3,
+		"a term-1 acknowledgement through index 4 neither matches voter two nor commits index 4");
+}
+
 void bounds_and_semantic_recovery() {
 	Limits limits; limits.log_entries = 4; limits.control_entries = 2;
 	Network bounded(1, limits); bounded.start(); bounded.elect();
@@ -1936,7 +2015,7 @@ void recovered_delivery_byte_bound() {
 }
 
 int main() {
-	try { recovered_delivery_byte_bound(); terminal_retirement(); snapshot_sender_maximum_fanout(); snapshot_sender_lost_ack_and_terms(); snapshot_sender_receiver_contact(); snapshot_sender_restart_clock_and_admission(); snapshot_sender_correlation(); snapshot_sender_keepalive_pacing(); snapshot_sender_retries_and_retention(); snapshot_timeout_retries(); portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); repair_at_or_below_commit(); prevote_guard_checkquorum(); membership_scripts(); membership_formats(); leadership_transfer(); witnesses(); checkpoint_with_configuration_suffix(); founding_records(); limits_by_position(); learner_install_and_promotion(); }
+	try { recovered_delivery_byte_bound(); terminal_retirement(); snapshot_sender_maximum_fanout(); snapshot_sender_lost_ack_and_terms(); snapshot_sender_receiver_contact(); snapshot_sender_restart_clock_and_admission(); snapshot_sender_correlation(); snapshot_sender_keepalive_pacing(); snapshot_sender_retries_and_retention(); snapshot_timeout_retries(); portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); late_append_responses(); stale_append_responses(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); repair_at_or_below_commit(); prevote_guard_checkquorum(); membership_scripts(); membership_formats(); leadership_transfer(); witnesses(); checkpoint_with_configuration_suffix(); founding_records(); limits_by_position(); learner_install_and_promotion(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " consensus checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

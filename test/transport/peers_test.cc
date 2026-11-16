@@ -180,8 +180,7 @@ struct FakeDns {
 };
 
 constexpr Timing compact{20, 40, 100, 200, 60000};
-// For a test that loads the one test thread: an append round trip past rpc_timeout is never
-// matched (consensus-late-append), and a slow runner under load exceeds compact's 40 ms.
+// For a test that loads the one test thread: a slow runner under load exceeds compact's 40 ms.
 constexpr Timing loaded{20, 200, 400, 800, 60000};
 Limits limits() {
 	Limits result;
@@ -1263,6 +1262,48 @@ asio::awaitable<void> fetch_hung_peer(asio::io_context &io, const Certificates &
 	CHECK(!resumed->error && resumed->bytes == (*files[1])["history/table"]);
 	CHECK(co_await cluster.stop_all(2s));
 }
+
+// The executor burns 5 ms each cycle, so append round trips outlast compact's 40 ms
+// rpc_timeout and every flight is re-sent: the late responses still match the followers' logs,
+// and each command commits within 2 s.
+asio::awaitable<void> late_append(asio::io_context &io, const Certificates &certificates) {
+	Cluster cluster(io, certificates);
+	serving(cluster, io);
+	for (unsigned i = 0; i != 3; ++i)
+		cluster.start(i);
+	CHECK(co_await cluster.commit("before", {0, 1, 2}, 5s));
+	CHECK(co_await cluster.fully_connected(3s));
+	auto stop = std::make_shared<bool>(false);
+	auto hog = std::make_shared<std::function<void()>>();
+	*hog = [&io, stop, weak = std::weak_ptr(hog)] {
+		if (*stop)
+			return;
+		for (const auto end = Clock::now() + 5ms; Clock::now() < end;) {
+		}
+		if (auto next = weak.lock())
+			asio::post(io, *next);
+	};
+	asio::post(io, *hog);
+	const auto superseded = [&] {
+		std::uint64_t count = 0;
+		for (unsigned i = 0; i != 3; ++i)
+			count += cluster.peers[i]->stats().append.superseded.snapshot().count;
+		return count;
+	};
+	const auto before = superseded();
+	bool committed = true;
+	long long slowest = 0;
+	for (int k = 0; k != 3 && committed; ++k) {
+		const auto begun = Clock::now();
+		committed = co_await cluster.commit("late " + std::to_string(k), {0, 1, 2}, 2s);
+		slowest = std::max(slowest, ms(Clock::now() - begun));
+	}
+	*stop = true;
+	std::printf("  5 ms hog: commits %s, slowest %lld ms, %llu appends superseded\n", committed ? "ok" : "FAILED", slowest,
+				static_cast<unsigned long long>(superseded() - before));
+	CHECK(committed);
+	CHECK(co_await cluster.stop_all(5s));
+}
 } // namespace
 
 static_assert(PeerHost<MinimalHost> && PeerHost<Node>);
@@ -1286,6 +1327,7 @@ int main(int argc, char **argv) {
 		{"lookup-spacing", lookup_spacing},   {"membership", membership},
 		{"fetch-exact", fetch_exact},         {"fetch-alongside-consensus", fetch_alongside_consensus},
 		{"fetch-failures", fetch_failures},   {"fetch-hung-peer", fetch_hung_peer},
+		{"late-append", late_append},
 	};
 	for (const auto &[name, scenario] : scenarios)
 		if (only.empty() || only == name)

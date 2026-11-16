@@ -1224,11 +1224,15 @@ asio::awaitable<void> fetch_alongside_stalls(asio::io_context &io, const Certifi
 // F3: voter two hangs as its reply starts. Voter one's fetch fails at its deadline; voter two
 // resumes within the next, the late reply drains into the failed fetch over the same lanes, and
 // the next fetch succeeds. Then voter two closes as its reply starts: the fetch fails at once, and the other
-// two keep committing. With `stalls`, the process stops 1100 ms as the next fetch is asked, past
-// the fetch deadline by more than one deadline: it fires late, extends by the cap, and the
-// peer gets one whole deadline of running time after resuming, as without the stop.
+// two keep committing. With `stalls`, the process stops as the next fetch is asked: 1100 ms,
+// past the fetch deadline by more than one deadline, so it fires late, extends by the cap, and
+// the peer gets one whole deadline of running time after resuming, as without the stop. Then
+// 2100 ms with a silent peer: the fetch fails one deadline of running time after resuming.
+// The stops the runner adds are measured (Cluster::stalled): the retried fetch must succeed
+// while they leave it its extension, and else fail within one deadline of running time.
 asio::awaitable<void> fetch_failures(asio::io_context &io, const Certificates &certificates, bool stalls) {
 	constexpr std::size_t size = 8 * 1024 * 1024;
+	constexpr Clock::duration margin = 150ms;
 	Cluster cluster(io, certificates);
 	cluster.aside = 1;
 	auto files = serving(cluster, io);
@@ -1258,17 +1262,41 @@ asio::awaitable<void> fetch_failures(asio::io_context &io, const Certificates &c
 	CHECK(cluster.peers[0]->occupancy().fetches == 1); // the failed fetch keeps its slot until its reply ends
 	cluster.frozen = false;
 	CHECK(co_await cluster.until([&] { return cluster.peers[0]->occupancy().fetches == 0; }, 3s));
+	const auto deadline = cluster.options[0].fetch_deadline;
+	const Clock::duration pause = 2 * deadline + 100ms;
+	const auto lost = cluster.stalled;
 	auto retried = fetch(cluster, 0, 2, "history/table");
-	const Clock::duration pause = 2 * cluster.options[0].fetch_deadline + 100ms;
 	if (stalls)
 		asio::post(io, [pause] { std::this_thread::sleep_for(pause); });
 	CHECK(co_await cluster.until([&] { return retried->done; }, 3s));
-	std::printf("  retried fetch: %s in %lld ms (stopped %lld ms)\n",
+	// What the process lost beyond the stop placed: covered when the extension still leaves the
+	// fetch its running time (an 8 MiB fetch takes up to ~210 ms of 500), else bounded.
+	const auto extra = std::max(cluster.stalled - lost - (stalls ? pause : Clock::duration::zero()), Clock::duration::zero());
+	const auto ran = retried->answered - retried->asked - (cluster.stalled - lost);
+	const bool covered = extra <= deadline / 4;
+	std::printf("  retried fetch: %s in %lld ms (stopped %lld ms placed, %lld ms more: %s)\n",
 				retried->error ? retried->error.message().c_str() : "ok", ms(retried->answered - retried->asked),
-				stalls ? ms(pause) : 0);
-	CHECK(!retried->error && retried->bytes == (*files[1])["history/table"]);
+				stalls ? ms(pause) : 0, ms(extra), covered ? "covered, must succeed" : "beyond one extension, bounded");
+	if (covered)
+		CHECK(!retried->error && retried->bytes == (*files[1])["history/table"]);
+	else
+		CHECK(retried->error ? !retried->bytes && ran <= deadline + margin : retried->bytes == (*files[1])["history/table"]);
 	CHECK(cluster.peers[0]->stats().admitted == admitted && cluster.connections(0) == 4); // the same lanes
 	CHECK(co_await cluster.commit("after the hang", {0, 1, 2}, 5s));
+
+	if (stalls) { // 2100 ms stop, silent peer: the deadline is 1600 ms late, the extension its cap
+		then = Then::Freeze;
+		const auto before = cluster.stalled;
+		auto silent = fetch(cluster, 0, 2, "history/table");
+		asio::post(io, [] { std::this_thread::sleep_for(2100ms); });
+		CHECK(co_await cluster.until([&] { return silent->done; }, 3s));
+		const auto ran = silent->answered - silent->asked - (cluster.stalled - before);
+		std::printf("  silent peer, stopped 2100 ms: %s after %lld ms of running time\n", silent->error.message().c_str(), ms(ran));
+		CHECK(cluster.frozen && silent->error == std::errc::timed_out && !silent->bytes);
+		CHECK(ran >= deadline / 2 && ran <= deadline + margin);
+		cluster.frozen = false;
+		CHECK(co_await cluster.until([&] { return cluster.peers[0]->occupancy().fetches == 0; }, 3s));
+	}
 
 	then = Then::Close;
 	auto closed = fetch(cluster, 0, 2, "history/table");

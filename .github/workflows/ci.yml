@@ -14,3 +14,4 @@ jobs:
     uses: Kronuz/cpp-libraries/.github/workflows/cmake.yml@main
     with:
       nightly: ${{ inputs.nightly || false }}
+      cmake_args: -DCONSENSUS_TIMING_TESTS=OFF

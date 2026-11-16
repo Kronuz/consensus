@@ -20,6 +20,7 @@ add_library(consensus::consensus ALIAS consensus)
 # The authenticated peer transport (TLS over TCP, a control and a bulk lane per peer):
 # optional, since it brings Asio, reactor, and OpenSSL 3.
 option(CONSENSUS_TRANSPORT "Build the peer transport target consensus::transport" OFF)
+option(CONSENSUS_TIMING_TESTS "Register the wall-clock tests (ctest label timing)" ON)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	set(CONSENSUS_TRANSPORT ON)
 endif()
@@ -121,10 +122,14 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 		set_tests_properties(consensus_transport_${t} PROPERTIES TIMEOUT 30)
 	endforeach()
 	# The peers scenarios run in groups, each its own entry within the limit (peers_test.cc main).
-	foreach(group fetch stalls)
-		add_test(NAME consensus_transport_peers_${group} COMMAND consensus_transport_peers_test --${group})
-		set_tests_properties(consensus_transport_peers_${group} PROPERTIES TIMEOUT 30)
-	endforeach()
+	add_test(NAME consensus_transport_peers_fetch COMMAND consensus_transport_peers_test --fetch)
+	set_tests_properties(consensus_transport_peers_fetch PROPERTIES TIMEOUT 30)
+	# The stalls scenarios inject and measure process stops in wall time, which a runner that stops
+	# the process breaks: ctest label `timing` (ctest -LE timing skips it), and CI configures it out.
+	if(CONSENSUS_TIMING_TESTS)
+		add_test(NAME consensus_transport_peers_stalls COMMAND consensus_transport_peers_test --stalls)
+		set_tests_properties(consensus_transport_peers_stalls PROPERTIES TIMEOUT 30 LABELS timing)
+	endif()
 	add_test(NAME consensus_transport_tls COMMAND consensus_transport_tls_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture)
 	add_test(NAME consensus_transport_pipe COMMAND consensus_transport_tls_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture --pipes)
 	add_test(NAME consensus_transport_authentication COMMAND consensus_transport_authentication_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture)

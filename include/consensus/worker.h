@@ -107,12 +107,13 @@ public:
 		if (scheduling_.async_storage) { scheduling_.async_appends = true; }
 		validate_configuration(admission);
 	}
-	// D11: the group persists through its core's turn driver (journal's shared Store), so
-	// its appends and checkpoint records are asynchronous and complete at turn barriers.
-	Worker(std::shared_ptr<kronuz::journal::IO> io, kronuz::journal::TurnDriver& turns, std::uint64_t group, FixedConfiguration configuration,
+	// D11: the group is one of a journal host's (journal/host.h): its batches and checkpoint
+	// records go to its loop's turn log, so its appends and publications are asynchronous and
+	// complete at turn barriers; its artifacts are its own names in the host's directory.
+	Worker(kronuz::journal::Host& host, std::uint64_t group, FixedConfiguration configuration,
 		kronuz::journal::AdmissionLimits admission, Limits limits = {}, Timing timing = {}, WorkerLimits scheduling = {}, std::optional<SnapshotLimits> snapshots = {})
 		: configuration_(std::move(configuration)), limits_(limits), timing_(timing), scheduling_(scheduling),
-		snapshot_limits_(snapshots), store_(std::move(io), turns, group, admission, batch_limit(configuration_, limits, scheduling), artifact_limit(snapshots)) {
+		snapshot_limits_(snapshots), store_(host, group, admission, batch_limit(configuration_, limits, scheduling), artifact_limit(snapshots)) {
 		scheduling_.async_appends = scheduling_.async_storage = true;
 		validate_configuration(admission);
 	}
@@ -163,10 +164,7 @@ public:
 					recovery.restore(std::move(decoded.state), decoded.storage_sequence);
 					restore_application(dependencies[0]); // Build unpublished application state.
 				};
-			// A shared group whose directory still holds a per-group journal migrates (R20);
-			// the host calls finish_migration() once the driver's turns are durable.
-			auto frontier = store_.shared() && store_.layout() == kronuz::journal::Journal::Layout::Legacy
-				? store_.migrate(replay, restore) : store_.recover(replay, restore);
+			auto frontier = store_.recover(replay, restore);
 			if (frontier.sequence == 0 && frontier.base_sequence == 0 && frontier.version == 1 && !frontier.checkpoint && frontier.dependencies.empty()) {
 				// Generic bootstrap is already durable; typed initialization may
 				// have been queued when the previous process exited.
@@ -174,11 +172,6 @@ public:
 				core_ = std::make_unique<Core>(configuration_, initial_state(), limits_, timing_, Flow{}, scheduling_.retained);
 			} else { core_ = std::make_unique<Core>(configuration_, recovery.finish(frontier.sequence), limits_, timing_, Flow{}, scheduling_.retained); }
 		} catch (const std::exception& error) { fail(error.what()); throw; }
-	}
-	// R20: after a migrating recover, once the turn driver has made its records durable.
-	bool migrating() const noexcept { return store_.migrating(); }
-	void finish_migration() {
-		try { store_.finish_migration(); } catch (const std::exception& error) { fail(error.what()); throw; }
 	}
 	bool ready() const noexcept { return !closing_ && core_ && initialization_.empty() && store_.accounting().has_value() && !fenced(); }
 	// Close protocol interest, then reap accepted originals before invalidating

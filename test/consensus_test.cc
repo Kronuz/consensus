@@ -582,10 +582,12 @@ void stale_rpc_and_failure_transitions() {
 	cluster.consume(1, cluster.host(1).core->step(Propose{40, "delayed"}));
 	auto old = std::get<AppendRequest>(cluster.network.front().message);
 	cluster.host(1).core->step(Tick{140, 100}); // Retry replaces expired RPC correlation.
-	auto stale_success = cluster.host(1).core->step(Receive{2, AppendResponse{1, old.rpc, true, 2, 3, old.read_probe}});
+	auto late_success = cluster.host(1).core->step(Receive{2, AppendResponse{1, old.rpc, true, 2, 3, old.read_probe}});
+	check(find<Persist>(late_success), "a replaced RPC's success in this term still matches the follower and commits");
+	cluster.consume(1, std::move(late_success)); cluster.network.clear();
 	auto stale_failure = cluster.host(1).core->step(Receive{2, AppendResponse{1, old.rpc, false, 0, 1, old.read_probe}});
-	check(stale_success.empty() && stale_failure.empty() && cluster.host(1).core->committed() == 1,
-		"old successes and failures cannot advance or rewind a replaced RPC");
+	check(stale_failure.empty() && cluster.host(1).core->committed() == 2 && cluster.host(1).core->progress(2) == Index{2},
+		"an old failure cannot rewind a replaced RPC");
 	auto higher = cluster.host(1).core->step(Receive{2, AppendResponse{2, old.rpc, false, 0, 1, old.read_probe}});
 	check(find<Persist>(higher) && cluster.host(1).core->role() == Role::Follower && cluster.host(1).core->term() == 2,
 		"valid higher term persists before obsolete RPC correlation is filtered");
@@ -624,9 +626,10 @@ void late_append_responses() {
 	check(late.size() == 2 && late[0].to == 2 && late[1].to == 3 && retried(2) && retried(3), "past rpc_timeout both flights are re-sent");
 	if (late.size() != 2) { return; }
 	const auto three = std::get<AppendRequest>(late[1].message).rpc;
+	const auto matched = leader.progress(3);
 	auto failure = leader.step(Receive{3, AppendResponse{1, three, false, 0, 1, 0}});
 	auto beyond = leader.step(Receive{3, AppendResponse{1, three, true, leader.last_index() + 1, leader.last_index() + 2, 0}});
-	check(failure.empty() && beyond.empty() && leader.progress(3) == Index{0}, "a late failure, or a success past the leader's log, is stale");
+	check(failure.empty() && beyond.empty() && leader.progress(3) == matched, "a late failure, or a success past the leader's log, is stale");
 	for (auto& envelope : late) { cluster.consume(envelope.to, cluster.host(envelope.to).core->step(Receive{1, std::move(envelope.message)})); }
 	std::deque<Envelope> answers; std::swap(answers, cluster.network);
 	check(answers.size() == 2, "both followers answer the superseded request");
@@ -648,15 +651,16 @@ void stale_append_responses() {
 	Network cluster(5); cluster.start(); cluster.elect();
 	auto& one = *cluster.host(1).core;
 	for (RequestId request : {60u, 61u, 62u}) { cluster.consume(1, one.step(Propose{request, "doomed"})); }
-	// Only voter two takes indexes 2 to 4 in term 1; its acknowledgement is held back.
-	std::deque<Envelope> sent; std::swap(sent, cluster.network);
-	for (auto& envelope : sent) {
-		if (envelope.to == 2) { cluster.consume(2, cluster.host(2).core->step(Receive{1, std::move(envelope.message)})); }
-	}
+	// Only voter two takes indexes 2 to 4 in term 1; its acknowledgement through 4 is held back.
 	std::optional<AppendResponse> stale;
-	for (const auto& envelope : cluster.network) {
-		auto response = std::get_if<AppendResponse>(&envelope.message);
-		if (response && response->success && (!stale || response->matched > stale->matched)) { stale = *response; }
+	for (int round = 0; round != 8 && !stale; ++round) {
+		std::deque<Envelope> sent; std::swap(sent, cluster.network);
+		for (auto& envelope : sent) {
+			auto response = std::get_if<AppendResponse>(&envelope.message);
+			if (envelope.from == 1 && envelope.to == 2) { cluster.consume(2, cluster.host(2).core->step(Receive{1, std::move(envelope.message)})); }
+			else if (envelope.from == 2 && response && response->matched == 4) { stale = *response; }
+			else if (envelope.from == 2 && envelope.to == 1) { cluster.consume(1, one.step(Receive{2, std::move(envelope.message)})); }
+		}
 	}
 	cluster.network.clear();
 	check(stale && stale->term == 1 && stale->matched == 4 && cluster.host(2).core->last_index() == 4, "voter two acknowledges indexes 2 to 4 in term 1");

@@ -8,6 +8,7 @@
 #include <iostream>
 #include <openssl/pem.h>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace kronuz::consensus::transport;
@@ -254,6 +255,84 @@ void malformed_frames(const std::filesystem::path &directory, unsigned mode) {
 	assert(budget->used() == 0);
 }
 
+// The reader stops (blocks its thread) 600 ms, three of its 200 ms timeouts, once a 1 MiB
+// frame's deadline runs. A peer that sends the rest is read: the late deadline extends. A
+// silent one fails one timeout after the reader resumes, not the stop's lateness later.
+void late_deadline(const std::filesystem::path &directory, bool silent) {
+	using Clock = std::chrono::steady_clock;
+	asio::io_context io;
+	auto server_context = std::make_shared<asio::ssl::context>(asio::ssl::context::tls);
+	auto client_context = std::make_shared<asio::ssl::context>(asio::ssl::context::tls);
+	reactor::tls::configure(
+		*server_context,
+		{(directory / "one.pem").string(), (directory / "one.key").string(), (directory / "ca.pem").string()},
+		reactor::tls::Role::Peer);
+	reactor::tls::configure(
+		*client_context,
+		{(directory / "two.pem").string(), (directory / "two.key").string(), (directory / "ca.pem").string()},
+		reactor::tls::Role::Peer);
+	constexpr std::size_t size = 1024 * 1024, head = 1024;
+	auto pipes = AsyncPipe::pair(io);
+	auto budget = std::make_shared<ByteBudget>(size);
+	BasicSession<AsyncPipe> server(std::move(pipes.first), server_context, budget, size, 200ms);
+	asio::ssl::stream<AsyncPipe> client(std::move(pipes.second), *client_context);
+	std::map<kronuz::consensus::NodeId, Fingerprint> pins{{1, pin(directory / "one.pem")},
+														   {2, pin(directory / "two.pem")}};
+	auto first = hello(1), second = hello(2);
+	bool received = false;
+	asio::error_code failed;
+	Clock::time_point resumed, failed_at;
+	auto serve = [&]() -> asio::awaitable<void> {
+		(void)co_await server.authenticate(true, first, pins);
+		try {
+			auto frame = co_await server.receive();
+			received = frame.bytes() == std::string(size, 'x');
+		} catch (const asio::system_error &error) {
+			failed = error.code();
+			failed_at = Clock::now();
+		}
+	};
+	auto send = [&]() -> asio::awaitable<void> {
+		co_await client.async_handshake(asio::ssl::stream_base::client, asio::use_awaitable);
+		auto bytes = encode_hello(second);
+		co_await asio::async_write(client, asio::buffer(bytes), asio::use_awaitable);
+		std::array<char, hello_size> reply{};
+		co_await asio::async_read(client, asio::buffer(reply), asio::use_awaitable);
+		std::array<unsigned char, 4> header{};
+		for (unsigned i = 0; i != 4; ++i)
+			header[i] = static_cast<unsigned char>(size >> (i * 8));
+		const std::string body(size, 'x');
+		co_await asio::async_write(client, asio::buffer(header), asio::use_awaitable);
+		co_await asio::async_write(client, asio::buffer(body.data(), head), asio::use_awaitable);
+		asio::steady_timer wait(io);
+		while (budget->used() == 0) { // the frame is admitted: its deadline runs
+			wait.expires_after(1ms);
+			co_await wait.async_wait(asio::use_awaitable);
+		}
+		std::this_thread::sleep_for(600ms);
+		resumed = Clock::now();
+		if (silent) {
+			wait.expires_after(500ms);
+			co_await wait.async_wait(asio::use_awaitable);
+		} else
+			co_await asio::async_write(client, asio::buffer(body.data() + head, size - head), asio::use_awaitable);
+	};
+	auto a = asio::co_spawn(io, serve(), asio::use_future);
+	auto b = asio::co_spawn(io, send(), asio::use_future);
+	io.run();
+	a.get();
+	try {
+		b.get();
+	} catch (const asio::system_error &) { // the reader closed the lane
+	}
+	const auto after = std::chrono::duration_cast<std::chrono::milliseconds>(failed_at - resumed).count();
+	if (silent ? failed != asio::error::timed_out || after < 150 || after >= 300 : !received || failed)
+		std::fprintf(stderr, "late deadline (%s): %s, failed %lld ms after resuming\n", silent ? "silent" : "sent",
+					 failed ? failed.message().c_str() : "received", silent ? after : 0LL);
+	assert(silent ? failed == asio::error::timed_out && after >= 150 && after < 300 : received && !failed);
+	assert(budget->used() == 0);
+}
+
 int main(int argc, char **argv) {
 	std::signal(SIGPIPE, SIG_IGN);
 	assert(argc == 2 || argc == 3);
@@ -263,9 +342,12 @@ int main(int argc, char **argv) {
 		else
 			exchange<Tcp::socket>(argv[1], failure);
 	}
-	if (argc == 3)
+	if (argc == 3) {
 		for (unsigned mode = 0; mode != 5; ++mode)
 			malformed_frames(argv[1], mode);
+		late_deadline(argv[1], false);
+		late_deadline(argv[1], true);
+	}
 	auto budget = std::make_shared<ByteBudget>(3);
 	{
 		Frame held(budget, 3);

@@ -332,13 +332,15 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 		connection->serving.clear();
 	}
 	// A reply unfinished at fetch_deadline fails its fetch; one unfinished a deadline later
-	// closes the bulk lane, whose peer is hung or gone, which frees the fetch's slot.
+	// closes the bulk lane, whose peer is hung or gone, which frees the fetch's slot. Each
+	// deadline that fires late extends by what the peer is owed (async_deadline).
 	void await_reply(const std::shared_ptr<Connection> &connection, std::uint64_t id) {
 		auto &timer = *connection->fetching.at(id).timer;
 		timer.expires_after(options_.fetch_deadline);
 		++tasks_;
-		timer.async_wait([owner = this->shared_from_this(), weak = std::weak_ptr<Connection>(connection),
-						  id](asio::error_code error) {
+		detail::async_deadline(timer, options_.fetch_deadline,
+					   [owner = this->shared_from_this(), weak = std::weak_ptr<Connection>(connection),
+						id](asio::error_code error) {
 			--owner->tasks_;
 			auto connection = weak.lock();
 			if (!connection || error)
@@ -564,7 +566,7 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 		auto timer = std::make_shared<asio::steady_timer>(executor_, route.answer_by);
 		route.waiting.push_back(timer);
 		asio::error_code error;
-		co_await timer->async_wait(asio::redirect_error(asio::use_awaitable, error));
+		co_await detail::async_deadline(*timer, options_.resolve_deadline, asio::redirect_error(asio::use_awaitable, error));
 		std::erase(route.waiting, timer);
 		if (!error)
 			++stats_.lookup_timeouts;
@@ -615,8 +617,9 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 		};
 		auto race = std::make_shared<Race>(executor_);
 		const auto now = std::chrono::steady_clock::now();
-		const auto deadline = now + options_.deadline;
+		auto deadline = now + options_.deadline;
 		auto next_start = now;
+		bool extended = false;
 		while (!stopping_ && !race->winner && std::chrono::steady_clock::now() < deadline) {
 			const auto started = race->sockets.size();
 			if (started < endpoints.size() && (!race->pending || std::chrono::steady_clock::now() >= next_start)) {
@@ -643,6 +646,11 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 			race->wake.expires_at(started < endpoints.size() ? std::min(next_start, deadline) : deadline);
 			asio::error_code error;
 			co_await race->wake.async_wait(asio::redirect_error(asio::use_awaitable, error));
+			// A wake past the deadline that fired late: the attempts are owed that time, once.
+			if (const auto resumed = std::chrono::steady_clock::now(); !error && !extended && resumed >= deadline) {
+				extended = true;
+				deadline = resumed + detail::owed(race->wake, options_.deadline);
+			}
 		}
 		asio::error_code ignored;
 		for (std::size_t i = 0; i != race->sockets.size(); ++i)

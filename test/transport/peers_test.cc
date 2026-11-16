@@ -47,6 +47,10 @@ struct MinimalHost {
 long long ms(Clock::duration duration) {
 	return std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
 }
+// A pump iteration that outlasts its 1 ms wait and the CPU the thread used by more than this was
+// a stall: the process did not run (a VM stop). Two 10 ms scheduler quanta, far above timer
+// slack and preemption (Cluster::slack), far below the 300 ms stops that broke the bounds.
+constexpr Clock::duration stall_floor = 20ms;
 // The CPU time this thread has used.
 Clock::duration thread_cpu() {
 	timespec now{};
@@ -275,8 +279,9 @@ struct Cluster {
 	std::vector<std::shared_ptr<Peers<Node>>> retired;
 	Clock::time_point origin = Clock::now();
 	// Time the process lost while runnable or stopped (a slow runner's VM): ticks and limits
-	// leave it out, so they count the time the voters ran (until).
-	Clock::duration stalled{};
+	// leave it out, so they count the time the voters ran (until). Off-CPU blocking on the
+	// executor counts too. slack: the largest iteration overrun under stall_floor.
+	Clock::duration stalled{}, slack{};
 	RequestId request = 0;
 	Timing timing;
 
@@ -359,23 +364,25 @@ struct Cluster {
 				peers[i]->pump();
 		}
 	}
-	// Pumps every millisecond until done() or the limit; returns whether done() held. A wait
-	// that ends late by more than the CPU this thread used meanwhile was a stall: the limit
-	// moves out by it.
+	// Pumps every millisecond until done() or the limit; returns whether done() held. An
+	// iteration past stall_floor was a stall: the limit moves out by it.
 	asio::awaitable<bool> until(std::function<bool()> done, Clock::duration limit) {
 		auto end = Clock::now() + limit;
 		asio::steady_timer timer(io);
 		while (Clock::now() < end) {
+			const auto begun = Clock::now();
+			const auto used = thread_cpu();
 			pump();
 			if (done())
 				co_return true;
-			const auto used = thread_cpu();
 			timer.expires_after(1ms);
 			co_await timer.async_wait(asio::use_awaitable);
-			if (const auto stall = Clock::now() - timer.expiry() - (thread_cpu() - used); stall > Clock::duration::zero()) {
+			const auto stall = Clock::now() - begun - 1ms - (thread_cpu() - used);
+			if (stall > stall_floor) {
 				stalled += stall;
 				end += stall;
-			}
+			} else
+				slack = std::max(slack, stall);
 		}
 		if (verbose)
 			report();
@@ -1187,13 +1194,15 @@ asio::awaitable<void> fetch_alongside(asio::io_context &io, const Certificates &
 	std::printf("  quiet: %u commits, slowest %lld ms; %llu round trips, slowest bucket <= %llu us, %llu timeouts\n",
 				quiet_commits, quiet_slowest, (unsigned long long)quiet.count,
 				(unsigned long long)(quiet.slowest_ns / 1000), (unsigned long long)quiet.timeouts);
+	const auto bound = bucket_bound(round_trip_bound_ns + excused);
 	std::printf("  fetching: %u commits, slowest %lld ms; %llu round trips, slowest bucket <= %llu us, %llu timeouts; "
-				"stalled %lld ms\n",
+				"stalled %lld ms, bound %llu us; slack %lld us\n",
 				busy_commits, busy_slowest, (unsigned long long)busy.count, (unsigned long long)(busy.slowest_ns / 1000),
-				(unsigned long long)busy.timeouts, (long long)(excused / 1'000'000));
+				(unsigned long long)busy.timeouts, (long long)(excused / 1'000'000), (unsigned long long)(bound / 1000),
+				(long long)std::chrono::duration_cast<std::chrono::microseconds>(cluster.slack).count());
 	CHECK(busy_commits >= 1 && busy.count >= 10);
 	CHECK(busy.timeouts == 0 || round_trip_bound_ns + excused >= deadline);
-	CHECK(busy.slowest_ns <= bucket_bound(round_trip_bound_ns + excused));
+	CHECK(busy.slowest_ns <= bound);
 	CHECK(cluster.leader() == leader && cluster.nodes[*leader]->worker().term() == term);
 	CHECK(co_await cluster.stop_all(2s));
 }
@@ -1207,8 +1216,9 @@ asio::awaitable<void> fetch_alongside_stalls(asio::io_context &io, const Certifi
 // F3: voter two hangs as its reply starts. Voter one's fetch fails at its deadline; voter two
 // resumes within the next, the late reply drains into the failed fetch over the same lanes, and
 // the next fetch succeeds. Then voter two closes as its reply starts: the fetch fails at once, and the other
-// two keep committing.
-asio::awaitable<void> fetch_failures(asio::io_context &io, const Certificates &certificates) {
+// two keep committing. With `stalls`, the process stops 700 ms, past the fetch deadline, as the
+// next fetch is asked: it still succeeds (the deadline fires late and extends).
+asio::awaitable<void> fetch_failures(asio::io_context &io, const Certificates &certificates, bool stalls) {
 	constexpr std::size_t size = 8 * 1024 * 1024;
 	Cluster cluster(io, certificates);
 	cluster.aside = 1;
@@ -1240,7 +1250,11 @@ asio::awaitable<void> fetch_failures(asio::io_context &io, const Certificates &c
 	cluster.frozen = false;
 	CHECK(co_await cluster.until([&] { return cluster.peers[0]->occupancy().fetches == 0; }, 3s));
 	auto retried = fetch(cluster, 0, 2, "history/table");
+	if (stalls)
+		asio::post(io, [] { std::this_thread::sleep_for(700ms); });
 	CHECK(co_await cluster.until([&] { return retried->done; }, 3s));
+	if (retried->error)
+		std::printf("  retried fetch: %s\n", retried->error.message().c_str());
 	CHECK(!retried->error && retried->bytes == (*files[1])["history/table"]);
 	CHECK(cluster.peers[0]->stats().admitted == admitted && cluster.connections(0) == 4); // the same lanes
 	CHECK(co_await cluster.commit("after the hang", {0, 1, 2}, 5s));
@@ -1259,6 +1273,45 @@ asio::awaitable<void> fetch_failures(asio::io_context &io, const Certificates &c
 	CHECK(co_await cluster.until([&] { return reopened->done; }, 3s));
 	CHECK(!reopened->error && reopened->bytes == (*files[1])["history/table"]);
 	CHECK(co_await cluster.commit("with two again", {0, 1, 2}, 5s));
+	CHECK(co_await cluster.stop_all(2s));
+}
+
+asio::awaitable<void> fetch_failures(asio::io_context &io, const Certificates &certificates) {
+	co_await fetch_failures(io, certificates, false);
+}
+asio::awaitable<void> fetch_failures_stalls(asio::io_context &io, const Certificates &certificates) {
+	co_await fetch_failures(io, certificates, true);
+}
+
+// The stall measure (Cluster::until): the executor's own work is no stall, so a 150 ms spin adds
+// none; a stop is one wherever it lands, so a 150 ms sleep inside an iteration's done() adds it.
+asio::awaitable<void> stall_accounting(asio::io_context &io, const Certificates &certificates) {
+	Cluster cluster(io, certificates);
+	serving(cluster, io);
+	for (unsigned i = 0; i != 3; ++i)
+		cluster.start(i);
+	CHECK(co_await cluster.commit("before", {0, 1, 2}, 5s));
+	auto before = cluster.stalled;
+	asio::post(io, [] {
+		for (const auto end = Clock::now() + 150ms; Clock::now() < end;) {
+		}
+	});
+	co_await cluster.idle(300ms);
+	const auto spun = cluster.stalled - before;
+	before = cluster.stalled;
+	bool slept = false;
+	cluster.verbose = false;
+	(void)co_await cluster.until(
+		[&] {
+			if (!std::exchange(slept, true))
+				std::this_thread::sleep_for(150ms);
+			return false;
+		},
+		300ms);
+	cluster.verbose = true;
+	const auto stopped = cluster.stalled - before;
+	std::printf("  150 ms spin: stalled %lld ms; 150 ms stop inside an iteration: stalled %lld ms\n", ms(spun), ms(stopped));
+	CHECK(spun < 75ms && stopped >= 140ms);
 	CHECK(co_await cluster.stop_all(2s));
 }
 
@@ -1359,6 +1412,8 @@ template class kronuz::consensus::transport::Peers<MinimalHost>;
 
 int main(int argc, char **argv) {
 	std::signal(SIGPIPE, SIG_IGN);
+	// No argument runs every scenario but the stalls; --stalls runs those (their own ctest
+	// entry, as they sleep seconds); a name runs that scenario.
 	const std::string only = argc > 1 ? argv[1] : "";
 	Certificates certificates(std::filesystem::current_path() / ".scratch" /
 							  ("peers-dns-certificates-" + std::to_string(::getpid())));
@@ -1374,12 +1429,19 @@ int main(int argc, char **argv) {
 		{"refused-first", refused_first},     {"slow-resolver", slow_resolver},
 		{"lookup-spacing", lookup_spacing},   {"membership", membership},
 		{"fetch-exact", fetch_exact},         {"fetch-alongside-consensus", fetch_alongside_consensus},
-		{"fetch-alongside-stalls", fetch_alongside_stalls},
 		{"fetch-failures", fetch_failures},   {"fetch-hung-peer", fetch_hung_peer},
 		{"late-append", late_append},
 	};
+	const std::pair<const char *, Scenario> stalls[] = {
+		{"stall-accounting", stall_accounting},
+		{"fetch-alongside-stalls", fetch_alongside_stalls},
+		{"fetch-failures-stalls", fetch_failures_stalls},
+	};
 	for (const auto &[name, scenario] : scenarios)
 		if (only.empty() || only == name)
+			run(name, certificates, scenario);
+	for (const auto &[name, scenario] : stalls)
+		if (only == "--stalls" || only == name)
 			run(name, certificates, scenario);
 	std::printf("peers: ok\n");
 	return EXIT_SUCCESS;

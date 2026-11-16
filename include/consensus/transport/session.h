@@ -96,6 +96,34 @@ class Frame {
 	std::string bytes_;
 };
 
+namespace detail {
+// The time a peer deadline that just fired is owed: the timer's lateness, at most `cap`. A late
+// timer fired while this executor did not run (the host stopped or descheduled the process), so
+// the peer gets that time again after resuming, bounded by one deadline.
+inline std::chrono::steady_clock::duration owed(const asio::steady_timer &timer,
+												std::chrono::steady_clock::duration cap) {
+	return std::clamp(std::chrono::steady_clock::now() - timer.expiry(), std::chrono::steady_clock::duration::zero(),
+					  cap);
+}
+// Waits for a peer deadline: once it fires, the wait extends by what the peer is owed (owed),
+// once. Completes with the wait's error, operation_aborted when cancelled.
+template <class Token>
+auto async_deadline(asio::steady_timer &timer, std::chrono::steady_clock::duration cap, Token &&token) {
+	return asio::async_compose<Token, void(asio::error_code)>(
+		[&timer, cap, waits = 0](auto &self, asio::error_code error = {}) mutable {
+			if (waits++ == 0)
+				return timer.async_wait(std::move(self));
+			if (!error && waits == 2)
+				if (const auto more = owed(timer, cap); more > std::chrono::steady_clock::duration::zero()) {
+					timer.expires_after(more);
+					return timer.async_wait(std::move(self));
+				}
+			self.complete(error);
+		},
+		token, timer);
+}
+} // namespace detail
+
 template <class Socket> class BasicSession {
   public:
 	using Stream = asio::ssl::stream<Socket>;
@@ -241,27 +269,17 @@ template <class Socket> class BasicSession {
 		// || cancels and reaps the losing original operation before returning.
 		// Errors are values so an I/O failure wins immediately, rather than waiting
 		// for the deadline because the combinator considers exceptions failures.
-		auto result = co_await (std::move(operation) || expiry(timer));
+		asio::error_code expired;
+		auto result = co_await (std::move(operation) ||
+								detail::async_deadline(timer, timeout_, asio::redirect_error(asio::use_awaitable, expired)));
 		if (result.index() != 0) {
 			close();
-			throw asio::system_error(std::get<1>(result) ? std::get<1>(result) : asio::error::timed_out);
+			throw asio::system_error(expired ? expired : asio::error::timed_out);
 		}
 		if (auto error = std::get<0>(result)) {
 			close();
 			throw asio::system_error(error);
 		}
-	}
-	// A deadline that fires late passed while this executor did not run (descheduled, or
-	// busy), so the peer is owed that time: the wait extends by the lateness, once.
-	static asio::awaitable<asio::error_code> expiry(asio::steady_timer &timer) {
-		asio::error_code error;
-		co_await timer.async_wait(asio::redirect_error(asio::use_awaitable, error));
-		if (const auto late = std::chrono::steady_clock::now() - timer.expiry();
-			!error && late > std::chrono::steady_clock::duration::zero()) {
-			timer.expires_after(late);
-			co_await timer.async_wait(asio::redirect_error(asio::use_awaitable, error));
-		}
-		co_return error;
 	}
 	std::shared_ptr<asio::ssl::context> context_;
 	Stream stream_;

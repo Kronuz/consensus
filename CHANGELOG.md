@@ -10,6 +10,13 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 
 ### Added
 
+- The host transport ([docs/mechanisms/host-transport.md](docs/mechanisms/host-transport.md)),
+  beside `Peers`: `transport/host_transport.h` shares a Control and a Bulk connection per peer
+  node among every group, each connection on the loop its node places on. Frames reach their
+  group's loop in one post per read; senders keep per-group queues with credit and control
+  frames first, round robin across groups. `send_message` and `receive_message` wire the
+  Driver's Sink `Send` and `receive` to it. `Connection` gains `on_read`, `on_drained`,
+  `rehome()` and `TCP_NOTSENT_LOWAT`; `Links` moves an accept to the loop that owns its peer.
 - The host connection ([docs/mechanisms/host-connection.md](docs/mechanisms/host-connection.md)),
   beside `Peers`: `transport/connection.h` drives OpenSSL on the non-blocking socket with
   released buffers, length-prefixed frames, a keepalive per connection and a graceful close

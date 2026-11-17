@@ -54,6 +54,14 @@ MUTANTS = {
     # links.h: gcc (13, 16) miscompiles a co_await in the right operand of && (run with g++)
     "dial-one-expression": (T + "links.h", "\t\tif (!connection)\n\t\t\tco_return false;\n\t\tco_return co_await offer(",
                             "\t\tco_return connection && co_await offer("),
+    # host_transport.h, links.h (transport-groups A1, A2)
+    "bulk-ahead-of-control": (T + "host_transport.h", "} else if (auto group = next(lane, false)) {",
+                              "} else if (auto group = next(lane, true) ? std::nullopt : next(lane, false)) {"),
+    "no-credit": (T + "host_transport.h", "return !g.data.empty() && (!g.outstanding || g.outstanding + g.data.front().size() <= options_.window);",
+                  "return !g.data.empty();"),
+    "reader-loop-delivers": (T + "host_transport.h", "\t\t\tif (to == k) {\n\t\t\t\tdeliver(k, std::move(moved));",
+                             "\t\t\tif (true) {\n\t\t\t\tdeliver(k, std::move(moved));"),
+    "no-hand-off": (T + "links.h", "Links *home = owner ? owner(peer) : nullptr;", "Links *home = nullptr;"),
 }
 
 

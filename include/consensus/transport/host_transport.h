@@ -52,6 +52,7 @@ struct HostLoop {
 	task::scheduler_ref scheduler;
 };
 
+// Destroy it after stop(), once drained() on every loop and the loops have stopped running.
 class HostTransport {
   public:
 	// On the group's loop, for each received message: false when the group cannot take it now,
@@ -105,6 +106,10 @@ class HostTransport {
 			kronuz::journal::put64(frame, value);
 		frame.append(payload);
 		auto &here = loops_.at(loop);
+		if (frame.size() > options_.links.connection.maximum_frame) {
+			++here.stats.dropped;  // no connection carries it
+			return;
+		}
 		const auto to = loop_of_node(node);
 		here.out[to].push_back({node, lane, kind, route.group, std::move(frame)});
 		if (!here.flushing) {
@@ -362,8 +367,12 @@ class HostTransport {
 		auto &here = loops_[k];
 		std::map<GroupId, std::uint64_t> credit;
 		for (auto &r : batch.frames) {
-			if (!here.deliver || !here.deliver(r))
-				++here.stats.refused;
+			bool taken = false;
+			try {
+				taken = here.deliver && here.deliver(r);
+			} catch (...) {
+			}
+			here.stats.refused += !taken;
 			if (r.data)
 				credit[r.route.group] += frame_header + r.payload.size();
 		}

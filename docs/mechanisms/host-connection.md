@@ -59,6 +59,13 @@ peer reading steadily but slower than the queue drains is not stuck.
 `close_notify` (`abort()`, a crash) leaves the peer `failed`, never `closed`, so a truncated
 stream is never taken for a complete one.
 
+A sender with queues of its own (the host transport) hooks two moments: `on_read`, after each
+read's frames went to the handler, and `on_drained`, when the queue is out and the writer would
+wait, so it hands over a little at a time and keeps the order of what waits. Where the
+platform has `TCP_NOTSENT_LOWAT`, the socket holds at most 64 KiB unsent, so what the sender
+queues next waits behind little more than that. `rehome()` moves a connection to another loop
+between its handshake and its hellos.
+
 An end (`abort()`, a failure) shuts the socket down and cancels its waits; the fd closes only
 when `run()` returns, or with the connection. Until then the number stays this socket's, so no
 socket opened elsewhere can take it while the reader or writer still holds it, and no SSL call
@@ -90,7 +97,8 @@ A hello that breaks a rule ends the connection. The RPC lane's version on the co
 lane. A dial resolves the peer (a literal at once; a cached name at once while a lookup
 refreshes it; an uncached name after its lookup's answer, or its deadline), races the addresses
 (RFC 8305: the next a `stagger` after the one before, or as soon as every started one failed),
-and handshakes against the dialed node's pin. An accept handshakes against every pin.
+and handshakes against the dialed node's pin. An accept handshakes against every pin; when another loop's `Links` owns the peer (`owner`), the
+authenticated connection moves there for its hellos (`adopt`).
 
 Two nodes may dial each other at once. The hellos settle it before any frame:
 

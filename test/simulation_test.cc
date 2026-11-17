@@ -35,7 +35,8 @@
 //     sender's durable state at the moment it is sent.
 // After the run the group heals, elects a leader, and commits a new entry. Then the same
 // group runs through the Driver on journal hosts (driver_simulation.cc), a tenth of the seeds.
-//   simulation_test [seeds] [steps] [first seed]   (defaults 200, 10000, 1)
+//   simulation_test [seeds] [steps] [first seed]   (defaults 200, 10000, 1; SIM_DRIVER_SEEDS
+//   sets the Driver's seed count)
 #include "consensus/core.h"
 #include "consensus/membership.h"
 
@@ -979,6 +980,7 @@ int main(int argc, char** argv) {
 	std::printf("  forced: %llu crashes between promotion and removal; removals committed with a snapshot in flight %llu, with a read in flight %llu; %llu delayed duplicate TimeoutNows; %llu appends held back from peers below their next entry\n",
 		(unsigned long long)replacements, (unsigned long long)with_snapshot, (unsigned long long)with_read, (unsigned long long)duplicated, (unsigned long long)held);
 	if (failures) { return EXIT_FAILURE; }
-	const bool driver = driver_simulation::run((seeds + 9) / 10, std::min<std::uint64_t>(steps, 3000), first);
+	const auto* driver_seeds = std::getenv("SIM_DRIVER_SEEDS");  // the Driver's seeds alone, when set
+	const bool driver = driver_simulation::run(driver_seeds ? std::strtoull(driver_seeds, nullptr, 10) : (seeds + 9) / 10, std::min<std::uint64_t>(steps, 3000), first);
 	return driver ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -38,6 +38,7 @@
 #include <cstdlib>
 #include <deque>
 #include <mutex>
+#include <random>
 #include <functional>
 #include <map>
 #include <string>
@@ -57,13 +58,16 @@ void fail(const std::string& what) {
 }
 
 // Stateless exploration: each run follows a prefix of choices, then takes the first option;
-// next() backtracks to the deepest choice with an option left.
+// next() backtracks to the deepest choice with an option left. Sampling, each choice is drawn
+// instead, so a bounded run also varies its early choices.
 struct Explorer {
 	std::vector<unsigned> prefix, taken, widths;
+	std::mt19937_64 random{1};
+	bool sampling = false;
 	unsigned choose(unsigned n) {
 		if (n <= 1) { return 0; }
 		const auto at = taken.size();
-		const unsigned c = at < prefix.size() ? prefix[at] : 0;
+		const unsigned c = sampling ? static_cast<unsigned>(random() % n) : at < prefix.size() ? prefix[at] : 0;
 		taken.push_back(c); widths.push_back(n);
 		return c;
 	}
@@ -148,6 +152,8 @@ struct Caller {
 	int completions = 0;
 	std::exception_ptr error;
 	bool value = false;
+	Placement placement;   // propose's result
+	Index read_index = 0;  // read's result
 };
 
 template <class E> bool is(std::exception_ptr error) {
@@ -202,9 +208,9 @@ struct World {
 	task::task<void> call(Caller& c) {
 		auto token = c.token ? c.cancel.token() : task::cancel_token{};
 		switch (c.kind) {
-		case Kind::propose: co_await driver->propose(g, c.command, token); break;
+		case Kind::propose: c.placement = co_await driver->propose(g, c.command, token); break;
 		case Kind::committed: co_await driver->committed(g, Placement{1, 100}, token); break;
-		case Kind::read: co_await driver->read(g, token); break;
+		case Kind::read: c.read_index = (co_await driver->read(g, token)).index; break;
 		case Kind::create: co_await driver->create(g, j::Identity{'G', '1'}, token); break;
 		}
 		c.value = true;
@@ -300,6 +306,11 @@ void run_case(const Case& spec, Explorer& explorer) {
 		auto& c = *w.callers[i];
 		if (c.completions != 1) { fail("caller " + std::to_string(i) + " completed " + std::to_string(c.completions) + " times before shutdown"); continue; }
 		if (c.value) {
+			// A result is only what its D8 row completes with: a placement, a confirmed read; no
+			// run commits index 100.
+			if (c.kind == Kind::propose && c.placement.index == 0) { fail("a proposal completed with no placement"); }
+			if (c.kind == Kind::read && c.read_index == 0) { fail("a read completed with no read index"); }
+			if (c.kind == Kind::committed) { fail("committed completed below its index"); }
 			if (c.kind == Kind::propose && std::find(w.sink.commands.begin(), w.sink.commands.end(), c.command) == w.sink.commands.end() && !spec.close) {
 				fail("a placed proposal never committed");
 			}
@@ -319,17 +330,23 @@ void run_case(const Case& spec, Explorer& explorer) {
 	w.finish();
 }
 
+// Explores the case's schedules in order; past half the limit with schedules left, the rest
+// of the limit samples schedules at random (seeded, so a failure's schedule replays).
 std::uint64_t explore(const char* name, const Case& spec, std::uint64_t limit = 2'000'000) {
 	Explorer explorer;
-	std::uint64_t count = 0;
-	do {
+	std::uint64_t count = 0, sampled = 0;
+	bool more = true;
+	while (more && count < limit) {
 		++runs; ++count;
 		schedule = explorer.trace();
 		run_case(spec, explorer);
 		schedule = explorer.trace();
 		if (failures) { std::fprintf(stderr, "%s: failed at schedule %s\n", name, schedule.c_str()); break; }
-	} while (count < limit && explorer.next());
-	std::printf("%s: %llu schedules%s\n", name, (unsigned long long)count, count >= limit ? " (limit)" : "");
+		if (explorer.sampling) { ++sampled; }
+		if (explorer.sampling || count >= limit / 2) { explorer.sampling = true; explorer.taken.clear(); explorer.widths.clear(); }
+		else { more = explorer.next(); }
+	}
+	std::printf("%s: %llu schedules%s\n", name, (unsigned long long)count, sampled ? (" (" + std::to_string(count - sampled) + " in order, " + std::to_string(sampled) + " sampled)").c_str() : "");
 	return count;
 }
 

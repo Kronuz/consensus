@@ -663,7 +663,7 @@ void pipes() {
 						  .done = [&e](const Status &s) { ++e.completions, e.status = s; }};
 		},
 		b.post(), [&b] { b.pump(); });
-	constexpr int calls = 12;
+	static constexpr int calls = 12;
 	std::promise<void> all;
 	int finished = 0;
 	asio::post(a.io, [&] {

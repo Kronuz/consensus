@@ -15,9 +15,10 @@ import tempfile
 T = "include/consensus/transport/"
 MUTANTS = {
     # deadline.h (A1)
-    "no-extension": (T + "deadline.h", "if (!self.extended_ && late > wheel::timer_wheel::tick) {", "if (false) {"),
+    "no-extension": (T + "deadline.h", "if (self.extend_late_ && !self.extended_ && late > wheel::timer_wheel::tick) {", "if (false) {"),
     "uncapped": (T + "deadline.h", "self.extended_ = std::min(late, self.timeout_);", "self.extended_ = late;"),
-    "twice": (T + "deadline.h", "if (!self.extended_ && late > wheel::timer_wheel::tick) {", "if (late > wheel::timer_wheel::tick) {"),
+    "twice": (T + "deadline.h", "if (self.extend_late_ && !self.extended_ && late > wheel::timer_wheel::tick) {",
+              "if (self.extend_late_ && late > wheel::timer_wheel::tick) {"),
     "wake-ignores-extension": (T + "deadline.h", "\t\tif (state_ != outcome::pending)\n\t\t\treturn;\n\t\tstate_ = outcome::woken;",
                                "\t\tif (state_ != outcome::pending || extended_)\n\t\t\treturn;\n\t\tstate_ = outcome::woken;"),
     "entry-left-armed": (T + "deadline.h", "\t\tif (armed())\n\t\t\tloop_.cancel(*this);\n\t\tleave();", "\t\tleave();"),
@@ -63,8 +64,8 @@ MUTANTS = {
     "lookup-no-wake": (T + "links.h", "\t\t\troute.endpoints = interleave(found, route.address.port);\n\t\troute.waiting.wake_all();",
                        "\t\t\troute.endpoints = interleave(found, route.address.port);"),
     # links.h (security review S2, N1)
-    "abandon-keeps-dial": (T + "links.h", "\t\t\tconnection->abort();\n\t\t\tforget(connection);\n\t\t\tco_return false;",
-                           "\t\t\tco_return false;"),
+    "abandon-keeps-dial": (T + "links.h", "handshook\n\t\t\tconnection->abort();\n\t\t\tforget(connection);\n\t\t\tco_return false;",
+                           "handshook\n\t\t\tco_return false;"),
     "refuse-newest": (T + "links.h", "\t\telse if (handshaking_.size() >= options_.handshakes)\n\t\t\tdrop = handshaking_.begin();",
                       "\t\telse if (handshaking_.size() >= options_.handshakes)\n\t\t\treturn connection->abort();"),
     "no-source-cap": (T + "links.h", ">= options_.handshakes_per_source", ">= std::size_t(-1)"),

@@ -28,7 +28,8 @@
 // checks each caller completes exactly once, with a result its D8 row allows, close frees the
 // group's state, and after teardown no waiter stays linked; ASan checks no frame is touched
 // after it is freed. test/driver_mutants.py seeds the faults this must catch.
-//   waiter_test [case [limit]]   rows, close, close-read, close-open, close-late, teardown, threads
+//   waiter_test [case [limit]]   rows-propose, rows-committed, rows-read, rows-propose-pair, close,
+//                                close-read, close-open, close-late, teardown, teardown-close, threads
 #include "consensus/driver.h"
 #include "journal/memory_io.h"
 
@@ -463,36 +464,33 @@ void threads(int rounds) {
 	std::printf("threads: %d rounds\n", rounds);
 }
 
-// Each case explores up to `limit` schedules per spec (threads: rounds).
+// Each case explores one spec up to `limit` schedules (threads: rounds).
 const std::map<std::string, std::function<void(std::uint64_t)>> cases{
-	{"rows", [](std::uint64_t n) {
-		explore("rows propose", Case{{Kind::propose}}, n);
-		explore("rows committed", Case{{Kind::committed}}, n);
-		explore("rows read", Case{{Kind::read}, false, false, true}, n);
-		explore("rows propose pair", Case{{Kind::propose, Kind::propose}}, n);
-	}},
+	{"rows-propose", [](std::uint64_t n) { explore("rows propose", Case{{Kind::propose}}, n); }},
+	{"rows-committed", [](std::uint64_t n) { explore("rows committed", Case{{Kind::committed}}, n); }},
+	{"rows-read", [](std::uint64_t n) { explore("rows read", Case{{Kind::read}, false, false, true}, n); }},
+	{"rows-propose-pair", [](std::uint64_t n) { explore("rows propose pair", Case{{Kind::propose, Kind::propose}}, n); }},
 	{"close", [](std::uint64_t n) { explore("close", Case{{Kind::propose, Kind::propose, Kind::committed}, true}, n); }},
 	{"close-read", [](std::uint64_t n) { explore("close-read", Case{{Kind::read, Kind::read}, true, false, true, false, true, true, true}, n); }},
 	{"close-open", [](std::uint64_t n) { explore("close-open", Case{{Kind::create, Kind::create}, true, false, false, false, false}, n); }},
 	{"close-late", [](std::uint64_t n) { explore("close-late", Case{{Kind::propose, Kind::propose}, true, false, true, true}, n); }},
-	{"teardown", [](std::uint64_t n) {
-		explore("teardown", Case{{Kind::propose, Kind::read}, false, true}, n);
-		explore("teardown close", Case{{Kind::propose, Kind::committed}, true, true}, n);
-	}},
+	{"teardown", [](std::uint64_t n) { explore("teardown", Case{{Kind::propose, Kind::read}, false, true}, n); }},
+	{"teardown-close", [](std::uint64_t n) { explore("teardown close", Case{{Kind::propose, Kind::committed}, true, true}, n); }},
 	{"threads", [](std::uint64_t n) { threads(static_cast<int>(std::min<std::uint64_t>(n, 300))); }},
 };
 
 }  // namespace
 
-// `waiter_test CASE [LIMIT]` explores CASE up to LIMIT schedules (2,000,000; threads 300
-// rounds); with no case, every case up to 20,000 (threads 100 rounds), the ctest smoke run.
+// `waiter_test [CASE [LIMIT]]` explores CASE, or every case, up to LIMIT schedules (threads:
+// rounds, at most 300); the default, 20,000 (threads 100 rounds), is ctest's run of each case.
 int main(int argc, char** argv) {
+	const auto limit = [&](const std::string& name) -> std::uint64_t { return argc > 2 ? std::strtoull(argv[2], nullptr, 10) : name == "threads" ? 100 : 20'000; };
 	if (argc > 1) {
 		auto found = cases.find(argv[1]);
 		if (found == cases.end()) { std::fprintf(stderr, "unknown case %s\n", argv[1]); return 2; }
-		found->second(argc > 2 ? std::strtoull(argv[2], nullptr, 10) : 2'000'000);
+		found->second(limit(found->first));
 	} else {
-		for (const auto& [name, run] : cases) { run(name == "threads" ? 100 : 20'000); }
+		for (const auto& [name, run] : cases) { run(limit(name)); }
 	}
 	std::printf("waiter: %llu runs, %llu failures\n", (unsigned long long)runs, (unsigned long long)failures);
 	return failures ? 1 : 0;

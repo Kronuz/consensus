@@ -14,7 +14,7 @@ run() {
 }
 for c in lone_voter rows checkpoints close fence; do run 120 "$build/consensus_driver_test" "$c"; done
 for c in lone_voter stalled needs_peer staged_then_cancelled cross_thread_cancel ownership; do run 120 "$build/consensus_blocking_entry_test" "$c"; done
-for c in rows close close-read close-open close-late teardown threads; do run 900 "$build/consensus_waiter_test" "$c" "${WAITER_LIMIT:-1000000}"; done
+for c in rows-propose rows-committed rows-read rows-propose-pair close close-read close-open close-late teardown teardown-close threads; do run 900 "$build/consensus_waiter_test" "$c" "${WAITER_LIMIT:-1000000}"; done
 run 300 "$build/consensus_driver_idle" 1000
 SIM_DRIVER_SEEDS="${SIM_DRIVER_SEEDS:-8}" run 600 "$build/consensus_simulation_test" 0 3000 1
 exit $status

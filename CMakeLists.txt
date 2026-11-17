@@ -71,8 +71,11 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	set_tests_properties(consensus_shared_cluster PROPERTIES TIMEOUT 600)
 	add_executable(consensus_waiter_test test/waiter_test.cc)
 	target_link_libraries(consensus_waiter_test PRIVATE consensus::consensus)
-	add_test(NAME consensus_waiter COMMAND consensus_waiter_test)
-	set_tests_properties(consensus_waiter PROPERTIES TIMEOUT 600)
+	# One entry per case, so each stays well inside its timeout under ASan on a CI runner.
+	foreach(c rows-propose rows-committed rows-read rows-propose-pair close close-read close-open close-late teardown teardown-close threads)
+		add_test(NAME consensus_waiter_${c} COMMAND consensus_waiter_test ${c})
+		set_tests_properties(consensus_waiter_${c} PROPERTIES TIMEOUT 600)
+	endforeach()
 	# A seeded fault (test/driver_mutants.py), for the waiter, driver and membership tests' mutant jobs.
 	set(CONSENSUS_DRIVER_MUTANT "" CACHE STRING "a test/driver_mutants.py fault built into consensus_waiter_test, consensus_driver_test and consensus_membership_test")
 	if(CONSENSUS_DRIVER_MUTANT)

@@ -1,0 +1,271 @@
+#pragma once
+#include "deadline.h"
+#include "node_hello.h"
+#include "node_pins.h"
+#include <asio/ip/tcp.hpp>
+#include <asio/ssl/context.hpp>
+#include <climits>
+#include <functional>
+#include <memory>
+#include <netinet/tcp.h>
+#include <string>
+#include <sys/socket.h>
+#include <task_asio.hh>
+
+// One host connection (docs/mechanisms/host-connection.md): OpenSSL driven on the non-blocking
+// socket (SSL_set_fd, readiness through await_asio on async_wait), with SSL_MODE_RELEASE_BUFFERS
+// so an idle end holds no record buffers. Frames are a 4-byte little-endian length and the
+// bytes; a length of 0 is a keepalive. Everything runs on the connection's loop.
+namespace kronuz::consensus::transport {
+struct ConnectionOptions {
+	std::chrono::milliseconds handshake{5000};  // TLS and the hellos
+	std::chrono::milliseconds keepalive{1000};  // a connection that sent nothing for this long sends a keepalive
+	std::chrono::milliseconds dead_after{5000}; // a connection that received nothing for this long, or cannot write, ends
+	std::size_t maximum_frame = 4 * 1024 * 1024;
+};
+// How run() ended: both ends sent close_notify, a socket, TLS or framing failure, or a peer
+// silent for dead_after.
+enum class ConnectionEnd : std::uint8_t { open, closed, failed, dead };
+
+class Connection {
+  public:
+	// Each frame, synchronously on the loop, viewing the connection's own buffer until it returns.
+	using Handler = std::function<void(std::string_view)>;
+
+	Connection(task::scheduler_ref loop, asio::ip::tcp::socket socket, std::shared_ptr<asio::ssl::context> tls,
+			   bool dialer, ConnectionOptions options = {})
+		: loop_(loop), socket_(std::move(socket)), tls_(std::move(tls)), options_(options), dialer_(dialer) {
+		if (!tls_ || options_.maximum_frame > UINT32_MAX || options_.keepalive <= options_.keepalive.zero() ||
+			options_.dead_after <= options_.dead_after.zero() || options_.handshake <= options_.handshake.zero())
+			throw std::invalid_argument("connection options");
+		socket_.non_blocking(true);
+		const int one = 1;
+		::setsockopt(socket_.native_handle(), IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+		ssl_.reset(SSL_new(tls_->native_handle()));
+		if (!ssl_ || SSL_set_fd(ssl_.get(), int(socket_.native_handle())) != 1)
+			throw std::runtime_error("connection: SSL_new");
+		SSL_set_mode(ssl_.get(),
+					 SSL_MODE_RELEASE_BUFFERS | SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+		dialer_ ? SSL_set_connect_state(ssl_.get()) : SSL_set_accept_state(ssl_.get());
+	}
+	Connection(const Connection &) = delete;
+	Connection &operator=(const Connection &) = delete;
+
+	bool dialer() const noexcept { return dialer_; }
+	bool draining() const noexcept { return closing_; }
+	ConnectionEnd end() const noexcept { return end_; }
+	std::size_t queued() const noexcept { return out_.size() + sending_.size(); }
+	std::uint64_t keepalives_sent() const noexcept { return keepalives_sent_; }
+	std::uint64_t keepalives_received() const noexcept { return keepalives_received_; }
+	const asio::ip::tcp::socket &socket() const noexcept { return socket_; }
+
+	// The TLS handshake, then the peer's node by its pin (`expected` when nonzero). Throws, and
+	// the connection is unusable, when either fails or `deadline` is requested.
+	task::task<kronuz::consensus::NodeId> handshake(const NodePins &pins, kronuz::consensus::NodeId expected,
+													task::cancel_token deadline) {
+		for (;;) {
+			const int r = SSL_do_handshake(ssl_.get());
+			if (r == 1)
+				break;
+			co_await want(SSL_get_error(ssl_.get(), r), deadline, "TLS handshake");
+		}
+		co_return pins.authenticate(ssl_.get(), expected);
+	}
+	task::task<void> write_hello(const NodeHello &hello, task::cancel_token deadline) {
+		sending_ = encode_node_hello(hello);
+		co_await flush(deadline);
+	}
+	task::task<NodeHello> read_hello(task::cancel_token deadline) {
+		while (in_.size() < node_hello_size)
+			if (!co_await fill(deadline))
+				throw std::runtime_error("connection: closed before its hello");
+		auto hello = decode_node_hello(std::string_view(in_).substr(0, node_hello_size));
+		in_.erase(0, node_hello_size);
+		co_return hello;
+	}
+
+	// Runs the connection once its hellos are exchanged: frames to `handler`, queued frames out,
+	// a keepalive while idle, until it ends; destroy it after this returns.
+	task::task<ConnectionEnd> run(Handler handler) {
+		handler_ = std::move(handler);
+		co_await task::when_all(reader(), writer());
+		asio::error_code ignored;
+		socket_.close(ignored);
+		co_return end_;
+	}
+
+	// Queues a frame, sent in order after every frame queued before it.
+	void send(std::string_view frame) {
+		if (closing_ || end_ != ConnectionEnd::open)
+			throw std::logic_error("connection: send after close");
+		if (frame.empty() || frame.size() > options_.maximum_frame)
+			throw std::invalid_argument("connection: frame size");
+		put_length(frame.size());
+		out_.append(frame);
+		wake_writer();
+	}
+	// Graceful: the frames queued so far, then close_notify; run() ends when the peer's arrives.
+	void close() noexcept {
+		if (closing_)
+			return;
+		closing_ = true;
+		wake_writer();
+	}
+	// Now: the socket closes and run() ends failed.
+	void abort() noexcept { fail(ConnectionEnd::failed); }
+
+  private:
+	struct ssl_free {
+		void operator()(SSL *ssl) const noexcept { SSL_free(ssl); }
+	};
+	void put_length(std::size_t n) {
+		for (int i = 0; i != 4; ++i)
+			out_.push_back(char(n >> (8 * i)));
+	}
+	void wake_writer() noexcept {
+		if (writer_wake_)
+			writer_wake_->wake();
+	}
+	void fail(ConnectionEnd why) noexcept {
+		if (end_ == ConnectionEnd::open)
+			end_ = why;
+		closing_ = true;
+		asio::error_code ignored;
+		socket_.close(ignored);
+		wake_writer();
+	}
+	// Waits for what SSL_get_error asked for: readable or writable, or throws.
+	task::task<void> want(int error, const task::cancel_token &deadline, const char *what) {
+		using wait = asio::socket_base::wait_type;
+		if (error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE) {
+			ERR_clear_error();
+			throw std::runtime_error(std::string("connection: ") + what + " failed");
+		}
+		const auto type = error == SSL_ERROR_WANT_READ ? wait::wait_read : wait::wait_write;
+		const auto ec = co_await task::await_asio<void(asio::error_code)>(
+			[this, type](auto h) { socket_.async_wait(type, std::move(h)); }, deadline);
+		if (deadline.requested())
+			throw std::runtime_error(std::string("connection: ") + what + " deadline");
+		if (ec)
+			throw std::system_error(ec);
+	}
+	// One SSL_read into the buffer: false at the peer's close_notify. The buffer grows only by
+	// what arrived, so a connection waiting to read holds none.
+	task::task<bool> fill(task::cancel_token deadline) {
+		constexpr std::size_t chunk = 16 * 1024;
+		for (;;) {
+			const auto had = in_.size();
+			in_.resize(had + chunk);
+			const int r = SSL_read(ssl_.get(), in_.data() + had, int(chunk));
+			in_.resize(had + std::size_t(std::max(r, 0)));
+			if (r > 0)
+				co_return true;
+			if (in_.empty())
+				std::string().swap(in_);
+			const int error = SSL_get_error(ssl_.get(), r);
+			if (error == SSL_ERROR_ZERO_RETURN)
+				co_return false;
+			co_await want(error, deadline, "read");
+		}
+	}
+	// Writes `sending_` whole.
+	task::task<void> flush(task::cancel_token deadline) {
+		while (!sending_.empty()) {
+			const int r = SSL_write(ssl_.get(), sending_.data(), int(std::min<std::size_t>(sending_.size(), INT_MAX)));
+			if (r > 0) {
+				sending_.erase(0, std::size_t(r));
+				continue;
+			}
+			co_await want(SSL_get_error(ssl_.get(), r), deadline, "write");
+		}
+	}
+	// Hands every whole frame in the buffer to the handler; throws on an oversized one.
+	void deliver() {
+		std::size_t at = 0;
+		while (in_.size() - at >= 4) {
+			std::size_t n = 0;
+			for (int i = 0; i != 4; ++i)
+				n |= std::size_t(static_cast<unsigned char>(in_[at + i])) << (8 * i);
+			if (n > options_.maximum_frame)
+				throw std::runtime_error("connection: frame over its bound");
+			if (in_.size() - at - 4 < n)
+				break;
+			if (n == 0)
+				++keepalives_received_;
+			else if (handler_)
+				handler_(std::string_view(in_).substr(at + 4, n));
+			at += 4 + n;
+		}
+		in_.erase(0, at);
+		if (in_.empty())
+			std::string().swap(in_);  // an idle connection holds no frame buffer
+	}
+	task::task<void> reader() {
+		try {
+			for (bool more = true; more;) {
+				deliver();
+				late_deadline dead(loop_, options_.dead_after);
+				try {
+					more = co_await fill(dead.token());
+				} catch (...) {
+					dead_ = dead.state() == late_deadline::outcome::expired;
+					throw;
+				}
+			}
+			close();  // the peer's close_notify: answer with ours once the queue is out
+		} catch (...) {
+			fail(dead_ ? ConnectionEnd::dead : ConnectionEnd::failed);
+		}
+		reading_done_ = true;
+		if (end_ == ConnectionEnd::open && writing_done_)
+			end_ = ConnectionEnd::closed;
+	}
+	task::task<void> writer() {
+		try {
+			for (;;) {
+				if (sending_.empty())
+					sending_.swap(out_);
+				if (!sending_.empty()) {
+					late_deadline stuck(loop_, options_.dead_after);
+					co_await flush(stuck.token());
+					continue;
+				}
+				if (closing_)
+					break;
+				late_deadline idle(loop_, options_.keepalive);
+				writer_wake_ = &idle;
+				const auto woke = co_await idle.wait();
+				writer_wake_ = nullptr;
+				if (woke == late_deadline::outcome::expired && out_.empty() && !closing_) {
+					put_length(0);
+					++keepalives_sent_;
+				}
+			}
+			if (end_ == ConnectionEnd::open) {
+				late_deadline stuck(loop_, options_.dead_after);
+				for (int r; (r = SSL_shutdown(ssl_.get())) < 0;)
+					co_await want(SSL_get_error(ssl_.get(), r), stuck.token(), "close_notify");
+				::shutdown(socket_.native_handle(), SHUT_WR);
+			}
+		} catch (...) {
+			writer_wake_ = nullptr;
+			fail(ConnectionEnd::failed);
+		}
+		writing_done_ = true;
+		if (end_ == ConnectionEnd::open && reading_done_)
+			end_ = ConnectionEnd::closed;
+	}
+	task::scheduler_ref loop_;
+	asio::ip::tcp::socket socket_;
+	std::shared_ptr<asio::ssl::context> tls_;
+	std::unique_ptr<SSL, ssl_free> ssl_;
+	ConnectionOptions options_;
+	Handler handler_;
+	std::string in_, out_, sending_;
+	late_deadline *writer_wake_ = nullptr;
+	std::uint64_t keepalives_sent_ = 0, keepalives_received_ = 0;
+	ConnectionEnd end_ = ConnectionEnd::open;
+	// dead_: the reader failed at its dead-peer deadline, nothing arrived within dead_after.
+	bool dialer_, closing_ = false, reading_done_ = false, writing_done_ = false, dead_ = false;
+};
+} // namespace kronuz::consensus::transport

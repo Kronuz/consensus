@@ -21,6 +21,14 @@ MUTANTS = {
     "wake-ignores-extension": (T + "deadline.h", "\t\tif (state_ != outcome::pending)\n\t\t\treturn;\n\t\tstate_ = outcome::woken;",
                                "\t\tif (state_ != outcome::pending || extended_)\n\t\t\treturn;\n\t\tstate_ = outcome::woken;"),
     "entry-left-armed": (T + "deadline.h", "\t\tif (armed())\n\t\t\tloop_.cancel(*this);\n\t\tleave();", "\t\tleave();"),
+    # node_pins.h (A2)
+    "pin-any-node": (T + "node_pins.h", "if (expected && found != expected)", "if (false)"),
+    "pin-self": (T + "node_pins.h", "if (found == local_)", "if (false)"),
+    "pin-unpinned": (T + "node_pins.h", "\t\tif (!found)\n", "\t\tif (false)\n"),
+    # connection.h (A4, T8's transport half)
+    "close-drops-queue": (T + "connection.h", "\t\tclosing_ = true;\n\t\twake_writer();", "\t\tclosing_ = true;\n\t\tout_.clear();\n\t\twake_writer();"),
+    "no-close-notify": (T + "connection.h", "if (end_ == ConnectionEnd::open) {\n\t\t\t\tlate_deadline stuck", "if (false) {\n\t\t\t\tlate_deadline stuck"),
+    "no-keepalive": (T + "connection.h", "\t\t\t\t\tput_length(0);\n", "\t\t\t\t\t(void)0;\n"),
 }
 
 

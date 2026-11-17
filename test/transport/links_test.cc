@@ -209,9 +209,8 @@ void lookup() {
 	Host one(1, loop), two(2, loop);
 	LinkOptions options;
 	options.resolve_deadline = 1000ms;
-	std::atomic<int> calls{0};
-	options.resolver = [&](const std::string &host) {
-		++calls;
+	// The slow lookup's thread outlives this case (abandoned, it ends on its own): it captures nothing.
+	options.resolver = [](const std::string &host) {
 		std::this_thread::sleep_for(host == "slow.test" ? 3000ms : 100ms);
 		return std::vector<asio::ip::address>{asio::ip::address_v4::loopback()};
 	};

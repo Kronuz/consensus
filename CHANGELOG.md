@@ -10,6 +10,10 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 
 ### Added
 
+- The RPC lane's codec and call machinery ([docs/mechanisms/rpc-lane.md](docs/mechanisms/rpc-lane.md)):
+  `transport/rpc.h` encodes and checks its six frame kinds, keeps one connection's call table
+  (ids, credit, deadlines, `Drain`), and draws credit from thread-safe host pools with an atomic
+  `ByteBudget::renew`. It does no I/O and is not yet on Bulk.
 - The host transport ([docs/mechanisms/host-transport.md](docs/mechanisms/host-transport.md)),
   beside `Peers`: `transport/host_transport.h` shares a Control and a Bulk connection per peer
   node among every group, each connection on the loop its node places on. Frames reach their
@@ -26,6 +30,14 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
   `transport/links.h` dials, accepts and settles duplicate dials before any frame.
 - `transport/deadline.h`: `late_deadline`, the one rule for a transport deadline that fires
   late after a process stop (extend once by the lateness, capped at one timeout).
+
+### Fixed
+
+- The host transport's loops no longer race, as ThreadSanitizer sees it, on the TLS context's
+  certificates: `Links` caches their extensions (`cache_certificates`) before any loop
+  handshakes, instead of the first handshake caching the CA's while another loop reads it.
+- A loop's `HostTransportStats` count a read before its cross-loop posts, so a snapshot that
+  loads `posts` first never shows more than `L - 1` posts a read.
 
 ## 2026-11-16
 

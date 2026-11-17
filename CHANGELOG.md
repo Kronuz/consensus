@@ -16,6 +16,8 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
   `task::task` calls, with a Sink for what no caller awaits. `consensus::run` is the blocking
   entry over it. The Worker pump API stays beside it.
 - `Core::next_deadline()`, `Core::term_at()` and `Core::leader()`.
+- `Worker::runnable()`: `run_one` has work beyond a Tick (a record to persist, finished IO, a
+  completion, runnable maintenance), so a driver steps the group again.
 
 ### Changed
 

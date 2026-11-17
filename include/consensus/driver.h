@@ -708,7 +708,8 @@ private:
 		if (g.inbox.empty()) { std::vector<Receive>().swap(g.inbox); }  // an idle group holds no buffer
 		for (auto* x = g.head; x && !g.closing;) {
 			auto* next = x->next;
-			if (x->admitted || x->kind == Kind::open || x->kind == Kind::close) { x = next; continue; }
+			// A waiter its token claimed is unlinked by the hop on its way: never submitted.
+			if (x->admitted || x->kind == Kind::open || x->kind == Kind::close || x->state.load(std::memory_order_acquire) != Waiter::linked) { x = next; continue; }
 			if (x->kind == Kind::checkpoint) {
 				if (!reserve(g, *x)) { break; }
 				progress = true; x = next; continue;

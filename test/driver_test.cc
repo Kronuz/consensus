@@ -366,6 +366,59 @@ void checkpoints() {
 	}
 }
 
+
+// msg-1: a checkpoint never covers less than an acknowledged record. Checkpoints land at the
+// applied index while placed records above it are unapplied, and beside a proposal staged in
+// the same held turn; after recovery every placed record above the last checkpoint commits.
+void checkpoint_keeps_acknowledged() {
+	constexpr GroupId g = 71;
+	jt::Disk disk;
+	std::vector<std::pair<std::string, Placement>> acknowledged;
+	Index covered = 0;
+	{
+		Loop loop(disk, true);
+		loop.lone(g);
+		std::exception_ptr error; std::optional<Placement> placed;
+		auto propose = [&](const std::string& command) {
+			auto call = loop.start(loop.driver->propose(g, command));
+			loop.release();
+			check(call->done && !call->error && call->value, "placed: " + command + ": " + what(call->error));
+			if (call->value) { acknowledged.emplace_back(command, *call->value); }
+		};
+		for (int round = 0; round < 4; ++round) {
+			propose("applied-" + std::to_string(round));
+			loop.apply(g);
+			const auto through = loop.sink.last_committed(g);
+			const auto term = acknowledged.back().second.term;
+			// Acknowledged, committed and handed to the Sink, never applied: above the checkpoint.
+			propose("above-" + std::to_string(round) + "a");
+			propose("above-" + std::to_string(round) + "b");
+			// One more proposal staged in the held turn as the checkpoint starts.
+			auto staged = loop.start(loop.driver->propose(g, "staged-" + std::to_string(round)));
+			auto checkpoint = loop.start(loop.driver->checkpoint(g, 1 << 20, Capture{std::string(5000, char('a' + round)), 0, through, term}));
+			loop.release();
+			check(staged->done && !staged->error && staged->value, "the staged proposal is placed: " + what(staged->error));
+			if (staged->value) { acknowledged.emplace_back("staged-" + std::to_string(round), *staged->value); }
+			check(checkpoint->done && !checkpoint->error && checkpoint->value && checkpoint->value->through == through, "the checkpoint publishes at the applied index: " + what(checkpoint->error));
+			if (checkpoint->value) { covered = checkpoint->value->through; }
+			loop.apply(g);
+		}
+		propose("last");
+	}
+	Loop loop(disk);
+	loop.driver->open(g, options({1}));
+	std::exception_ptr error;
+	check(loop.settle(loop.driver->recover(g, [](j::ArtifactReader&) {}), error) && !error, "recover: " + what(error));
+	loop.apply(g);
+	std::size_t above = 0;
+	for (const auto& [command, placement] : acknowledged) {
+		if (placement.index <= covered) { continue; }
+		++above;
+		check(committed_command(loop.sink, g, command), "acknowledged record " + command + " at " + std::to_string(placement.index) + " survives recovery above checkpoint " + std::to_string(covered));
+		check(loop.settle(loop.driver->committed(g, placement), error) && !error, "and commits with its term: " + command + ": " + what(error));
+	}
+	check(covered > 0 && above >= 4, "checkpoints published and acknowledged records above the last one: " + std::to_string(above));
+}
 // Close: waiters holding no staged record complete with `closed`; an admitted proposal
 // completes when its record is written; late plain calls are dropped and counted.
 void close_rows() {
@@ -447,6 +500,7 @@ const std::map<std::string, void (*)()> cases{
 	{"lone_voter", &lone_voter},
 	{"rows", &rows},
 	{"checkpoints", &checkpoints},
+	{"checkpoint_keeps_acknowledged", &checkpoint_keeps_acknowledged},
 	{"close", &close_rows},
 	{"fence", &fence_and_shutdown},
 	{"sink_throws", &sink_throws},

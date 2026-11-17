@@ -36,6 +36,11 @@ MUTANTS = {
         "\t\t\tw.fence(g.fence_reason);\n",
         "",
     ),
+    # A local checkpoint captures none of the retained log above its boundary (msg-1).
+    "checkpoint-drops-suffix": ("core.h",
+        "\t\tif (capture_mode_) { captured_ = FrozenCheckpoint(*this, id, state, entries_.size() - first); }\n",
+        "\t\tif (capture_mode_) { captured_ = FrozenCheckpoint(*this, id, state, 0); }\n",
+    ),
     # A witness incarnation may become a learner or voter (R16).
     "witness-becomes-data": ("core.h",
         "\t\t\tif (old && old->role == MemberRole::Witness && x.role != MemberRole::Witness) { reject(RejectReason::InvalidMembership); return; }\n",

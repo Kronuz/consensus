@@ -45,10 +45,6 @@ class Connection {
 #ifdef SO_NOSIGPIPE
 		::setsockopt(socket_.native_handle(), SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
 #endif
-#ifdef TCP_NOTSENT_LOWAT
-		const int unsent = 64 * 1024;  // a frame queued here waits behind little more than the socket holds
-		::setsockopt(socket_.native_handle(), IPPROTO_TCP, TCP_NOTSENT_LOWAT, &unsent, sizeof unsent);
-#endif
 		ssl_.reset(SSL_new(tls_->native_handle()));
 		if (!ssl_ || SSL_set_fd(ssl_.get(), int(socket_.native_handle())) != 1)
 			throw std::runtime_error("connection: SSL_new");

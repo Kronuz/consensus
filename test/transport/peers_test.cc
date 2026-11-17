@@ -20,6 +20,7 @@
 #include <journal/memory_io.h>
 #include <openssl/pem.h>
 #include <openssl/x509v3.h>
+#include <thread>
 #include <unistd.h>
 
 using namespace kronuz::consensus;
@@ -1167,12 +1168,16 @@ asio::awaitable<void> fetch_failures(asio::io_context &io, const Certificates &c
 	auto files = serving(cluster, io);
 	(*files[1])["history/table"] = pattern(size, 20);
 	enum class Then { Serve, Freeze, Close } then = Then::Serve;
+	// PEERS_RETRY_LAG_MS delays the retry's first read, as a loaded runner would.
+	std::chrono::milliseconds lag{};
 	cluster.options[1].reader = reader(files[1], [&](std::string_view) {
 		if (then == Then::Freeze) {
 			cluster.frozen = true;
 			cluster.side.stop();
 		} else if (then == Then::Close)
 			asio::post(io, [&] { cluster.stop(1); });
+		else if (lag.count())
+			std::this_thread::sleep_for(std::exchange(lag, {}));
 		then = Then::Serve;
 	});
 	cluster.options[0].fetch_deadline = 500ms;
@@ -1191,6 +1196,8 @@ asio::awaitable<void> fetch_failures(asio::io_context &io, const Certificates &c
 	CHECK(cluster.peers[0]->occupancy().fetches == 1); // the failed fetch keeps its slot until its reply ends
 	cluster.frozen = false;
 	CHECK(co_await cluster.until([&] { return cluster.peers[0]->occupancy().fetches == 0; }, 3s));
+	if (const char *env = std::getenv("PEERS_RETRY_LAG_MS"))
+		lag = std::chrono::milliseconds(std::atoi(env));
 	auto retried = fetch(cluster, 0, 2, "history/table");
 	CHECK(co_await cluster.until([&] { return retried->done; }, 3s));
 	CHECK(!retried->error && retried->bytes == (*files[1])["history/table"]);

@@ -357,16 +357,25 @@ void threads() {
 			});
 	}
 	step("threads: 64 groups' frames both ways");
+	// A read posts to each other loop at most once, in any snapshot that loads posts first.
+	auto bounded = [](const HostTransportStats &s) {
+		const std::uint64_t posts = s.posts;
+		return posts <= s.reads * (L - 1);
+	};
 	const auto start = steady::now();
-	while (delivered < 2 * 64 * per_group && ms_since(start) < 20'000)
-		std::this_thread::sleep_for(10ms);
+	while (delivered < 2 * 64 * per_group && ms_since(start) < 20'000) {
+		for (Host *h : {&one, &two})
+			for (std::uint32_t k = 0; k != L; ++k)
+				assert(bounded(h->transport->stats(k)));
+		std::this_thread::yield();
+	}
 	std::uint64_t reads = 0, posts = 0, received = 0;
 	for (Host *h : {&one, &two})
 		for (std::uint32_t k = 0; k != L; ++k) {
 			reads += h->transport->stats(k).reads;
 			posts += h->transport->stats(k).posts;
 			received += h->transport->stats(k).received;
-			assert(h->transport->stats(k).posts <= h->transport->stats(k).reads * (L - 1));
+			assert(bounded(h->transport->stats(k)));
 			// One Control connection, on the peer's loop at both ends, whichever end accepted it.
 			assert(h->transport->stats(k).links == (k == h->transport->loop_of_node(h->node == 1 ? 2 : 1)));
 		}

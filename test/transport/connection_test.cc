@@ -1,9 +1,10 @@
 // The host connection over loopback TCP with the TLS fixture: node authentication by the
 // host's pins (A2), frames, the keepalive and the dead-peer deadline, graceful close (A4), the
 // fd kept until run() returns, a slow but steady reader and a busy one (security review S1, N2),
-// and a peer that never reads.
+// a peer that never reads, and loops handshaking at once with the context Links took.
 //   consensus_transport_connection_test <fixture dir> [case]
 #include "consensus/transport/connection.h"
+#include "consensus/transport/links.h"
 #include <algorithm>
 #include <asio/connect.hpp>
 #include <asio/io_context.hpp>
@@ -806,6 +807,30 @@ void nonreader() {
 	assert(ended && ms < 5000 && *ends.dialer == ConnectionEnd::failed);
 }
 
+// Loops of a host handshake at once with the one context its Links took: no handshake writes
+// what another reads (run under TSan, which reports such a write in libcrypto).
+void shared_context() {
+	for (int round = 0; round != 32; ++round) {
+		auto shared = context("one");
+		auto one = pins_of(1, "one"), two = pins_of(2, "two");
+		Loop a, b;
+		Links taken(a.io.get_executor(), a.ref(), shared, one, id('K'), {});
+		std::atomic<int> ready{0};
+		auto handshake = [&](Loop &loop) {
+			Pair p(loop, shared, context("two"));
+			ready.fetch_add(1);
+			while (ready.load() != 2)
+				std::this_thread::yield();
+			auto [d, x] = p.handshake(one, 2, two);
+			assert(d.node == 2 && x.node == 1);
+		};
+		std::thread first([&] { handshake(a); }), second([&] { handshake(b); });
+		first.join();
+		second.join();
+	}
+	std::printf("shared_context: 32 rounds of two loops handshaking at once on one context\n");
+}
+
 struct Case {
 	const char *name;
 	void (*run)();
@@ -815,7 +840,8 @@ constexpr Case cases[] = {{"authenticate", authenticate}, {"wrong_node", wrong_n
 						  {"keepalive", keepalive},	   {"dead_peer", dead_peer}, {"graceful_close", graceful_close},
 						  {"abort_truncates", abort_truncates}, {"fd_reuse_reader", fd_reuse_reader},
 						  {"fd_reuse_writer", fd_reuse_writer}, {"slow_reader", slow_reader},
-						  {"busy_reader", busy_reader}, {"coarse_writer", coarse_writer}, {"nonreader", nonreader}};
+						  {"busy_reader", busy_reader}, {"coarse_writer", coarse_writer}, {"nonreader", nonreader},
+						  {"shared_context", shared_context}};
 } // namespace
 
 int main(int argc, char **argv) {

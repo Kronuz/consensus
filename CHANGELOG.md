@@ -6,6 +6,27 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#consensus) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-16
+
+### Added
+
+- `consensus::Driver` (`driver.h`, [docs/DRIVER.md](docs/DRIVER.md)): one per reactor loop, it
+  steps each group only on work and exposes `create`, `recover`, `propose`, `committed`,
+  `change_membership`, `transfer_leadership`, `repair`, `checkpoint`, `read` and `close` as
+  `task::task` calls, with a Sink for what no caller awaits. `consensus::run` is the blocking
+  entry over it. The Worker pump API stays beside it.
+- `Core::next_deadline()`, `Core::term_at()` and `Core::leader()`.
+
+### Changed
+
+- A lone voter (the only voting member) is due to campaign at `Start`, so its first proposal
+  after create or recover needs no election timeout.
+- A leader with no peers arms no heartbeat.
+- `SnapshotChannel` allocates a frame's buffer when its length prefix arrives and frees it once
+  processed: an idle channel holds no 64 KiB array per peer.
+- The journal pin moves to journal:7c08540; the Worker's shared constructor takes a
+  `journal::Host` and its migration calls are gone.
+
 ## 2026-11-15
 
 ### Fixed

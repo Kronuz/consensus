@@ -106,6 +106,9 @@ public:
 	// On the loop: an open group's role, term, leader, indexes and membership in force.
 	struct GroupState { Role role; Term term; NodeId leader; Index committed, applied; Membership membership; };
 	std::optional<GroupState> state(GroupId) const;
+	std::size_t armed_group_timers() const;     // groups whose wheel entry is armed
+	std::vector<std::uint64_t> waiting_groups() const;  // groups holding a waiter, in order
+	std::size_t in_flight() const;              // IO tasks and turn watches: a group's only frames
 };
 
 // The blocking entry (D5): runs `work` and the Driver on the calling thread over `scheduler`,
@@ -148,7 +151,7 @@ A waiter destroyed unresumed (task teardown, phase 3) unlinks itself.
 `RepairCompleted`, which goes to the Sink.
 
 **Time.** A group's wheel entry is armed at `Core::next_deadline()` after every step and cancelled
-when it has none (a learner, or a fenced group): an idle group holds no frame, thread, descriptor
+when it has none (a learner, a fenced group, or a leader with no peers to heartbeat): an idle group holds no frame, thread, descriptor
 or armed timer of its own beyond that entry. Core sees `Tick{now / 1 ms, jitter}`, `now` being the
 scheduler's clock and the jitter drawn per tick in `[election_min, election_max]`.
 

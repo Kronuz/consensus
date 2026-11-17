@@ -49,7 +49,22 @@
 using namespace kronuz::consensus;
 namespace j = kronuz::journal;
 
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define DRIVER_IDLE_SANITIZED 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer) || __has_feature(memory_sanitizer)
+#define DRIVER_IDLE_SANITIZED 1
+#endif
+#endif
+
 namespace {
+
+// A sanitizer's allocator pads every block and reports no zone statistics: bytes go unchecked.
+#if defined(DRIVER_IDLE_SANITIZED)
+constexpr bool heap_measured = false;
+#else
+constexpr bool heap_measured = true;
+#endif
 
 std::size_t heap_in_use() {
 #if defined(__APPLE__)
@@ -146,8 +161,9 @@ void measure(std::size_t groups, bool three) {
 			const auto member = per_group + double(channel_bytes);
 			std::printf("  three-voter member's consensus state: %.0f bytes (Y9: 8192)\n", member);
 #if defined(__linux__)
-			expect(member <= 8192, "a three-voter member's consensus state within 8 KiB (Y9)");
+			if (heap_measured) { expect(member <= 8192, "a three-voter member's consensus state within 8 KiB (Y9)"); }
 #endif
+			if (!heap_measured) { std::printf("  (bytes not checked under a sanitizer)\n"); }
 		}
 		stop.request(task::cancel_reason::shutdown);
 		scheduler.run();

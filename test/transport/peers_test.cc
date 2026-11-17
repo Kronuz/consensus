@@ -1180,7 +1180,7 @@ asio::awaitable<void> fetch_failures(asio::io_context &io, const Certificates &c
 			std::this_thread::sleep_for(std::exchange(lag, {}));
 		then = Then::Serve;
 	});
-	cluster.options[0].fetch_deadline = 2s; // also bounds the retried 8 MiB reply on a loaded runner
+	cluster.options[0].fetch_deadline = 500ms;
 	for (unsigned i = 0; i != 3; ++i)
 		cluster.start(i);
 	CHECK(co_await cluster.commit("before", {0, 1, 2}, 5s));
@@ -1189,10 +1189,10 @@ asio::awaitable<void> fetch_failures(asio::io_context &io, const Certificates &c
 
 	then = Then::Freeze;
 	auto stalled = fetch(cluster, 0, 2, "history/table");
-	CHECK(co_await cluster.until([&] { return stalled->done; }, 4s));
+	CHECK(co_await cluster.until([&] { return stalled->done; }, 2s));
 	const auto waited = ms(stalled->answered - stalled->asked);
-	std::printf("  frozen peer: fetch failed after %lld ms (deadline 2000 ms)\n", waited);
-	CHECK(cluster.frozen && stalled->error == std::errc::timed_out && !stalled->bytes && waited >= 2000);
+	std::printf("  frozen peer: fetch failed after %lld ms (deadline 500 ms)\n", waited);
+	CHECK(cluster.frozen && stalled->error == std::errc::timed_out && !stalled->bytes && waited >= 500);
 	CHECK(cluster.peers[0]->occupancy().fetches == 1); // the failed fetch keeps its slot until its reply ends
 	cluster.frozen = false;
 	const auto thawed = Clock::now();
@@ -1203,7 +1203,7 @@ asio::awaitable<void> fetch_failures(asio::io_context &io, const Certificates &c
 	if (const char *env = std::getenv("PEERS_RETRY_LAG_MS"))
 		lag = std::chrono::milliseconds(std::atoi(env));
 	auto retried = fetch(cluster, 0, 2, "history/table");
-	CHECK(co_await cluster.until([&] { return retried->done; }, 5s));
+	CHECK(co_await cluster.until([&] { return retried->done; }, 3s));
 	if (retried->error || retried->bytes != (*files[1])["history/table"])
 		std::printf("  retried fetch: error %d %s, %zu of %zu bytes, after %lld ms\n", retried->error.value(),
 					retried->error.message().c_str(), retried->bytes ? retried->bytes->size() : 0, size,

@@ -1,6 +1,7 @@
 #pragma once
 #include "connection.h"
 #include "resolve.h"
+#include <algorithm>
 #include <asio/ip/tcp.hpp>
 #include <map>
 #include <tuple>
@@ -15,12 +16,14 @@ struct LinkOptions {
 	std::chrono::milliseconds dial{5000};  // the TCP connect race
 	// A name with no cached address waits for its lookup this long, which also spaces lookups.
 	std::chrono::milliseconds resolve_deadline{1000}, stagger{250};
-	PeerResolver resolver = system_resolver;
-	std::size_t handshakes = 4;  // incoming connections handshaking at once; more are closed
+	PeerResolver resolver = system_resolver;  // on a thread that may outlive Links: capture only what it owns
+	// Incoming connections before authentication: at most `handshakes`, and `handshakes_per_source`
+	// from one address (a node dials each lane once at a time); a newcomer replaces the oldest.
+	std::size_t handshakes = 4, handshakes_per_source = 2;
 	std::uint32_t rpc_min = 1, rpc_max = 1;
 };
 struct LinkStats {
-	std::uint64_t established = 0, refused = 0, abandoned = 0, rejected = 0;
+	std::uint64_t established = 0, refused = 0, abandoned = 0, rejected = 0, evicted = 0;
 	std::uint64_t lookups = 0, lookup_failures = 0, lookup_timeouts = 0;
 };
 // An established connection and the hellos that made it.
@@ -43,6 +46,8 @@ class Links {
 		  LinkOptions options = {})
 		: executor_(std::move(executor)), loop_(loop), tls_(std::move(tls)), pins_(std::move(pins)), cluster_(cluster),
 		  options_(std::move(options)), state_(std::make_shared<Shared>()) {
+		if (!options_.handshakes || !options_.handshakes_per_source)
+			throw std::invalid_argument("links: handshakes");
 		for (auto &[node, address] : addresses) {
 			auto &route = state_->routes[node];
 			route.address = address;
@@ -79,7 +84,9 @@ class Links {
 	// when the peer's own dial won the tie-break, the dial failed, or this host is stopping.
 	task::task<bool> dial(kronuz::consensus::NodeId peer, LinkLane lane) {
 		auto connection = co_await connect(peer, lane);
-		co_return connection && co_await offer(peer, lane, std::move(connection));
+		if (!connection)
+			co_return false;
+		co_return co_await offer(peer, lane, std::move(connection));
 	}
 	// The first half of a dial: the name, the TCP race and the TLS handshake to `peer`; null when
 	// a link or another dial of the lane exists, or it failed.
@@ -113,6 +120,8 @@ class Links {
 		auto &slot = slots_[{peer, lane}];
 		if (stopping_ || find(peer, lane) || slot.offered) {
 			++stats_.abandoned;  // an incoming connection won while this one handshook
+			connection->abort();
+			forget(connection);
 			co_return false;
 		}
 		auto link = std::make_shared<Link>(Link{peer, lane, connection, hello(lane), {}, true, 0});
@@ -146,19 +155,22 @@ class Links {
 	// Takes one accepted socket: the TLS handshake against every pin, the dialer's hello, and
 	// the tie-break; false when refused or failed.
 	task::task<bool> accept(asio::ip::tcp::socket socket) {
-		if (stopping_ || handshaking_ >= options_.handshakes) {
+		asio::error_code error;
+		const auto source = socket.remote_endpoint(error).address();
+		if (stopping_ || error) {
 			++stats_.rejected;
 			co_return false;
 		}
 		Task running(*this);
-		++handshaking_;
 		auto connection = std::make_shared<Connection>(loop_, std::move(socket), tls_, false, options_.connection);
 		live_.push_back(connection);
+		admit(source, connection);
 		std::shared_ptr<Link> reserved;
 		bool established = false;
 		try {
 			late_deadline deadline(loop_, options_.connection.handshake);
 			const auto peer = co_await connection->handshake(pins_, 0, deadline.token());
+			authenticated(connection);
 			auto remote = co_await connection->read_hello(deadline.token());
 			auto link = std::make_shared<Link>(Link{peer, remote.lane, connection, hello(remote.lane), remote, false, 0});
 			check_node_hello(remote, link->local, peer, false);
@@ -177,7 +189,7 @@ class Links {
 			}
 		} catch (...) {
 		}
-		--handshaking_;
+		authenticated(connection);
 		if (!established) {
 			if (reserved)
 				release(*reserved);
@@ -253,6 +265,11 @@ class Links {
 			waiting.wake_all();
 		}
 	};
+	// An incoming connection not yet authenticated, oldest first.
+	struct Handshake {
+		asio::ip::address source;
+		std::shared_ptr<Connection> connection;
+	};
 	struct Task {
 		Links &links;
 		explicit Task(Links &l) : links(l) { ++links.tasks_; }
@@ -305,6 +322,25 @@ class Links {
 	void forget(const std::shared_ptr<Connection> &connection) {
 		if (connection)
 			std::erase(live_, connection);
+	}
+	// Makes room for an incoming connection before it authenticates: when its source, or the
+	// pool, is full, the oldest of it ends at once (host-connection.md, Before authentication).
+	void admit(const asio::ip::address &source, std::shared_ptr<Connection> connection) {
+		const auto from = [&](const Handshake &h) { return h.source == source; };
+		auto drop = handshaking_.end();
+		if (std::size_t(std::count_if(handshaking_.begin(), handshaking_.end(), from)) >= options_.handshakes_per_source)
+			drop = std::find_if(handshaking_.begin(), handshaking_.end(), from);
+		else if (handshaking_.size() >= options_.handshakes)
+			drop = handshaking_.begin();
+		if (drop != handshaking_.end()) {
+			++stats_.evicted;
+			drop->connection->abort();
+			handshaking_.erase(drop);
+		}
+		handshaking_.push_back({source, std::move(connection)});
+	}
+	void authenticated(const std::shared_ptr<Connection> &connection) {
+		std::erase_if(handshaking_, [&](const Handshake &h) { return h.connection == connection; });
 	}
 
 	// The peer's endpoints: a literal's, the cache's (a lookup refreshes it behind the dial), or
@@ -405,9 +441,10 @@ class Links {
 	std::map<std::pair<kronuz::consensus::NodeId, LinkLane>, Slot> slots_;
 	std::vector<std::shared_ptr<Connection>> live_;
 	std::vector<std::shared_ptr<Race>> races_;
+	std::vector<Handshake> handshaking_;
 	asio::ip::tcp::acceptor *acceptor_ = nullptr;
 	LinkStats stats_;
-	std::size_t tasks_ = 0, handshaking_ = 0;
+	std::size_t tasks_ = 0;
 	bool stopping_ = false;
 };
 } // namespace kronuz::consensus::transport

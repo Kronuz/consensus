@@ -1,12 +1,14 @@
 // Links over loopback with the TLS fixture: a dial and its frames, simultaneous dials settled
 // to one connection before any frame (T6), a draining link that does not count, a name's lookup
-// through the late deadline, and two hosts on two loops (run under TSan).
+// through the late deadline, two hosts on two loops (run under TSan), a given-up dial released,
+// and a flood of idle connections that cannot lock a real dialer out (security review S2, N1).
 //   consensus_transport_links_test <fixture dir> [case]
 #include "consensus/transport/links.h"
 #include <asio/io_context.hpp>
 #include <asio/post.hpp>
 #include <atomic>
 #include <cassert>
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -314,17 +316,79 @@ void threads() {
 	(void)drained;
 }
 
+// S2: node 1's dial finishes TLS, then node 2's own dial establishes the lane, so node 1's
+// offer gives up quietly. The given-up connection is aborted and released, not kept to stop().
+void abandoned_dial() {
+	Loop loop;
+	Host one(1, loop), two(2, loop);
+	one.open(to(two));
+	two.open(to(one));
+	Result<std::shared_ptr<Connection>> c1;
+	c1.spawn(loop, one.links->connect(2, LinkLane::Control));
+	assert(loop.until([&] { return c1.value.has_value(); }) && *c1.value);
+	Result<bool> two_dialed;
+	two_dialed.spawn(loop, two.links->dial(1, LinkLane::Control));
+	assert(loop.until([&] { return two_dialed.value.has_value(); }) && *two_dialed.value);
+	std::weak_ptr<Connection> weak = *c1.value;
+	Result<bool> offered;
+	offered.spawn(loop, one.links->offer(2, LinkLane::Control, std::move(*c1.value)));
+	c1.value.reset();
+	assert(loop.until([&] { return offered.value.has_value(); }));
+	const bool released = loop.until([&] { return weak.expired(); }, 1s);
+	std::printf("abandoned_dial: offer %s, abandoned %llu, the given-up connection %s\n", *offered.value ? "won" : "gave up",
+				(unsigned long long)one.links->stats().abandoned, released ? "released" : "still held");
+	assert(!*offered.value && one.links->stats().abandoned == 1 && released);
+	assert(one.links->find(2, LinkLane::Control) && !one.links->find(2, LinkLane::Control)->dialed);
+	one.stop();
+	two.stop();
+}
+
+// N1: 16 idle connections that never start TLS, all from 127.0.0.1 as the real dialer is.
+// With the default per-source cap they keep 2 slots; with the cap lifted above the pool's
+// size they fill it, and a full pool drops its oldest. Either way node 1's dial still links.
+void flood() {
+	for (const bool per_source : {true, false}) {
+		Loop loop;
+		Host one(1, loop), two(2, loop);
+		LinkOptions options;
+		if (!per_source)
+			options.handshakes_per_source = options.handshakes + 1;
+		one.open(to(two));
+		two.open(to(one), options);
+		std::vector<tcp::socket> idle;
+		for (int i = 0; i != 16; ++i) {
+			idle.emplace_back(loop.io);
+			idle.back().connect(tcp::endpoint(asio::ip::address_v4::loopback(), two.port()));
+		}
+		const auto kept = per_source ? options.handshakes_per_source : options.handshakes;
+		const bool settled = loop.until([&] { return two.links->stats().evicted == 16 - kept; }, 5s);
+		std::printf("flood: %s, 16 idle connections, %llu evicted\n", per_source ? "per-source cap 2" : "pool of 4 only",
+					(unsigned long long)two.links->stats().evicted);
+		assert(settled);
+		Result<bool> dialed;
+		dialed.spawn(loop, one.links->dial(2, LinkLane::Control));
+		assert(loop.until([&] { return dialed.value.has_value(); }));
+		std::printf("flood: node 1's dial %s with the idle connections still open\n", *dialed.value ? "linked" : "failed");
+		assert(*dialed.value && two.links->stats().established == 1 && two.links->stats().rejected == 0);
+		same_link(one, two, LinkLane::Control, 1);
+		one.stop();
+		two.stop();
+	}
+}
+
 struct Case {
 	const char *name;
 	void (*run)();
 };
-constexpr Case cases[] = {{"dial", dial},	{"simultaneous", simultaneous}, {"draining", draining},
-						  {"lookup", lookup}, {"threads", threads}};
+constexpr Case cases[] = {{"dial", dial},	  {"simultaneous", simultaneous},	  {"draining", draining},
+						  {"lookup", lookup}, {"threads", threads}, {"abandoned_dial", abandoned_dial},
+						  {"flood", flood}};
 } // namespace
 
 int main(int argc, char **argv) {
 	assert(argc >= 2);
 	fixture = argv[1];
+	std::signal(SIGPIPE, SIG_IGN);  // the host's duty where SO_NOSIGPIPE is missing (connection.h)
 	int ran = 0;
 	for (const auto &c : cases) {
 		if (argc > 2 && std::strcmp(argv[2], c.name) != 0)

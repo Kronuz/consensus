@@ -25,7 +25,9 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
   after create or recover needs no election timeout.
 - A leader with no peers arms no heartbeat.
 - `SnapshotChannel` allocates a frame's buffer when its length prefix arrives and frees it once
-  processed: an idle channel holds no 64 KiB array per peer.
+  processed: an idle channel holds no 64 KiB array per peer. Its transfer state (a send, a
+  receive, pending frames, a peer's last result) is allocated only while in use, so an idle
+  three-voter channel holds 296 bytes instead of 1,648.
 - The journal pin moves to journal:7c08540; the Worker's shared constructor takes a
   `journal::Host` and its migration calls are gone.
 

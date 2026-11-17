@@ -188,7 +188,7 @@ public:
 		group->driver = this; group->id = id; group->fire = &Driver::fired;
 		group->timing = options.timing; group->inbox_limit = options.inbox;
 		group->worker = std::make_unique<Worker>(host_, id, std::move(options.configuration), options.admission, options.limits, options.timing, options.scheduling, options.snapshots);
-		group->founding = std::move(options.founding);
+		if (options.founding) { group->founding = std::make_unique<Membership>(std::move(*options.founding)); }
 		groups_.emplace(id, std::move(group));
 	}
 	void receive(GroupId id, Receive message) {
@@ -355,7 +355,8 @@ private:
 		Driver* driver = nullptr;
 		GroupId id = 0;
 		std::unique_ptr<Worker> worker;
-		std::optional<Membership> founding;  // create's founding roles
+		// Rare state lives off the idle entry (Y9): create's founding roles, the install announced to the Sink.
+		std::unique_ptr<Membership> founding;
 		Timing timing{};
 		Waiter *head = nullptr, *tail = nullptr;
 		std::vector<Receive> inbox;
@@ -363,7 +364,7 @@ private:
 		std::optional<Applied> applied;
 		std::optional<std::pair<Index, std::string>> application_failure;
 		std::optional<std::pair<Token, std::optional<std::string>>> activation;
-		std::optional<SnapshotActivation> activating;  // announced to the Sink
+		std::unique_ptr<SnapshotActivation> activating;
 		std::vector<PeerLimits> limits;
 		std::string fence_reason;
 		Group* ready_next = nullptr;
@@ -824,7 +825,7 @@ private:
 			fail_all(g, std::make_exception_ptr(fenced(fence_reason(g))));
 		}
 		if (auto activation = w.snapshot_activation(); activation && (!g.activating || g.activating->token != activation->token)) {
-			g.activating = activation;
+			g.activating = std::make_unique<SnapshotActivation>(*activation);
 			sink_(g.id, ActivateInstall{activation->token, 0, {activation->descriptor.through, activation->descriptor.term}});
 		}
 		for (auto* x = g.head; x;) {

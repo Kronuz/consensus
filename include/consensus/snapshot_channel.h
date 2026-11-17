@@ -140,7 +140,7 @@ public:
 				else if (!channel->control) {
 					auto terminal = worker_.take_snapshot_result(); auto outcome = terminal->reason == SnapshotReason::Installed ? TransferOutcome::Installed : terminal->rejection == InstallRejectReason::CaughtUp ? TransferOutcome::CaughtUp : (terminal->receiver_term && *terminal->receiver_term) ? TransferOutcome::Rejected : TransferOutcome::Failed;
 					std::string body(1, static_cast<char>(outcome)); body.append(7, '\0'); kronuz::journal::put64(body, terminal->receiver_term.value_or(0));
-					channel->completed.emplace(Completed{receiving_->key, receiving_->descriptor, body});
+					channel->completed = std::make_unique<Completed>(Completed{receiving_->key, receiving_->descriptor, body});
 					control(*channel, TransferKind::Result, receiving_->key, body); receiving_.reset();
 				}
 			}
@@ -157,13 +157,13 @@ public:
 			auto channel = find(source->peer); if (!channel->session) { worker_.source_failed(source->source); return; }
 			if (channel->control) { return; }
 			auto policy = worker_.snapshot_policy(); if (!policy) { throw std::logic_error("source without snapshot policy"); }
-			control(*channel, TransferKind::Begin, source->key, encode_snapshot(source->descriptor, *policy)); sending_.emplace(*source); return;
+			control(*channel, TransferKind::Begin, source->key, encode_snapshot(source->descriptor, *policy)); sending_ = std::make_unique<Sending>(*source); return;
 		}
 		// Up to the window's chunks in flight; each Credit retires the oldest (D18).
 		if (sending_ && sending_->accepted && !sending_->final && !data_ && sending_->flights.size() < worker_.snapshot_window()) {
 			auto chunk = worker_.source_chunk(sending_->flights.size()); if (!chunk) { return; }
 			auto channel = find(sending_->info.peer); if (!channel->session) { return; }
-			data_.emplace(make_frame(*channel, TransferKind::Chunk, sending_->info.key, transfer_chunk_body(chunk->chunk, chunk->offset, std::string_view(chunk->bytes.data(), chunk->bytes.size()), chunk->final)));
+			data_ = std::make_unique<Output>(make_frame(*channel, TransferKind::Chunk, sending_->info.key, transfer_chunk_body(chunk->chunk, chunk->offset, std::string_view(chunk->bytes.data(), chunk->bytes.size()), chunk->final)));
 			sending_->flights.push_back({chunk->chunk, data_->token, chunk->offset + chunk->bytes.size(), chunk->final}); sending_->final = chunk->final;
 		}
 	}
@@ -186,7 +186,7 @@ private:
 	struct Completed { SnapshotKey key; SnapshotDescriptor descriptor; std::string body; };
 	struct Channel {
 		explicit Channel(NodeId node) : peer(node) {}
-		NodeId peer; std::optional<TrustedSession> session; std::array<char, 12> prefix{}; std::unique_ptr<char[]> input; std::size_t used = 0; std::optional<Output> control; std::optional<Completed> completed;
+		NodeId peer; std::optional<TrustedSession> session; std::array<char, 12> prefix{}; std::unique_ptr<char[]> input; std::size_t used = 0; std::unique_ptr<Output> control; std::unique_ptr<Completed> completed;
 	};
 	struct Flight { Token chunk, output; std::uint64_t next; bool final; };
 	struct Sending { explicit Sending(SourceInfo source) : info(std::move(source)) {} SourceInfo info; bool accepted = false, final = false; std::deque<Flight> flights; };
@@ -214,7 +214,7 @@ private:
 		auto& configuration = worker_.configuration(); auto& session = *channel.session;
 		return {channel.peer, ++next_output_, encode_transfer(kind, {configuration.cluster, configuration.configuration, session.local, session.remote, configuration.local, channel.peer, key}, body), 0, kind};
 	}
-	void control(Channel& channel, TransferKind kind, SnapshotKey key, std::string_view body) { if (channel.control) { throw std::logic_error("transfer control output occupied"); } channel.control.emplace(make_frame(channel, kind, key, body)); }
+	void control(Channel& channel, TransferKind kind, SnapshotKey key, std::string_view body) { if (channel.control) { throw std::logic_error("transfer control output occupied"); } channel.control = std::make_unique<Output>(make_frame(channel, kind, key, body)); }
 	Output* selected_frame() { if (data_ && data_->token == selected_) { return &*data_; } for (auto& channel : channels_) { if (channel.control && channel.control->token == selected_) { return &*channel.control; } } return nullptr; }
 	bool process(Channel& channel) {
 		using namespace kronuz::journal;
@@ -239,7 +239,7 @@ private:
 				control(channel, TransferKind::Accepted, key, {}); return true;
 			}
 			auto id = worker_.reserve_snapshot({session.peer, key.leader_term, key.transfer, key.transfer, descriptor}); if (!id) { return false; }
-			receiving_.emplace(Receiving{session, *id, key, descriptor, 0, now_}); control(channel, TransferKind::Accepted, key, {}); return true;
+			receiving_ = std::make_unique<Receiving>(Receiving{session, *id, key, descriptor, 0, now_}); control(channel, TransferKind::Accepted, key, {}); return true;
 		}
 		case TransferKind::Accepted:
 			if (sending_ && sending_->info.peer == session.peer && sending_->info.key == key) { sending_->accepted = true; } return true;
@@ -279,7 +279,8 @@ private:
 		} throw Corruption("unsupported frame");
 	}
 	Worker& worker_; std::uint64_t timeout_, now_ = 0; Token next_output_ = 0, selected_ = 0;
-	std::vector<Channel> channels_; std::optional<Output> data_; std::optional<Sending> sending_; std::optional<Receiving> receiving_;
+	// D9: a transfer's state, its frames and a peer's last result exist only while in use.
+	std::vector<Channel> channels_; std::unique_ptr<Output> data_; std::unique_ptr<Sending> sending_; std::unique_ptr<Receiving> receiving_;
 };
 
 } // namespace kronuz::consensus

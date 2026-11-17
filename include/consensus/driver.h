@@ -613,6 +613,10 @@ private:
 	// wheel entry at Core's next deadline.
 	void step(Group& g) {
 		if (g.closed || !g.worker) { return; }
+		if (!g.opened) {  // created or recovered by neither call yet: only close moves it
+			if (g.closing) { close_step(g); }
+			return;
+		}
 		auto& w = *g.worker;
 		bool exhausted = true;
 		try {
@@ -914,7 +918,7 @@ private:
 	// next record to be durable there.
 	void watch(Group& g) {
 		g.watching = true; ++g.io; ++in_flight_;
-		task::spawn(scheduler_, turns_.durable(g.id, turns_.sequence(g.id) + 1), [this, &g](std::exception_ptr) {
+		task::spawn(scheduler_, turns_.durable(g.id, turns_.sequence(g.id) + 1, shutdown_.token()), [this, &g](std::exception_ptr) {
 			g.watching = false; --g.io; --in_flight_;
 			mark_ready(g);
 		});

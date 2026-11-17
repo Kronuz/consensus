@@ -30,8 +30,8 @@ struct Table {
 	Events events(Handle *h, bool serving) {
 		return {.body = [this, h, serving](std::string_view bytes, bool end) {
 					owed[*h] += bytes.size();
-					if (serving && end && lane->sendable(*h))
-						lane->send(*h, "ok", false);
+					if (auto k = serving && end ? lane->sendable(*h) : 0)
+						lane->send(*h, std::string("ok").substr(0, k), false);
 				},
 				.credit = {},
 				.done = [this, h](const Status &) { ++done[*h]; }};

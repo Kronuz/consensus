@@ -68,7 +68,7 @@ posts it to the waiting lane's loop.
 `drain()` queues `Drain` with the highest `Call` id accepted, fails this end's unqueued calls
 `not_processed`, and discards later `Call`s unanswered. The receiver fails its calls above the id
 `not_processed`, which is safe to retry, and starts no more. `drained()` is true once no call is
-live at the drained end, when the connection may close.
+live at the drained end: the connection writes what `next()` still holds, then closes.
 
 ## Evidence
 

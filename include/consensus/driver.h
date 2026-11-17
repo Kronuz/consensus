@@ -259,7 +259,7 @@ public:
 	task::task<void> create(GroupId id, kronuz::journal::Identity identity, task::cancel_token token = {}) {
 		Call call(*this, Kind::open, std::move(token));
 		co_await call.enter();
-		if (call.begin(id, false)) {
+		if (call.begin(id, false) && !call.resume_open()) {
 			try { call.group->worker->create(identity); call.group->opened = true; }
 			catch (...) { call.fail(std::current_exception()); }
 		}
@@ -269,7 +269,7 @@ public:
 	task::task<void> recover(GroupId id, Restore restore, task::cancel_token token = {}) {
 		Call call(*this, Kind::open, std::move(token));
 		co_await call.enter();
-		if (call.begin(id, false)) {
+		if (call.begin(id, false) && !call.resume_open()) {
 			try { call.group->worker->recover(std::move(restore)); call.group->opened = true; }
 			catch (...) { call.fail(std::current_exception()); }
 		}
@@ -402,10 +402,15 @@ private:
 			auto* g = driver.live(id);
 			if (!g || g->closing) { return fail(std::make_exception_ptr(closed{})); }
 			if (g->worker->fenced()) { return fail(std::make_exception_ptr(fenced(driver.fence_reason(*g)))); }
-			if (waiter.kind == Kind::open && g->opened) { return fail(std::make_exception_ptr(std::logic_error("the group is already created or recovered"))); }
 			if (needs_peer_check && driver.holder_ == Holder::entry && driver.has_peer(*g)) { return fail(std::make_exception_ptr(needs_peer{})); }
 			if (waiter.kind != Kind::open && waiter.kind != Kind::committed) { waiter.request = driver.next_request(); }
 			link(*g);
+			return true;
+		}
+		// create/recover on a group already opened (X15): waits for it to be ready, or ends now.
+		bool resume_open() {
+			if (!group->opened) { return false; }
+			if (group->started) { fail({}); }
 			return true;
 		}
 		bool fail(std::exception_ptr error) {

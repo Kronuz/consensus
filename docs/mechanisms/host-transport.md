@@ -68,9 +68,15 @@ to 64 KiB, picking in this order:
    `window` (4 MiB) of data sent and not yet credited, and one frame always fits when nothing
    is outstanding.
 
-A data frame is handed over whole, and `TCP_NOTSENT_LOWAT` (64 KiB where the platform has it)
-keeps the socket's unsent bytes small, so a control frame waits behind at most one data frame
-and the socket's bound. A 2 MiB append at 40 MB/s is 50 ms, against `election_min` of 1 s.
+A data frame is handed over whole, so a control frame waits behind at most one data frame, the
+last feed and what the kernel's socket buffers hold. A 2 MiB append at 40 MB/s is 50 ms,
+against `election_min` of 1 s.
+
+The socket keeps its default buffers; `TCP_NOTSENT_LOWAT` is not set. On Linux it also caps
+what a write may queue, so a writer to a peer that reads steadily but slowly sees progress
+only as the peer's window opens, and its stuck deadline (`dead_after` without write progress)
+ends the connection (`connection_test`'s `slow_reader` and `busy_reader`). On macOS it bought
+nothing measurable in `upload` (a 233 ms gap without it, 195 ms with it).
 
 Queues are bounded: a group queues at most 64 control frames and 8 MiB of data frames per
 connection; more are dropped and counted. A lane with frames and no connection dials, at
@@ -98,6 +104,10 @@ most once per `redial` (200 ms) after a failed dial.
 | `reader` | `reader_test`: a group refused for 3 s beside a heartbeat group on the reader's own loop; the heartbeat's longest gap stays near 100 ms | |
 | `upload` | four groups upload 2 MiB appends of 1 MiB commands to a reader throttled to 40 MB/s; a heartbeat and a vote on the same connection keep under the 1,000 ms election timeout | `bulk-ahead-of-control` (the gap becomes the whole 4 s upload) |
 | `driver` | three nodes of 2 loops, a Driver per loop with its Sink's `Send` over the transport: two groups elect and commit, the first group's leader restarts, and both commit again on all three | |
+| `refill` | frames of 40 KiB against a 64 KiB window, so one goes at a time: after the receiver refuses frames for 1 s, and after it restarts with a frame outstanding, a marker frame still arrives | `no-credit-on-refuse`, `no-reset-on-end` |
 
-A timing case that the host stalled 250 ms or more runs again, at most twice. Mutants are
+A timing case that the host stalled 250 ms or more runs again, at most twice. Each step prints
+as it starts, and a case still running after 100 s prints its step, whether each loop still
+turns, the loops' counters and every thread's stack (`sample` on macOS, `gdb` elsewhere), then
+exits 3. Mutants are
 written by `test/transport/mutant_commit.py`; the plain case run at one must fail.

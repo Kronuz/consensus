@@ -9,7 +9,11 @@
 //            never delays another group's heartbeat or vote past the election timeout
 //   driver   three Drivers' Sinks over the transport: a three-voter group elects, commits and
 //            survives a peer's restart
-// A timing case the host stalled (a 250 ms oversleep) runs again, at most twice.
+//   refill   credit comes back: for refused frames, and with a new connection after the
+//            receiver restarts with the window full
+// A timing case the host stalled (a 250 ms oversleep) runs again, at most twice. Each step prints
+// as it starts; a case still running after 100 s prints its step, which loops stopped turning
+// and every thread's stack, then exits 3.
 //   consensus_transport_groups_test <fixture dir> case
 #include "consensus/driver.h"
 #include "consensus/transport/host_transport.h"
@@ -18,13 +22,19 @@
 #include <asio/io_context.hpp>
 #include <algorithm>
 #include <cassert>
+#include <condition_variable>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <future>
 #include <mutex>
 #include <openssl/pem.h>
 #include <thread>
+#include <unistd.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 
 using namespace kronuz::consensus::transport;
 using namespace kronuz::consensus;
@@ -53,6 +63,16 @@ std::shared_ptr<asio::ssl::context> context(const std::string &name) {
 }
 std::uint64_t ms_since(steady::time_point t) {
 	return std::uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(steady::now() - t).count());
+}
+
+// The step the case is in, printed as it starts and named by the watchdog.
+const steady::time_point began = steady::now();
+std::mutex step_mutex;
+std::string current_step = "start";
+void step(std::string what) {
+	std::lock_guard hold(step_mutex);
+	std::printf("[%6llu ms] %s\n", (unsigned long long)ms_since(began), what.c_str());
+	current_step = std::move(what);
 }
 
 // One loop on its own thread.
@@ -87,7 +107,10 @@ struct Host {
 	tcp::acceptor acceptor;
 	std::unique_ptr<HostTransport> transport;
 	bool running = false, quiet = false;
-	Host(NodeId n, std::uint32_t L, std::uint16_t port = 0) : node(n), loops(make(L)), acceptor(loops[0]->io, {asio::ip::address_v4::loopback(), port}) {}
+	Host(NodeId n, std::uint32_t L, std::uint16_t port = 0) : node(n), loops(make(L)), acceptor(loops[0]->io, {asio::ip::address_v4::loopback(), port}) {
+		std::lock_guard hold(hosts_mutex);
+		hosts.push_back(this);
+	}
 	static std::vector<std::unique_ptr<Loop>> make(std::uint32_t L) {
 		std::vector<std::unique_ptr<Loop>> loops;
 		for (std::uint32_t k = 0; k != L; ++k)
@@ -118,22 +141,101 @@ struct Host {
 		if (!running || quiet)
 			return;
 		quiet = true;
+		step("host " + std::to_string(node) + ": the transport stops");
 		transport->stop();
-		for (std::uint32_t k = 0; k != loops.size(); ++k)
+		for (std::uint32_t k = 0; k != loops.size(); ++k) {
+			step("host " + std::to_string(node) + ": loop " + std::to_string(k) + " drains");
 			for (int i = 0; !loops[k]->at([&] { return transport->drained(k); }); ++i) {
 				assert(i < 2000 && "transport drains");
 				std::this_thread::sleep_for(5ms);
 			}
+		}
 	}
 	void stop() {
 		if (!running)
 			return;
 		quiesce();
+		step("host " + std::to_string(node) + ": the loops join");
 		for (auto &l : loops)
 			l->join();
 		running = false;
 	}
-	~Host() { stop(); }
+	~Host() {
+		stop();
+		std::lock_guard hold(hosts_mutex);
+		std::erase(hosts, this);
+	}
+	// The live hosts, for the watchdog.
+	static inline std::mutex hosts_mutex;
+	static inline std::vector<Host *> hosts;
+};
+
+// What a case that hangs leaves: its step, each host's loops (turning, blocked or stopped) with
+// their counters, and every thread's stack.
+void report_hang() {
+	{
+		std::lock_guard hold(step_mutex);
+		std::printf("HUNG after %llu ms in step: %s\n", (unsigned long long)ms_since(began), current_step.c_str());
+	}
+	{
+		std::lock_guard hold(Host::hosts_mutex);
+		for (auto *h : Host::hosts)
+			for (std::uint32_t k = 0; k != h->loops.size(); ++k) {
+				auto &loop = *h->loops[k];
+				auto turned = std::make_shared<std::atomic<bool>>(false);
+				if (!loop.io.stopped())
+					asio::post(loop.io, [turned] { *turned = true; });
+				for (int i = 0; i != 100 && !*turned; ++i)
+					std::this_thread::sleep_for(10ms);
+				const char *state = loop.io.stopped() ? "stopped" : *turned ? "turning" : "BLOCKED for 1 s";
+				std::printf("host %llu loop %u: %s", (unsigned long long)h->node, k, state);
+				if (h->transport) {
+					const auto &s = h->transport->stats(k);
+					std::printf("; links %llu sent %llu received %llu reads %llu posts %llu dropped %llu refused %llu",
+								(unsigned long long)s.links, (unsigned long long)s.sent, (unsigned long long)s.received,
+								(unsigned long long)s.reads, (unsigned long long)s.posts, (unsigned long long)s.dropped,
+								(unsigned long long)s.refused);
+				}
+				std::printf("\n");
+			}
+	}
+	const auto pid = std::to_string(::getpid());
+#ifdef __APPLE__
+	const std::string stacks = "sample " + pid + " 1 -file /dev/stdout 2>&1";
+#else
+	const std::string stacks = "gdb -p " + pid + " -batch -ex 'thread apply all bt' 2>&1";
+#endif
+	std::fflush(stdout);
+	if (std::system(stacks.c_str()) != 0)
+		std::printf("(no stacks: %s failed)\n", stacks.c_str());
+	std::fflush(stdout);
+}
+// Reports a hang and exits 3 once `limit` passes, unless done() came first.
+class Watchdog {
+  public:
+	explicit Watchdog(std::chrono::seconds limit)
+		: thread_([this, limit] {
+			  std::unique_lock lock(mutex_);
+			  if (wake_.wait_for(lock, limit, [this] { return done_; }))
+				  return;
+			  lock.unlock();
+			  report_hang();
+			  std::_Exit(3);
+		  }) {}
+	~Watchdog() {
+		{
+			std::lock_guard hold(mutex_);
+			done_ = true;
+		}
+		wake_.notify_all();
+		thread_.join();
+	}
+
+  private:
+	std::mutex mutex_;
+	std::condition_variable wake_;
+	bool done_ = false;
+	std::thread thread_;
 };
 std::map<NodeId, PeerAddress> addresses(std::initializer_list<const Host *> hosts) {
 	std::map<NodeId, PeerAddress> r;
@@ -197,6 +299,7 @@ struct Stalls {
 // Runs a timing case; one the host stalled for 250 ms or more runs again, at most twice.
 void timed(const char *name, const std::function<bool()> &run) {
 	for (int attempt = 1;; ++attempt) {
+		step(std::string(name) + ": attempt " + std::to_string(attempt));
 		Stalls stalls;
 		const bool ok = run();
 		const auto worst = stalls.stop();
@@ -253,6 +356,7 @@ void threads() {
 						}
 			});
 	}
+	step("threads: 64 groups' frames both ways");
 	const auto start = steady::now();
 	while (delivered < 2 * 64 * per_group && ms_since(start) < 20'000)
 		std::this_thread::sleep_for(10ms);
@@ -306,7 +410,9 @@ bool credit() {
 		const auto k = one.transport->loop_of_group(g2);
 		one.post(k, [&, k] { one.transport->send(k, LinkLane::Control, FrameKind::control, {g2, 1, 2}, 2, "heartbeat"); });
 	};
+	step("credit: the connection comes up");
 	warm(heartbeat, [&] { return g2_beats.count > 0; });
+	step("credit: group 1's loop stalls 1.5 s under 40 frames");
 	const auto before = g2_beats.count.load();
 	two.post(stalled, [] { std::this_thread::sleep_for(1500ms); });
 	const auto start = steady::now();
@@ -365,11 +471,15 @@ bool reader() {
 	AppendRequest append{1, 1, 0, 0, 0, 0, {{1, 1, EntryKind::Command, std::string(1024, 'a')}}};
 	AppendRequest heartbeat{1, 1, 0, 0, 0, 0, {}};
 	const auto hb = one.transport->loop_of_group(g2);
+	step("reader: the connection comes up");
 	warm([&] { one.post(hb, [&] { send_message(*one.transport, hb, g2, 1, 2, Send{2, heartbeat}); }); },
 		 [&] { return beats_2.count > 0; });
+	step("reader: 5 s of appends and heartbeats");
 	start = steady::now();
 	busy = true;
-	for (std::uint64_t tick = 0; ms_since(start) < 5000; ++tick) {
+	// A signed tick: libc++'s steady sleep_until subtracts in the time point's own rep, so with an
+	// unsigned one a slot already past (a loaded host) sleeps for centuries.
+	for (std::int64_t tick = 0; ms_since(start) < 5000; ++tick) {
 		const auto at = one.transport->loop_of_group(g1);
 		one.post(at, [&, at] { send_message(*one.transport, at, g1, 1, 2, Send{2, append}); });
 		if (tick % 10 == 0)
@@ -377,6 +487,7 @@ bool reader() {
 		std::this_thread::sleep_until(start + (tick + 1) * 10ms);
 	}
 	std::this_thread::sleep_for(200ms);
+	step("reader: the hosts stop");
 	one.stop();
 	two.stop();
 	const bool ok = beats_2.worst < 1000 && refused_1 && delivered_1;
@@ -418,11 +529,13 @@ bool upload() {
 	const AppendRequest heartbeat{1, 1, 0, 0, 0, 0, {}};
 	const VoteRequest vote{2, 0, 0};
 	const auto f = one.transport->loop_of_group(followers[0]), v = one.transport->loop_of_group(followers[1]);
+	step("upload: the connection comes up");
 	warm([&] { one.post(f, [&] { send_message(*one.transport, f, followers[0], 1, 2, Send{2, heartbeat}); }); },
 		 [&] { return beats.count > 0; });
+	step("upload: 4 s of uploads, heartbeats and votes");
 	const auto before = beats.count.load();
 	const auto start = steady::now();
-	for (std::uint64_t tick = 0; ms_since(start) < 4000; ++tick) {
+	for (std::int64_t tick = 0; ms_since(start) < 4000; ++tick) {  // signed: see reader()
 		for (auto g : uploads) {
 			const auto k = one.transport->loop_of_group(g);
 			one.post(k, [&, g, k] { send_message(*one.transport, k, g, 1, 2, Send{2, chunk}); });
@@ -435,6 +548,7 @@ bool upload() {
 	const auto elapsed = ms_since(start);
 	two.post(other, [&] { beats.beat(); });  // a silence at the end counts
 	std::this_thread::sleep_for(100ms);
+	step("upload: the hosts stop");
 	one.stop();
 	two.stop();
 	const auto controls = beats.count - before, gap = beats.worst;
@@ -623,6 +737,7 @@ void driver() {
 		nodes[n] = std::make_unique<Node>(n, ports[n], disks[n], groups, peers(n));
 	auto all = [&] { return std::vector<Node *>{nodes[1].get(), nodes[2].get(), nodes[3].get()}; };
 	for (auto g : groups) {
+		step("driver: group " + std::to_string(g) + " elects and commits");
 		const bool ok = commit_everywhere(all(), g, "before-" + std::to_string(g), 30'000);
 		std::printf("driver: group %llu elected and committed on all three nodes: %s\n", (unsigned long long)g, ok ? "yes" : "NO");
 		assert(ok);
@@ -631,9 +746,11 @@ void driver() {
 	for (NodeId n = 1; n <= 3; ++n)
 		if (auto s = nodes[n]->state(groups[0]); s && s->role == Role::Leader)
 			restarted = n;
+	step("driver: node " + std::to_string(restarted) + " restarts");
 	nodes[restarted].reset();
 	nodes[restarted] = std::make_unique<Node>(restarted, ports[restarted], disks[restarted], groups, peers(restarted));
 	for (auto g : groups) {
+		step("driver: group " + std::to_string(g) + " commits again");
 		const bool ok = commit_everywhere(all(), g, "after-" + std::to_string(g), 30'000);
 		auto s = nodes[restarted]->state(g);
 		std::printf("driver: after node %llu's restart (group %llu's leader), group %llu committed on all three: %s (node %llu term %llu, committed %llu)\n",
@@ -642,18 +759,104 @@ void driver() {
 		assert(ok);
 	}
 }
+
+// Credit comes back. Frames of 40 KiB against a 64 KiB window go one at a time, so any credit
+// lost wedges the group: the receiver refuses frames for 1 s, then a marker frame still arrives
+// (refused frames return their credit); then it restarts while a frame it never delivered is
+// outstanding, and a marker arrives over the next connection (which starts with none).
+void refill() {
+	constexpr std::uint32_t L = 2;
+	HostTransportOptions options;
+	options.window = 64 * 1024;
+	auto one = std::make_unique<Host>(1, L);
+	auto two = std::make_unique<Host>(2, L);
+	const auto port = two->port();
+	one->open(addresses({two.get()}), options);
+	two->open(addresses({one.get()}), options);
+	const GroupId g = groups_on(L, 1, 1)[0];
+	std::atomic<std::uint64_t> taken{0}, refused{0}, marked{0};
+	std::atomic<bool> refuse{false}, slow{false};
+	auto receive = [&](Host &h) {
+		for (std::uint32_t k = 0; k != L; ++k)
+			h.transport->on_deliver(k, [&](const Received &r) {
+				if (refuse) {
+					++refused;
+					return false;
+				}
+				if (slow)
+					std::this_thread::sleep_for(300ms);
+				++taken;
+				marked += r.payload == "M";
+				return true;
+			});
+	};
+	receive(*two);
+	one->start();
+	two->start();
+	const auto k = one->transport->loop_of_group(g);
+	auto send = [&](int n) {
+		one->post(k, [&, n, k] {
+			for (int i = 0; i != n; ++i)
+				one->transport->send(k, LinkLane::Control, FrameKind::data, {g, 1, 2}, 2, std::string(40 * 1024, 'x'));
+		});
+	};
+	// A marker data frame every 50 ms until one arrives, for at most 10 s.
+	auto marker_arrives = [&] {
+		marked = 0;
+		for (int i = 0; i != 200 && !marked; ++i) {
+			one->post(k, [&, k] { one->transport->send(k, LinkLane::Control, FrameKind::data, {g, 1, 2}, 2, "M"); });
+			std::this_thread::sleep_for(50ms);
+		}
+		return marked > 0;
+	};
+	step("refill: the connection comes up");
+	warm([&] { send(1); }, [&] { return taken > 0; });
+	step("refill: frames refused for 1 s");
+	refuse = true;
+	for (int i = 0; i != 50; ++i) {
+		send(2);
+		std::this_thread::sleep_for(20ms);
+	}
+	std::this_thread::sleep_for(300ms);
+	refuse = false;
+	step("refill: a marker after the refusals");
+	const bool after_refusals = marker_arrives();
+	step("refill: the receiver restarts with a frame outstanding");
+	slow = true;
+	send(3);
+	std::this_thread::sleep_for(150ms);  // the first is in the receiver's 300 ms delivery
+	two.reset();
+	slow = false;
+	two = std::make_unique<Host>(2, L, port);
+	two->open(addresses({one.get()}), options);
+	receive(*two);
+	two->start();
+	step("refill: a marker over the next connection");
+	const bool after_restart = marker_arrives();
+	one->stop();
+	two->stop();
+	std::printf("refill: %llu frames refused, then a marker arrived: %s; after the receiver's restart with a frame outstanding, a marker arrived: %s\n",
+				(unsigned long long)refused.load(), after_refusals ? "yes" : "NO (credit leaked)",
+				after_restart ? "yes" : "NO (credit leaked)");
+	assert(refused >= 8 && after_refusals && after_restart);  // 8 frames: 5 windows
+}
 } // namespace
 
 int main(int argc, char **argv) {
 	if (argc != 3) {
-		std::fprintf(stderr, "usage: %s <fixture dir> threads|credit|reader|upload|driver\n", argv[0]);
+		std::fprintf(stderr, "usage: %s <fixture dir> threads|credit|reader|upload|driver|refill\n", argv[0]);
 		return 2;
 	}
 #ifndef SO_NOSIGPIPE
 	std::signal(SIGPIPE, SIG_IGN);
 #endif
+#ifdef __linux__
+	::prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY);  // the watchdog's gdb attaches to its parent
+#endif
+	std::setvbuf(stdout, nullptr, _IOLBF, 0);  // what ran reaches the log of a run that is killed
 	fixture = argv[1];
 	const std::string which = argv[2];
+	Watchdog watchdog(100s);  // under ctest's 120 s
 	if (which == "threads")
 		threads();
 	else if (which == "credit")
@@ -664,6 +867,8 @@ int main(int argc, char **argv) {
 		timed("upload", upload);
 	else if (which == "driver")
 		driver();
+	else if (which == "refill")
+		refill();
 	else
 		return 2;
 	std::printf("%s: ok\n", which.c_str());

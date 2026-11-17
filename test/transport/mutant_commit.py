@@ -6,7 +6,7 @@ catches the fault.
     test/transport/mutant_commit.py REF NAME       prints the mutant commit's sha
     test/transport/mutant_commit.py --list          names every mutant
 
-Each mutant is (file, search, replace); the search must occur exactly once."""
+Each mutant is (file, search, replace), or a list of them; each search must occur exactly once."""
 import os
 import subprocess
 import sys
@@ -62,6 +62,14 @@ MUTANTS = {
     "reader-loop-delivers": (T + "host_transport.h", "\t\t\tif (to == k) {\n\t\t\t\tdeliver(k, std::move(moved));",
                              "\t\t\tif (true) {\n\t\t\t\tdeliver(k, std::move(moved));"),
     "no-hand-off": (T + "links.h", "Links *home = owner ? owner(peer) : nullptr;", "Links *home = nullptr;"),
+    # host_transport.h (transport-groups review F3: credit comes back)
+    "no-credit-on-refuse": (T + "host_transport.h", "\t\t\tif (r.data)\n\t\t\t\tcredit[", "\t\t\tif (r.data && taken)\n\t\t\t\tcredit["),
+    "no-reset-on-end": [
+        (T + "host_transport.h", "\t\tlane.grants.clear();\n\t\tfor (auto &[id, group] : lane.groups)\n\t\t\tgroup.outstanding = 0;\n\t\tlink.connection->on_read",
+         "\t\tlane.grants.clear();\n\t\tlink.connection->on_read"),
+        (T + "host_transport.h", "\t\tlane.grants.clear();\n\t\tfor (auto &[id, group] : lane.groups)\n\t\t\tgroup.outstanding = 0;\n\t\tif (!lane.groups.empty())",
+         "\t\tlane.grants.clear();\n\t\tif (!lane.groups.empty())"),
+    ],
 }
 
 
@@ -74,17 +82,21 @@ def main():
         print("\n".join(MUTANTS))
         return 0
     ref, name = sys.argv[1], sys.argv[2]
-    path, search, replace = MUTANTS[name]
-    text = git("show", f"{ref}:{path}")
-    if text.count(search) != 1:
-        sys.exit(f"{name}: mutation point found {text.count(search)} times in {path}")
-    blob = git("hash-object", "-w", "--stdin", data=(text.replace(search, replace) + "\n").encode())
+    edits = MUTANTS[name] if isinstance(MUTANTS[name], list) else [MUTANTS[name]]
+    texts = {}
+    for path, search, replace in edits:
+        text = texts.setdefault(path, git("show", f"{ref}:{path}"))
+        if text.count(search) != 1:
+            sys.exit(f"{name}: mutation point found {text.count(search)} times in {path}")
+        texts[path] = text.replace(search, replace)
     with tempfile.TemporaryDirectory(dir=os.path.join(git("rev-parse", "--git-common-dir"))) as tmp:
         env = dict(os.environ, GIT_INDEX_FILE=os.path.join(tmp, "index"))
         git("read-tree", ref, env=env)
-        git("update-index", "--cacheinfo", f"100644,{blob},{path}", env=env)
+        for path, text in texts.items():
+            blob = git("hash-object", "-w", "--stdin", data=(text + "\n").encode())
+            git("update-index", "--cacheinfo", f"100644,{blob},{path}", env=env)
         tree = git("write-tree", env=env)
-    print(git("commit-tree", tree, "-p", git("rev-parse", ref), "-m", f"Mutant {name}: {path}"))
+    print(git("commit-tree", tree, "-p", git("rev-parse", ref), "-m", f"Mutant {name}: {', '.join(texts)}"))
     return 0
 
 

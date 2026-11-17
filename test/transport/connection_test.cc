@@ -1,16 +1,24 @@
 // The host connection over loopback TCP with the TLS fixture: node authentication by the
-// host's pins (A2), frames, the keepalive and the dead-peer deadline, graceful close (A4).
+// host's pins (A2), frames, the keepalive and the dead-peer deadline, graceful close (A4), the
+// fd kept until run() returns, and a slow but steady reader (security review S1, N2).
 //   consensus_transport_connection_test <fixture dir> [case]
 #include "consensus/transport/connection.h"
 #include <asio/connect.hpp>
 #include <asio/io_context.hpp>
+#include <arpa/inet.h>
 #include <asio/post.hpp>
+#include <atomic>
 #include <cassert>
+#include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
 #include <filesystem>
 #include <openssl/pem.h>
 #include <optional>
+#include <sys/ioctl.h>
+#include <thread>
+#include <unistd.h>
 
 using namespace kronuz::consensus::transport;
 using namespace std::chrono_literals;
@@ -378,6 +386,184 @@ void abort_truncates() {
 	std::printf("abort_truncates: both ends failed\n");
 }
 
+// A socket that takes the connection's fd number after an abort (dup2 onto it, the worst a
+// socket opened elsewhere could do): the connection must neither read its bytes nor write onto
+// it. `kept` is the stranger's own end under another number, `remote` its peer.
+struct Stranger {
+	static constexpr std::string_view bytes = "STRANGER-BYTES-0123456789";
+	int kept = -1, remote = -1;
+	void take(int old) {
+		int fds[2];
+		assert(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+		kept = fds[0];
+		remote = fds[1];
+		assert(::dup2(kept, old) == old);
+		for (int fd : {kept, remote})
+			::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL) | O_NONBLOCK);
+		assert(::write(remote, bytes.data(), bytes.size()) == ssize_t(bytes.size()));
+	}
+	~Stranger() {
+		for (int fd : {kept, remote})
+			if (fd >= 0)
+				::close(fd);
+	}
+	// The stranger's bytes still unread, and the bytes something wrote from its end.
+	void check(const char *name) const {
+		int unread = 0;
+		::ioctl(kept, FIONREAD, &unread);
+		char buffer[4096];
+		const ssize_t got = ::recv(remote, buffer, sizeof buffer, 0);
+		std::printf("%s: of the stranger's %zu bytes %d unread, %zd written onto it\n", name, bytes.size(), unread,
+					got < 0 ? ssize_t(0) : got);
+		assert(unread == int(bytes.size()) && got <= 0);
+	}
+};
+// The local port of `fd`, 0 when it is not an open socket.
+std::uint16_t port_of(int fd) {
+	sockaddr_storage address{};
+	socklen_t size = sizeof address;
+	if (::getsockname(fd, reinterpret_cast<sockaddr *>(&address), &size) != 0)
+		return 0;
+	return ntohs(reinterpret_cast<sockaddr_in &>(address).sin_port);
+}
+int fd_of(const Connection &c) { return const_cast<tcp::socket &>(c.socket()).native_handle(); }
+
+// S1: a frame handler aborts, as an on_frame that drops a peer would. The fd stays the
+// connection's until run() returns, and the reader makes no SSL call after the abort.
+void fd_reuse_reader() {
+	Loop loop;
+	auto one = pins_of(1, "one"), two = pins_of(2, "two");
+	Pair p(loop, context("one"), context("two"));
+	p.establish(one, two);
+	Stranger s;
+	std::optional<ConnectionEnd> a;
+	const int old = fd_of(*p.acceptor);
+	const auto port = port_of(old);
+	task::spawn(loop.ref(), p.acceptor->run([&](std::string_view) {
+		if (s.kept >= 0)
+			return;
+		p.acceptor->abort();
+		assert(port_of(old) == port);  // still this connection's socket
+		s.take(old);
+	}),
+				[&](std::exception_ptr e, std::optional<ConnectionEnd> v) {
+					assert(!e);
+					a = v;
+				});
+	task::spawn(loop.ref(), p.dialer->run({}), [](std::exception_ptr, std::optional<ConnectionEnd>) {});
+	loop.call([&] {
+		p.dialer->send("one");
+		p.dialer->send("two");
+	});
+	assert(loop.until([&] { return a.has_value(); }, 3s));
+	loop.until([] { return false; }, 50ms);
+	assert(s.kept >= 0 && a == ConnectionEnd::failed);
+	s.check("fd_reuse_reader");
+}
+
+// S1: abort() from the loop with a frame queued; the writer makes no SSL call after it.
+void fd_reuse_writer() {
+	Loop loop;
+	auto one = pins_of(1, "one"), two = pins_of(2, "two");
+	Pair p(loop, context("one"), context("two"));
+	p.establish(one, two);
+	Ends ends;
+	run_both(p, ends);
+	loop.until([] { return false; }, 30ms);  // both writers idle
+	Stranger s;
+	loop.call([&] {
+		p.acceptor->send("queued before the abort");
+		const int old = fd_of(*p.acceptor);
+		const auto port = port_of(old);
+		p.acceptor->abort();
+		assert(port_of(old) == port);
+		s.take(old);
+	});
+	assert(loop.until([&] { return ends.acceptor && ends.dialer; }, 3s));
+	loop.until([] { return false; }, 50ms);
+	assert(ends.acceptor == ConnectionEnd::failed && ends.dialer == ConnectionEnd::failed);
+	s.check("fd_reuse_writer");
+}
+
+// N2: a peer reading steadily, slower than the queue drains, is not stuck. The acceptor runs
+// on its own loop thread and takes 20 ms per 512 KiB frame: 32 MiB take over 1.2 s to read
+// against a 300 ms dead_after, with write progress every frame.
+void slow_reader() {
+	Loop l1, l2;
+	ConnectionOptions options;
+	options.keepalive = 50ms;
+	options.dead_after = 300ms;
+	tcp::acceptor listener(l1.io, tcp::endpoint(asio::ip::address_v4::loopback(), 0));
+	tcp::socket a(l1.io), b(l2.io);
+	a.connect(listener.local_endpoint());
+	listener.accept(b);
+	Connection dialer(l1.ref(), std::move(a), context("one"), true, options);
+	Connection acceptor(l2.ref(), std::move(b), context("two"), false, options);
+	auto one = pins_of(1, "one"), two = pins_of(2, "two");
+	std::atomic<bool> stop{false};
+	std::thread t2([&] {
+		while (!stop) {
+			l2.io.restart();
+			l2.io.run_for(5ms);
+		}
+	});
+	std::atomic<int> ready{0};
+	auto accept_side = [&]() -> task::task<void> {
+		late_deadline d(l2.ref(), 2s);
+		(void)co_await acceptor.handshake(two, 0, d.token());
+		(void)co_await acceptor.read_hello(d.token());
+		co_await acceptor.write_hello({2, LinkLane::Bulk, false, id('K'), id('a'), 1, 1}, d.token());
+	};
+	auto dial_side = [&]() -> task::task<void> {
+		late_deadline d(l1.ref(), 2s);
+		(void)co_await dialer.handshake(one, 2, d.token());
+		co_await dialer.write_hello({1, LinkLane::Bulk, false, id('K'), id('d'), 1, 1}, d.token());
+		(void)co_await dialer.read_hello(d.token());
+	};
+	auto counted = [&](std::exception_ptr e) {
+		assert(!e);
+		++ready;
+	};
+	asio::post(l2.io, [&] { task::spawn(l2.ref(), accept_side(), counted); });
+	task::spawn(l1.ref(), dial_side(), counted);
+	assert(l1.until([&] { return ready == 2; }));
+	constexpr int count = 64;
+	constexpr std::size_t size = 512 * 1024;
+	std::atomic<int> got{0};
+	std::atomic<bool> acceptor_done{false};
+	std::optional<ConnectionEnd> acceptor_end, dialer_end;
+	asio::post(l2.io, [&] {
+		task::spawn(l2.ref(), acceptor.run([&](std::string_view f) {
+			assert(f.size() == size);
+			std::this_thread::sleep_for(20ms);
+			++got;
+		}),
+					[&](std::exception_ptr e, std::optional<ConnectionEnd> v) {
+						assert(!e);
+						acceptor_end = v;
+						acceptor_done = true;
+					});
+	});
+	task::spawn(l1.ref(), dialer.run({}), [&](std::exception_ptr e, std::optional<ConnectionEnd> v) {
+		assert(!e);
+		dialer_end = v;
+	});
+	const auto start = std::chrono::steady_clock::now();
+	l1.call([&] {
+		for (int i = 0; i != count; ++i)
+			dialer.send(std::string(size, char('a' + i % 26)));
+		dialer.close();
+	});
+	assert(l1.until([&] { return dialer_end && acceptor_done; }, 20s));
+	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+	stop = true;
+	t2.join();
+	std::printf("slow_reader: %d of %d frames read in %lld ms against a 300 ms dead_after; dialer %d, acceptor %d\n",
+				got.load(), count, (long long)ms, int(*dialer_end), int(*acceptor_end));
+	assert(got == count && ms >= count * 20);
+	assert(dialer_end == ConnectionEnd::closed && acceptor_end == ConnectionEnd::closed);
+}
+
 struct Case {
 	const char *name;
 	void (*run)();
@@ -385,12 +571,14 @@ struct Case {
 constexpr Case cases[] = {{"authenticate", authenticate}, {"wrong_node", wrong_node}, {"unpinned", unpinned},
 						  {"no_certificate", no_certificate}, {"pins", pins},		 {"frames", frames},
 						  {"keepalive", keepalive},	   {"dead_peer", dead_peer}, {"graceful_close", graceful_close},
-						  {"abort_truncates", abort_truncates}};
+						  {"abort_truncates", abort_truncates}, {"fd_reuse_reader", fd_reuse_reader},
+						  {"fd_reuse_writer", fd_reuse_writer}, {"slow_reader", slow_reader}};
 } // namespace
 
 int main(int argc, char **argv) {
 	assert(argc >= 2);
 	fixture = argv[1];
+	std::signal(SIGPIPE, SIG_IGN);  // the host's duty where SO_NOSIGPIPE is missing (connection.h)
 	int ran = 0;
 	for (const auto &c : cases) {
 		if (argc > 2 && std::strcmp(argv[2], c.name) != 0)

@@ -127,7 +127,7 @@ the flood stops replaces what is left of it.
 | DTHL0002 | `node_hello_test`; `fuzz_decoders` case 9 |
 | Frames, keepalive, dead peer, close | `connection_test` `frames`, `keepalive`, `dead_peer`, `graceful_close`, `abort_truncates`; mutants `no-keepalive`, `close-drops-queue`, `no-close-notify` |
 | The fd kept until `run()` returns, no SSL call after the end | `connection_test` `fd_reuse_reader`, `fd_reuse_writer`; mutants `fail-closes-fd`, `ssl-after-end` |
-| Write progress restarts the stuck deadline | `connection_test` `slow_reader`; mutant `stuck-spans-flush` |
+| Write progress restarts the stuck deadline | `connection_test` `slow_reader` (a failed run the host stalled 100 ms or more runs again, at most twice); mutant `stuck-spans-flush`; `slow_reader_stops.py` forces the stalls with `SIGSTOP` |
 | Dial, tie-break, draining, lookup, two loops | `links_test`; mutants `refuse-when-offered`, `accept-when-offered`, `draining-counts`, `lookup-no-wake`; `threads` under TSan |
 | A given-up dial released; the pre-authentication bounds | `links_test` `abandoned_dial`, `flood`; mutants `abandon-keeps-dial`, `refuse-newest`, `no-source-cap` |
 

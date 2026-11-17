@@ -3,6 +3,7 @@
 // fd kept until run() returns, and a slow but steady reader (security review S1, N2).
 //   consensus_transport_connection_test <fixture dir> [case]
 #include "consensus/transport/connection.h"
+#include <algorithm>
 #include <asio/connect.hpp>
 #include <asio/io_context.hpp>
 #include <arpa/inet.h>
@@ -485,10 +486,43 @@ void fd_reuse_writer() {
 	s.check("fd_reuse_writer");
 }
 
+// The longest this process went unscheduled during a run: a thread asks to sleep 1 ms and
+// records how long it slept. A host stop or starvation shows here as a gap.
+class stall_watch {
+  public:
+	~stall_watch() {
+		stop_ = true;
+		thread_.join();
+	}
+	long long worst_ms() const { return worst_; }
+
+  private:
+	std::atomic<bool> stop_{false};
+	std::atomic<long long> worst_{0};
+	std::thread thread_{[this] {
+		while (!stop_) {
+			const auto before = std::chrono::steady_clock::now();
+			std::this_thread::sleep_for(1ms);
+			const auto slept =
+				std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - before).count();
+			worst_ = std::max<long long>(worst_, slept);
+		}
+	}};
+};
+
+struct slow_run {
+	int got;
+	long long ms, stalled_ms;
+	ConnectionEnd dialer, acceptor;
+	std::uint64_t keepalives;
+};
+constexpr int slow_frames = 64;
+
 // N2: a peer reading steadily, slower than the queue drains, is not stuck. The acceptor runs
 // on its own loop thread and takes 20 ms per 512 KiB frame: 32 MiB take over 1.2 s to read
 // against a 300 ms dead_after, with write progress every frame.
-void slow_reader() {
+slow_run slow_reader_once() {
+	stall_watch watch;
 	Loop l1, l2;
 	ConnectionOptions options;
 	options.keepalive = 50ms;
@@ -527,7 +561,7 @@ void slow_reader() {
 	asio::post(l2.io, [&] { task::spawn(l2.ref(), accept_side(), counted); });
 	task::spawn(l1.ref(), dial_side(), counted);
 	assert(l1.until([&] { return ready == 2; }));
-	constexpr int count = 64;
+	constexpr int count = slow_frames;
 	constexpr std::size_t size = 512 * 1024;
 	std::atomic<int> got{0};
 	std::atomic<bool> acceptor_done{false};
@@ -558,10 +592,24 @@ void slow_reader() {
 	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 	stop = true;
 	t2.join();
-	std::printf("slow_reader: %d of %d frames read in %lld ms against a 300 ms dead_after; dialer %d, acceptor %d\n",
-				got.load(), count, (long long)ms, int(*dialer_end), int(*acceptor_end));
-	assert(got == count && ms >= count * 20);
-	assert(dialer_end == ConnectionEnd::closed && acceptor_end == ConnectionEnd::closed);
+	return {got, ms, watch.worst_ms(), *dialer_end, *acceptor_end, acceptor.keepalives_sent()};
+}
+// Both ends share this process, so a host stop silences the reader's keepalives too, which no
+// two hosts do: a failed run the host stalled for a third of dead_after or more runs again, at
+// most twice. Only a whole run passes, and any failure without such a stall fails at once.
+void slow_reader() {
+	for (int attempt = 1;; ++attempt) {
+		const auto r = slow_reader_once();
+		std::printf("slow_reader: %d of %d frames read in %lld ms against a 300 ms dead_after; dialer %d, acceptor %d; "
+					"%llu keepalives from the reader; the process stalled %lld ms at most\n",
+					r.got, slow_frames, r.ms, int(r.dialer), int(r.acceptor), (unsigned long long)r.keepalives,
+					r.stalled_ms);
+		if (r.got == slow_frames && r.dialer == ConnectionEnd::closed && r.acceptor == ConnectionEnd::closed) {
+			assert(r.ms >= slow_frames * 20);
+			return;
+		}
+		assert(r.stalled_ms >= 100 && attempt < 3);
+	}
 }
 
 struct Case {

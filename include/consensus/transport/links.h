@@ -55,7 +55,12 @@ class Links {
 	}
 	Links(const Links &) = delete;
 	Links &operator=(const Links &) = delete;
-	~Links() { assert(!tasks_ && "Links destroyed with tasks running: stop() and run the loop until drained()"); }
+	~Links() {
+		assert(!tasks_ && "Links destroyed with tasks running: stop() and run the loop until drained()");
+		for (auto &[node, route] : state_->routes)
+			if (route.lookup)
+				route.lookup->abandon();  // a cached name's refresh may still run: it must not post
+	}
 
 	// What established links deliver, and when a link starts and ends.
 	FrameHandler on_frame;

@@ -181,8 +181,10 @@ struct Cluster {
 			}
 			while (!node.driver->idle()) {
 				const auto& write = node.driver->begin();
-				for (auto& [g, worker] : node.workers) { pump(node, g); }
+				// A power cut anywhere until the barrier fails the turn in flight, so the host
+				// tears down with no operation left submitted.
 				try {
+					for (auto& [g, worker] : node.workers) { pump(node, g); }
 					if (write.file->write_at(write.offset, write.bytes) != write.bytes.size()) { throw std::runtime_error("short turn write"); }
 					write.file->sync_data();
 				} catch (...) { node.driver->failed(std::current_exception()); throw; }

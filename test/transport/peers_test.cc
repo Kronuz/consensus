@@ -1212,8 +1212,10 @@ asio::awaitable<void> fetch_failures(asio::io_context &io, const Certificates &c
 	CHECK(cluster.peers[0]->stats().admitted == admitted && cluster.connections(0) == 4); // the same lanes
 	CHECK(co_await cluster.commit("after the hang", {0, 1, 2}, 5s));
 
+	// A reply too long to finish before the close lands, whatever the host's speed.
+	(*files[1])["history/large"] = pattern(8 * 1024 * 1024, 21);
 	then = Then::Close;
-	auto closed = fetch(cluster, 0, 2, "history/table");
+	auto closed = fetch(cluster, 0, 2, "history/large");
 	CHECK(co_await cluster.until([&] { return closed->done; }, 2s));
 	const auto failed = ms(closed->answered - closed->asked);
 	std::printf("  closed peer: fetch failed after %lld ms\n", failed);

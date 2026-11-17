@@ -182,4 +182,10 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 		add_test(NAME consensus_transport_groups_${c} COMMAND consensus_transport_groups_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture ${c})
 		set_tests_properties(consensus_transport_groups_${c} PROPERTIES FIXTURES_REQUIRED consensus_tls TIMEOUT 120)
 	endforeach()
+	# The host transport's idle cost per group, connection end and host, and its hop's CPU
+	# (docs/perf/transport-idle-cost.md); ctest checks the counts on every platform.
+	add_executable(consensus_transport_idle bench/transport_idle.cc)
+	target_link_libraries(consensus_transport_idle PRIVATE consensus::transport)
+	add_test(NAME consensus_transport_idle COMMAND consensus_transport_idle ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture cost --quick)
+	set_tests_properties(consensus_transport_idle PROPERTIES FIXTURES_REQUIRED consensus_tls TIMEOUT 120)
 endif()

@@ -4,9 +4,15 @@ project(consensus LANGUAGES CXX)
 # Strict durable Raft: a deterministic Core, a Worker over journal storage, checkpoints,
 # and snapshot transfer, plus an optional authenticated peer transport. Header-only.
 include(FetchContent)
-# The standalone build's completion test and bench use completion's task driver.
+# Standalone, the transport, the completion test and the bench need Asio: task and completion
+# at journal's pins, with their Asio targets, made available before journal turns them off.
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-	set(COMPLETION_ASIO ON CACHE BOOL "completion::asio, the task::task driver")
+	FetchContent_Declare(task GIT_REPOSITORY https://github.com/Kronuz/task.git GIT_TAG 95798a02f68c86f070401329a05c78d326ac2579)
+	FetchContent_Declare(completion GIT_REPOSITORY https://github.com/Kronuz/completion.git GIT_TAG 7731315d0660a953f7b3bf956df3127d5a525a03)
+	set(TASK_ASIO ON)
+	set(COMPLETION_TASK ON)
+	set(COMPLETION_ASIO ON)
+	FetchContent_MakeAvailable(task completion)
 endif()
 FetchContent_Declare(journal GIT_REPOSITORY https://github.com/Kronuz/journal.git GIT_TAG 7c08540c312044c21215c831ab455fd0777f1efd)
 FetchContent_MakeAvailable(journal)

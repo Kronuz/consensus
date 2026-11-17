@@ -15,7 +15,9 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
   an exchange of its cluster, group identity, epoch and profile; and a message frame reaches
   `Deliver` only for a stored group, opened on that connection, to the incarnation held here,
   from a source whose node is the connection's where the membership (`member_of`, now
-  required) names it (R7). `admit` and `open_fault` are the rule as values.
+  required) names it (R7). `admit` and `open_fault` are the rule as values. `store` refuses a
+  zero cluster, group or epoch, and a connection's `on_read` also follows a read that fails
+  after handing frames over, so they leave under their own connection.
 
 - The host transport ([docs/mechanisms/host-transport.md](docs/mechanisms/host-transport.md)),
   beside `Peers`: `transport/host_transport.h` shares a Control and a Bulk connection per peer

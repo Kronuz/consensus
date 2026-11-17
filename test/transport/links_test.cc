@@ -223,7 +223,9 @@ void lookup() {
 	assert(loop.until([&] { return dialed.value.has_value(); }));
 	auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 	std::printf("lookup: answered in ~100 ms, dialed in %lld ms\n", (long long)ms);
-	assert(*dialed.value && ms >= 95 && ms < 900 && one.links->stats().lookups == 1);
+	// Woken by the answer, not the 1 s deadline: no lookup timeout (the bound in ms is printed;
+	// a runner that stops the process stretches it, D100).
+	assert(*dialed.value && ms >= 95 && one.links->stats().lookups == 1);
 	assert(one.links->stats().lookup_timeouts == 0);
 	one.stop();
 	two.stop();
@@ -240,7 +242,7 @@ void lookup() {
 	ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 	std::printf("lookup: a 3 s resolver failed the dial in %lld ms, lookup_timeouts %llu\n", (long long)ms,
 				(unsigned long long)three.links->stats().lookup_timeouts);
-	assert(!*slow.value && ms >= 195 && ms < 1000 && three.links->stats().lookup_timeouts == 1);
+	assert(!*slow.value && ms >= 195 && three.links->stats().lookup_timeouts == 1);
 	three.stop();  // abandons the lookup; its thread ends on its own
 	four.stop();
 }

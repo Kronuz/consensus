@@ -301,9 +301,11 @@ void keepalive() {
 	const auto sent = p.dialer->keepalives_sent(), received = p.acceptor->keepalives_received();
 	std::printf("keepalive: %lld ms idle, %llu sent, %llu received, %llu the other way\n", (long long)ms,
 				(unsigned long long)sent, (unsigned long long)received, (unsigned long long)p.acceptor->keepalives_sent());
+	// Open after 1 s against a 300 ms dead_after: the keepalives kept it. The counts' upper bound
+	// is one per interval; a runner that stops the process only lowers them (D100).
 	assert(!ends.dialer && !ends.acceptor);
-	assert(sent >= 10 && sent <= std::uint64_t(ms / 50) + 1 && received + 1 >= sent);
-	assert(p.acceptor->keepalives_sent() >= 10 && p.acceptor->keepalives_sent() <= std::uint64_t(ms / 50) + 1);
+	assert(sent >= 1 && sent <= std::uint64_t(ms / 50) + 1 && received + 1 >= sent);
+	assert(p.acceptor->keepalives_sent() >= 1 && p.acceptor->keepalives_sent() <= std::uint64_t(ms / 50) + 1);
 	loop.call([&] { p.dialer->close(); });
 	assert(loop.until([&] { return ends.dialer && ends.acceptor; }));
 	assert(ends.dialer == ConnectionEnd::closed && ends.acceptor == ConnectionEnd::closed);
@@ -327,7 +329,7 @@ void dead_peer() {
 	assert(loop.until([&] { return end.has_value(); }, 3s));
 	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 	std::printf("dead_peer: ended %s after %lld ms\n", end == ConnectionEnd::dead ? "dead" : "otherwise", (long long)ms);
-	assert(end == ConnectionEnd::dead && ms >= 295 && ms < 1000);
+	assert(end == ConnectionEnd::dead && ms >= 295);  // never early; a runner's stop only delays it
 }
 
 // T8's transport half: close() sends every queued frame, then close_notify; the peer reads

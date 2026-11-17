@@ -6,6 +6,19 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#consensus) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-17
+
+### Added
+
+- The host connection ([docs/mechanisms/host-connection.md](docs/mechanisms/host-connection.md)),
+  beside `Peers`: `transport/connection.h` drives OpenSSL on the non-blocking socket with
+  released buffers, length-prefixed frames, a keepalive per connection and a graceful close
+  (queued frames, then `close_notify`); `transport/node_pins.h` pins one certificate per node
+  per host; `transport/node_hello.h` is the DTHL0002 hello with the RPC lane's version range;
+  `transport/links.h` dials, accepts and settles duplicate dials before any frame.
+- `transport/deadline.h`: `late_deadline`, the one rule for a transport deadline that fires
+  late after a process stop (extend once by the lateness, capped at one timeout).
+
 ## 2026-11-16
 
 ### Added

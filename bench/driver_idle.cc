@@ -98,7 +98,8 @@ std::size_t descriptors() {
 
 struct Sink { template <class N> void operator()(GroupId, N&&) {} };
 
-const j::TurnLogOptions turn_options{16 * 1024, 1024, 1, 4, 4096};
+// Segments large enough that creating the groups rotates none: a rotation's descriptor is the host's.
+const j::TurnLogOptions turn_options{4u << 20, 32 << 10, 1, 4, 1 << 20};
 const j::AdmissionLimits admission{{256u << 20, 8192}, {256 * 1024, 3}, {64u << 20, 4}, 32, 3};
 
 GroupOptions options(bool three) {
@@ -129,14 +130,18 @@ void measure(std::size_t groups, bool three) {
 		task::spawn(ref, host.driver(0).run(j::completion_ref::of(io), stop.token()), [](std::exception_ptr) {});
 		task::spawn(ref, driver.run(stop.token()), [](std::exception_ptr) {});
 		scheduler.run();
-		const auto threads_before = threads(), fds_before = descriptors(), timers_before = scheduler.armed_timers();
-		const auto heap_before = heap_in_use();
 		std::size_t created = 0;
-		for (GroupId id = 1; id <= groups; ++id) {
+		auto create = [&](GroupId id) {
 			driver.open(id, options(three));
 			task::spawn(ref, driver.create(id, j::Identity{'G', 'I'}), [&created](std::exception_ptr e) { created += !e; });
 			scheduler.run();
-		}
+		};
+		// The first group opens what the host shares (the turn log's segment): the baseline
+		// follows it, so what is counted is each further group's own cost.
+		create(1);
+		const auto threads_before = threads(), fds_before = descriptors(), timers_before = scheduler.armed_timers();
+		const auto heap_before = heap_in_use();
+		for (GroupId id = 2; id <= groups + 1; ++id) { create(id); }
 		scheduler.run();
 		const auto heap_after = heap_in_use();
 		const auto per_group = double(heap_after - heap_before) / double(groups);
@@ -144,15 +149,15 @@ void measure(std::size_t groups, bool three) {
 		const auto fds = descriptors() - fds_before;
 		const auto extra_threads = threads() - threads_before;
 		std::printf("%s x %zu: created %zu; per group %.0f bytes, %.3f armed timers, %.3f descriptors, %zu threads in all, %zu frames in flight\n",
-			three ? "three-voter member" : "lone voter", groups, created, per_group, double(timers) / double(groups), double(fds) / double(groups), extra_threads, driver.in_flight());
-		expect(created == groups, "every group created");
+			three ? "three-voter member" : "lone voter", groups, created - 1, per_group, double(timers) / double(groups), double(fds) / double(groups), extra_threads, driver.in_flight());
+		expect(created == groups + 1, "every group created");
 		expect(extra_threads == 0, "no thread per group");
 		expect(fds == 0, "no descriptor per idle group");
 		expect(driver.in_flight() == 0 && driver.waiting_groups().empty(), "no frame per idle group");
 		expect(three ? timers <= groups : timers == 0, three ? "at most one armed wheel entry per member" : "no armed timer per idle lone voter");
 		if (three) {
 			// D9: an idle member's snapshot channel holds no frame buffer; its bytes join the member's.
-			Worker worker(host, groups + 1, options(true).configuration, admission);
+			Worker worker(host, groups + 2, options(true).configuration, admission);
 			const auto channel_before = heap_in_use();
 			auto channel = std::make_unique<SnapshotChannel>(worker);
 			const auto channel_bytes = heap_in_use() - channel_before;

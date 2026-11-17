@@ -37,7 +37,8 @@ A host has one TLS context and one `NodePins`: a certificate per node, pinned on
 that is not the context's certificate. A handshake authenticates a verified leaf that is pinned
 to a node other than this one, and, on a dial, to the dialed node. Another node's certificate,
 this node's own, an unpinned one or none is refused before any hello or frame. Per-group checks
-(cluster, group, epoch, profile) belong to the group-open exchange, not to the connection.
+(cluster, group, epoch, profile) belong to the group-open exchange, not to the connection
+([host-transport.md](host-transport.md), Identity).
 
 ## The connection
 
@@ -74,7 +75,8 @@ its own buffer fills, and the next wait ends the connection. The cost is one `io
 stream is never taken for a complete one.
 
 A sender with queues of its own (the host transport) hooks two moments: `on_read`, after each
-read's frames went to the handler, and `on_drained`, when the queue is out and the writer would
+read's frames went to the handler (also when the read then fails, as on an oversized length,
+so no frame it handed over is left waiting for another connection's read), and `on_drained`, when the queue is out and the writer would
 wait, so it hands over a little at a time and keeps the order of what waits. `rehome()` moves
 a connection to another loop between its handshake and its hellos.
 

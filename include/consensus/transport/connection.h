@@ -5,6 +5,7 @@
 #include <asio/ip/tcp.hpp>
 #include <asio/ssl/context.hpp>
 #include <climits>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <netinet/tcp.h>
@@ -70,8 +71,9 @@ class Connection {
 	std::uint64_t drained_expiries() const noexcept { return drained_expiries_; }
 	const asio::ip::tcp::socket &socket() const noexcept { return socket_; }
 
-	// After each read's frames went to the handler; when the queue is empty and the writer would
-	// wait, so a sender keeps its own queues and hands over a little at a time. Set before run().
+	// After each read's frames went to the handler, also a read that fails after handing some
+	// over; when the queue is empty and the writer would wait, so a sender keeps its own queues
+	// and hands over a little at a time. Set before run().
 	std::function<void()> on_read, on_drained;
 
 	// Moves the connection to another loop between its handshake and its hellos; nothing waits.
@@ -285,9 +287,16 @@ class Connection {
 	task::task<void> reader() {
 		try {
 			for (bool more = true; more;) {
-				deliver();
+				std::exception_ptr failed;
+				try {
+					deliver();
+				} catch (...) {
+					failed = std::current_exception();
+				}
 				if (on_read)
-					on_read();
+					on_read();  // the frames this read handed over, even when it then failed
+				if (failed)
+					std::rethrow_exception(failed);
 				late_deadline dead(loop_, options_.dead_after);
 				try {
 					more = co_await fill(dead.token());

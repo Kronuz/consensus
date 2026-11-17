@@ -18,14 +18,15 @@ class wait_list;
 // A deadline on the loop's timer wheel. Its token is requested (cancel_reason::deadline) at
 // expiry, for IO awaited with it; wait() ends at a wake() or at expiry. The object is its
 // wheel entry, so the wait owns its timer: destroying it unfiles the entry and leaves any
-// wait_list it joined.
+// wait_list it joined. With `extend_late` false a late fire expires at once: for a wait that
+// times this end's own duty (the keepalive interval), not the peer's time.
 class late_deadline : wheel::timer_entry {
   public:
 	enum class outcome : std::uint8_t { pending, woken, expired };
 
-	late_deadline(task::scheduler_ref loop, std::chrono::nanoseconds timeout)
+	late_deadline(task::scheduler_ref loop, std::chrono::nanoseconds timeout, bool extend_late = true)
 		: loop_(loop), timeout_(std::uint64_t(std::max<std::int64_t>(1, timeout.count()))),
-		  at_(loop.now() + timeout_) {
+		  at_(loop.now() + timeout_), extend_late_(extend_late) {
 		fire = &on_wheel;
 		if (!loop_.arm(*this, at_))
 			throw std::logic_error("late_deadline needs a scheduler with timers");
@@ -77,7 +78,7 @@ class late_deadline : wheel::timer_entry {
 			return;  // the wheel is dying, or a wake already ended it
 		const std::uint64_t now = self.loop_.now();
 		const std::uint64_t late = now > self.at_ ? now - self.at_ : 0;
-		if (!self.extended_ && late > wheel::timer_wheel::tick) {
+		if (self.extend_late_ && !self.extended_ && late > wheel::timer_wheel::tick) {
 			self.extended_ = std::min(late, self.timeout_);
 			self.at_ = now + self.extended_;
 			self.loop_.arm(self, self.at_);
@@ -95,6 +96,7 @@ class late_deadline : wheel::timer_entry {
 
 	task::scheduler_ref loop_;
 	std::uint64_t timeout_, at_, extended_ = 0;
+	bool extend_late_;
 	outcome state_ = outcome::pending;
 	std::coroutine_handle<> waiter_;
 	task::cancel_source source_;

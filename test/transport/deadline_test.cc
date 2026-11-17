@@ -104,6 +104,20 @@ void once() {
 	std::printf("once: a second late fire expires\n");
 }
 
+// Without extend_late (the keepalive interval), a late fire expires at once: the stop gives
+// nothing back, so a keepalive held by a busy or stopped loop goes as soon as it runs.
+void late_expires() {
+	Loop loop;
+	late_deadline d(loop.ref(), 100ms, false);
+	Waiter w;
+	w.start(loop, d);
+	loop.stop(130 * ms);
+	loop.s.run();
+	assert(w.result == outcome::expired && d.extended() == 0ns && w.ended == 130 * ms);
+	assert(d.token().requested() && loop.s.armed_timers() == 0);
+	std::printf("late_expires: 30 ms late, expired at once\n");
+}
+
 // F11, F17: the timer fired late and armed the extension; the event it waits for lands in the
 // same batch after the stop. The wait ends then, not at the extension's end.
 void wake_after_late_fire() {
@@ -198,7 +212,7 @@ struct Case {
 	void (*run)();
 };
 constexpr Case cases[] = {{"on_time", on_time},	 {"stop_extends", stop_extends},
-						  {"capped", capped},	 {"once", once},
+						  {"capped", capped},	 {"once", once}, {"late_expires", late_expires},
 						  {"wake_after_late_fire", wake_after_late_fire},
 						  {"wake_before", wake_before}, {"owns_timer", owns_timer},
 						  {"wake_all", wake_all}, {"token", token}};

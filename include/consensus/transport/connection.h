@@ -258,7 +258,7 @@ class Connection {
 				}
 				if (closing_)
 					break;
-				late_deadline idle(loop_, options_.keepalive);
+				late_deadline idle(loop_, options_.keepalive, false);  // a late keepalive goes at once
 				writer_wake_ = &idle;
 				const auto woke = co_await idle.wait();
 				writer_wake_ = nullptr;

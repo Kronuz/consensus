@@ -34,6 +34,10 @@ MUTANTS = {
                        "\t\t\tsocket_.close(ignored);"),
     "ssl-after-end": (T + "connection.h", "if (end_ != ConnectionEnd::open)\n\t\t\tthrow", "if (false)\n\t\t\tthrow"),
     "stuck-spans-flush": (T + "connection.h", "co_await flush(stuck.token(), true);", "co_await flush(stuck.token());"),
+    # deadline.h, connection.h (fix round 2: a late keepalive goes at once)
+    "late-always-extends": (T + "deadline.h", "if (self.extend_late_ && !self.extended_", "if (!self.extended_"),
+    "keepalive-extends": (T + "connection.h", "late_deadline idle(loop_, options_.keepalive, false);",
+                          "late_deadline idle(loop_, options_.keepalive);"),
     # links.h (A4's tie-break, A1's lookup)
     "refuse-when-offered": (T + "links.h", "return !offered || peer < pins_.local();", "return !offered;"),
     "accept-when-offered": (T + "links.h", "return !offered || peer < pins_.local();", "return true || offered;"),

@@ -1,6 +1,6 @@
 // The host connection over loopback TCP with the TLS fixture: node authentication by the
 // host's pins (A2), frames, the keepalive and the dead-peer deadline, graceful close (A4), the
-// fd kept until run() returns, and a slow but steady reader (security review S1, N2).
+// fd kept until run() returns, and a slow but steady reader and a busy one (security review S1, N2).
 //   consensus_transport_connection_test <fixture dir> [case]
 #include "consensus/transport/connection.h"
 #include <algorithm>
@@ -510,23 +510,26 @@ class stall_watch {
 	}};
 };
 
-struct slow_run {
+// A reader on its own loop thread whose handler holds that loop `per_frame` for each frame.
+struct reader_load {
+	const char *name;
+	int frames;
+	std::size_t size;
+	std::chrono::milliseconds per_frame, dead_after;
+};
+struct reader_run {
 	int got;
 	long long ms, stalled_ms;
 	ConnectionEnd dialer, acceptor;
 	std::uint64_t keepalives;
 };
-constexpr int slow_frames = 64;
 
-// N2: a peer reading steadily, slower than the queue drains, is not stuck. The acceptor runs
-// on its own loop thread and takes 20 ms per 512 KiB frame: 32 MiB take over 1.2 s to read
-// against a 300 ms dead_after, with write progress every frame.
-slow_run slow_reader_once() {
+reader_run read_slowly_once(const reader_load &load) {
 	stall_watch watch;
 	Loop l1, l2;
 	ConnectionOptions options;
 	options.keepalive = 50ms;
-	options.dead_after = 300ms;
+	options.dead_after = load.dead_after;
 	tcp::acceptor listener(l1.io, tcp::endpoint(asio::ip::address_v4::loopback(), 0));
 	tcp::socket a(l1.io), b(l2.io);
 	a.connect(listener.local_endpoint());
@@ -561,15 +564,15 @@ slow_run slow_reader_once() {
 	asio::post(l2.io, [&] { task::spawn(l2.ref(), accept_side(), counted); });
 	task::spawn(l1.ref(), dial_side(), counted);
 	assert(l1.until([&] { return ready == 2; }));
-	constexpr int count = slow_frames;
-	constexpr std::size_t size = 512 * 1024;
+	const int count = load.frames;
+	const std::size_t size = load.size;
 	std::atomic<int> got{0};
 	std::atomic<bool> acceptor_done{false};
 	std::optional<ConnectionEnd> acceptor_end, dialer_end;
 	asio::post(l2.io, [&] {
 		task::spawn(l2.ref(), acceptor.run([&](std::string_view f) {
 			assert(f.size() == size);
-			std::this_thread::sleep_for(20ms);
+			std::this_thread::sleep_for(load.per_frame);
 			++got;
 		}),
 					[&](std::exception_ptr e, std::optional<ConnectionEnd> v) {
@@ -597,20 +600,27 @@ slow_run slow_reader_once() {
 // Both ends share this process, so a host stop silences the reader's keepalives too, which no
 // two hosts do: a failed run the host stalled for a third of dead_after or more runs again, at
 // most twice. Only a whole run passes, and any failure without such a stall fails at once.
-void slow_reader() {
+void read_slowly(const reader_load &load) {
 	for (int attempt = 1;; ++attempt) {
-		const auto r = slow_reader_once();
-		std::printf("slow_reader: %d of %d frames read in %lld ms against a 300 ms dead_after; dialer %d, acceptor %d; "
+		const auto r = read_slowly_once(load);
+		std::printf("%s: %d of %d frames read in %lld ms against a %lld ms dead_after; dialer %d, acceptor %d; "
 					"%llu keepalives from the reader; the process stalled %lld ms at most\n",
-					r.got, slow_frames, r.ms, int(r.dialer), int(r.acceptor), (unsigned long long)r.keepalives,
-					r.stalled_ms);
-		if (r.got == slow_frames && r.dialer == ConnectionEnd::closed && r.acceptor == ConnectionEnd::closed) {
-			assert(r.ms >= slow_frames * 20);
+					load.name, r.got, load.frames, r.ms, (long long)load.dead_after.count(), int(r.dialer),
+					int(r.acceptor), (unsigned long long)r.keepalives, r.stalled_ms);
+		if (r.got == load.frames && r.dialer == ConnectionEnd::closed && r.acceptor == ConnectionEnd::closed) {
+			assert(r.ms >= load.frames * load.per_frame.count());
 			return;
 		}
-		assert(r.stalled_ms >= 100 && attempt < 3);
+		assert(r.stalled_ms >= load.dead_after.count() / 3 && attempt < 3);
 	}
 }
+// N2: a peer reading steadily, slower than the queue drains, is not stuck: 20 ms per 512 KiB
+// frame, 32 MiB over 1.2 s against a 300 ms dead_after, with write progress every frame.
+void slow_reader() { read_slowly({"slow_reader", 64, 512 * 1024, 20ms, 300ms}); }
+// N2's keepalive: a reader whose loop is busy 400 ms per frame sends its overdue keepalive at
+// each turn between frames. Held to the late rule's extension it would go every other frame,
+// 800 ms apart, against a 600 ms dead_after.
+void busy_reader() { read_slowly({"busy_reader", 6, 64 * 1024, 400ms, 600ms}); }
 
 struct Case {
 	const char *name;
@@ -620,7 +630,8 @@ constexpr Case cases[] = {{"authenticate", authenticate}, {"wrong_node", wrong_n
 						  {"no_certificate", no_certificate}, {"pins", pins},		 {"frames", frames},
 						  {"keepalive", keepalive},	   {"dead_peer", dead_peer}, {"graceful_close", graceful_close},
 						  {"abort_truncates", abort_truncates}, {"fd_reuse_reader", fd_reuse_reader},
-						  {"fd_reuse_writer", fd_reuse_writer}, {"slow_reader", slow_reader}};
+						  {"fd_reuse_writer", fd_reuse_writer}, {"slow_reader", slow_reader},
+						  {"busy_reader", busy_reader}};
 } // namespace
 
 int main(int argc, char **argv) {

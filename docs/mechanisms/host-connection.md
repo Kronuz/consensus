@@ -14,7 +14,10 @@ did not run: the host stopped or descheduled the process. The peer had no chance
 during that time, so the deadline extends once, by the lateness, capped at one timeout. A
 second late fire expires it. `late_deadline` is the only implementation, and every transport
 wait uses it: the TLS handshake and hellos, each read wait (the dead-peer deadline), each
-stuck write, the keepalive interval, a name's lookup and the TCP connect race.
+stuck write, the keepalive interval, a name's lookup and the TCP connect race. The keepalive
+interval times this end's own duty, not the peer's time, so it takes no extension: a late fire
+sends the keepalive at once. Extended, a loop busy longer than the interval would send one
+every other turn, twice as far apart as it can.
 
 - **The wait owns its timer.** A `late_deadline` is its own wheel entry, so destroying it
   unfiles the entry. A `wait_list` holds the deadlines waiting for one event, and a deadline
@@ -122,10 +125,10 @@ the flood stops replaces what is left of it.
 
 | What | Where |
 |---|---|
-| The rule, a mutant per part | `deadline_test`; mutants `no-extension`, `uncapped`, `twice`, `wake-ignores-extension`, `entry-left-armed` |
+| The rule, a mutant per part | `deadline_test`; mutants `no-extension`, `uncapped`, `twice`, `wake-ignores-extension`, `entry-left-armed`, `late-always-extends` |
 | Node identity | `connection_test` `authenticate`, `wrong_node`, `unpinned`, `no_certificate`, `pins`; mutants `pin-any-node`, `pin-self`, `pin-unpinned` |
 | DTHL0002 | `node_hello_test`; `fuzz_decoders` case 9 |
-| Frames, keepalive, dead peer, close | `connection_test` `frames`, `keepalive`, `dead_peer`, `graceful_close`, `abort_truncates`; mutants `no-keepalive`, `close-drops-queue`, `no-close-notify` |
+| Frames, keepalive, dead peer, close | `connection_test` `frames`, `keepalive`, `dead_peer`, `graceful_close`, `abort_truncates`, `busy_reader`; mutants `no-keepalive`, `keepalive-extends`, `close-drops-queue`, `no-close-notify` |
 | The fd kept until `run()` returns, no SSL call after the end | `connection_test` `fd_reuse_reader`, `fd_reuse_writer`; mutants `fail-closes-fd`, `ssl-after-end` |
 | Write progress restarts the stuck deadline | `connection_test` `slow_reader` (a failed run the host stalled 100 ms or more runs again, at most twice); mutant `stuck-spans-flush`; `slow_reader_stops.py` forces the stalls with `SIGSTOP` |
 | Dial, tie-break, draining, lookup, two loops | `links_test`; mutants `refuse-when-offered`, `accept-when-offered`, `draining-counts`, `lookup-no-wake`; `threads` under TSan |

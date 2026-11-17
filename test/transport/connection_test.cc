@@ -511,11 +511,14 @@ class stall_watch {
 };
 
 // A reader on its own loop thread whose handler holds that loop `per_frame` for each frame.
+// With `coarse`, the kernel reports the writer's socket writable only after 1 MiB drained (its
+// send buffer 1 MiB, its low-water mark too where settable) and the reader's buffer is 64 KiB.
 struct reader_load {
 	const char *name;
 	int frames;
 	std::size_t size;
 	std::chrono::milliseconds per_frame, dead_after;
+	bool coarse = false;
 };
 struct reader_run {
 	int got;
@@ -532,6 +535,13 @@ reader_run read_slowly_once(const reader_load &load) {
 	options.dead_after = load.dead_after;
 	tcp::acceptor listener(l1.io, tcp::endpoint(asio::ip::address_v4::loopback(), 0));
 	tcp::socket a(l1.io), b(l2.io);
+	if (load.coarse) {
+		const int buffer = 1 << 20, reading = 64 * 1024;
+		a.open(tcp::v4());
+		::setsockopt(a.native_handle(), SOL_SOCKET, SO_SNDBUF, &buffer, sizeof buffer);
+		(void)::setsockopt(a.native_handle(), SOL_SOCKET, SO_SNDLOWAT, &buffer, sizeof buffer);  // Linux refuses it
+		::setsockopt(listener.native_handle(), SOL_SOCKET, SO_RCVBUF, &reading, sizeof reading);
+	}
 	a.connect(listener.local_endpoint());
 	listener.accept(b);
 	Connection dialer(l1.ref(), std::move(a), context("one"), true, options);
@@ -621,6 +631,10 @@ void slow_reader() { read_slowly({"slow_reader", 64, 512 * 1024, 20ms, 300ms}); 
 // each turn between frames. Held to the late rule's extension it would go every other frame,
 // 800 ms apart, against a 600 ms dead_after.
 void busy_reader() { read_slowly({"busy_reader", 6, 64 * 1024, 400ms, 600ms}); }
+// Write progress counts the socket's queue draining: a writer the kernel wakes only after 1 MiB
+// drained (Linux's send buffer wakes at a third free, macOS's low-water mark) to a reader of
+// 64 KiB every 60 ms waits about a second for a write, against a 300 ms dead_after.
+void coarse_writer() { read_slowly({"coarse_writer", 48, 64 * 1024, 60ms, 300ms, true}); }
 
 struct Case {
 	const char *name;
@@ -631,13 +645,14 @@ constexpr Case cases[] = {{"authenticate", authenticate}, {"wrong_node", wrong_n
 						  {"keepalive", keepalive},	   {"dead_peer", dead_peer}, {"graceful_close", graceful_close},
 						  {"abort_truncates", abort_truncates}, {"fd_reuse_reader", fd_reuse_reader},
 						  {"fd_reuse_writer", fd_reuse_writer}, {"slow_reader", slow_reader},
-						  {"busy_reader", busy_reader}};
+						  {"busy_reader", busy_reader}, {"coarse_writer", coarse_writer}};
 } // namespace
 
 int main(int argc, char **argv) {
 	assert(argc >= 2);
 	fixture = argv[1];
 	std::signal(SIGPIPE, SIG_IGN);  // the host's duty where SO_NOSIGPIPE is missing (connection.h)
+	std::setvbuf(stdout, nullptr, _IOLBF, 0);  // a case's line reaches the log before an assert aborts
 	int ran = 0;
 	for (const auto &c : cases) {
 		if (argc > 2 && std::strcmp(argv[2], c.name) != 0)

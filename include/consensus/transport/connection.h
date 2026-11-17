@@ -9,8 +9,12 @@
 #include <memory>
 #include <netinet/tcp.h>
 #include <string>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <task_asio.hh>
+#ifdef __linux__
+#include <linux/sockios.h>
+#endif
 
 // One host connection (docs/mechanisms/host-connection.md): OpenSSL driven on the non-blocking
 // socket (SSL_set_fd, readiness through await_asio on async_wait), with SSL_MODE_RELEASE_BUFFERS
@@ -214,6 +218,23 @@ class Connection {
 		std::string().swap(sending_);  // an idle connection holds no send buffer
 		sent_ = 0;
 	}
+	// The socket's send queue: bytes written and not yet acknowledged by the peer; 0 when the
+	// platform cannot tell. It drains while the peer reads, however coarsely writes wake.
+	std::size_t unacknowledged() noexcept {
+		int n = 0;
+#if defined(SIOCOUTQ)
+		if (::ioctl(socket_.native_handle(), SIOCOUTQ, &n) != 0)
+			return 0;
+#elif defined(SO_NWRITE)
+		socklen_t size = sizeof n;
+		if (::getsockopt(socket_.native_handle(), SOL_SOCKET, SO_NWRITE, &n, &size) != 0)
+			return 0;
+#elif defined(FIONWRITE)
+		if (::ioctl(socket_.native_handle(), FIONWRITE, &n) != 0)
+			return 0;
+#endif
+		return n > 0 ? std::size_t(n) : 0;
+	}
 	// Hands every whole frame in the buffer to the handler, none after the connection ends;
 	// throws on an oversized one.
 	void deliver() {
@@ -267,9 +288,16 @@ class Connection {
 						on_drained();
 					sending_.swap(out_);
 				}
-				if (!sending_.empty()) {  // stuck: no write progress for dead_after
+				if (!sending_.empty()) {  // stuck: for dead_after, no write progress and the socket's queue never drained
+					const auto queued = unacknowledged();
 					late_deadline stuck(loop_, options_.dead_after);
-					co_await flush(stuck.token(), true);
+					try {
+						co_await flush(stuck.token(), true);
+					} catch (...) {
+						if (stuck.state() != late_deadline::outcome::expired || end_ != ConnectionEnd::open ||
+							unacknowledged() >= queued)
+							throw;
+					}
 					continue;
 				}
 				if (closing_)

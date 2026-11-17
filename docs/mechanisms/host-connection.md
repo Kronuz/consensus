@@ -51,8 +51,13 @@ connection's handler synchronously, viewing the connection's own buffer, and nev
 shared budget. A zero-length frame is the keepalive: a connection that sent nothing for
 `keepalive` (1 s) sends one, once per connection, whatever groups use it. A connection that
 received nothing for `dead_after` (5 s) ends `dead`; one whose writes make no progress for as
-long ends `failed`. The stuck-write deadline restarts at every write that makes progress, so a
-peer reading steadily but slower than the queue drains is not stuck.
+long ends `failed`. The stuck-write deadline restarts at every write that makes progress, and at
+its expiry a socket whose send queue (bytes written and not yet acknowledged: `SIOCOUTQ`,
+`SO_NWRITE` or `FIONWRITE`) drained since it was armed gets it again. So a peer reading
+steadily but slower than the queue drains is not stuck, however coarsely the kernel wakes the
+writer: Linux reports a full socket writable only once a third of its send buffer is free,
+which at a slow reader's pace can take longer than `dead_after`. A peer that stops reading
+stops the drain once its own buffer fills.
 
 `close()` drains: the frames queued so far, then TLS `close_notify`. A peer that reads
 `close_notify` answers the same way, and both ends finish `closed`. An end that stops without
@@ -137,6 +142,7 @@ the flood stops replaces what is left of it.
 | Frames, keepalive, dead peer, close | `connection_test` `frames`, `keepalive`, `dead_peer`, `graceful_close`, `abort_truncates`, `busy_reader`; mutants `no-keepalive`, `keepalive-extends`, `close-drops-queue`, `no-close-notify` |
 | The fd kept until `run()` returns, no SSL call after the end | `connection_test` `fd_reuse_reader`, `fd_reuse_writer`; mutants `fail-closes-fd`, `ssl-after-end` |
 | Write progress restarts the stuck deadline | `connection_test` `slow_reader` (a failed run the host stalled 100 ms or more runs again, at most twice); mutant `stuck-spans-flush`; `slow_reader_stops.py` forces the stalls with `SIGSTOP` |
+| A draining send queue is progress | `connection_test` `coarse_writer` (the writer wakes only after 1 MiB drained); mutant `stuck-ignores-drain` |
 | Dial, tie-break, draining, lookup, two loops | `links_test`; mutants `refuse-when-offered`, `accept-when-offered`, `draining-counts`, `lookup-no-wake`; `threads` under TSan |
 | A given-up dial released; the pre-authentication bounds | `links_test` `abandoned_dial`, `flood`; mutants `abandon-keeps-dial`, `refuse-newest`, `no-source-cap` |
 

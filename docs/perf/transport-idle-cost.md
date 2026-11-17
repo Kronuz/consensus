@@ -25,7 +25,9 @@ wheels are 40,960- and 45,056-byte blocks there, under the 64 KiB the bench then
 wheels apart, so they landed on the per-end fit (56,317 B at 4 loops). The bench now sets apart
 every block at least `sizeof(wheel::timer_wheel)` (40,640 B) as a wheel, which on this Mac's
 allocator are 65,536-byte blocks, so this Mac's counts do not move. macos-arm64 never got a
-runner. CI at the current commit runs once the lead pushes the branch.
+runner. CI run 44169921897 (consensus:4c80573) checks the cut: `consensus_transport_idle` passed
+on macos-x86_64, macos-arm64 and every Linux and FreeBSD job; that run's one failure is
+`consensus_transport_peers` on macos-x86_64, the known retry flake (quest peers-retry-flake).
 
 ## How it is counted
 
@@ -53,11 +55,11 @@ per frame, and at 10,000 groups connections end (job 261117-092742-231632).
 
 ## A1: idle cost
 
-Job 261117-092707-067ee0 (exclusive, consensus:2c8e710) measured every row below; it failed only
-against the old per-host formula, `29 KB + 2P x 41 KB`. A1 at the current commit, judged against
-D108: job 261117-122812-45a7bf (exclusive, consensus:0d92ef5).
+Job 261117-122812-45a7bf (exclusive, consensus:0d92ef5) measured every row below and passed
+against D108. The earlier job 261117-092707-067ee0 (consensus:2c8e710) gave the same bytes and
+failed only against the old per-host formula, `29 KB + 2P x 41 KB`.
 
-Per idle group, at H = 2, 3, 5 and L = 1, 4: at most 0.3 bytes (OpenSSL 0), 0 descriptors, 0
+Per idle group, at H = 2, 3, 5 and L = 1, 4: at most 0.2 bytes (OpenSSL 0), 0 descriptors, 0
 armed timers; every frame delivered (4,004 to 40,040 per configuration), 0 dropped, refused or
 malformed. Budget: 64 bytes and none of the rest.
 
@@ -80,7 +82,7 @@ Per host, against `52 KB + 2P x 44 KB` (53,248 + 90,112 P bytes), within 10%:
 Fits: `52,273 + 2P x 44,454` at L = 1, `55,277 + 2P x 48,394` at L = 4. Besides these, each loop
 that armed a timer holds one 64 KiB timer wheel, the scheduler's. Descriptors per host: 1 + 2P.
 
-An idle host spends 287-1,116 us of CPU per second (0.03-0.11% of a core) at H = 2 to 5: the
+An idle host spends 284-1,291 us of CPU per second (0.03-0.13% of a core) at H = 2 to 5: the
 keepalives, one per connection end per second. macOS reports no voluntary context switches through
 `getrusage`, so the bench's wake count reads 0 here and counts nothing.
 
@@ -94,23 +96,24 @@ difference of any round. An effect counts only when its median clears that band.
 
 | Row | Job | Same | Hop | Hop - same, median [range] | A/A band | Verdict |
 |---|---|---|---|---|---|---|
-| Per frame, control stream | 261117-092717-30ce96 | 275 ns | 415 ns | 139 ns [95, 174] | 73 ns | clears |
-| Per frame, data stream | 261117-092717-30ce96 | 602 ns | 807 ns | 208 ns [182, 221] | 61 ns | clears |
-| Per idle wake, a frame alone every 1 ms | 261117-092717-30ce96 | 50.8 us | 64.8 us | 11.8 us [1.8, 19.3] | 15.3 us | within the band |
+| Per frame, control stream | 261117-122822-488d1f | 290 ns | 421 ns | 131 ns [90, 169] | 77 ns | clears |
+| Per frame, data stream | 261117-122836-fb319f | 603 ns | 813 ns | 216 ns [185, 255] | 70 ns | clears |
+| Per idle wake, a frame alone every 1 ms | 261117-122848-92c892 | 52.9 us | 68.4 us | 15.3 us [12.9, 20.8] | 8.7 us | clears |
 
-Job 261117-092717-30ce96 is exclusive, 7 rounds, consensus:2c8e710. In the streams the reader
-posts 204.8 frames per hop, so the hop's post is spread over them; what is left is the group
-loop's queue and cache traffic, 139-208 ns per frame. A frame alone costs the receiver about 51 us
-of CPU on its own loop (a TLS record read, the wake, the dispatch), and the hop adds the group
-loop's wake, 11.8 us, which 2,000 frames per run do not separate from run-to-run noise. Row jobs
-at the current commit, one per row: control 261117-122822-488d1f, data 261117-122836-fb319f, idle wake 261117-122848-92c892 (8,000
-frames per run, 9 rounds, to narrow the band).
+Each row is one exclusive job at consensus:0d92ef5: 7 rounds for the streams, 9 rounds of 8,000
+frames per run for the idle wake. In the streams the reader posts 204.8 frames per hop, so the
+hop's post is spread over them; what is left is 131-216 ns per frame. A frame alone costs the
+receiver about 53 us of CPU on its own loop (a TLS record read, the wake, the dispatch), and the
+hop adds the group loop's wake, 15.3 us, which clears its band; its p50 latency from send to
+delivery is 157.2 us against 138.1 us. The earlier 7-round job 261117-092717-30ce96 (2,000
+frames per run, consensus:2c8e710) put the wake at 11.8 us [1.8, 19.3], within its 15.3 us band:
+2,000 frames per run were too few to separate it from run-to-run noise.
 
 Beside it, the bare Asio hop with no TLS and no transport (Detent `run.sh hop_cost`, job
 261117-092732-0475d9, exclusive, Detent:d15d063): 793-851 ns per frame posted alone, 21-22 ns in
 batches of 64, and 7.2 us of CPU per batch that wakes an idle loop (2.7 us at 16 frames). D10's
 design job 261111-012904-94206c measured 832 ns, 22 ns and 6.5-7.8 us on the same Mac. The
-transport's per-frame hop, 139-208 ns at about 205 frames per post, sits above `hop_cost`'s batched
+transport's per-frame hop, 131-216 ns at about 205 frames per post, sits above `hop_cost`'s batched
 figure; this bench does not split that difference further.
 
-At 100,000 streamed frames a second, the hop costs 1.4-2.1% of a core.
+At 100,000 streamed frames a second, the hop costs 1.3-2.2% of a core.

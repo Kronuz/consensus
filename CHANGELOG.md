@@ -14,6 +14,14 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
   `transport/rpc.h` encodes and checks its six frame kinds, keeps one connection's call table
   (ids, credit, deadlines, `Drain`), and draws credit from thread-safe host pools with an atomic
   `ByteBudget::renew`. It does no I/O and is not yet on Bulk.
+- The host transport ([docs/mechanisms/host-transport.md](docs/mechanisms/host-transport.md)),
+  beside `Peers`: `transport/host_transport.h` shares a Control and a Bulk connection per peer
+  node among every group, each connection on the loop its node places on. Frames reach their
+  group's loop in one post per read; senders keep per-group queues with credit and control
+  frames first, round robin across groups. `send_message` and `receive_message` wire the
+  Driver's Sink `Send` and `receive` to it. `Connection` gains `on_read`, `on_drained`
+  and `rehome()`; each write wait, `close_notify`'s included, ends the connection after
+  `dead_after` only when the socket's send queue did not drain during it; `Links` moves an accept to the loop that owns its peer.
 - The host connection ([docs/mechanisms/host-connection.md](docs/mechanisms/host-connection.md)),
   beside `Peers`: `transport/connection.h` drives OpenSSL on the non-blocking socket with
   released buffers, length-prefixed frames, a keepalive per connection and a graceful close

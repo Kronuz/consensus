@@ -211,6 +211,11 @@ writes, and RPC timing. It needs Asio (through `reactor`) and OpenSSL 3.
 limits, the group's identities, and the fingerprint from `profile_fingerprint`, which
 hashes the application's own profile bytes with the membership and limits.
 
+The host transport replaces it for Driver hosts: one Control and one Bulk connection per peer
+node, shared by every group and each run on one loop, with frames batched to their groups'
+loops, per-group credit and control frames first
+([docs/mechanisms/host-transport.md](docs/mechanisms/host-transport.md)).
+
 ## Bounds
 
 Limits cap voters, entry counts, individual command payloads, aggregate retained payloads, RPC entry counts and payloads, uncommitted entry count, and pending reads. `log_bytes` and `rpc_bytes` are payload budgets; entry counts separately bound object/framing overhead. The storage decoder caps payload and framing before allocation. A future wire decoder must independently cap the complete encoded and decompressed message before building these typed events, and the transport must bound its own queues.

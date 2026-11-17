@@ -3,6 +3,8 @@
 #include "resolve.h"
 #include <algorithm>
 #include <asio/ip/tcp.hpp>
+#include <asio/post.hpp>
+#include <atomic>
 #include <map>
 #include <tuple>
 
@@ -70,9 +72,12 @@ class Links {
 	// What established links deliver, and when a link starts and ends.
 	FrameHandler on_frame;
 	LinkHandler on_established, on_ended;
+	// The Links that keeps `peer`'s connections when a host runs one per loop; null keeps them here.
+	// An accept authenticated here moves to it for its hellos (Connection::rehome).
+	std::function<Links *(kronuz::consensus::NodeId)> owner;
 
 	const LinkStats &stats() const noexcept { return stats_; }
-	bool drained() const noexcept { return !tasks_; }
+	bool drained() const noexcept { return !tasks_ && !incoming_.load(std::memory_order_acquire); }
 	// The established, undrained link to `peer` on `lane`, or null.
 	const Link *find(kronuz::consensus::NodeId peer, LinkLane lane) const noexcept {
 		const auto it = slots_.find({peer, lane});
@@ -152,8 +157,8 @@ class Links {
 		}
 		co_return established;
 	}
-	// Takes one accepted socket: the TLS handshake against every pin, the dialer's hello, and
-	// the tie-break; false when refused or failed.
+	// Takes one accepted socket: the TLS handshake against every pin, then adopt() here or on the
+	// peer's owner; false when refused, failed or moved.
 	task::task<bool> accept(asio::ip::tcp::socket socket) {
 		asio::error_code error;
 		const auto source = socket.remote_endpoint(error).address();
@@ -165,12 +170,43 @@ class Links {
 		auto connection = std::make_shared<Connection>(loop_, std::move(socket), tls_, false, options_.connection);
 		live_.push_back(connection);
 		admit(source, connection);
+		kronuz::consensus::NodeId peer = 0;
+		try {
+			late_deadline deadline(loop_, options_.connection.handshake);
+			peer = co_await connection->handshake(pins_, 0, deadline.token());
+		} catch (...) {
+		}
+		authenticated(connection);
+		if (!peer || stopping_) {
+			connection->abort();
+			forget(connection);
+			co_return false;
+		}
+		Links *home = owner ? owner(peer) : nullptr;
+		if (!home || home == this)
+			co_return co_await adopt(peer, std::move(connection));
+		forget(connection);
+		connection->rehome(home->loop_, home->executor_);
+		home->incoming_.fetch_add(1, std::memory_order_acq_rel);
+		asio::post(home->executor_, [home, peer, connection = std::move(connection)]() mutable {
+			task::spawn(home->loop_, home->adopt(peer, std::move(connection), true), [](std::exception_ptr, std::optional<bool>) {});
+		});
+		co_return false;
+	}
+	// The accepted side once `peer` is authenticated: the dialer's hello, the tie-break, the reply.
+	// `moved`: the connection came from another loop's accept.
+	task::task<bool> adopt(kronuz::consensus::NodeId peer, std::shared_ptr<Connection> connection, bool moved = false) {
+		Task running(*this);
+		if (moved) {
+			live_.push_back(connection);
+			incoming_.fetch_sub(1, std::memory_order_acq_rel);
+		}
 		std::shared_ptr<Link> reserved;
 		bool established = false;
 		try {
+			if (stopping_)
+				throw std::runtime_error("links: stopping");
 			late_deadline deadline(loop_, options_.connection.handshake);
-			const auto peer = co_await connection->handshake(pins_, 0, deadline.token());
-			authenticated(connection);
 			auto remote = co_await connection->read_hello(deadline.token());
 			auto link = std::make_shared<Link>(Link{peer, remote.lane, connection, hello(remote.lane), remote, false, 0});
 			check_node_hello(remote, link->local, peer, false);
@@ -189,7 +225,6 @@ class Links {
 			}
 		} catch (...) {
 		}
-		authenticated(connection);
 		if (!established) {
 			if (reserved)
 				release(*reserved);
@@ -445,6 +480,7 @@ class Links {
 	asio::ip::tcp::acceptor *acceptor_ = nullptr;
 	LinkStats stats_;
 	std::size_t tasks_ = 0;
+	std::atomic<std::size_t> incoming_{0};  // accepts moving here from another loop's Links
 	bool stopping_ = false;
 };
 } // namespace kronuz::consensus::transport

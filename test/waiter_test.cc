@@ -27,7 +27,7 @@
 // point: the target may run what it has queued before the poster's next statement. Every run
 // checks each caller completes exactly once, with a result its D8 row allows, close frees the
 // group's state, and after teardown no waiter stays linked; ASan checks no frame is touched
-// after it is freed. tools/driver_mutants.py seeds the faults this must catch.
+// after it is freed. test/driver_mutants.py seeds the faults this must catch.
 //   waiter_test [case]   rows, close, close-read, close-open, close-late, teardown, threads
 #include "consensus/driver.h"
 #include "journal/memory_io.h"
@@ -387,6 +387,7 @@ struct thread_loop {
 
 void threads(int rounds) {
 	for (int round = 0; round < rounds && !failures; ++round) {
+		++runs;
 		jt::Disk disk;
 		j::InlineCompletion io;
 		Sink sink;

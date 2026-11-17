@@ -207,6 +207,14 @@ public:
 		if (!store_.shared()) { return false; }
 		return (io_job_ && !io_job_->done()) || (maintenance_io_ && maintenance_kind_ == MaintenanceKind::Publish && !maintenance_io_->done());
 	}
+	// run_one has work beyond submitting a Tick: a record to persist, finished IO to take, a
+	// completion to step, or maintenance that can run now. A driver steps the group again.
+	bool runnable() const noexcept {
+		if (closing_ || fenced() || !core_) { return false; }
+		if (maintenance_io_ || io_job_) { return (maintenance_io_ && maintenance_io_->done()) || (io_job_ && io_job_->done()); }
+		return !store_.accounting() || !initialization_.empty() || maintenance_due() || persist_ || application_ || completion_ ||
+			activation_completion_ || installation_waiting() || (timer_blocked_ && !cutover_debt_) || preparation_runnable() || source_runnable() || !held_.empty();
+	}
 	Index base_index() const noexcept { return core_ ? core_->base_index() : 0; }
 	LogBoundary base_boundary() const noexcept { return core_ ? core_->base_boundary() : LogBoundary{}; }
 	auto storage_frontier() const { return store_.frontier(); }

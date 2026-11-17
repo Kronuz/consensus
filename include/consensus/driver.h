@@ -624,6 +624,7 @@ private:
 				bool progress = deliver(g);
 				const auto result = w.run_one(tick(g));
 				progress |= result == TurnResult::Inventory || result == TurnResult::Stored || result == TurnResult::Completed || result == TurnResult::Maintenance;
+				progress |= result == TurnResult::Idle && w.runnable();  // the Tick left work behind it
 				progress |= drain(g);
 				// What admission submits answers in the same turn (a Reject before settle()).
 				if (admit(g)) { progress = true; drain(g); }
@@ -924,6 +925,9 @@ private:
 		});
 	}
 
+	// After a blocking entry's own stop: the Driver takes calls again.
+	void rearm() { stopping_ = false; shutdown_ = task::cancel_source{}; }
+
 	// D8 step 1: every waiter completes with task::cancelled (cancel_reason::shutdown); new
 	// calls complete the same way; staged records are still written.
 	void shutdown() {
@@ -1006,6 +1010,7 @@ T run(Driver<Sink>& driver, task::blocking_scheduler& scheduler, task::task<T> w
 		}
 		break;
 	}
+	driver.rearm();  // the entry's stop ends this run only: the next entry starts afresh
 	if (result.error) { std::rethrow_exception(result.error); }
 	if (turn_error) { std::rethrow_exception(turn_error); }
 	if constexpr (!std::is_void_v<T>) { return std::move(*result.value); }

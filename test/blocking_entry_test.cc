@@ -68,9 +68,14 @@ GroupOptions options(std::vector<NodeId> voters, std::optional<Membership> found
 	return o;
 }
 
+// The application: applies each committed range at once (a plain call, so the Sink may make it).
 struct Sink {
+	Driver<Sink>* driver = nullptr;
 	std::vector<std::string> commands;
-	void operator()(GroupId, Committed c) { for (const auto& e : c.entries) { if (e.kind == EntryKind::Command) { commands.push_back(e.payload); } } }
+	void operator()(GroupId id, Committed c) {
+		for (const auto& e : c.entries) { if (e.kind == EntryKind::Command) { commands.push_back(e.payload); } }
+		if (driver && !c.entries.empty()) { driver->applied(id, Applied{c.entries.back().index}); }
+	}
 	template <class N> void operator()(GroupId, N&&) {}
 };
 
@@ -84,6 +89,7 @@ struct Entry {
 	Entry() {
 		host = std::make_unique<j::Host>(std::make_shared<jt::MemoryIO>(disk, "host/"), j::Identity{'B', 'E'}, j::HostOptions{1, turn_options});
 		driver = std::make_unique<Driver<Sink>>(Seams{task::scheduler_ref::of(scheduler), j::completion_ref::of(io), *host, 0, 3}, sink);
+		sink.driver = driver.get();
 	}
 	template <class T> T run(task::task<T> work) { return kronuz::consensus::run(*driver, scheduler, std::move(work)); }
 	// A created lone voter (or `voters`), opened on the Driver.

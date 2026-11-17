@@ -302,7 +302,7 @@ void rows() {
 		std::exception_ptr error;
 		check(loop.settle(loop.driver->transfer_leadership(g, 2), error) && is<rejected>(error), "a transfer with no target voter is rejected");
 		std::optional<Placement> placed;
-		check(loop.settle(loop.driver->propose(g, "r"), placed, error) && placed, "placed");
+		check(loop.settle(loop.driver->propose(g, "r"), placed, error) && placed, "placed after the refused transfer: " + what(error));
 		loop.apply(g);
 		std::optional<RepairCompleted> repaired;
 		check(loop.settle(loop.driver->repair(g, LogBoundary{placed->index, placed->term}), repaired, error) && !error && repaired, "repair completes at RepairCompleted");
@@ -398,7 +398,8 @@ void fence_and_shutdown() {
 	loop.run();
 	check(read->done && is<fenced>(read->error), "a waiter on a fenced group completes with fenced");
 	check(!loop.sink.fenced.empty() && loop.sink.fenced.back().first == g, "the Sink hears Fenced");
-	auto waiting = loop.start(loop.driver->read(h));
+	check(loop.settle(loop.driver->propose(h, "w"), placed, error) && placed, "placed on the other group");
+	auto waiting = loop.start(loop.driver->read(h));  // its range is committed, not yet applied
 	check(!waiting->done, "a read waits for its apply");
 	loop.stop.request(task::cancel_reason::shutdown); loop.run();
 	check(waiting->done && is<task::cancelled>(waiting->error), "shutdown completes a waiter with task::cancelled");

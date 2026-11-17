@@ -52,7 +52,7 @@ template <class F> bool throws_as(F&& f, const std::function<bool(std::exception
 
 constexpr Timing compact{20, 40, 100, 200, 60000};
 const j::TurnLogOptions turn_options{16 * 1024, 1024, 1, 4, 4096};
-const j::AdmissionLimits admission{{4u << 20, 4096}, {64 * 1024, 3}, {256 * 1024, 4}, 16, 3};
+const j::AdmissionLimits admission{{256u << 20, 8192}, {256 * 1024, 3}, {64u << 20, 4}, 32, 3};
 const j::Identity host_identity{'H', 'O', 'S', 'T'};
 
 Limits limits() { Limits l; l.command_bytes = 1024; l.rpc_bytes = 4096; l.log_bytes = 64 * 1024; l.log_entries = 64; l.control_entries = 4; l.rpc_entries = 8; return l; }
@@ -115,9 +115,20 @@ struct Loop {
 		auto ref = task::scheduler_ref::of(scheduler);
 		task::spawn(ref, host->driver(0).run(turns, stop.token()), [this](std::exception_ptr) { turns_done = true; });
 		task::spawn(ref, driver->run(stop.token()), [this](std::exception_ptr) { driver_done = true; });
-		scheduler.run();
+		run();
 	}
 	~Loop() { finish(); }
+	// Runs what is queued, failing (not hanging) if the loop never settles.
+	void run() {
+		std::size_t budget = 1'000'000;
+		scheduler.run_until([&] { return --budget == 0; });
+		if (!budget) {
+			auto s = driver ? driver->state(current) : std::nullopt;
+			check(false, "the loop spins: role " + std::to_string(s ? int(s->role) : -1) + " committed " + std::to_string(s ? s->committed : 0) + " held " + std::to_string(held.held()));
+			std::exit(1);
+		}
+	}
+	GroupId current = 0;
 	void finish() {
 		if (!driver) { return; }
 		stop.request(task::cancel_reason::shutdown);
@@ -127,8 +138,8 @@ struct Loop {
 	}
 	// Completes every held primitive, and what they lead to.
 	void release() {
-		scheduler.run();
-		while (held.held()) { held.complete(held.tickets().front()); scheduler.run(); }
+		run();
+		while (held.held()) { held.complete(held.tickets().front()); run(); }
 	}
 	// Starts `work` and runs the loop with no clock advance.
 	template <class T> struct Started {
@@ -139,14 +150,14 @@ struct Loop {
 	template <class T> std::shared_ptr<Started<T>> start(task::task<T> work) {
 		auto state = std::make_shared<Started<T>>();
 		task::spawn(task::scheduler_ref::of(scheduler), std::move(work), [state](std::exception_ptr e, std::optional<T> v) { state->done = true; state->error = e; state->value = std::move(v); });
-		scheduler.run();
+		run();
 		return state;
 	}
 	std::shared_ptr<Started<bool>> start(task::task<void> work) {
 		auto state = std::make_shared<Started<bool>>();
 		auto wrapped = [](task::task<void> inner) -> task::task<bool> { co_await std::move(inner); co_return true; };
 		task::spawn(task::scheduler_ref::of(scheduler), wrapped(std::move(work)), [state](std::exception_ptr e, std::optional<bool> v) { state->done = true; state->error = e; state->value = v; });
-		scheduler.run();
+		run();
 		return state;
 	}
 	template <class T> bool settle(task::task<T> work, std::optional<T>& out, std::exception_ptr& error) {
@@ -172,12 +183,18 @@ struct Loop {
 	}
 	// A lone voter, created and leading.
 	void lone(GroupId g) {
+		current = g;
 		driver->open(g, options({1}));
 		std::exception_ptr error;
 		check(settle(driver->create(g, j::Identity{'L', static_cast<char>(g)}), error) && !error, "create");
 	}
 };
 
+std::string what(std::exception_ptr error) {
+	if (!error) { return "no error"; }
+	try { std::rethrow_exception(error); } catch (const std::exception& e) { return e.what(); } catch (...) {}
+	return "unknown";
+}
 template <class E> bool is(std::exception_ptr error) {
 	if (!error) { return false; }
 	try { std::rethrow_exception(error); } catch (const E&) { return true; } catch (...) {}
@@ -237,7 +254,7 @@ void rows() {
 		task::cancel_source cancel;
 		auto call = loop.start(loop.driver->propose(g, "never", cancel.token()));
 		check(!call->done, "a call on a group not yet created waits");
-		cancel.request(); loop.scheduler.run();
+		cancel.request(); loop.run();
 		check(call->done && is<task::cancelled>(call->error), "cancelled before admission completes with task::cancelled");
 		std::exception_ptr error;
 		check(loop.settle(loop.driver->create(g, j::Identity{'R', 'O'}), error) && !error, "create");
@@ -252,7 +269,7 @@ void rows() {
 		task::cancel_source cancel;
 		auto call = loop.start(loop.driver->propose(g, "staged", cancel.token()));
 		check(!call->done && loop.held.held() == 1, "the proposal's record waits in a held turn");
-		cancel.request(); loop.scheduler.run();
+		cancel.request(); loop.run();
 		check(call->done && is<task::cancelled>(call->error), "the caller completes with task::cancelled");
 		loop.release(); loop.apply(g);
 		check(committed_command(loop.sink, g, "staged"), "the cancelled proposal's record is written and commits");
@@ -266,7 +283,7 @@ void rows() {
 		auto later = loop.start(loop.driver->committed(g, Placement{placed->term, placed->index + 5}, cancel.token()));
 		auto read = loop.start(loop.driver->read(g, cancel.token()));
 		check(!later->done && !read->done, "committed waits for its index; read waits for the apply");
-		cancel.request(); loop.scheduler.run();
+		cancel.request(); loop.run();
 		check(later->done && is<task::cancelled>(later->error) && read->done && is<task::cancelled>(read->error), "both complete with task::cancelled");
 		check(loop.settle(loop.driver->committed(g, *placed), error) && !error, "the entry is unaffected");
 		check(loop.settle(loop.driver->committed(g, Placement{placed->term + 1, placed->index}), error) && is<superseded>(error), "another term at the index is superseded");
@@ -314,7 +331,7 @@ void checkpoints() {
 		loop.apply(g);
 		std::optional<CheckpointPublished> published;
 		Capture capture{std::string(100000, 'x'), 0, placed->index, placed->term};
-		check(loop.settle(loop.driver->checkpoint(g, 1 << 20, capture), published, error) && !error && published, "checkpoint completes at CheckpointPublished");
+		check(loop.settle(loop.driver->checkpoint(g, 1 << 20, capture), published, error) && !error && published, "checkpoint completes at CheckpointPublished: " + what(error));
 		check(published && published->through == placed->index, "through the capture's boundary");
 		check(loop.sink.published.empty(), "the Sink hears nothing a caller awaited");
 	}
@@ -327,7 +344,7 @@ void checkpoints() {
 		task::cancel_source cancel;
 		auto call = loop.start(loop.driver->checkpoint(g, 1 << 20, Capture{std::string(1000, 'y'), 0, placed->index, placed->term}, cancel.token()));
 		check(!call->done && loop.held.held() >= 1, "the checkpoint's artifact IO is held");
-		cancel.request(); loop.scheduler.run();
+		cancel.request(); loop.run();
 		check(call->done && is<task::cancelled>(call->error), "cancelled before publication completes with task::cancelled");
 		loop.release();
 		check(loop.sink.published.empty(), "a checkpoint cancelled before publication is never published");
@@ -348,11 +365,11 @@ void close_rows() {
 	auto closing = loop.start(loop.driver->close(g));
 	check(queued->done && is<closed>(queued->error), "a call not yet admitted completes with closed");
 	check(later->done && is<closed>(later->error) && read->done && is<closed>(read->error), "committed and read complete with closed");
-	check(!staged->done && !closing->done, "the staged proposal drains; close waits for it");
+	check(!staged->done && !closing->done, "the staged proposal drains; close waits for it: " + what(staged->error));
 	auto refused = loop.start(loop.driver->propose(g, "refused"));
 	check(refused->done && is<closed>(refused->error), "a call on a closing group completes with closed");
 	loop.release();
-	check(staged->done && !staged->error && staged->value && staged->value->index > 0, "the staged proposal completes with its placement once written");
+	check(staged->done && !staged->error && staged->value && staged->value->index > 0, "the staged proposal completes with its placement once written: " + what(staged->error));
 	check(closing->done && !closing->error, "close completes once the group drained");
 	check(!loop.driver->state(g), "the group's state is freed");
 	loop.driver->receive(g, Receive{2, VoteRequest{9, 0, 0}}); loop.driver->applied(g, Applied{1});
@@ -368,12 +385,12 @@ void fence_and_shutdown() {
 	check(loop.settle(loop.driver->propose(g, "f"), placed, error) && placed, "placed");
 	auto read = loop.start(loop.driver->read(g));
 	loop.driver->application_failed(g, loop.sink.last_committed(g), "the application failed");
-	loop.scheduler.run();
+	loop.run();
 	check(read->done && is<fenced>(read->error), "a waiter on a fenced group completes with fenced");
 	check(!loop.sink.fenced.empty() && loop.sink.fenced.back().first == g, "the Sink hears Fenced");
 	auto waiting = loop.start(loop.driver->read(h));
 	check(!waiting->done, "a read waits for its apply");
-	loop.stop.request(task::cancel_reason::shutdown); loop.scheduler.run();
+	loop.stop.request(task::cancel_reason::shutdown); loop.run();
 	check(waiting->done && is<task::cancelled>(waiting->error), "shutdown completes a waiter with task::cancelled");
 	auto refused = loop.start(loop.driver->propose(h, "x"));
 	check(refused->done && is<task::cancelled>(refused->error), "a call after shutdown completes with task::cancelled");
@@ -393,9 +410,10 @@ int main(int argc, char** argv) {
 	if (argc > 1) {
 		auto found = cases.find(argv[1]);
 		if (found == cases.end()) { std::cerr << "unknown case " << argv[1] << '\n'; return 2; }
+		std::cerr << "case " << argv[1] << '\n';
 		found->second();
 	} else {
-		for (const auto& [name, run] : cases) { run(); }
+		for (const auto& [name, run] : cases) { std::cerr << "case " << name << '\n'; run(); }
 	}
 	std::cout << checks << " driver checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

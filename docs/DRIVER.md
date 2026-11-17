@@ -29,7 +29,7 @@ using stalled = kronuz::journal::stalled;       // consensus::run only: a lost w
 
 struct GroupOptions {
 	FixedConfiguration configuration;
-	std::optional<Membership> founding{};       // Worker::found: a founding membership with roles
+	std::optional<Membership> founding{};       // create() founds the group with these roles (Worker::found)
 	kronuz::journal::AdmissionLimits admission;
 	Limits limits{};
 	Timing timing{};
@@ -52,7 +52,9 @@ struct Seams {
 // What the Driver hands the host: `sink(group, notice)` for each notice type, with static
 // dispatch; a generic `template <class N> void operator()(GroupId, N&&)` satisfies it.
 //   Send               a message for a peer incarnation (the transport's)
-//   Committed          the next committed range for the application; Core holds it until applied()
+//   Committed          the next committed range for the application; Core holds it until applied().
+//                      Never for a witness member: it keeps the log, no application state, so the
+//                      Driver acknowledges its ranges itself
 //   RoleChanged        role, term and leader changes
 //   ActivateInstall    an installed image to activate; answer with activated() or activation_failed()
 //   CheckpointPublished, RepairCompleted   only when no caller awaits it (the caller was cancelled)

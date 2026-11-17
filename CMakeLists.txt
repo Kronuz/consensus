@@ -51,6 +51,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	endforeach()
 	# Sanitized and beside the shared-journal tests on two CPUs, the simulation needs more.
 	set_tests_properties(consensus_simulation PROPERTIES TIMEOUT 300)
+	target_sources(consensus_simulation_test PRIVATE test/driver_simulation.cc)  # the same oracles through the Driver
 	# T1: stores written at b7073bb recover unchanged.
 	add_executable(consensus_compat_test test/compat_test.cc)
 	target_link_libraries(consensus_compat_test PRIVATE consensus::consensus)

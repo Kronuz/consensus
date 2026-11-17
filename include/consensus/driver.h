@@ -188,7 +188,7 @@ public:
 		group->driver = this; group->id = id; group->fire = &Driver::fired;
 		group->timing = options.timing; group->inbox_limit = options.inbox;
 		group->worker = std::make_unique<Worker>(host_, id, std::move(options.configuration), options.admission, options.limits, options.timing, options.scheduling, options.snapshots);
-		if (options.founding) { group->worker->found(std::move(*options.founding)); }
+		group->founding = std::move(options.founding);
 		groups_.emplace(id, std::move(group));
 	}
 	void receive(GroupId id, Receive message) {
@@ -260,7 +260,10 @@ public:
 		Call call(*this, Kind::open, std::move(token));
 		co_await call.enter();
 		if (call.begin(id, false) && !call.resume_open()) {
-			try { call.group->worker->create(identity); call.group->opened = true; }
+			try {
+				if (call.group->founding) { call.group->worker->found(std::move(*call.group->founding)); call.group->founding.reset(); }
+				call.group->worker->create(identity); call.group->opened = true;
+			}
 			catch (...) { call.fail(std::current_exception()); }
 		}
 		co_await call;
@@ -350,6 +353,7 @@ private:
 		Driver* driver = nullptr;
 		GroupId id = 0;
 		std::unique_ptr<Worker> worker;
+		std::optional<Membership> founding;  // create's founding roles
 		Timing timing{};
 		Waiter *head = nullptr, *tail = nullptr;
 		std::vector<Receive> inbox;
@@ -526,6 +530,14 @@ private:
 			if (voting(member.role) && member.incarnation != w.configuration().local) { return true; }
 		}
 		return false;
+	}
+
+	bool witness(const Group& g) const {
+		const auto& w = *g.worker;
+		auto membership = w.membership();
+		if (!membership) { return false; }
+		auto self = find_member(*membership, w.configuration().local);
+		return self && self->role == MemberRole::Witness;
 	}
 
 	void link(Group& g, Waiter& w) noexcept {
@@ -783,7 +795,10 @@ private:
 				} else if constexpr (std::is_same_v<T, Fenced>) {
 					g.fence_reason = value.reason;
 					if (!g.fence_seen) { g.fence_seen = true; sink_(g.id, std::move(value)); }
-				} else if constexpr (std::is_same_v<T, Send> || std::is_same_v<T, Committed> || std::is_same_v<T, RoleChanged> ||
+				} else if constexpr (std::is_same_v<T, Committed>) {
+					// A witness keeps the log but no application state: it acknowledges its own ranges.
+					if (witness(g)) { g.applied = Applied{value.entries.back().index}; mark_ready(g); } else { sink_(g.id, std::move(value)); }
+				} else if constexpr (std::is_same_v<T, Send> || std::is_same_v<T, RoleChanged> ||
 					std::is_same_v<T, SnapshotNeeded> || std::is_same_v<T, SnapshotTransmit> || std::is_same_v<T, SnapshotReleased>) {
 					sink_(g.id, std::move(value));
 				}

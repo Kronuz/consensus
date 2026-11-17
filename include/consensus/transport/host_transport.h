@@ -503,6 +503,8 @@ class HostTransport {
 			auto &batch = here.in[to];
 			if (batch.frames.empty())
 				continue;
+			if (!any)
+				++here.stats.reads;  // before its posts, so a reader loading posts first sees at most L - 1 a read
 			any = true;
 			batch.from = k;
 			batch.peer = {link.peer, link.lane, generation};
@@ -515,7 +517,6 @@ class HostTransport {
 				on(to, [this, to, moved = std::move(moved)]() mutable { deliver(to, std::move(moved)); });
 			}
 		}
-		here.stats.reads += any;
 		if (auto &lane = here.lanes[{link.peer, link.lane}]; lane.link == &link)
 			feed(k, lane);  // credit that arrived in this read
 	}

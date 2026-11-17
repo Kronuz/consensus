@@ -50,6 +50,8 @@ class Links {
 		  options_(std::move(options)), state_(std::make_shared<Shared>()) {
 		if (!options_.handshakes || !options_.handshakes_per_source)
 			throw std::invalid_argument("links: handshakes");
+		if (tls_)
+			cache_certificates(*tls_);  // before any loop handshakes with it: a host's loops share it
 		for (auto &[node, address] : addresses) {
 			auto &route = state_->routes[node];
 			route.address = address;

@@ -47,6 +47,11 @@ OpenSSL runs on the non-blocking socket (`SSL_set_fd`); readiness comes from `aw
 grows only by what arrived, so an idle connection holds neither. OpenSSL writes with plain
 `write()`, so where `SO_NOSIGPIPE` is missing (Linux) the host ignores `SIGPIPE`.
 
+A host's loops share its TLS context. OpenSSL decodes a certificate's extensions on its first
+verification and publishes them through an atomic flag that ThreadSanitizer cannot see in
+libcrypto, so `Links` caches every certificate the context holds (`cache_certificates`, in
+`tls.h`) when it takes the context, before any loop handshakes: handshakes only read them.
+
 A frame is a 4-byte little-endian length and its bytes. The reader hands each frame to the
 connection's handler synchronously, viewing the connection's own buffer, and never waits on a
 shared budget. A zero-length frame is the keepalive: a connection that sent nothing for

@@ -337,6 +337,8 @@ public:
 	task::task<void> close(GroupId id) {
 		Call call(*this, Kind::close, {});
 		co_await call.enter();
+		// After shutdown nothing steps the loop: close completes as every other call does.
+		if (stopping_) { call.fail(std::make_exception_ptr(task::cancelled{})); co_await call; co_return; }
 		auto found = groups_.find(id);
 		if (found == groups_.end() || found->second->closed) { co_await call.leave(); co_return; }
 		auto& g = *found->second;
@@ -636,7 +638,10 @@ private:
 				if (!progress) { exhausted = false; break; }
 			}
 		} catch (const std::exception& error) {
-			fail_all(g, std::make_exception_ptr(fenced(error.what())));
+			// A throw mid-step (a Sink's included) leaves its batch half delivered: the group fences.
+			if (g.fence_reason.empty()) { g.fence_reason = error.what(); }
+			w.fence(g.fence_reason);
+			fail_all(g, std::make_exception_ptr(fenced(fence_reason(g))));
 		}
 		if (g.closed) { return; }
 		if (w.awaiting_turn() && !g.watching) { watch(g); }

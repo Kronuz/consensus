@@ -135,6 +135,19 @@ void stalled_with_heartbeat() {
 	check(throws<stalled>(lost(live.token())), "a lost wake under a live token nobody requests throws stalled");
 	auto state = e.driver->state(g);
 	check(state && state->role == Role::Leader, "the group is untouched");
+	// A4 literally: a leader's heartbeat armed (a lone voter with a learner), no other voter.
+	Entry h;
+	h.create();
+	h.run([](Entry& e) -> task::task<void> {
+		Membership next; next.members = {{1, 1, MemberRole::Voter}, {2, 2, MemberRole::Learner}}; next.next_incarnation = 3;
+		co_await e.driver->committed(g, co_await e.driver->change_membership(g, next));
+	}(h));
+	auto leading = h.driver->state(g);
+	check(leading && leading->role == Role::Leader && h.driver->armed_group_timers() == 1, "the leader's heartbeat is its group's one armed timer");
+	named = false;
+	try { h.run([](Entry& e) -> task::task<void> { co_await e.driver->committed(g, Placement{1, 100}); }(h)); }
+	catch (const stalled& error) { named = error.groups == std::vector<std::uint64_t>{g}; } catch (...) {}
+	check(named, "a lost wake throws stalled naming the group, with its heartbeat armed");
 }
 
 // D5: calls that need another voting member fail at the call and submit nothing.

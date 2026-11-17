@@ -98,7 +98,7 @@ Source verification completion always observes the authentic typed IO result bef
 
 ### Many groups on one core
 
-`Worker(io, TurnDriver&, group, ...)` opens a group on journal's shared turn log (D11): the core's groups stage their batches and checkpoint records there, and one data barrier per turn persists all of them. A group checkpoints and recovers from its latest checkpoint record, and a per-group journal migrates into the turn log at every crash point (R20). `test/shared_worker_test.cc` and `test/shared_cluster_test.cc` run single- and multi-voter groups through it.
+`Worker(journal::Host&, group, ...)` opens a group of a journal host (`journal/host.h`, D11): the group's batches and checkpoint records go to its loop's shared turn log, so its appends and publications complete at turn barriers, and one data barrier per turn persists every group on the loop. Its artifacts are its own names in the host's directory. A group checkpoints and recovers from its latest checkpoint record. `test/shared_worker_test.cc` and `test/shared_cluster_test.cc` run single- and multi-voter groups through it.
 
 ## Local immutable checkpoints
 

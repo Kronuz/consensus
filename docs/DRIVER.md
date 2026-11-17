@@ -138,6 +138,18 @@ Every call completes with `fenced` once its group fences, and with `task::cancel
 (`cancel_reason::shutdown`) once the loop shuts down; a staged record is still written. A call on
 an id that is not open, or is closing or closed, completes with `closed` and submits nothing.
 
+**Shutdown order.** A host closes its groups while `run()` steps the loop, then requests `stop`.
+After `stop`, `close` completes with `task::cancelled` like every other call and frees nothing;
+`~Driver` frees what the groups still hold.
+
+**The Sink must not throw.** A throw out of a Sink call fences the group: the rest of that step's
+actions are lost, so its waiters complete with `fenced` and the Sink hears `Fenced`.
+
+**A witness stays a witness.** A witness member's ranges are acknowledged, never applied, so its
+incarnation never becomes a learner or voter: `change_membership` rejects that
+(`InvalidMembership`). The witness leaves by removal, and its node rejoins as a data member under
+a new incarnation, catching up by snapshot.
+
 **Waiters.** A caller awaiting a group holds its waiter in its own frame: a claim word, the result
 slot, its home scheduler, a `cancel_callback` and an intrusive link in the group's list. The loop
 links it. Completion, on the loop, unlinks the waiter and then claims it, and posts the caller's

@@ -261,6 +261,8 @@ public:
 	}
 	// The application epoch, which a repair advances; a capture records it (CaptureMetadata).
 	std::uint64_t epoch() const noexcept { return core_ ? core_->epoch() : 0; }
+	// The host fences the group: a handler of its actions failed partway.
+	void fence(std::string reason) { if (!fenced()) { fail(std::move(reason)); } }
 	void application_failed(Index through, std::string reason) {
 		// A stale/duplicate report cannot fence unrelated application work.
 		if (!closing_ && !fenced() && core_ && through != 0 && through == delivered_) { fail(std::move(reason)); }

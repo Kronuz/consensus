@@ -670,6 +670,12 @@ private:
 		} catch (const std::invalid_argument&) {
 			reject(RejectReason::InvalidMembership); return;
 		}
+		// A witness incarnation holds no application state (its ranges were acknowledged, never
+		// applied): it leaves only by removal, and a data member joins under a new incarnation.
+		for (const auto& x : change.next.members) {
+			auto old = find_member(current, x.incarnation);
+			if (old && old->role == MemberRole::Witness && x.role != MemberRole::Witness) { reject(RejectReason::InvalidMembership); return; }
+		}
 		// A group's limits stay within the node's, which bound its transport, admission,
 		// codec, and Worker; a group lowers and raises them beneath (R16).
 		if (change.next.limits && !within(*change.next.limits, limits_)) { reject(RejectReason::InvalidMembership); return; }

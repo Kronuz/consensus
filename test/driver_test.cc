@@ -31,6 +31,7 @@
 #include <functional>
 #include <iostream>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -75,8 +76,12 @@ struct Sink {
 	std::vector<std::pair<GroupId, RepairCompleted>> repaired;
 	std::vector<std::pair<GroupId, Fenced>> fenced;
 	std::size_t snapshots = 0;
+	bool throw_committed = false;  // the application's handler fails
 	void operator()(GroupId g, Send n) { sent.emplace_back(g, std::move(n)); }
-	void operator()(GroupId g, Committed n) { committed.emplace_back(g, std::move(n)); }
+	void operator()(GroupId g, Committed n) {
+		if (throw_committed) { throw std::runtime_error("the application's handler failed"); }
+		committed.emplace_back(g, std::move(n));
+	}
 	void operator()(GroupId g, RoleChanged n) { roles.emplace_back(g, n); }
 	void operator()(GroupId g, ActivateInstall n) { activations.emplace_back(g, n); }
 	void operator()(GroupId g, CheckpointPublished n) { published.emplace_back(g, n); }
@@ -371,10 +376,24 @@ void close_rows() {
 	auto queued = loop.start(loop.driver->propose(g, "queued"));
 	auto later = loop.start(loop.driver->committed(g, Placement{1, 100}));
 	auto read = loop.start(loop.driver->read(g));
+	// The other kinds, queued behind the staged turn: linked, none admitted.
+	Membership next; next.members = {{1, 1, MemberRole::Voter}, {2, 2, MemberRole::Learner}}; next.next_incarnation = 3;
+	auto membership = loop.start(loop.driver->change_membership(g, next));
+	auto transfer = loop.start(loop.driver->transfer_leadership(g, 2));
+	auto repair = loop.start(loop.driver->repair(g, LogBoundary{1, 1}));
+	auto checkpoint = loop.start(loop.driver->checkpoint(g, 1 << 20, Capture{std::string(1000, 'c'), 0, 1, 1}));
+	std::vector<std::pair<const char*, std::function<std::pair<bool, std::exception_ptr>()>>> others{
+		{"change_membership", [&] { return std::pair{membership->done, membership->error}; }},
+		{"transfer_leadership", [&] { return std::pair{transfer->done, transfer->error}; }},
+		{"repair", [&] { return std::pair{repair->done, repair->error}; }},
+		{"checkpoint", [&] { return std::pair{checkpoint->done, checkpoint->error}; }},
+	};
 	check(loop.held.held() == 1 && !staged->done && !queued->done && !later->done && !read->done, "one proposal staged, the rest waiting");
+	for (auto& [name, result] : others) { check(!result().first, std::string(name) + " waits, linked: " + what(result().second)); }
 	auto closing = loop.start(loop.driver->close(g));
 	check(queued->done && is<closed>(queued->error), "a call not yet admitted completes with closed");
 	check(later->done && is<closed>(later->error) && read->done && is<closed>(read->error), "committed and read complete with closed");
+	for (auto& [name, result] : others) { auto [done, error] = result(); check(done && is<closed>(error), std::string(name) + " completes with closed: " + what(error)); }
 	check(!staged->done && !closing->done, "the staged proposal drains; close waits for it: " + what(staged->error));
 	auto refused = loop.start(loop.driver->propose(g, "refused"));
 	check(refused->done && is<closed>(refused->error), "a call on a closing group completes with closed");
@@ -405,6 +424,23 @@ void fence_and_shutdown() {
 	check(waiting->done && is<task::cancelled>(waiting->error), "shutdown completes a waiter with task::cancelled");
 	auto refused = loop.start(loop.driver->propose(h, "x"));
 	check(refused->done && is<task::cancelled>(refused->error), "a call after shutdown completes with task::cancelled");
+	auto closing = loop.start(loop.driver->close(h));
+	check(closing->done && is<task::cancelled>(closing->error), "close after shutdown completes with task::cancelled: " + what(closing->error));
+	check(loop.driver->waiting_groups().empty(), "and links no waiter on the stopped loop");
+}
+
+// A Sink that throws mid-batch fences the group: nothing after the throw is silently lost.
+void sink_throws() {
+	constexpr GroupId g = 61;
+	jt::Disk disk; Loop loop(disk);
+	loop.lone(g);
+	loop.sink.throw_committed = true;
+	std::exception_ptr error; std::optional<Placement> placed;
+	loop.settle(loop.driver->propose(g, "lost"), placed, error);
+	loop.run();
+	check(!loop.sink.fenced.empty() && loop.sink.fenced.back().first == g, "the group fences when its Sink throws, and the Sink hears Fenced");
+	loop.sink.throw_committed = false;
+	check(loop.settle(loop.driver->propose(g, "after"), placed, error) && is<fenced>(error), "a later call completes with fenced: " + what(error));
 }
 
 const std::map<std::string, void (*)()> cases{
@@ -413,6 +449,7 @@ const std::map<std::string, void (*)()> cases{
 	{"checkpoints", &checkpoints},
 	{"close", &close_rows},
 	{"fence", &fence_and_shutdown},
+	{"sink_throws", &sink_throws},
 };
 
 }  // namespace

@@ -18,12 +18,16 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 - `Core::next_deadline()`, `Core::term_at()` and `Core::leader()`.
 - `Worker::runnable()`: `run_one` has work beyond a Tick (a record to persist, finished IO, a
   completion, runnable maintenance), so a driver steps the group again.
+- `Worker::fence(reason)`: the host fences a group whose action handler failed partway.
 
 ### Changed
 
 - A lone voter (the only voting member) is due to campaign at `Start`, so its first proposal
   after create or recover needs no election timeout.
 - A leader with no peers arms no heartbeat.
+- A leader rejects a membership change that turns a witness incarnation into a learner or
+  voter (`InvalidMembership`): the witness never applied its ranges, so it leaves by removal
+  and rejoins under a new incarnation.
 - `SnapshotChannel` allocates a frame's buffer when its length prefix arrives and frees it once
   processed: an idle channel holds no 64 KiB array per peer. Its transfer state (a send, a
   receive, pending frames, a peer's last result) is allocated only while in use, so an idle

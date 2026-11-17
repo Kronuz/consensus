@@ -37,7 +37,8 @@ A host has one TLS context and one `NodePins`: a certificate per node, pinned on
 that is not the context's certificate. A handshake authenticates a verified leaf that is pinned
 to a node other than this one, and, on a dial, to the dialed node. Another node's certificate,
 this node's own, an unpinned one or none is refused before any hello or frame. Per-group checks
-(cluster, group, epoch, profile) belong to the group-open exchange, not to the connection.
+(cluster, group, epoch, profile) belong to the group-open exchange, not to the connection
+([host-transport.md](host-transport.md), Identity).
 
 ## The connection
 

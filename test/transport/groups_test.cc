@@ -11,13 +11,18 @@
 //            survives a peer's restart
 //   refill   credit comes back: for refused frames, and with a new connection after the
 //            receiver restarts with the window full
+//   identity the per-frame rule and the group-open exchange over the wire: each refusal, with
+//            the receiver's counters; a refused group opens once stored; a store opens it again
+//   joiner   frame_admission: a joiner (empty membership) catches up as a learner and is promoted
+//   lagging  frame_admission: a follower that missed a voter's addition catches up from it
+//   relayout a host restarted with another L serves every group from its new loop
 // A timing case the host stalled (a 250 ms oversleep) runs again, at most twice. Each step prints
 // as it starts; a case still running after 100 s prints its step, which loops stopped turning
 // and every thread's stack, then exits 3.
 //   consensus_transport_groups_test <fixture dir> case
 #include "consensus/driver.h"
 #include "consensus/transport/host_transport.h"
-#include "journal/memory_io.h"
+#include <completion/posix.h>
 #include <asio/executor_work_guard.hpp>
 #include <asio/io_context.hpp>
 #include <algorithm>
@@ -30,6 +35,7 @@
 #include <future>
 #include <mutex>
 #include <openssl/pem.h>
+#include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
 #ifdef __linux__
@@ -42,11 +48,10 @@ using namespace std::chrono_literals;
 using tcp = asio::ip::tcp;
 using steady = std::chrono::steady_clock;
 namespace j = kronuz::journal;
-namespace jt = kronuz::journal::testing;
 
 namespace {
 std::filesystem::path fixture;
-const char *names[] = {"", "one", "two", "three"};
+const char *names[] = {"", "one", "two", "three", "four"};
 
 Fingerprint pin_of(const std::string &name) {
 	std::unique_ptr<BIO, decltype(&BIO_free)> input(BIO_new_file((fixture / (name + ".pem")).c_str(), "r"), BIO_free);
@@ -118,15 +123,37 @@ struct Host {
 		return loops;
 	}
 	std::uint16_t port() const { return acceptor.local_endpoint().port(); }
+	// Without a member_of, the membership puts incarnation k on node k for k up to 4.
 	void open(const std::map<NodeId, PeerAddress> &addresses, HostTransportOptions options = {}) {
 		auto tls = context(names[node]);
-		std::map<NodeId, Fingerprint> pins{{1, pin_of("one")}, {2, pin_of("two")}, {3, pin_of("three")}};
+		std::map<NodeId, Fingerprint> pins;
+		for (NodeId n = 1; n <= 4; ++n)
+			pins[n] = pin_of(names[n]);
+		if (!options.member_of)
+			options.member_of = [](GroupId, NodeId incarnation) -> std::optional<Member> {
+				if (incarnation < 1 || incarnation > 4)
+					return std::nullopt;
+				return Member{incarnation, incarnation, MemberRole::Voter};
+			};
 		std::vector<HostLoop> at;
 		for (auto &l : loops)
 			at.push_back({l->io.get_executor(), task::scheduler_ref::of(l->scheduler)});
 		Identity cluster{};
 		cluster.fill('K');
 		transport = std::make_unique<HostTransport>(at, tls, NodePins(node, pins, tls->native_handle()), cluster, addresses, options);
+	}
+	// Before start(): stores each group as incarnation `node`, with `open`.
+	void stores(const std::vector<GroupId> &groups, const GroupOpen &open = test_open()) {
+		for (auto g : groups)
+			transport->store(g, node, open);
+	}
+	static GroupOpen test_open() {
+		GroupOpen o;
+		o.cluster.fill('T');
+		o.group.fill('G');
+		o.epoch.fill('E');
+		o.profile.fill(0x5A);
+		return o;
 	}
 	void start() {
 		transport->serve(acceptor);
@@ -326,7 +353,11 @@ void threads() {
 	};
 	std::map<NodeId, std::map<GroupId, Seen>> seen;  // each group's entry is written on its loop only
 	std::atomic<std::uint64_t> delivered{0}, misplaced{0}, disordered{0};
+	std::vector<GroupId> all;
+	for (GroupId g = 1; g <= 64; ++g)
+		all.push_back(g);
 	for (Host *h : {&one, &two}) {
+		h->stores(all);
 		for (GroupId g = 1; g <= 64; ++g)
 			seen[h->node][g];
 		for (std::uint32_t k = 0; k != L; ++k)
@@ -392,6 +423,8 @@ bool credit() {
 	// Group 2 runs on the loop that reads node 1's connection on host 2; group 1 on the other.
 	const auto reading = two.transport->loop_of_node(1), stalled = 1 - reading;
 	const auto g1 = groups_on(L, stalled, 1)[0], g2 = groups_on(L, reading, 1)[0];
+	one.stores({g1, g2});
+	two.stores({g1, g2});
 	std::atomic<std::uint64_t> g1_delivered{0}, held_at_resume{0}, disordered{0};
 	Beats g2_beats;  // on loop `reading`
 	two.transport->on_deliver(stalled, [&](const Received &r) {
@@ -450,6 +483,8 @@ bool reader() {
 	const auto reading = two.transport->loop_of_node(1);
 	const auto ids = groups_on(L, reading, 2);
 	const GroupId g1 = ids[0], g2 = ids[1];
+	one.stores(ids);
+	two.stores(ids);
 	std::uint64_t delivered_1 = 0, refused_1 = 0;  // on loop `reading`
 	Beats beats_2;
 	std::atomic<bool> busy{false};
@@ -511,6 +546,10 @@ bool upload() {
 	const auto reader_loop = two.transport->loop_of_node(1), other = 1 - reader_loop;
 	const auto uploads = groups_on(L, reader_loop, 4);
 	const auto followers = groups_on(L, other, 2);
+	for (Host *h : {&one, &two}) {
+		h->stores(uploads);
+		h->stores(followers);
+	}
 	std::atomic<std::uint64_t> uploaded{0};
 	Beats beats;  // on loop `other`
 	two.transport->on_deliver(reader_loop, [&](const Received &r) {
@@ -559,10 +598,11 @@ bool upload() {
 	return ok;
 }
 
-// A3: three nodes, each 2 loops with a Driver per loop (and its own in-memory journal), the
-// Drivers' Sends over the transport.
+// Nodes of L loops over one journal host, a Driver per loop, the Drivers' Sends over the
+// transport; the membership the transport's per-frame rule reads is the Driver's.
 const j::TurnLogOptions turn_options{16 * 1024, 1024, 1, 4, 4096};
 const j::AdmissionLimits admission{{256u << 20, 8192}, {256 * 1024, 3}, {64u << 20, 4}, 32, 3};
+std::atomic<NodeId> cut{0};  // a node whose frames, both ways, every node refuses
 
 struct Node;
 struct GroupSink {
@@ -572,9 +612,18 @@ struct GroupSink {
 	void operator()(GroupId g, Committed n);
 	template <class N> void operator()(GroupId, N &&) {}
 };
+task::task<void> proposing(Driver<GroupSink> *d, GroupId g, std::string command) {
+	auto placed = co_await d->propose(g, std::move(command));
+	co_await d->committed(g, placed);
+}
+task::task<void> changing(Driver<GroupSink> *d, GroupId g, Membership next) {
+	auto placed = co_await d->change_membership(g, std::move(next));
+	co_await d->committed(g, placed);
+}
+task::task<void> transferring(Driver<GroupSink> *d, GroupId g, NodeId target) { co_await d->transfer_leadership(g, target); }
+
 struct Node {
 	struct PerLoop {
-		std::unique_ptr<j::Host> journal;
 		j::InlineCompletion io;
 		GroupSink sink;
 		std::unique_ptr<Driver<GroupSink>> driver;
@@ -582,26 +631,39 @@ struct Node {
 		std::atomic<bool> turns_done{false}, driver_done{false};
 	};
 	Host host;
+	std::unique_ptr<j::Host> journal;
 	std::vector<std::unique_ptr<PerLoop>> per;
 	std::mutex mutex;
 	std::map<GroupId, std::vector<std::string>> applied;
-	Node(NodeId id, std::uint16_t port, std::vector<jt::Disk> &disks, const std::vector<GroupId> &groups,
-		 const std::map<NodeId, PeerAddress> &peers)
-		: host(id, 2, port) {
-		host.open(peers);
-		for (std::uint32_t k = 0; k != 2; ++k) {
+	std::atomic<std::uint64_t> misplaced{0};  // frames delivered off their group's loop
+	// Each group is founded by `voters`; with none, this node is a joiner (D5).
+	Node(NodeId id, std::uint32_t L, std::uint16_t port, std::shared_ptr<j::IO> io, const std::vector<GroupId> &groups,
+		 const std::map<NodeId, PeerAddress> &peers, std::vector<NodeId> voters = {1, 2, 3})
+		: host(id, L, port) {
+		HostTransportOptions options;
+		options.member_of = [this](GroupId g, NodeId incarnation) -> std::optional<Member> {
+			auto s = per[host.transport->loop_of_group(g)]->driver->state(g);
+			const Member *m = s ? find_member(s->membership, incarnation) : nullptr;
+			return m ? std::optional<Member>(*m) : std::nullopt;
+		};
+		host.open(peers, options);
+		journal = std::make_unique<j::Host>(std::move(io), j::Identity{'N', char('0' + id)}, j::HostOptions{L, turn_options});
+		assert(journal->loops() == L);
+		for (std::uint32_t k = 0; k != L; ++k) {
 			auto p = std::make_unique<PerLoop>();
-			p->journal = std::make_unique<j::Host>(std::make_shared<jt::MemoryIO>(disks[k], "host/"), j::Identity{'N', char('0' + id)},
-												   j::HostOptions{1, turn_options});
 			p->sink = {this, k};
 			auto ref = task::scheduler_ref::of(host.loops[k]->scheduler);
-			p->driver = std::make_unique<Driver<GroupSink>>(Seams{ref, j::completion_ref::of(p->io), *p->journal, 0, id * 31 + k}, p->sink);
-			task::spawn(ref, p->journal->driver(0).run(j::completion_ref::of(p->io), p->stop.token()), [q = p.get()](std::exception_ptr) { q->turns_done = true; });
+			p->driver = std::make_unique<Driver<GroupSink>>(Seams{ref, j::completion_ref::of(p->io), *journal, k, id * 31 + k}, p->sink);
+			task::spawn(ref, journal->driver(k).run(j::completion_ref::of(p->io), p->stop.token()), [q = p.get()](std::exception_ptr) { q->turns_done = true; });
 			task::spawn(ref, p->driver->run(p->stop.token()), [q = p.get()](std::exception_ptr) { q->driver_done = true; });
 			host.transport->on_deliver(k, [this, k](const Received &r) {
+				if (const NodeId c = cut; c && (host.node == c || r.node == c))
+					return false;
+				if (host.transport->loop_of_group(r.route.group) != k || journal->loop(r.route.group) != k)
+					++misplaced;
 				auto receive = receive_message(r);
-				if (!receive || r.route.source != r.node || r.route.destination != host.node)
-					return false;  // fixed voters: each incarnation is its node
+				if (!receive)
+					return false;
 				per[k]->driver->receive(r.route.group, std::move(*receive));
 				return true;
 			});
@@ -610,21 +672,22 @@ struct Node {
 		host.start();
 		for (auto g : groups) {
 			const auto k = host.transport->loop_of_group(g);
+			assert(journal->loop(g) == k);
 			auto *driver = per[k]->driver.get();
 			std::promise<void> opened;
 			auto done = opened.get_future();
 			host.post(k, [&, driver, g, k] {
 				GroupOptions o;
 				o.configuration.local = host.node;
-				o.configuration.voters = {1, 2, 3};
+				o.configuration.voters = voters;
 				o.configuration.cluster[0] = 'T';
 				o.configuration.configuration[0] = 'G';
 				o.admission = admission;
 				o.scheduling = WorkerLimits{16, 128};
 				driver->open(g, std::move(o));
-				auto opening = per[k]->journal->status(g) == j::GroupStatus::stored
-								   ? driver->recover(g, [](j::ArtifactReader &) {})
-								   : driver->create(g, j::Identity{'G', char('0' + host.node)});
+				host.transport->store(g, host.node, Host::test_open());
+				auto opening = journal->status(g) == j::GroupStatus::stored ? driver->recover(g, [](j::ArtifactReader &) {})
+																			: driver->create(g, j::Identity{'G', char('0' + host.node)});
 				task::spawn(task::scheduler_ref::of(host.loops[k]->scheduler), std::move(opening), [&opened](std::exception_ptr e) {
 					assert(!e && "create or recover");
 					opened.set_value();
@@ -637,27 +700,26 @@ struct Node {
 		const auto k = host.transport->loop_of_group(g);
 		return host.loops[k]->at([&] { return per[k]->driver->state(g); });
 	}
-	// Proposes `command` here and waits for its commit: false on any error or after 3 s.
-	bool propose(GroupId g, std::string command) {
+	// Runs make(driver)'s task on the group's loop: false on any error or after `limit`.
+	template <class F> bool call(GroupId g, F make, std::chrono::milliseconds limit = 5s) {
 		const auto k = host.transport->loop_of_group(g);
 		auto *driver = per[k]->driver.get();
 		auto done = std::make_shared<std::promise<bool>>();
 		auto result = done->get_future();
-		auto work = [](Driver<GroupSink> *d, GroupId g, std::string c) -> task::task<void> {
-			auto placed = co_await d->propose(g, std::move(c));
-			co_await d->committed(g, placed);
-		};
 		host.post(k, [=, this] {
-			task::spawn(task::scheduler_ref::of(host.loops[k]->scheduler), work(driver, g, command), [done](std::exception_ptr e) { done->set_value(!e); });
+			task::spawn(task::scheduler_ref::of(host.loops[k]->scheduler), make(driver), [done](std::exception_ptr e) { done->set_value(!e); });
 		});
-		return result.wait_for(3s) == std::future_status::ready && result.get();
+		return result.wait_for(limit) == std::future_status::ready && result.get();
+	}
+	bool propose(GroupId g, std::string command) {
+		return call(g, [=](Driver<GroupSink> *d) { return proposing(d, g, command); });
 	}
 	bool has(GroupId g, const std::string &command) {
 		std::lock_guard hold(mutex);
 		auto &a = applied[g];
 		return std::find(a.begin(), a.end(), command) != a.end();
 	}
-	// The transport stops, then each Driver, which is destroyed on its loop, then the loops.
+	// The transport stops, then each Driver, which is destroyed on its loop, then the journal and the loops.
 	~Node() {
 		host.quiesce();
 		for (std::uint32_t k = 0; k != per.size(); ++k) {
@@ -667,11 +729,9 @@ struct Node {
 				assert(i < 2000 && "the Driver stops");
 				std::this_thread::sleep_for(5ms);
 			}
-			host.loops[k]->at([&] {
-				p.driver.reset();
-				p.journal.reset();
-			});
+			host.loops[k]->at([&] { p.driver.reset(); });
 		}
+		host.loops[0]->at([&] { journal.reset(); });
 		host.stop();
 	}
 };
@@ -712,52 +772,370 @@ bool commit_everywhere(std::vector<Node *> nodes, GroupId g, const std::string &
 	}
 	return false;
 }
+// Polls `done` every 50 ms for up to `limit_ms`.
+template <class F> bool until(F done, std::uint64_t limit_ms) {
+	for (const auto start = steady::now(); !done(); std::this_thread::sleep_for(50ms))
+		if (ms_since(start) > limit_ms)
+			return false;
+	return true;
+}
 
-void driver() {
-	std::vector<jt::Disk> disks[4];
-	for (auto &d : disks)
-		d.resize(2);
-	// Ports first, so every node knows every address; a restarted node binds its port again.
-	std::uint16_t ports[4] = {};
-	for (NodeId n = 1; n <= 3; ++n) {
-		asio::io_context io;
-		tcp::acceptor probe(io, {asio::ip::address_v4::loopback(), 0});
-		ports[n] = probe.local_endpoint().port();
+// Up to four nodes on fixed ports, each with its own journal directory (under the working
+// directory, named for the case) that survives a restart.
+struct Cluster {
+	std::filesystem::path root;
+	std::vector<GroupId> groups;
+	std::uint16_t ports[5] = {};
+	std::unique_ptr<Node> nodes[5];
+	Cluster(const std::string &name, std::vector<GroupId> ids)
+		: root(std::filesystem::current_path() / ("groups-" + name)), groups(std::move(ids)) {
+		std::filesystem::remove_all(root);
+		for (NodeId n = 1; n <= 4; ++n) {
+			asio::io_context io;
+			tcp::acceptor probe(io, {asio::ip::address_v4::loopback(), 0});
+			ports[n] = probe.local_endpoint().port();
+			std::filesystem::create_directories(directory(n));
+			::chmod(directory(n).c_str(), 0700);
+		}
 	}
-	auto peers = [&](NodeId self) {
-		std::map<NodeId, PeerAddress> r;
-		for (NodeId n = 1; n <= 3; ++n)
-			if (n != self)
-				r[n] = {"127.0.0.1", ports[n]};
+	~Cluster() {
+		for (auto &n : nodes)
+			n.reset();
+		std::filesystem::remove_all(root);
+	}
+	std::filesystem::path directory(NodeId n) const { return root / ("node" + std::to_string(n)); }
+	// Starts node `n` with L loops, or restarts it on its journal.
+	void start(NodeId n, std::uint32_t L, std::vector<NodeId> voters = {1, 2, 3}) {
+		nodes[n].reset();
+		std::map<NodeId, PeerAddress> peers;
+		for (NodeId m = 1; m <= 4; ++m)
+			if (m != n)
+				peers[m] = {"127.0.0.1", ports[m]};
+		nodes[n] = std::make_unique<Node>(n, L, ports[n], std::make_shared<j::PosixIO>(directory(n)), groups, peers, std::move(voters));
+	}
+	std::vector<Node *> of(std::initializer_list<NodeId> ids) {
+		std::vector<Node *> r;
+		for (auto id : ids)
+			r.push_back(nodes[id].get());
 		return r;
-	};
+	}
+	// The node among `ids` that leads `g` in the highest term, or 0.
+	NodeId leader(std::initializer_list<NodeId> ids, GroupId g) {
+		NodeId best = 0;
+		Term term = 0;
+		for (auto id : ids)
+			if (auto s = nodes[id]->state(g); s && s->role == Role::Leader && s->term >= term)
+				best = id, term = s->term;
+		return best;
+	}
+	Membership membership(NodeId n, GroupId g) {
+		auto s = nodes[n]->state(g);
+		assert(s);
+		return s->membership;
+	}
+};
+
+// A3 of transport-groups: three nodes of 2 loops; two groups elect and commit, the first
+// group's leader restarts, and both commit again.
+void driver() {
 	const std::vector<GroupId> groups{groups_on(2, 0, 1)[0], groups_on(2, 1, 1)[0]};  // one on each loop
-	std::unique_ptr<Node> nodes[4];
+	Cluster c("driver", groups);
 	for (NodeId n = 1; n <= 3; ++n)
-		nodes[n] = std::make_unique<Node>(n, ports[n], disks[n], groups, peers(n));
-	auto all = [&] { return std::vector<Node *>{nodes[1].get(), nodes[2].get(), nodes[3].get()}; };
+		c.start(n, 2);
+	auto all = c.of({1, 2, 3});
 	for (auto g : groups) {
 		step("driver: group " + std::to_string(g) + " elects and commits");
-		const bool ok = commit_everywhere(all(), g, "before-" + std::to_string(g), 30'000);
+		const bool ok = commit_everywhere(all, g, "before-" + std::to_string(g), 30'000);
 		std::printf("driver: group %llu elected and committed on all three nodes: %s\n", (unsigned long long)g, ok ? "yes" : "NO");
 		assert(ok);
 	}
-	NodeId restarted = 1;  // the first group's leader
-	for (NodeId n = 1; n <= 3; ++n)
-		if (auto s = nodes[n]->state(groups[0]); s && s->role == Role::Leader)
-			restarted = n;
+	NodeId restarted = c.leader({1, 2, 3}, groups[0]);
+	restarted = restarted ? restarted : 1;
 	step("driver: node " + std::to_string(restarted) + " restarts");
-	nodes[restarted].reset();
-	nodes[restarted] = std::make_unique<Node>(restarted, ports[restarted], disks[restarted], groups, peers(restarted));
+	c.start(restarted, 2);
+	all = c.of({1, 2, 3});
 	for (auto g : groups) {
 		step("driver: group " + std::to_string(g) + " commits again");
-		const bool ok = commit_everywhere(all(), g, "after-" + std::to_string(g), 30'000);
-		auto s = nodes[restarted]->state(g);
+		const bool ok = commit_everywhere(all, g, "after-" + std::to_string(g), 30'000);
+		auto s = c.nodes[restarted]->state(g);
 		std::printf("driver: after node %llu's restart (group %llu's leader), group %llu committed on all three: %s (node %llu term %llu, committed %llu)\n",
 					(unsigned long long)restarted, (unsigned long long)groups[0], (unsigned long long)g, ok ? "yes" : "NO",
 					(unsigned long long)restarted, s ? (unsigned long long)s->term : 0ull, s ? (unsigned long long)s->committed : 0ull);
 		assert(ok);
 	}
+}
+
+Membership with_learner(Membership m, NodeId incarnation) {
+	m.members.push_back({incarnation, incarnation, MemberRole::Learner});
+	m.next_incarnation = std::max(m.next_incarnation, incarnation + 1);
+	return m;
+}
+Membership promoted(Membership m, NodeId incarnation) {
+	for (auto &x : m.members)
+		if (x.incarnation == incarnation)
+			x.role = MemberRole::Voter;
+	return m;
+}
+// Adds incarnation 4 (on node 4, a joiner) as a learner through `leader`, waits until it applied
+// `seen`, then promotes it: false, naming the step, when one fails.
+bool add_voter_4(Cluster &c, NodeId leader, GroupId g, const std::string &seen, const char *name) {
+	step(std::string(name) + ": node " + std::to_string(leader) + " adds incarnation 4 as a learner");
+	if (!c.nodes[leader]->call(g, [g, m = with_learner(c.membership(leader, g), 4)](Driver<GroupSink> *d) { return changing(d, g, m); }, 10s))
+		return std::printf("%s: adding learner 4 did not commit\n", name), false;
+	step(std::string(name) + ": learner 4 catches up");
+	if (!until([&] { return c.nodes[4]->has(g, seen); }, 30'000)) {
+		auto s = c.nodes[4]->state(g);
+		const auto &t = c.nodes[4]->host.transport;
+		std::uint64_t spoofed = 0, unopened = 0;
+		for (std::uint32_t k = 0; k != t->loops(); ++k)
+			spoofed += t->stats(k).spoofed, unopened += t->stats(k).unopened;
+		return std::printf("%s: learner 4 never caught up (committed %llu, members %zu, spoofed %llu, unopened %llu)\n", name,
+						   s ? (unsigned long long)s->committed : 0ull, s ? s->membership.members.size() : 0, (unsigned long long)spoofed,
+						   (unsigned long long)unopened),
+			   false;
+	}
+	step(std::string(name) + ": incarnation 4 promoted");
+	if (!c.nodes[leader]->call(g, [g, m = promoted(c.membership(leader, g), 4)](Driver<GroupSink> *d) { return changing(d, g, m); }, 10s))
+		return std::printf("%s: promoting 4 did not commit\n", name), false;
+	return true;
+}
+
+// The sum of a counter over a host's loops.
+std::uint64_t total(Host &h, std::atomic<std::uint64_t> HostTransportStats::*counter) {
+	std::uint64_t sum = 0;
+	for (std::uint32_t k = 0; k != h.transport->loops(); ++k)
+		sum += (h.transport->stats(k).*counter).load();
+	return sum;
+}
+std::uint64_t misplaced(Cluster &c) {
+	std::uint64_t sum = 0;
+	for (auto &n : c.nodes)
+		sum += n ? n->misplaced.load() : 0;
+	return sum;
+}
+
+// frame_admission's joiner: incarnation 4 on node 4 starts with an empty membership, so nothing
+// it knows names its leader; it catches up as a learner over connections the group's voters
+// share, is promoted, and commits with the others (async-drivers X1, Y4).
+void joiner() {
+	const GroupId g = groups_on(2, 1, 1)[0];
+	Cluster c("joiner", {g});
+	for (NodeId n = 1; n <= 3; ++n)
+		c.start(n, 2);
+	c.start(4, 2, {});
+	step("joiner: the group elects and commits");
+	bool ok = commit_everywhere(c.of({1, 2, 3}), g, "a", 60'000);
+	const NodeId leader = c.leader({1, 2, 3}, g);
+	ok = ok && leader && add_voter_4(c, leader, g, "a", "joiner");
+	step("joiner: the four commit");
+	ok = ok && commit_everywhere(c.of({1, 2, 3, 4}), g, "b", 60'000);
+	auto s = c.nodes[4]->state(g);
+	const bool votes = s && votes_in(s->membership, 4);
+	std::printf("joiner: learner 4 caught up from leader %llu, was promoted and commits with the others: %s (votes %d, committed %llu, members %zu, misplaced %llu)\n",
+				(unsigned long long)leader, ok ? "yes" : "NO", int(votes), s ? (unsigned long long)s->committed : 0ull,
+				s ? s->membership.members.size() : 0, (unsigned long long)misplaced(c));
+	assert(ok && votes && !misplaced(c));
+}
+
+// frame_admission's lagging follower: node 3 is cut off while incarnation 4 joins, is promoted
+// and takes over by transfer, so 3's membership never names 4; once the cut heals, 3 catches up
+// from leader 4.
+void lagging() {
+	const GroupId g = groups_on(2, 0, 1)[0];
+	Cluster c("lagging", {g});
+	for (NodeId n = 1; n <= 3; ++n)
+		c.start(n, 2);
+	c.start(4, 2, {});
+	step("lagging: the group elects and commits");
+	bool ok = commit_everywhere(c.of({1, 2, 3}), g, "a", 60'000);
+	step("lagging: node 3 is cut off");
+	cut = 3;
+	ok = ok && commit_everywhere(c.of({1, 2}), g, "a2", 60'000);
+	const NodeId leader = c.leader({1, 2}, g);
+	ok = ok && leader && add_voter_4(c, leader, g, "a2", "lagging");
+	step("lagging: leadership moves to 4");
+	ok = ok && c.nodes[leader]->call(g, [g](Driver<GroupSink> *d) { return transferring(d, g, 4); }, 10s) &&
+		 until([&] { return c.leader({1, 2, 4}, g) == 4; }, 10'000);
+	const bool unnamed = !find_member(c.membership(3, g), 4);
+	const auto lag = c.nodes[3]->state(g)->committed;
+	step("lagging: the cut heals");
+	cut = 0;
+	ok = ok && commit_everywhere(c.of({1, 2, 3, 4}), g, "b", 60'000);
+	const NodeId after = c.leader({1, 2, 3, 4}, g);
+	auto s = c.nodes[3]->state(g);
+	const bool named = votes_in(s->membership, 4);
+	std::printf("lagging: node 3 missed 4's addition (4 unnamed in its membership: %d, committed %llu), then caught up from leader %llu: %s (committed %llu, 4 votes in its membership: %d, misplaced %llu)\n",
+				int(unnamed), (unsigned long long)lag, (unsigned long long)after, ok ? "yes" : "NO", (unsigned long long)s->committed,
+				int(named), (unsigned long long)misplaced(c));
+	assert(ok && unnamed && named && !misplaced(c));
+}
+
+// A2: node 1 runs 2 loops, then restarts on its journal with 3. The journal re-partitions, the
+// transport places each group by the same slot rule, and every group commits on all three with
+// node 1 receiving each group's frames on its new loop.
+void relayout() {
+	std::vector<GroupId> groups, moving;
+	for (GroupId g = 1000, staying = 0; moving.size() < 2 || staying < 2; ++g) {
+		const auto slot = j::host_detail::slot(g);
+		const bool moves = j::host_detail::loop(slot, 2) != j::host_detail::loop(slot, 3);
+		if (moves ? moving.size() < 2 : staying < 2) {
+			groups.push_back(g);
+			moves ? moving.push_back(g) : void(++staying);
+		}
+	}
+	Cluster c("relayout", groups);
+	for (NodeId n = 1; n <= 3; ++n)
+		c.start(n, 2);
+	for (auto g : groups) {
+		step("relayout: group " + std::to_string(g) + " commits on 2 loops");
+		const bool committed = commit_everywhere(c.of({1, 2, 3}), g, "before", 60'000);
+		assert(committed);
+	}
+	step("relayout: node 1 restarts with 3 loops");
+	c.start(1, 3);
+	auto &one = *c.nodes[1];
+	assert(one.journal->loops() == 3 && one.host.transport->loops() == 3);
+	bool ok = true;
+	for (auto g : groups) {
+		step("relayout: group " + std::to_string(g) + " commits with node 1 on 3 loops");
+		const auto k = one.host.transport->loop_of_group(g);
+		const bool committed = commit_everywhere(c.of({1, 2, 3}), g, "after", 60'000);
+		const auto s = one.state(g);
+		std::printf("relayout: group %llu on loop %u of 2, then %u of 3 (journal: %u), %s; committed on all three: %s (node 1 term %llu, committed %llu)\n",
+					(unsigned long long)g, j::host_detail::loop(j::host_detail::slot(g), 2), k, one.journal->loop(g),
+					std::find(moving.begin(), moving.end(), g) != moving.end() ? "moved" : "stayed", committed ? "yes" : "NO",
+					s ? (unsigned long long)s->term : 0ull, s ? (unsigned long long)s->committed : 0ull);
+		ok = ok && committed && one.journal->loop(g) == k && s;
+	}
+	std::uint64_t received = 0;
+	for (std::uint32_t k = 0; k != 3; ++k)
+		received += one.host.transport->stats(k).received;
+	std::printf("relayout: node 1 received %llu frames on 3 loops, %llu off their group's loop\n", (unsigned long long)received,
+				(unsigned long long)one.misplaced.load());
+	assert(ok && received && !one.misplaced);
+}
+
+// The per-frame rule and the group-open exchange over the wire, host 1 sending to host 2. Host
+// 2 stores `ok` as host 1 does, four groups each with one open field differing, and `late` not
+// yet. Each refusal shows in host 2's counters and in what reached its groups.
+void identity() {
+	constexpr std::uint32_t L = 2;
+	Host one(1, L), two(2, L);
+	one.open(addresses({&two}));
+	two.open(addresses({&one}));
+	const GroupId ok = 1001, cluster = 1002, group = 1003, epoch = 1004, profile = 1005, late = 1006;
+	const auto differing = [](void (*change)(GroupOpen &)) {
+		auto o = Host::test_open();
+		change(o);
+		return o;
+	};
+	one.stores({ok, cluster, group, epoch, profile, late});
+	two.stores({ok});
+	two.stores({cluster}, differing([](GroupOpen &o) { o.cluster[0] = 'X'; }));
+	two.stores({group}, differing([](GroupOpen &o) { o.group[15] = 'X'; }));
+	two.stores({epoch}, differing([](GroupOpen &o) { o.epoch[8] = 'X'; }));
+	two.stores({profile}, differing([](GroupOpen &o) { o.profile[31] ^= 1; }));
+	std::mutex mutex;
+	std::map<std::pair<GroupId, std::string>, std::uint64_t> got;  // by group and payload
+	for (std::uint32_t k = 0; k != L; ++k)
+		two.transport->on_deliver(k, [&](const Received &r) {
+			std::lock_guard hold(mutex);
+			++got[{r.route.group, r.payload}];
+			return true;
+		});
+	auto received = [&](GroupId g, const std::string &payload) {
+		std::lock_guard hold(mutex);
+		return got[{g, payload}];
+	};
+	auto from_group = [&](GroupId g) {
+		std::lock_guard hold(mutex);
+		std::uint64_t sum = 0;
+		for (auto &[key, n] : got)
+			sum += key.first == g ? n : 0;
+		return sum;
+	};
+	auto send = [&](GroupId g, NodeId source, NodeId destination, std::string payload) {
+		const auto k = one.transport->loop_of_group(g);
+		one.post(k, [&one, g, source, destination, k, payload] {
+			one.transport->send(k, LinkLane::Control, FrameKind::control, {g, source, destination}, 2, payload);
+		});
+	};
+	auto counters = [&] {
+		std::printf("identity: host 2 counts opens %llu, mismatched %llu, unstored %llu, unopened %llu, misrouted %llu, spoofed %llu; host 1 heard closed %llu\n",
+					(unsigned long long)total(two, &HostTransportStats::opens), (unsigned long long)total(two, &HostTransportStats::mismatched),
+					(unsigned long long)total(two, &HostTransportStats::unstored), (unsigned long long)total(two, &HostTransportStats::unopened),
+					(unsigned long long)total(two, &HostTransportStats::misrouted), (unsigned long long)total(two, &HostTransportStats::spoofed),
+					(unsigned long long)total(one, &HostTransportStats::closed));
+	};
+	one.start();
+	two.start();
+	step("identity: the connection comes up");
+	warm([&] { send(ok, 1, 2, "warm"); }, [&] { return received(ok, "warm") > 0; });
+	step("identity: 20 rounds of each refusal");
+	for (int i = 0; i != 20; ++i) {
+		for (auto g : {cluster, group, epoch, profile, late})
+			send(g, 1, 2, "x");
+		send(ok, 1, 7, "misrouted");  // a destination incarnation host 2 does not hold
+		send(ok, 3, 2, "spoofed");    // incarnation 3, which the membership puts on node 3
+		send(ok, 9, 2, "unnamed");    // an incarnation the membership does not name: admitted
+		std::this_thread::sleep_for(20ms);
+	}
+	const bool settled = until(
+		[&] {
+			return total(two, &HostTransportStats::misrouted) == 20 && total(two, &HostTransportStats::spoofed) == 20 &&
+				   total(two, &HostTransportStats::unopened) == 80 && received(ok, "unnamed") == 20;
+		},
+		20'000);
+	counters();
+	std::printf("identity: delivered of 20 each: cluster %llu, group %llu, epoch %llu, profile %llu, late %llu, misrouted %llu, spoofed %llu, unnamed %llu\n",
+				(unsigned long long)from_group(cluster), (unsigned long long)from_group(group), (unsigned long long)from_group(epoch),
+				(unsigned long long)from_group(profile), (unsigned long long)from_group(late), (unsigned long long)received(ok, "misrouted"),
+				(unsigned long long)received(ok, "spoofed"), (unsigned long long)received(ok, "unnamed"));
+	assert(settled);
+	for (auto g : {cluster, group, epoch, profile, late})
+		assert(from_group(g) == 0);
+	assert(!received(ok, "misrouted") && !received(ok, "spoofed"));
+	assert(total(two, &HostTransportStats::mismatched) >= 4 && total(two, &HostTransportStats::unstored) >= 20);
+
+	step("identity: host 2 stores the late group; host 1 opens it again");
+	two.loops[two.transport->loop_of_group(late)]->at([&] { two.transport->store(late, 2, Host::test_open()); });
+	const bool late_opened = until([&] { return send(late, 1, 2, "late"), received(late, "late") > 0; }, 20'000);
+	std::printf("identity: once host 2 stored it, the late group's frames arrive: %s\n", late_opened ? "yes" : "NO");
+	assert(late_opened);
+
+	step("identity: host 1 stores ok again under another epoch");
+	const auto epoch2 = differing([](GroupOpen &o) { o.epoch.fill('Y'); });
+	one.loops[one.transport->loop_of_group(ok)]->at([&] { one.transport->store(ok, 1, epoch2); });
+	const auto mismatched = total(two, &HostTransportStats::mismatched);
+	for (int i = 0; i != 20; ++i) {
+		send(ok, 1, 2, "epoch2");
+		std::this_thread::sleep_for(20ms);
+	}
+	const bool reopened = until([&] { return total(two, &HostTransportStats::mismatched) > mismatched; }, 20'000);
+	std::this_thread::sleep_for(300ms);
+	std::printf("identity: under host 1's new epoch, host 2 refused its open: %s, and delivered %llu of 20\n", reopened ? "yes" : "NO",
+				(unsigned long long)received(ok, "epoch2"));
+	assert(reopened && !received(ok, "epoch2"));
+	step("identity: host 2 stores ok under the same epoch");
+	two.loops[two.transport->loop_of_group(ok)]->at([&] { two.transport->store(ok, 2, epoch2); });
+	const bool agreed = until([&] { return send(ok, 1, 2, "agreed"), received(ok, "agreed") > 0; }, 20'000);
+	std::printf("identity: once both store the new epoch, frames arrive: %s\n", agreed ? "yes" : "NO");
+	assert(agreed);
+
+	step("identity: host 2 forgets ok");
+	two.loops[two.transport->loop_of_group(ok)]->at([&] { two.transport->forget(ok); });
+	const auto unstored = total(two, &HostTransportStats::unstored);
+	for (int i = 0; i != 20; ++i) {
+		send(ok, 1, 2, "forgotten");
+		std::this_thread::sleep_for(20ms);
+	}
+	const bool refused = until([&] { return total(two, &HostTransportStats::unstored) >= unstored + 20; }, 20'000);
+	counters();
+	std::printf("identity: after host 2 forgot it, the group's frames are refused: %s, delivered %llu of 20\n", refused ? "yes" : "NO",
+				(unsigned long long)received(ok, "forgotten"));
+	assert(refused && !received(ok, "forgotten"));
+	one.stop();
+	two.stop();
 }
 
 // Credit comes back. Frames of 40 KiB against a 64 KiB window go one at a time, so any credit
@@ -774,6 +1152,8 @@ void refill() {
 	one->open(addresses({two.get()}), options);
 	two->open(addresses({one.get()}), options);
 	const GroupId g = groups_on(L, 1, 1)[0];
+	one->stores({g});
+	two->stores({g});
 	std::atomic<std::uint64_t> taken{0}, refused{0}, marked{0};
 	std::atomic<bool> refuse{false}, slow{false};
 	auto receive = [&](Host &h) {
@@ -829,6 +1209,7 @@ void refill() {
 	slow = false;
 	two = std::make_unique<Host>(2, L, port);
 	two->open(addresses({one.get()}), options);
+	two->stores({g});
 	receive(*two);
 	two->start();
 	step("refill: a marker over the next connection");
@@ -844,7 +1225,7 @@ void refill() {
 
 int main(int argc, char **argv) {
 	if (argc != 3) {
-		std::fprintf(stderr, "usage: %s <fixture dir> threads|credit|reader|upload|driver|refill\n", argv[0]);
+		std::fprintf(stderr, "usage: %s <fixture dir> threads|credit|reader|upload|driver|refill|identity|joiner|lagging|relayout\n", argv[0]);
 		return 2;
 	}
 #ifndef SO_NOSIGPIPE
@@ -856,7 +1237,9 @@ int main(int argc, char **argv) {
 	std::setvbuf(stdout, nullptr, _IOLBF, 0);  // what ran reaches the log of a run that is killed
 	fixture = argv[1];
 	const std::string which = argv[2];
-	Watchdog watchdog(100s);  // under ctest's 120 s
+	// Under ctest's 120 s, and 240 s for the cases that elect and change membership more than once.
+	const bool long_case = which == "joiner" || which == "lagging" || which == "relayout";
+	Watchdog watchdog(long_case ? 220s : 100s);
 	if (which == "threads")
 		threads();
 	else if (which == "credit")
@@ -869,6 +1252,14 @@ int main(int argc, char **argv) {
 		driver();
 	else if (which == "refill")
 		refill();
+	else if (which == "identity")
+		identity();
+	else if (which == "joiner")
+		joiner();
+	else if (which == "lagging")
+		lagging();
+	else if (which == "relayout")
+		relayout();
 	else
 		return 2;
 	std::printf("%s: ok\n", which.c_str());

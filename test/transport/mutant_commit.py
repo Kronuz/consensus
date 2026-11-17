@@ -88,6 +88,21 @@ MUTANTS = {
         (T + "host_transport.h", "\t\tlane.grants.clear();\n\t\tfor (auto &[id, group] : lane.groups)\n\t\t\tgroup.outstanding = 0;\n\t\tif (!lane.groups.empty())",
          "\t\tlane.grants.clear();\n\t\tif (!lane.groups.empty())"),
     ],
+    # host_transport.h (transport-identity A1: the per-frame rule, R7, and the group-open exchange)
+    "admit-unstored": (T + "host_transport.h", "\tif (!held)\n\t\treturn Admission::unstored;\n", ""),
+    "admit-unopened": (T + "host_transport.h", "\tif (!opened)\n\t\treturn Admission::unopened;\n", ""),
+    "admit-misrouted": (T + "host_transport.h", "\tif (route.destination != held)\n\t\treturn Admission::misrouted;\n", ""),
+    "admit-spoofed": (T + "host_transport.h", "source && source->node != node)", "source && source->node != node && false)"),
+    "open-cluster": (T + "host_transport.h", "\tif (remote.cluster != local.cluster)\n\t\treturn \"cluster\";\n", ""),
+    "open-group": (T + "host_transport.h", "\tif (remote.group != local.group)\n\t\treturn \"group\";\n", ""),
+    "open-epoch": (T + "host_transport.h", "\tif (remote.epoch != local.epoch)\n\t\treturn \"epoch\";\n", ""),
+    "open-profile": (T + "host_transport.h", "\tif (remote.profile != local.profile)\n\t\treturn \"profile\";\n", ""),
+    "closed-ignored": (T + "host_transport.h", "\t\t\tif (at != lane.opened.end() && at->first == group)\n\t\t\t\tlane.opened.erase(at);\n\t\t\t++here.stats.closed;",
+                       "\t\t\t++here.stats.closed;"),
+    "open-once": (T + "host_transport.h", "at->first == group && at->second == g.open->serial)\n\t\t\treturn 0;", "at->first == group)\n\t\t\treturn 0;"),
+    # the control: Detent:73e96d6's rule, only a sender that votes in the receiver's membership
+    "voters-only": (T + "host_transport.h", "source && source->node != node)",
+                    "!source || source->role == kronuz::consensus::MemberRole::Learner || source->node != node)"),
 }
 
 

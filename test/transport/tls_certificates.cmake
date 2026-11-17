@@ -13,7 +13,7 @@ run_openssl(req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=Consensus-Test-C
   -keyout ca.key -out ca.pem -addext basicConstraints=critical,CA:TRUE
   -addext keyUsage=critical,keyCertSign,cRLSign -addext subjectKeyIdentifier=hash)
 file(WRITE "${OUTPUT}/leaf.ext" "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth,clientAuth\nsubjectAltName=DNS:localhost\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n")
-foreach(node IN ITEMS one two three)
+foreach(node IN ITEMS one two three four)
   run_openssl(req -new -newkey rsa:2048 -nodes -subj "/CN=${node}"
     -keyout "${node}.key" -out "${node}.csr")
   run_openssl(x509 -req -in "${node}.csr" -CA ca.pem -CAkey ca.key -CAcreateserial

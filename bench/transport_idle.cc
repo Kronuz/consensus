@@ -28,16 +28,18 @@
 //                   idle: bytes, descriptors, armed timers and frames per group; and an idle
 //                   host's CPU and wakes. --quick (the ctest entry): no idle window.
 //   one H L G       one configuration of G groups
-//   hop [rounds]    host 1 sends to host 2 (2 loops) for 256 groups on the connection's loop
+//   hop [rounds [series [frames]]]
+//                   host 1 sends to host 2 (2 loops) for 256 groups on the connection's loop
 //                   ("same") or the other ("hop"): CPU of host 2's loops per frame, streaming
-//                   control and data frames, and per frame sent alone every 1 ms (each wakes
-//                   the idle group loop); rounds of same, hop, hop, same (default 7).
+//                   control (series 0) and data (1) frames, and per frame sent alone every 1 ms
+//                   (2; each wakes the idle group loop; `frames` per run, default 2,000); rounds
+//                   of same, hop, hop, same (default 7); every series unless one is named.
 //   consensus_transport_idle <fixture dir> cost|hop [...]
 // Bytes are counted exactly: OpenSSL's allocations (CRYPTO_set_mem_functions) and the C++ heap
 // (operator new), by usable size, on macOS and glibc without a sanitizer; zone statistics are
 // printed beside them only. cost exits nonzero when an idle group holds a descriptor, an armed
 // timer, a frame or more than 64 bytes; when an idle connection end holds more than 48 KB (the
-// fit's slope); or, without --quick, when a host is more than 10% over 29 KB + 2P x 41 KB.
+// fit's slope); or, without --quick, when a host is more than 10% over 52 KB + 2P x 44 KB.
 #include "consensus/transport/host_transport.h"
 #include <asio/executor_work_guard.hpp>
 #include <asio/io_context.hpp>
@@ -88,11 +90,13 @@ inline std::size_t usable(void *p) {
 	return malloc_usable_size(p);
 #endif
 }
+// A block at least a timer wheel's size is a loop's wheel (task::asio_scheduler's timer_loop):
+// 40,960 or 45,056 usable bytes on macOS's older allocator, 65,536 on its newer one.
 inline void add(void *p, std::int64_t sign) {
 	const auto n = usable(p);
 	bytes.fetch_add(sign * std::int64_t(n), std::memory_order_relaxed);
 	count[std::min(n / 16, buckets - 1)].fetch_add(sign, std::memory_order_relaxed);
-	if (n / 16 >= buckets - 1)
+	if (n >= sizeof(wheel::timer_wheel))
 		big.fetch_add(sign * std::int64_t(n), std::memory_order_relaxed);
 }
 void *ssl_malloc(std::size_t n, const char *, int) {
@@ -421,6 +425,8 @@ Sample paused(const std::vector<std::unique_ptr<Host>> &hosts) {
 	return s;
 }
 
+// The idle per-host budget (Detent PLAN.md D108), in bytes: 52 KB + 2P x 44 KB.
+double host_budget(int P) { return 52.0 * 1024 + 2.0 * P * 44 * 1024; }
 const std::string payload39(39, 'p');  // a 64-byte frame: kind, group, source, destination, 39 bytes
 
 struct Cost {
@@ -548,16 +554,16 @@ Cost cost(int H, std::uint32_t L, std::size_t G, double idle_seconds, bool print
 		wakes_per_s = double(b.ru_nvcsw - a.ru_nvcsw) / wall / H;
 	}
 
-	// Counted bytes: OpenSSL's allocations and the C++ heap, without blocks of 64 KiB or more,
-	// which are the loops' timer wheels (task::asio_scheduler's, one per loop that armed a timer).
+	// Counted bytes: OpenSSL's allocations and the C++ heap, without the loops' timer wheels
+	// (task::asio_scheduler's, one per loop that armed a timer).
 	auto counted = [](const Sample &x) { return double(x.ssl + x.cxx - x.big); };
 	const double host = (counted(s2) - counted(s0)) / H, before = (counted(s1) - counted(s0)) / H;
 	const double end = (counted(s2) - counted(s1)) / double(ends), group = (counted(s3) - counted(before_groups)) / double(G * H);
-	const double budget = 29.0 * 1024 + 2.0 * P * 41 * 1024;
+	const double budget = host_budget(P);
 	const auto host_fds = double(s2.fds - s0.fds) / H, group_fds = double(s3.fds - before_groups.fds);
 	const auto end_timers = double(s2.timers - s1.timers) / double(ends), group_timers = double(s3.timers - before_groups.timers);
 	if (print) {
-		std::printf("cost hosts=%d peers=%d loops=%u groups=%zu: per host %.0f bytes, %.0f%% of 29 KB + 2P x 41 KB = %.0f (OpenSSL %.0f, C++ %.0f; "
+		std::printf("cost hosts=%d peers=%d loops=%u groups=%zu: per host %.0f bytes, %.0f%% of 52 KB + 2P x 44 KB = %.0f (OpenSSL %.0f, C++ %.0f; "
 					"before any connection %.0f); timer wheels %.0f per host; %.2f descriptors (1 + 2P = %d); zone statistics %.0f per host\n",
 					H, P, L, G, host, 100 * host / budget, budget, double(s2.ssl - s0.ssl) / H, double(s2.cxx - s2.big - s0.cxx + s0.big) / H, before,
 					double(s2.big - s0.big) / H, host_fds, 1 + 2 * P, double(s2.heap - s0.heap) / H);
@@ -601,7 +607,7 @@ Cost measured(int H, std::uint32_t L, std::size_t G, double idle_seconds) {
 
 // Least squares of counted bytes per host against 2P: the intercept is what a host holds besides
 // its connections, the slope what each idle connection end holds. `budget`: the slope within
-// 48 KB, and each host within 10% of 29 KB + 2P x 41 KB, fail the run.
+// 48 KB, and each host within 10% of 52 KB + 2P x 44 KB, fail the run.
 void fit(const std::vector<Cost> &rows, std::uint32_t L, bool budget) {
 	double n = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
 	for (auto &r : rows)
@@ -612,14 +618,14 @@ void fit(const std::vector<Cost> &rows, std::uint32_t L, bool budget) {
 	if (n < 2 || !heap_measured)
 		return;
 	const double slope = (n * sxy - sx * sy) / (n * sxx - sx * sx), intercept = (sy - slope * sx) / n;
-	std::printf("fit loops=%u: per host %.0f + 2P x %.0f bytes, against 29 KB + 2P x 41 KB = 29696 + 2P x 41984\n", L, intercept, slope);
+	std::printf("fit loops=%u: per host %.0f + 2P x %.0f bytes, against 52 KB + 2P x 44 KB = 53248 + 2P x 45056\n", L, intercept, slope);
 	expect(slope <= 48 * 1024, "an idle connection end within 48 KB, by the fit (loops " + std::to_string(L) + ")");
 	for (auto &r : rows)
 		if (r.loops == L) {
-			const double over = r.host / (29.0 * 1024 + 2.0 * r.peers * 41 * 1024) - 1;
-			std::printf("  peers %d: per host %.1f%% %s 29 KB + 2P x 41 KB\n", r.peers, 100 * std::abs(over), over > 0 ? "over" : "under");
+			const double over = r.host / host_budget(r.peers) - 1;
+			std::printf("  peers %d: per host %.1f%% %s 52 KB + 2P x 44 KB\n", r.peers, 100 * std::abs(over), over > 0 ? "over" : "under");
 			if (budget)
-				expect(over <= 0.10, "a host within 10% of 29 KB + 2P x 41 KB (peers " + std::to_string(r.peers) + ", loops " + std::to_string(L) + ")");
+				expect(over <= 0.10, "a host within 10% of 52 KB + 2P x 44 KB (peers " + std::to_string(r.peers) + ", loops " + std::to_string(L) + ")");
 		}
 }
 
@@ -736,7 +742,7 @@ double median(std::vector<double> v) {
 	return n % 2 ? v[n / 2] : (v[n / 2 - 1] + v[n / 2]) / 2;
 }
 
-int run_hop(int rounds, int only) {
+int run_hop(int rounds, int only, std::uint64_t alone_frames) {
 	std::printf("openssl=%s\n", OpenSSL_version(OPENSSL_VERSION));
 	Hop hop;
 	std::printf("host 2: connection on loop %u; groups same=%zu hop=%zu\n", hop.R, hop.groups[0].size(), hop.groups[1].size());
@@ -754,7 +760,7 @@ int run_hop(int rounds, int only) {
 				continue;
 			auto one = [&](int arm) {
 				if (s == 2) {
-					auto r = hop.alone(arm);
+					auto r = hop.alone(arm, alone_frames);
 					(arm ? lat_hop : lat_same).push_back(double(hop.p50(arm)));
 					return r;
 				}
@@ -792,7 +798,7 @@ int run_hop(int rounds, int only) {
 
 int main(int argc, char **argv) {
 	if (argc < 3) {
-		std::fprintf(stderr, "usage: consensus_transport_idle <fixture dir> cost [--quick] | hop [rounds]\n");
+		std::fprintf(stderr, "usage: consensus_transport_idle <fixture dir> cost [--quick] | one H L G | hop [rounds [series [frames]]]\n");
 		return 2;
 	}
 #ifndef SO_NOSIGPIPE
@@ -812,7 +818,7 @@ int main(int argc, char **argv) {
 		return failures ? 1 : 0;
 	}
 	if (mode == "hop")
-		return run_hop(argc > 3 ? std::atoi(argv[3]) : 7, argc > 4 ? std::atoi(argv[4]) : -1);  // [rounds] [series 0-2]
+		return run_hop(argc > 3 ? std::atoi(argv[3]) : 7, argc > 4 ? std::atoi(argv[4]) : -1, argc > 5 ? std::uint64_t(std::atoll(argv[5])) : 2000);
 	std::fprintf(stderr, "unknown mode %s\n", mode.c_str());
 	return 2;
 }

@@ -103,14 +103,15 @@ struct manual_loop {
 		}
 	}
 	void step() {
+		if (queue.empty()) { return; }
 		auto [f, a] = queue.front();
 		queue.pop_front();
-		running = true;
+		const bool was = std::exchange(running, true);
 		{
 			task::running_on scope(task::scheduler_ref::of(*this));
 			f(a);
 		}
-		running = false;
+		running = was;
 	}
 	void drain() { while (!queue.empty()) { step(); } }
 };
@@ -193,11 +194,11 @@ struct World {
 		a.drain();
 		if (!done || !sink.pending) { fail("setup"); }
 	}
-	void apply() {
-		if (!sink.pending) { return; }
-		driver->applied(g, Applied{*std::exchange(sink.pending, std::nullopt)});
-		a.drain();
+	// The application's acknowledgement, a plain call on loop A.
+	void applied() {
+		if (sink.pending) { driver->applied(g, Applied{*std::exchange(sink.pending, std::nullopt)}); }
 	}
+	void apply() { applied(); a.drain(); }
 	task::task<void> call(Caller& c) {
 		auto token = c.token ? c.cancel.token() : task::cancel_token{};
 		switch (c.kind) {
@@ -265,7 +266,7 @@ void run_case(const Case& spec, Explorer& explorer) {
 			break;
 		case apply:
 			--applies;
-			w.a.post_call([](void* p) { static_cast<World*>(p)->apply(); }, &w);
+			w.a.post_call([](void* p) { static_cast<World*>(p)->applied(); }, &w);
 			break;
 		case late_inputs:
 			late = true;
@@ -285,6 +286,9 @@ void run_case(const Case& spec, Explorer& explorer) {
 		for (auto& c : w.callers) { if (c->completions > 1) { fail("a caller completed twice"); } }
 		return;
 	}
+	// The application catches up, so every committed command reaches the Sink.
+	w.a.explorer = w.b.explorer = nullptr;
+	if (!spec.close) { for (int n = 0; n < 100 && w.sink.pending; ++n) { w.apply(); w.b.drain(); } }
 	if (spec.close && !w.closed_done) { fail("close did not complete"); }
 	if (spec.close && w.driver->state(g)) { fail("close left the group's state"); }
 	if (spec.close) {

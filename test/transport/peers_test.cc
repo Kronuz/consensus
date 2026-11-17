@@ -1200,6 +1200,10 @@ asio::awaitable<void> fetch_failures(asio::io_context &io, const Certificates &c
 		lag = std::chrono::milliseconds(std::atoi(env));
 	auto retried = fetch(cluster, 0, 2, "history/table");
 	CHECK(co_await cluster.until([&] { return retried->done; }, 5s));
+	if (retried->error || retried->bytes != (*files[1])["history/table"])
+		std::printf("  retried fetch: error %d %s, %zu of %zu bytes, after %lld ms\n", retried->error.value(),
+					retried->error.message().c_str(), retried->bytes ? retried->bytes->size() : 0, size,
+					ms(retried->answered - retried->asked));
 	CHECK(!retried->error && retried->bytes == (*files[1])["history/table"]);
 	CHECK(cluster.peers[0]->stats().admitted == admitted && cluster.connections(0) == 4); // the same lanes
 	CHECK(co_await cluster.commit("after the hang", {0, 1, 2}, 5s));

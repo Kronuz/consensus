@@ -206,6 +206,38 @@ public:
 		return found == peers_.end() ? std::nullopt : std::optional<Index>(found->second.matched);
 	}
 
+	// The leader this node knows of in its term; 0 for none.
+	NodeId leader() const noexcept { return leader_; }
+	// The term of the entry at `index`, while the retained log or its base holds it.
+	std::optional<Term> term_at(Index index) const {
+		if (index < base_index_ || index > last_index() || (index == 0 && base_index_ == 0)) { return std::nullopt; }
+		return log_term(index);
+	}
+	// The earliest Tick time (as Tick::now) by which a Tick may change anything; `maximum` when
+	// none would: before Start, while a persistence is outstanding (its Persisted is the next
+	// event), fenced, retiring, or a member that never campaigns. A host that ticks by then
+	// misses no timer; an earlier Tick is harmless. A due leader heartbeat or election may be
+	// now or past; every other deadline counts only while ahead of the clock.
+	std::uint64_t next_deadline() const {
+		if (!started_ || retiring_ || role_ == Role::Fenced || busy()) { return maximum; }
+		if (role_ != Role::Leader) { return is_voter(configuration_.local) && hard_.term != maximum ? election_deadline_ : maximum; }
+		auto at = heartbeat_deadline_;
+		auto later = [&](std::uint64_t base, std::uint64_t delay) {
+			const auto due = delay > maximum - base ? maximum : base + delay;
+			if (due > now_) { at = std::min(at, due); }
+		};
+		for (const auto& [id, answer] : answered_) { if (is_voter(id)) { later(answer, timing_.election_max); } }  // CheckQuorum
+		if (transfer_) { later(transfer_->until, 0); }
+		for (const auto& [id, peer] : peers_) {
+			later(peer.retry_after, 0);
+			if (peer.snapshot_retry_clock) { later(*peer.snapshot_retry_clock, 1); }
+			if (!peer.flights.empty()) { later(peer.flights.front().sent, timing_.rpc_timeout); }
+			if (peer.snapshot) { later(peer.snapshot->started, timing_.snapshot_timeout); }
+			if (peer.snapshot && peer.keepalive) { later(peer.keepalive->sent, timing_.heartbeat); }
+		}
+		return at;
+	}
+
 	class FrozenCheckpoint {
 	public:
 		const RecoveredState& metadata() const { validate(); return state_; }
@@ -429,7 +461,15 @@ private:
 	}
 	void handle(Start, Actions& output) {
 		if (started_) { return; }
-		started_ = true; reset_election(); deliver(output);
+		started_ = true; reset_election();
+		// X5: the only voter, with no witness, needs nobody's vote: its election is due at once,
+		// so the next Tick campaigns at the same clock and its admission funds the ballot.
+		if (lone_voter()) { election_deadline_ = now_; }
+		deliver(output);
+	}
+	bool lone_voter() const {
+		auto self = find_member(membership(), configuration_.local);
+		return self && self->role == MemberRole::Voter && voter_count(membership()) == 1;
 	}
 	void handle(Tick tick, Actions& output) {
 		if (tick.now < now_ || tick.election_delay < timing_.election_min || tick.election_delay > timing_.election_max) { return; }

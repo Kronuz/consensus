@@ -193,6 +193,20 @@ public:
 	std::size_t retired_log_bytes() const noexcept { return core_ ? core_->retired_log_bytes() : 0; }
 	std::size_t retired_log_entries() const noexcept { return core_ ? core_->retired_log_entries() : 0; }
 	bool owns_io_operation(const std::shared_ptr<kronuz::journal::IOOperation>& operation) const noexcept { return operation && (operation == io_job_ || operation == maintenance_io_); }
+	NodeId leader() const noexcept { return core_ ? core_->leader() : 0; }
+	bool transferring() const noexcept { return core_ && core_->transferring(); }
+	Index last_index() const noexcept { return core_ ? core_->last_index() : 0; }
+	std::optional<Term> term_at(Index index) const { return core_ ? core_->term_at(index) : std::nullopt; }
+	// When the Core next needs a Tick (Core::next_deadline), as Tick::now; the maximum for none.
+	std::uint64_t next_deadline() const {
+		return core_ && !closing_ && !fenced() ? core_->next_deadline() : std::numeric_limits<std::uint64_t>::max();
+	}
+	// A shared store's append or publication waits for its turn's barrier, which no IO the host
+	// runs completes: the host learns of it from the turn driver.
+	bool awaiting_turn() const noexcept {
+		if (!store_.shared()) { return false; }
+		return (io_job_ && !io_job_->done()) || (maintenance_io_ && maintenance_kind_ == MaintenanceKind::Publish && !maintenance_io_->done());
+	}
 	Index base_index() const noexcept { return core_ ? core_->base_index() : 0; }
 	LogBoundary base_boundary() const noexcept { return core_ ? core_->base_boundary() : LogBoundary{}; }
 	auto storage_frontier() const { return store_.frontier(); }

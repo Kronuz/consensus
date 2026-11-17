@@ -85,7 +85,7 @@ struct Entry {
 		host = std::make_unique<j::Host>(std::make_shared<jt::MemoryIO>(disk, "host/"), j::Identity{'B', 'E'}, j::HostOptions{1, turn_options});
 		driver = std::make_unique<Driver<Sink>>(Seams{task::scheduler_ref::of(scheduler), j::completion_ref::of(io), *host, 0, 3}, sink);
 	}
-	template <class T> T run(task::task<T> work) { return consensus::run(*driver, scheduler, std::move(work)); }
+	template <class T> T run(task::task<T> work) { return kronuz::consensus::run(*driver, scheduler, std::move(work)); }
 	// A created lone voter (or `voters`), opened on the Driver.
 	void create(std::vector<NodeId> voters = {1}, std::optional<Membership> founding = {}) {
 		run([](Entry& e, std::vector<NodeId> v, std::optional<Membership> f) -> task::task<void> {
@@ -113,13 +113,18 @@ void lone_voter() {
 void stalled_with_heartbeat() {
 	Entry e;
 	e.create();
-	check(e.scheduler.armed_timers() >= 1 && e.driver->armed_group_timers() >= 1, "the group's heartbeat entry is armed");
+	// A three-voter member beside it, waiting out its election: its timer stays armed.
+	e.run([](Entry& e) -> task::task<void> {
+		e.driver->open(g + 1, options({1, 2, 3}));
+		co_await e.driver->create(g + 1, j::Identity{'G', '2'});
+	}(e));
+	check(e.scheduler.armed_timers() >= 1 && e.driver->armed_group_timers() >= 1, "a group's timer entry is armed");
 	auto lost = [&](task::cancel_token token) {
 		return [&, token] { e.run([](Entry& e, task::cancel_token t) -> task::task<void> { co_await e.driver->committed(g, Placement{1, 100}, t); }(e, token)); };
 	};
 	bool named = false;
 	try { lost({})(); } catch (const stalled& error) { named = error.groups == std::vector<std::uint64_t>{g}; } catch (...) {}
-	check(named, "a lost wake throws stalled naming the group, with its heartbeat armed");
+	check(named, "a lost wake throws stalled naming the group, with a group timer armed");
 	task::cancel_source live;
 	check(throws<stalled>(lost(live.token())), "a lost wake under a live token nobody requests throws stalled");
 	auto state = e.driver->state(g);

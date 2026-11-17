@@ -118,6 +118,11 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 		add_executable(consensus_${b} bench/${b}.cc)
 		target_link_libraries(consensus_${b} PRIVATE consensus::consensus)
 	endforeach()
+	# Y6, Y9: an idle group's threads, descriptors, frames, timers and bytes on a Driver.
+	add_executable(consensus_driver_idle bench/driver_idle.cc)
+	target_link_libraries(consensus_driver_idle PRIVATE consensus::consensus)
+	add_test(NAME consensus_driver_idle COMMAND consensus_driver_idle 1000 WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+	set_tests_properties(consensus_driver_idle PROPERTIES TIMEOUT 120)
 	add_executable(consensus_demo examples/demo.cc)
 	target_link_libraries(consensus_demo PRIVATE consensus::consensus)
 

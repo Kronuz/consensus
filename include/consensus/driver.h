@@ -252,6 +252,8 @@ public:
 		std::sort(ids.begin(), ids.end());
 		return ids;
 	}
+	// IO tasks and turn watches in flight: the only frames a group holds besides its callers'.
+	std::size_t in_flight() const noexcept { return in_flight_; }
 	task::scheduler_ref scheduler() const noexcept { return scheduler_; }
 	kronuz::journal::TurnDriver& turns() noexcept { return turns_; }
 
@@ -621,8 +623,10 @@ private:
 				progress |= drain(g);
 				// What admission submits answers in the same turn (a Reject before settle()).
 				if (admit(g)) { progress = true; drain(g); }
+				const bool was_retiring = g.retiring;
 				settle(g);
 				if (g.closed) { return; }
+				progress |= g.retiring && !was_retiring;  // the retirement turns follow at once
 				if (!progress) { exhausted = false; break; }
 			}
 		} catch (const std::exception& error) {

@@ -221,7 +221,7 @@ public:
 	std::uint64_t next_deadline() const {
 		if (!started_ || retiring_ || role_ == Role::Fenced || busy()) { return maximum; }
 		if (role_ != Role::Leader) { return is_voter(configuration_.local) && hard_.term != maximum ? election_deadline_ : maximum; }
-		auto at = heartbeat_deadline_;
+		auto at = peers_.empty() ? maximum : heartbeat_deadline_;  // a leader with nobody to heartbeat sleeps
 		auto later = [&](std::uint64_t base, std::uint64_t delay) {
 			const auto due = delay > maximum - base ? maximum : base + delay;
 			if (due > now_) { at = std::min(at, due); }

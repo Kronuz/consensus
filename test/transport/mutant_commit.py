@@ -27,15 +27,30 @@ MUTANTS = {
     "pin-unpinned": (T + "node_pins.h", "\t\tif (!found)\n", "\t\tif (false)\n"),
     # connection.h (A4, T8's transport half)
     "close-drops-queue": (T + "connection.h", "\t\tclosing_ = true;\n\t\twake_writer();", "\t\tclosing_ = true;\n\t\tout_.clear();\n\t\twake_writer();"),
-    "no-close-notify": (T + "connection.h", "if (end_ == ConnectionEnd::open) {\n\t\t\t\tlate_deadline stuck", "if (false) {\n\t\t\t\tlate_deadline stuck"),
+    "no-close-notify": (T + "connection.h", "if (end_ == ConnectionEnd::open) {\n\t\t\t\tfor (int r;", "if (false) {\n\t\t\t\tfor (int r;"),
     "no-keepalive": (T + "connection.h", "\t\t\t\t\tput_length(0);\n", "\t\t\t\t\t(void)0;\n"),
     # connection.h (security review S1, N2)
     "fail-closes-fd": (T + "connection.h", "\t\t\t::shutdown(socket_.native_handle(), SHUT_RDWR);\n\t\t\tsocket_.cancel(ignored);",
                        "\t\t\tsocket_.close(ignored);"),
     "ssl-after-end": (T + "connection.h", "if (end_ != ConnectionEnd::open)\n\t\t\tthrow", "if (false)\n\t\t\tthrow"),
-    "stuck-spans-flush": (T + "connection.h", "co_await flush(stuck.token(), true);", "co_await flush(stuck.token());"),
-    # connection.h (transport-groups review F1: a draining queue is progress)
-    "stuck-ignores-drain": (T + "connection.h", "unacknowledged() >= queued)", "true)"),
+    # one stuck deadline for all of a flush's waits, not one per wait
+    "stuck-spans-flush": [
+        (T + "connection.h", "\t\twhile (sent_ != sending_.size()) {", "\t\tlate_deadline whole(loop_, options_.dead_after);\n\t\tspan_ = &whole;\n\t\twhile (sent_ != sending_.size()) {"),
+        (T + "connection.h", "\t\tstd::string().swap(sending_);  // an idle", "\t\tspan_ = nullptr;\n\t\tstd::string().swap(sending_);  // an idle"),
+        (T + "connection.h", "\t\tlate_deadline stuck(loop_, options_.dead_after);\n\t\ttry {",
+         "\t\tlate_deadline own(loop_, options_.dead_after);\n\t\tlate_deadline &stuck = span_ ? *span_ : own;\n\t\ttry {"),
+        (T + "connection.h", "\tstd::size_t sent_ = 0;", "\tlate_deadline *span_ = nullptr;\n\tstd::size_t sent_ = 0;"),
+    ],
+    # connection.h (transport-groups review F1, F4, F5: a draining queue keeps a write wait alive)
+    "stuck-ignores-drain": (T + "connection.h", "|| !drained(before))", "|| true)"),
+    "stuck-never-fails": (T + "connection.h", "|| !drained(before))", "|| false)"),
+    "stuck-equal-drains": (T + "connection.h", "return before && now && *now < *before;", "return before && now && *now <= *before;"),
+    # the queue sampled when the flush begins, before its own writes (round 2's sampling point)
+    "stuck-samples-before-flush": [
+        (T + "connection.h", "\t\twhile (sent_ != sending_.size()) {", "\t\tflush_queued_ = unacknowledged();\n\t\twhile (sent_ != sending_.size()) {"),
+        (T + "connection.h", "\t\tconst auto before = unacknowledged();", "\t\tconst auto before = flush_queued_;"),
+        (T + "connection.h", "\tstd::size_t sent_ = 0;", "\tstd::optional<std::size_t> flush_queued_;\n\tstd::size_t sent_ = 0;"),
+    ],
     # deadline.h, connection.h (fix round 2: a late keepalive goes at once)
     "late-always-extends": (T + "deadline.h", "if (self.extend_late_ && !self.extended_", "if (!self.extended_"),
     "keepalive-extends": (T + "connection.h", "late_deadline idle(loop_, options_.keepalive, false);",

@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <netinet/tcp.h>
+#include <optional>
 #include <string>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
@@ -25,7 +26,7 @@ namespace kronuz::consensus::transport {
 struct ConnectionOptions {
 	std::chrono::milliseconds handshake{5000};  // TLS and the hellos
 	std::chrono::milliseconds keepalive{1000};  // a connection that sent nothing for this long sends a keepalive
-	std::chrono::milliseconds dead_after{5000}; // nothing received, or no write progress, for this long ends it
+	std::chrono::milliseconds dead_after{5000}; // nothing received, or a write wait with no drain, this long ends it
 	std::size_t maximum_frame = 4 * 1024 * 1024;
 };
 // How run() ended: both ends sent close_notify, a socket, TLS or framing failure, or a peer
@@ -65,6 +66,8 @@ class Connection {
 	std::size_t queued() const noexcept { return out_.size() + sending_.size() - sent_; }
 	std::uint64_t keepalives_sent() const noexcept { return keepalives_sent_; }
 	std::uint64_t keepalives_received() const noexcept { return keepalives_received_; }
+	// Write waits that reached dead_after with the send queue drained: a slow reader, kept.
+	std::uint64_t drained_expiries() const noexcept { return drained_expiries_; }
 	const asio::ip::tcp::socket &socket() const noexcept { return socket_; }
 
 	// After each read's frames went to the handler; when the queue is empty and the writer would
@@ -93,7 +96,7 @@ class Connection {
 	}
 	task::task<void> write_hello(const NodeHello &hello, task::cancel_token deadline) {
 		sending_ = encode_node_hello(hello);
-		co_await flush(deadline);
+		co_await flush(std::move(deadline));
 	}
 	task::task<NodeHello> read_hello(task::cancel_token deadline) {
 		while (in_.size() < node_hello_size)
@@ -198,42 +201,64 @@ class Connection {
 			co_await want(error, deadline, "read");
 		}
 	}
-	// Writes `sending_` from `sent_` to its end, then releases it; with `progress`, returns early
-	// when a write made progress and the next must wait, so the caller's stuck deadline restarts.
-	task::task<void> flush(task::cancel_token deadline, bool progress = false) {
-		for (bool wrote = false; sent_ != sending_.size();) {
+	// Writes `sending_` from `sent_` to its end, then releases it: each wait under `deadline` (the
+	// hellos), or without one under the stuck rule (want_written).
+	task::task<void> flush(std::optional<task::cancel_token> deadline = std::nullopt) {
+		while (sent_ != sending_.size()) {
 			open_or_throw("write");
 			const auto rest = std::min<std::size_t>(sending_.size() - sent_, INT_MAX);
 			const int r = SSL_write(ssl_.get(), sending_.data() + sent_, int(rest));
 			if (r > 0) {
 				sent_ += std::size_t(r);
-				wrote = true;
 				continue;
 			}
 			const int error = SSL_get_error(ssl_.get(), r);
-			if (progress && wrote && (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE))
-				co_return;
-			co_await want(error, deadline, "write");
+			if (deadline)
+				co_await want(error, *deadline, "write");
+			else
+				co_await want_written(error, "write");
 		}
 		std::string().swap(sending_);  // an idle connection holds no send buffer
 		sent_ = 0;
 	}
-	// The socket's send queue: bytes written and not yet acknowledged by the peer; 0 when the
-	// platform cannot tell. It drains while the peer reads, however coarsely writes wake.
-	std::size_t unacknowledged() noexcept {
+	// The stuck rule, for every wait of the writer: a wait that lasts dead_after ends the
+	// connection unless the socket's send queue drained during it. The queue is sampled after
+	// this end's own writes, so only the peer's acknowledgments shrink it, however coarsely the
+	// kernel wakes the writer; after a drained expiry the caller retries its write.
+	task::task<void> want_written(int error, const char *what) {
+		const auto before = unacknowledged();
+		late_deadline stuck(loop_, options_.dead_after);
+		try {
+			co_await want(error, stuck.token(), what);
+		} catch (...) {
+			if (stuck.state() != late_deadline::outcome::expired || end_ != ConnectionEnd::open || !drained(before))
+				throw;
+			++drained_expiries_;
+		}
+	}
+	// The socket's send queue: bytes written and not yet acknowledged by the peer; none when the
+	// platform cannot tell or the call fails.
+	std::optional<std::size_t> unacknowledged() noexcept {
 		int n = 0;
 #if defined(SIOCOUTQ)
 		if (::ioctl(socket_.native_handle(), SIOCOUTQ, &n) != 0)
-			return 0;
+			return std::nullopt;
 #elif defined(SO_NWRITE)
 		socklen_t size = sizeof n;
 		if (::getsockopt(socket_.native_handle(), SOL_SOCKET, SO_NWRITE, &n, &size) != 0)
-			return 0;
+			return std::nullopt;
 #elif defined(FIONWRITE)
 		if (::ioctl(socket_.native_handle(), FIONWRITE, &n) != 0)
-			return 0;
+			return std::nullopt;
+#else
+		return std::nullopt;
 #endif
-		return n > 0 ? std::size_t(n) : 0;
+		return std::size_t(std::max(n, 0));
+	}
+	// Whether the queue shrank since `before`; never when either reading is missing.
+	bool drained(std::optional<std::size_t> before) noexcept {
+		const auto now = unacknowledged();
+		return before && now && *now < *before;
 	}
 	// Hands every whole frame in the buffer to the handler, none after the connection ends;
 	// throws on an oversized one.
@@ -288,16 +313,8 @@ class Connection {
 						on_drained();
 					sending_.swap(out_);
 				}
-				if (!sending_.empty()) {  // stuck: for dead_after, no write progress and the socket's queue never drained
-					const auto queued = unacknowledged();
-					late_deadline stuck(loop_, options_.dead_after);
-					try {
-						co_await flush(stuck.token(), true);
-					} catch (...) {
-						if (stuck.state() != late_deadline::outcome::expired || end_ != ConnectionEnd::open ||
-							unacknowledged() >= queued)
-							throw;
-					}
+				if (!sending_.empty()) {
+					co_await flush();
 					continue;
 				}
 				if (closing_)
@@ -312,9 +329,8 @@ class Connection {
 				}
 			}
 			if (end_ == ConnectionEnd::open) {
-				late_deadline stuck(loop_, options_.dead_after);
 				for (int r; (r = SSL_shutdown(ssl_.get())) < 0;)
-					co_await want(SSL_get_error(ssl_.get(), r), stuck.token(), "close_notify");
+					co_await want_written(SSL_get_error(ssl_.get(), r), "close_notify");
 				::shutdown(socket_.native_handle(), SHUT_WR);
 			}
 		} catch (...) {
@@ -334,7 +350,7 @@ class Connection {
 	std::string in_, out_, sending_;
 	std::size_t sent_ = 0;  // what of sending_ is written
 	late_deadline *writer_wake_ = nullptr;
-	std::uint64_t keepalives_sent_ = 0, keepalives_received_ = 0;
+	std::uint64_t keepalives_sent_ = 0, keepalives_received_ = 0, drained_expiries_ = 0;
 	ConnectionEnd end_ = ConnectionEnd::open;
 	// dead_: the reader failed at its dead-peer deadline, nothing arrived within dead_after.
 	bool dialer_, closing_ = false, reading_done_ = false, writing_done_ = false, dead_ = false;

@@ -74,8 +74,8 @@ against `election_min` of 1 s.
 
 The socket keeps its default buffers; `TCP_NOTSENT_LOWAT` is not set. On Linux it also caps
 what a write may queue, so a writer to a peer that reads steadily but slowly sees progress
-only as the peer's window opens, and its stuck deadline (`dead_after` without write progress)
-ends the connection (`connection_test`'s `slow_reader` and `busy_reader`). On macOS it bought
+only as the peer's window opens, and its stuck deadline (a write wait of `dead_after` in which
+the send queue did not drain) ends the connection (`connection_test`'s `slow_reader` and `busy_reader`). On macOS it bought
 nothing measurable in `upload` (a 233 ms gap without it, 195 ms with it).
 
 Queues are bounded: a group queues at most 64 control frames and 8 MiB of data frames per

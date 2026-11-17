@@ -173,6 +173,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	add_test(NAME consensus_transport_links COMMAND consensus_transport_links_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture)
 	set_tests_properties(consensus_transport_tls consensus_transport_pipe consensus_transport_authentication consensus_transport_connection consensus_transport_links
 		PROPERTIES FIXTURES_REQUIRED consensus_tls TIMEOUT 30)
+	set_tests_properties(consensus_transport_connection PROPERTIES TIMEOUT 120)  # the slow readers run for seconds each
 	# The host transport (host_transport.h): one ctest entry per case.
 	add_executable(consensus_transport_groups_test test/transport/groups_test.cc)
 	target_link_libraries(consensus_transport_groups_test PRIVATE consensus::transport)

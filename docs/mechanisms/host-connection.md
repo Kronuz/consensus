@@ -14,7 +14,7 @@ did not run: the host stopped or descheduled the process. The peer had no chance
 during that time, so the deadline extends once, by the lateness, capped at one timeout. A
 second late fire expires it. `late_deadline` is the only implementation, and every transport
 wait uses it: the TLS handshake and hellos, each read wait (the dead-peer deadline), each
-stuck write, the keepalive interval, a name's lookup and the TCP connect race. The keepalive
+write wait, close_notify's included, the keepalive interval, a name's lookup and the TCP connect race. The keepalive
 interval times this end's own duty, not the peer's time, so it takes no extension: a late fire
 sends the keepalive at once. Extended, a loop busy longer than the interval would send one
 every other turn, twice as far apart as it can.
@@ -50,14 +50,18 @@ A frame is a 4-byte little-endian length and its bytes. The reader hands each fr
 connection's handler synchronously, viewing the connection's own buffer, and never waits on a
 shared budget. A zero-length frame is the keepalive: a connection that sent nothing for
 `keepalive` (1 s) sends one, once per connection, whatever groups use it. A connection that
-received nothing for `dead_after` (5 s) ends `dead`; one whose writes make no progress for as
-long ends `failed`. The stuck-write deadline restarts at every write that makes progress, and at
+received nothing for `dead_after` (5 s) ends `dead`; one stuck writing ends `failed`. Each
+wait of the writer, the frames' and `close_notify`'s alike, has its own `dead_after`, and at
 its expiry a socket whose send queue (bytes written and not yet acknowledged: `SIOCOUTQ`,
-`SO_NWRITE` or `FIONWRITE`) drained since it was armed gets it again. So a peer reading
-steadily but slower than the queue drains is not stuck, however coarsely the kernel wakes the
-writer: Linux reports a full socket writable only once a third of its send buffer is free,
-which at a slow reader's pace can take longer than `dead_after`. A peer that stops reading
-stops the drain once its own buffer fills.
+`SO_NWRITE` or `FIONWRITE`) drained during the wait is retried rather than ended. The queue is
+sampled right before the wait, after this end's own writes, so only the peer's
+acknowledgments count, and a reading that fails counts as no drain. So a peer reading steadily
+but slower than the queue drains is not stuck, however coarsely the kernel wakes the writer:
+Linux reports a full socket writable only once a third of its send buffer is free, and a
+macOS or FreeBSD low-water mark as high as the buffer only once it is empty, which at a slow
+reader's pace can take longer than `dead_after`. A peer that stops reading stops the drain once
+its own buffer fills, and the next wait ends the connection. The cost is one `ioctl` or
+`getsockopt` before each wait and one at its expiry, none for a write that never waits.
 
 `close()` drains: the frames queued so far, then TLS `close_notify`. A peer that reads
 `close_notify` answers the same way, and both ends finish `closed`. An end that stops without
@@ -141,8 +145,9 @@ the flood stops replaces what is left of it.
 | DTHL0002 | `node_hello_test`; `fuzz_decoders` case 9 |
 | Frames, keepalive, dead peer, close | `connection_test` `frames`, `keepalive`, `dead_peer`, `graceful_close`, `abort_truncates`, `busy_reader`; mutants `no-keepalive`, `keepalive-extends`, `close-drops-queue`, `no-close-notify` |
 | The fd kept until `run()` returns, no SSL call after the end | `connection_test` `fd_reuse_reader`, `fd_reuse_writer`; mutants `fail-closes-fd`, `ssl-after-end` |
-| Write progress restarts the stuck deadline | `connection_test` `slow_reader` (a failed run the host stalled 100 ms or more runs again, at most twice); mutant `stuck-spans-flush`; `slow_reader_stops.py` forces the stalls with `SIGSTOP` |
-| A draining send queue is progress | `connection_test` `coarse_writer` (the writer wakes only after 1 MiB drained); mutant `stuck-ignores-drain` |
+| Each write wait has its own stuck deadline | `connection_test` `slow_reader` (a failed run the host stalled 100 ms or more runs again, at most twice); mutant `stuck-spans-flush`; `slow_reader_stops.py` forces the stalls with `SIGSTOP` |
+| A send queue draining during the wait keeps it, sampled after this end's writes | `connection_test` `coarse_writer` (the writer wakes only at an empty 1 MiB queue, about 2 s against a 1 s `dead_after`; where the low-water mark takes, a drained expiry must occur); mutants `stuck-ignores-drain`, `stuck-samples-before-flush` |
+| A peer that never reads ends the writer `failed` | `connection_test` `nonreader` (a relay stops forwarding to the peer, which keeps sending keepalives); mutants `stuck-never-fails`, `stuck-equal-drains` |
 | Dial, tie-break, draining, lookup, two loops | `links_test`; mutants `refuse-when-offered`, `accept-when-offered`, `draining-counts`, `lookup-no-wake`; `threads` under TSan |
 | A given-up dial released; the pre-authentication bounds | `links_test` `abandoned_dial`, `flood`; mutants `abandon-keeps-dial`, `refuse-newest`, `no-source-cap` |
 

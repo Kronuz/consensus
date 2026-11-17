@@ -1,6 +1,7 @@
 // The host connection over loopback TCP with the TLS fixture: node authentication by the
 // host's pins (A2), frames, the keepalive and the dead-peer deadline, graceful close (A4), the
-// fd kept until run() returns, and a slow but steady reader and a busy one (security review S1, N2).
+// fd kept until run() returns, a slow but steady reader and a busy one (security review S1, N2),
+// and a peer that never reads.
 //   consensus_transport_connection_test <fixture dir> [case]
 #include "consensus/transport/connection.h"
 #include <algorithm>
@@ -15,8 +16,10 @@
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
+#include <netinet/in.h>
 #include <openssl/pem.h>
 #include <optional>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <thread>
 #include <unistd.h>
@@ -123,10 +126,15 @@ struct Pair {
 	std::unique_ptr<Connection> dialer, acceptor;
 	Pair(Loop &l, std::shared_ptr<asio::ssl::context> dialing, std::shared_ptr<asio::ssl::context> accepting,
 		 ConnectionOptions options = {})
+		: Pair(l, tcp_pair(l.io), std::move(dialing), std::move(accepting), options, options) {}
+	Pair(Loop &l, std::pair<tcp::socket, tcp::socket> sockets, std::shared_ptr<asio::ssl::context> dialing,
+		 std::shared_ptr<asio::ssl::context> accepting, ConnectionOptions dialing_options,
+		 ConnectionOptions accepting_options)
 		: loop(l) {
-		auto [a, b] = tcp_pair(l.io);
-		dialer = std::make_unique<Connection>(l.ref(), std::move(a), std::move(dialing), true, options);
-		acceptor = std::make_unique<Connection>(l.ref(), std::move(b), std::move(accepting), false, options);
+		dialer = std::make_unique<Connection>(l.ref(), std::move(sockets.first), std::move(dialing), true,
+											  dialing_options);
+		acceptor = std::make_unique<Connection>(l.ref(), std::move(sockets.second), std::move(accepting), false,
+												accepting_options);
 	}
 	// Both handshakes; each side's authenticated node, or the error it threw.
 	struct Side {
@@ -524,7 +532,8 @@ struct reader_run {
 	int got;
 	long long ms, stalled_ms;
 	ConnectionEnd dialer, acceptor;
-	std::uint64_t keepalives;
+	std::uint64_t keepalives, drained_expiries;
+	bool coarse_wakes;  // the writer's low-water mark took: it wakes only at an empty queue
 };
 
 reader_run read_slowly_once(const reader_load &load) {
@@ -535,12 +544,17 @@ reader_run read_slowly_once(const reader_load &load) {
 	options.dead_after = load.dead_after;
 	tcp::acceptor listener(l1.io, tcp::endpoint(asio::ip::address_v4::loopback(), 0));
 	tcp::socket a(l1.io), b(l2.io);
+	bool coarse_wakes = false;
 	if (load.coarse) {
 		const int buffer = 1 << 20, reading = 64 * 1024;
 		a.open(tcp::v4());
 		::setsockopt(a.native_handle(), SOL_SOCKET, SO_SNDBUF, &buffer, sizeof buffer);
 		(void)::setsockopt(a.native_handle(), SOL_SOCKET, SO_SNDLOWAT, &buffer, sizeof buffer);  // Linux refuses it
 		::setsockopt(listener.native_handle(), SOL_SOCKET, SO_RCVBUF, &reading, sizeof reading);
+		int lowat = 0;
+		socklen_t size = sizeof lowat;
+		coarse_wakes = ::getsockopt(a.native_handle(), SOL_SOCKET, SO_SNDLOWAT, &lowat, &size) == 0 &&
+					   lowat >= buffer / 2;
 	}
 	a.connect(listener.local_endpoint());
 	listener.accept(b);
@@ -601,11 +615,12 @@ reader_run read_slowly_once(const reader_load &load) {
 			dialer.send(std::string(size, char('a' + i % 26)));
 		dialer.close();
 	});
-	assert(l1.until([&] { return dialer_end && acceptor_done; }, 20s));
+	assert(l1.until([&] { return dialer_end && acceptor_done; }, 60s));
 	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 	stop = true;
 	t2.join();
-	return {got, ms, watch.worst_ms(), *dialer_end, *acceptor_end, acceptor.keepalives_sent()};
+	return {got, ms, watch.worst_ms(), *dialer_end, *acceptor_end, acceptor.keepalives_sent(), dialer.drained_expiries(),
+			coarse_wakes};
 }
 // Both ends share this process, so a host stop silences the reader's keepalives too, which no
 // two hosts do: a failed run the host stalled for a third of dead_after or more runs again, at
@@ -614,11 +629,14 @@ void read_slowly(const reader_load &load) {
 	for (int attempt = 1;; ++attempt) {
 		const auto r = read_slowly_once(load);
 		std::printf("%s: %d of %d frames read in %lld ms against a %lld ms dead_after; dialer %d, acceptor %d; "
-					"%llu keepalives from the reader; the process stalled %lld ms at most\n",
+					"%llu keepalives from the reader; %llu write waits expired with the queue drained%s; "
+					"the process stalled %lld ms at most\n",
 					load.name, r.got, load.frames, r.ms, (long long)load.dead_after.count(), int(r.dialer),
-					int(r.acceptor), (unsigned long long)r.keepalives, r.stalled_ms);
+					int(r.acceptor), (unsigned long long)r.keepalives, (unsigned long long)r.drained_expiries,
+					r.coarse_wakes ? " (wakes at an empty queue)" : "", r.stalled_ms);
 		if (r.got == load.frames && r.dialer == ConnectionEnd::closed && r.acceptor == ConnectionEnd::closed) {
 			assert(r.ms >= load.frames * load.per_frame.count());
+			assert(!r.coarse_wakes || r.drained_expiries > 0);  // the case reached the rule it tests
 			return;
 		}
 		assert(r.stalled_ms >= load.dead_after.count() / 3 && attempt < 3);
@@ -631,10 +649,111 @@ void slow_reader() { read_slowly({"slow_reader", 64, 512 * 1024, 20ms, 300ms}); 
 // each turn between frames. Held to the late rule's extension it would go every other frame,
 // 800 ms apart, against a 600 ms dead_after.
 void busy_reader() { read_slowly({"busy_reader", 6, 64 * 1024, 400ms, 600ms}); }
-// Write progress counts the socket's queue draining: a writer the kernel wakes only after 1 MiB
-// drained (Linux's send buffer wakes at a third free, macOS's low-water mark) to a reader of
-// 64 KiB every 60 ms waits about a second for a write, against a 300 ms dead_after.
-void coarse_writer() { read_slowly({"coarse_writer", 48, 64 * 1024, 60ms, 300ms, true}); }
+// The socket's queue draining keeps a write wait alive: a writer the kernel wakes only at an
+// empty 1 MiB queue (the low-water mark where settable; Linux wakes at a third free) to a reader
+// of 64 KiB every 125 ms waits about 2 s, twice its 1 s dead_after. The reader drains several
+// frames in every dead_after, even on a slow host whose timers coalesce 100 ms.
+void coarse_writer() { read_slowly({"coarse_writer", 40, 64 * 1024, 125ms, 1000ms, true}); }
+
+// A loopback relay between a dialer (up) and its acceptor (down): down to up always flows, up
+// to down stops once `forward_up` goes false, so the acceptor still talks but never reads again.
+class Relay {
+  public:
+	Relay() : listener_(::socket(AF_INET, SOCK_STREAM, 0)) {
+		sockaddr_in a{};
+		a.sin_family = AF_INET;
+		a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		assert(::bind(listener_, reinterpret_cast<sockaddr *>(&a), sizeof a) == 0 && ::listen(listener_, 1) == 0);
+	}
+	~Relay() {
+		stop_ = true;
+		if (thread_.joinable())
+			thread_.join();
+		for (int fd : {listener_, up_, down_})
+			if (fd >= 0)
+				::close(fd);
+	}
+	std::uint16_t port() const { return port_of(listener_); }
+	// Accepts the dialer's connection and connects it to `to`, then relays.
+	void join(std::uint16_t to) {
+		up_ = ::accept(listener_, nullptr, nullptr);
+		down_ = ::socket(AF_INET, SOCK_STREAM, 0);
+		sockaddr_in a{};
+		a.sin_family = AF_INET;
+		a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		a.sin_port = htons(to);
+		assert(up_ >= 0 && ::connect(down_, reinterpret_cast<sockaddr *>(&a), sizeof a) == 0);
+		thread_ = std::thread([this] { pump(); });
+	}
+	std::atomic<bool> forward_up{true};
+
+  private:
+	static bool copy(int from, int to) {
+		char buffer[64 * 1024];
+		const auto n = ::read(from, buffer, sizeof buffer);
+		for (ssize_t at = 0; at < n;) {
+			const auto w = ::write(to, buffer + at, std::size_t(n - at));
+			if (w <= 0)
+				return false;
+			at += w;
+		}
+		return n > 0;
+	}
+	void pump() {
+		while (!stop_) {
+			const bool up = forward_up;
+			pollfd fds[2] = {{down_, POLLIN, 0}, {up_, short(up ? POLLIN : 0), 0}};
+			if (::poll(fds, 2, 10) <= 0)
+				continue;
+			if ((fds[0].revents & (POLLIN | POLLHUP)) && !copy(down_, up_))
+				return;
+			if (up && (fds[1].revents & (POLLIN | POLLHUP)) && !copy(up_, down_))
+				return;
+		}
+	}
+	int listener_, up_ = -1, down_ = -1;
+	std::atomic<bool> stop_{false};
+	std::thread thread_;
+};
+
+// Review F5, the stuck rule's safety half: a peer that keeps sending keepalives but never reads
+// again ends the writer `failed` once its queue stops draining, not `dead`, and not kept open.
+void nonreader() {
+	Loop loop;
+	Relay relay;
+	ConnectionOptions dialing, accepting;
+	dialing.keepalive = accepting.keepalive = 50ms;
+	dialing.dead_after = 300ms;
+	accepting.dead_after = 60s;  // the peer stays up and keeps talking
+	tcp::acceptor listener(loop.io, tcp::endpoint(asio::ip::address_v4::loopback(), 0));
+	tcp::socket a(loop.io), b(loop.io);
+	a.connect(tcp::endpoint(asio::ip::address_v4::loopback(), relay.port()));
+	relay.join(listener.local_endpoint().port());
+	listener.accept(b);
+	Pair p(loop, {std::move(a), std::move(b)}, context("one"), context("two"), dialing, accepting);
+	p.establish(pins_of(1, "one"), pins_of(2, "two"));
+	relay.forward_up = false;
+	Ends ends;
+	run_both(p, ends);
+	const auto start = std::chrono::steady_clock::now();
+	loop.call([&] {
+		for (int i = 0; i != 64; ++i)
+			p.dialer->send(std::string(512 * 1024, 'q'));
+	});
+	const bool ended = loop.until([&] { return ends.dialer.has_value(); }, 10s);
+	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+	std::printf("nonreader: the writer %s after %lld ms against a 300 ms dead_after, end %d; the peer %s and sent "
+				"%llu keepalives; %llu write waits expired with the queue drained\n",
+				ended ? "ended" : "is still open", (long long)ms, ended ? int(*ends.dialer) : -1,
+				ends.acceptor ? "ended" : "is open", (unsigned long long)p.dialer->keepalives_received(),
+				(unsigned long long)p.dialer->drained_expiries());
+	loop.call([&] {
+		p.dialer->abort();
+		p.acceptor->abort();
+	});
+	assert(loop.until([&] { return ends.dialer && ends.acceptor; }, 3s));
+	assert(ended && ms < 5000 && *ends.dialer == ConnectionEnd::failed);
+}
 
 struct Case {
 	const char *name;
@@ -645,7 +764,7 @@ constexpr Case cases[] = {{"authenticate", authenticate}, {"wrong_node", wrong_n
 						  {"keepalive", keepalive},	   {"dead_peer", dead_peer}, {"graceful_close", graceful_close},
 						  {"abort_truncates", abort_truncates}, {"fd_reuse_reader", fd_reuse_reader},
 						  {"fd_reuse_writer", fd_reuse_writer}, {"slow_reader", slow_reader},
-						  {"busy_reader", busy_reader}, {"coarse_writer", coarse_writer}};
+						  {"busy_reader", busy_reader}, {"coarse_writer", coarse_writer}, {"nonreader", nonreader}};
 } // namespace
 
 int main(int argc, char **argv) {

@@ -157,7 +157,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	add_test(NAME consensus_tls_certificates COMMAND ${CMAKE_COMMAND} -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/tls-fixture
 		-DOPENSSL=${CONSENSUS_TEST_OPENSSL} -P ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/tls_certificates.cmake)
 	set_tests_properties(consensus_tls_certificates PROPERTIES FIXTURES_SETUP consensus_tls TIMEOUT 30)
-	foreach(t codec rpc_observation ownership tls authentication peers deadline node_hello connection)
+	foreach(t codec rpc_observation ownership tls authentication peers deadline node_hello connection links)
 		add_executable(consensus_transport_${t}_test test/transport/${t}_test.cc)
 		target_link_libraries(consensus_transport_${t}_test PRIVATE consensus::transport)
 		target_compile_options(consensus_transport_${t}_test PRIVATE -UNDEBUG)
@@ -170,6 +170,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	add_test(NAME consensus_transport_pipe COMMAND consensus_transport_tls_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture --pipes)
 	add_test(NAME consensus_transport_authentication COMMAND consensus_transport_authentication_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture)
 	add_test(NAME consensus_transport_connection COMMAND consensus_transport_connection_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture)
-	set_tests_properties(consensus_transport_tls consensus_transport_pipe consensus_transport_authentication consensus_transport_connection
+	add_test(NAME consensus_transport_links COMMAND consensus_transport_links_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture)
+	set_tests_properties(consensus_transport_tls consensus_transport_pipe consensus_transport_authentication consensus_transport_connection consensus_transport_links
 		PROPERTIES FIXTURES_REQUIRED consensus_tls TIMEOUT 30)
 endif()

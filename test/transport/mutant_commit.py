@@ -29,6 +29,13 @@ MUTANTS = {
     "close-drops-queue": (T + "connection.h", "\t\tclosing_ = true;\n\t\twake_writer();", "\t\tclosing_ = true;\n\t\tout_.clear();\n\t\twake_writer();"),
     "no-close-notify": (T + "connection.h", "if (end_ == ConnectionEnd::open) {\n\t\t\t\tlate_deadline stuck", "if (false) {\n\t\t\t\tlate_deadline stuck"),
     "no-keepalive": (T + "connection.h", "\t\t\t\t\tput_length(0);\n", "\t\t\t\t\t(void)0;\n"),
+    # links.h (A4's tie-break, A1's lookup)
+    "refuse-when-offered": (T + "links.h", "return !offered || peer < pins_.local();", "return !offered;"),
+    "accept-when-offered": (T + "links.h", "return !offered || peer < pins_.local();", "return true || offered;"),
+    "draining-counts": (T + "links.h", "it->second.link && !it->second.link->connection->draining() ? &*it->second.link",
+                        "it->second.link ? &*it->second.link"),
+    "lookup-no-wake": (T + "links.h", "\t\t\troute.endpoints = interleave(found, route.address.port);\n\t\troute.waiting.wake_all();",
+                       "\t\t\troute.endpoints = interleave(found, route.address.port);"),
 }
 
 

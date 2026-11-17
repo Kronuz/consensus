@@ -1195,7 +1195,11 @@ asio::awaitable<void> fetch_failures(asio::io_context &io, const Certificates &c
 	CHECK(cluster.frozen && stalled->error == std::errc::timed_out && !stalled->bytes && waited >= 2000);
 	CHECK(cluster.peers[0]->occupancy().fetches == 1); // the failed fetch keeps its slot until its reply ends
 	cluster.frozen = false;
+	const auto thawed = Clock::now();
 	CHECK(co_await cluster.until([&] { return cluster.peers[0]->occupancy().fetches == 0; }, 3s));
+	std::printf("  drain: %lld ms after the thaw, %zu connections, %llu admitted (was %llu), %llu reconnects\n",
+				ms(Clock::now() - thawed), cluster.connections(0), (unsigned long long)cluster.peers[0]->stats().admitted,
+				(unsigned long long)admitted, (unsigned long long)cluster.peers[0]->stats().reconnects);
 	if (const char *env = std::getenv("PEERS_RETRY_LAG_MS"))
 		lag = std::chrono::milliseconds(std::atoi(env));
 	auto retried = fetch(cluster, 0, 2, "history/table");

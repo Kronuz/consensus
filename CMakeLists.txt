@@ -104,7 +104,8 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	if(CMAKE_GENERATOR MATCHES "Ninja")
 		add_test(NAME consensus_mutants COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/mutants.sh ${CMAKE_BINARY_DIR} 400 10000)
 	endif()
-	set_tests_properties(consensus_worker PROPERTIES TIMEOUT 180)
+	# Its real-file cases are flush-bound on macOS (F_FULLFSYNC): 145-170 s alone, more on a busy disk.
+	set_tests_properties(consensus_worker PROPERTIES TIMEOUT 600)
 	# T8: the decoders' checked-in corpus replays as a test; with CONSENSUS_FUZZ (Clang) the
 	# libFuzzer binary builds too.
 	add_executable(consensus_fuzz_decoders_replay fuzz/fuzz_decoders.cc fuzz/replay.cc)

@@ -10,6 +10,10 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 
 ### Added
 
+- The RPC lane's codec and call machinery ([docs/mechanisms/rpc-lane.md](docs/mechanisms/rpc-lane.md)):
+  `transport/rpc.h` encodes and checks its six frame kinds, keeps one connection's call table
+  (ids, credit, deadlines, `Drain`), and draws credit from thread-safe host pools with an atomic
+  `ByteBudget::renew`. It does no I/O and is not yet on Bulk.
 - The host connection ([docs/mechanisms/host-connection.md](docs/mechanisms/host-connection.md)),
   beside `Peers`: `transport/connection.h` drives OpenSSL on the non-blocking socket with
   released buffers, length-prefixed frames, a keepalive per connection and a graceful close

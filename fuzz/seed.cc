@@ -6,6 +6,7 @@
 #include "consensus/storage.h"
 #include "consensus/transport/codec.h"
 #include "consensus/transport/fetch.h"
+#include "consensus/transport/node_hello.h"
 
 #include <cstdio>
 #include <fstream>
@@ -29,6 +30,11 @@ int main(int argc, char** argv) {
 	write(8, transport::encode_fetch({transport::FetchKind::Request, 1, 0, "history/blocks/0001"}));
 	write(8, transport::encode_fetch({transport::FetchKind::Data, 2, 5, "bytes"}));
 	write(8, transport::encode_fetch({transport::FetchKind::Missing, 3, 0, {}}));
+	transport::NodeHello hello{2, transport::LinkLane::Control, false, c.cluster, {}, 1, 1};
+	hello.connection[0] = 'C';
+	write(9, transport::encode_node_hello(hello));
+	hello.lane = transport::LinkLane::Bulk; hello.refused = true; hello.rpc_max = 3;
+	write(9, transport::encode_node_hello(hello));
 	write(1, encode_membership(witness));
 	write(1, encode_membership(limited));
 	write(2, encode_initialization(c));

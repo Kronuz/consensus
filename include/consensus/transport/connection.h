@@ -45,6 +45,10 @@ class Connection {
 #ifdef SO_NOSIGPIPE
 		::setsockopt(socket_.native_handle(), SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
 #endif
+#ifdef TCP_NOTSENT_LOWAT
+		const int unsent = 64 * 1024;  // a frame queued here waits behind little more than the socket holds
+		::setsockopt(socket_.native_handle(), IPPROTO_TCP, TCP_NOTSENT_LOWAT, &unsent, sizeof unsent);
+#endif
 		ssl_.reset(SSL_new(tls_->native_handle()));
 		if (!ssl_ || SSL_set_fd(ssl_.get(), int(socket_.native_handle())) != 1)
 			throw std::runtime_error("connection: SSL_new");
@@ -62,6 +66,17 @@ class Connection {
 	std::uint64_t keepalives_sent() const noexcept { return keepalives_sent_; }
 	std::uint64_t keepalives_received() const noexcept { return keepalives_received_; }
 	const asio::ip::tcp::socket &socket() const noexcept { return socket_; }
+
+	// After each read's frames went to the handler; when the queue is empty and the writer would
+	// wait, so a sender keeps its own queues and hands over a little at a time. Set before run().
+	std::function<void()> on_read, on_drained;
+
+	// Moves the connection to another loop between its handshake and its hellos; nothing waits.
+	void rehome(task::scheduler_ref loop, const asio::any_io_executor &executor) {
+		const auto protocol = socket_.local_endpoint().protocol();
+		socket_ = asio::ip::tcp::socket(executor, protocol, socket_.release());
+		loop_ = loop;
+	}
 
 	// The TLS handshake, then the peer's node by its pin (`expected` when nonzero). Throws, and
 	// the connection is unusable, when either fails or `deadline` is requested.
@@ -229,6 +244,8 @@ class Connection {
 		try {
 			for (bool more = true; more;) {
 				deliver();
+				if (on_read)
+					on_read();
 				late_deadline dead(loop_, options_.dead_after);
 				try {
 					more = co_await fill(dead.token());
@@ -249,8 +266,11 @@ class Connection {
 	task::task<void> writer() {
 		try {
 			for (;;) {
-				if (sending_.empty())
+				if (sending_.empty()) {
+					if (out_.empty() && on_drained && !closing_)
+						on_drained();
 					sending_.swap(out_);
+				}
 				if (!sending_.empty()) {  // stuck: no write progress for dead_after
 					late_deadline stuck(loop_, options_.dead_after);
 					co_await flush(stuck.token(), true);

@@ -40,19 +40,26 @@ this node's own, an unpinned one or none is refused before any hello or frame. P
 
 OpenSSL runs on the non-blocking socket (`SSL_set_fd`); readiness comes from `await_asio` on
 `async_wait`. `SSL_MODE_RELEASE_BUFFERS` frees the record buffers while idle, and the read buffer
-grows only by what arrived, so an idle connection holds neither.
+grows only by what arrived, so an idle connection holds neither. OpenSSL writes with plain
+`write()`, so where `SO_NOSIGPIPE` is missing (Linux) the host ignores `SIGPIPE`.
 
 A frame is a 4-byte little-endian length and its bytes. The reader hands each frame to the
 connection's handler synchronously, viewing the connection's own buffer, and never waits on a
 shared budget. A zero-length frame is the keepalive: a connection that sent nothing for
 `keepalive` (1 s) sends one, once per connection, whatever groups use it. A connection that
-received nothing for `dead_after` (5 s) ends `dead`; one that cannot write for as long ends
-`failed`.
+received nothing for `dead_after` (5 s) ends `dead`; one whose writes make no progress for as
+long ends `failed`. The stuck-write deadline restarts at every write that makes progress, so a
+peer reading steadily but slower than the queue drains is not stuck.
 
 `close()` drains: the frames queued so far, then TLS `close_notify`. A peer that reads
 `close_notify` answers the same way, and both ends finish `closed`. An end that stops without
 `close_notify` (`abort()`, a crash) leaves the peer `failed`, never `closed`, so a truncated
 stream is never taken for a complete one.
+
+An end (`abort()`, a failure) shuts the socket down and cancels its waits; the fd closes only
+when `run()` returns, or with the connection. Until then the number stays this socket's, so no
+socket opened elsewhere can take it while the reader or writer still holds it, and no SSL call
+follows the end. No frame reaches the handler after it either.
 
 ## The hello, DTHL0002
 
@@ -85,7 +92,7 @@ and handshakes against the dialed node's pin. An accept handshakes against every
 Two nodes may dial each other at once. The hellos settle it before any frame:
 
 1. A dial's hello counts from the moment it is sent. Before that, a dial that finds a link
-   already established gives up quietly.
+   already established gives up quietly: its connection is aborted and released.
 2. An acceptor refuses a hello for a lane it holds undrained.
 3. When its own dial's hello is out, the dial of the lower node wins: the higher node accepts
    the lower one's dial, and the lower node refuses the higher one's. Both ends reach the same
@@ -94,7 +101,22 @@ Two nodes may dial each other at once. The hellos settle it before any frame:
    reads an accepting hello, and after the acceptor sends one.
 
 A draining connection does not count: once `close()` starts, or the peer's `close_notify`
-arrives, a new connection of the lane may be dialed or accepted while the old one finishes.
+arrives, a new connection of the lane may be dialed or accepted while the old one finishes. The
+peer sees the drain only when it reads the `close_notify`, behind the queued frames; until then it
+refuses the retiring end's redial, and the caller redials.
+
+### Before authentication
+
+An incoming connection is unauthenticated until its TLS handshake passes the pins, so `Links`
+bounds those: at most `handshakes` (4) at once, and at most `handshakes_per_source` (2) from one
+address, since a node dials each lane once at a time. A newcomer replaces the oldest instead of
+being refused: the source's oldest when the source is at its cap, else the pool's oldest when the
+pool is full. A peer holding idle connections from one address keeps 2 slots and cannot lock a
+real dialer out. An attacker with many addresses can still delay links: a real handshake is
+dropped when 4 newer connections arrive before it completes, so the attacker must keep opening
+connections faster than a handshake takes (milliseconds) for as long as it delays. Each of its
+connections holds a slot for at most the `handshake` deadline (5 s), and a dial that arrives once
+the flood stops replaces what is left of it.
 
 ## Checks
 
@@ -104,7 +126,10 @@ arrives, a new connection of the lane may be dialed or accepted while the old on
 | Node identity | `connection_test` `authenticate`, `wrong_node`, `unpinned`, `no_certificate`, `pins`; mutants `pin-any-node`, `pin-self`, `pin-unpinned` |
 | DTHL0002 | `node_hello_test`; `fuzz_decoders` case 9 |
 | Frames, keepalive, dead peer, close | `connection_test` `frames`, `keepalive`, `dead_peer`, `graceful_close`, `abort_truncates`; mutants `no-keepalive`, `close-drops-queue`, `no-close-notify` |
+| The fd kept until `run()` returns, no SSL call after the end | `connection_test` `fd_reuse_reader`, `fd_reuse_writer`; mutants `fail-closes-fd`, `ssl-after-end` |
+| Write progress restarts the stuck deadline | `connection_test` `slow_reader`; mutant `stuck-spans-flush` |
 | Dial, tie-break, draining, lookup, two loops | `links_test`; mutants `refuse-when-offered`, `accept-when-offered`, `draining-counts`, `lookup-no-wake`; `threads` under TSan |
+| A given-up dial released; the pre-authentication bounds | `links_test` `abandoned_dial`, `flood`; mutants `abandon-keeps-dial`, `refuse-newest`, `no-source-cap` |
 
 Mutants are commits written by `test/transport/mutant_commit.py`; the plain test run at one must
 fail.

@@ -700,17 +700,21 @@ struct Node {
 		const auto k = host.transport->loop_of_group(g);
 		return host.loops[k]->at([&] { return per[k]->driver->state(g); });
 	}
-	// Runs make(driver)'s task on the group's loop: false on any error or after `limit`.
-	template <class F> bool call(GroupId g, F make, std::chrono::milliseconds limit = 5s) {
+	// Runs make(driver)'s task on the group's loop: its error, a timeout's after `limit`, or null.
+	template <class F> std::exception_ptr attempt(GroupId g, F make, std::chrono::milliseconds limit = 5s) {
 		const auto k = host.transport->loop_of_group(g);
 		auto *driver = per[k]->driver.get();
-		auto done = std::make_shared<std::promise<bool>>();
+		auto done = std::make_shared<std::promise<std::exception_ptr>>();
 		auto result = done->get_future();
 		host.post(k, [=, this] {
-			task::spawn(task::scheduler_ref::of(host.loops[k]->scheduler), make(driver), [done](std::exception_ptr e) { done->set_value(!e); });
+			task::spawn(task::scheduler_ref::of(host.loops[k]->scheduler), make(driver), [done](std::exception_ptr e) { done->set_value(e); });
 		});
-		return result.wait_for(limit) == std::future_status::ready && result.get();
+		if (result.wait_for(limit) != std::future_status::ready)
+			return std::make_exception_ptr(std::runtime_error("timed out"));
+		return result.get();
 	}
+	// Runs make(driver)'s task on the group's loop: false on any error or after `limit`.
+	template <class F> bool call(GroupId g, F make, std::chrono::milliseconds limit = 5s) { return !attempt(g, std::move(make), limit); }
 	bool propose(GroupId g, std::string command) {
 		return call(g, [=](Driver<GroupSink> *d) { return proposing(d, g, command); });
 	}
@@ -894,10 +898,25 @@ bool add_voter_4(Cluster &c, NodeId leader, GroupId g, const std::string &seen, 
 						   (unsigned long long)unopened),
 			   false;
 	}
+	// D3 (c) refuses the promotion as NotReady until the leader hears 4 matched its commit index,
+	// which can trail 4 applying `seen` (the learner's own entry commits after it): retry only that.
 	step(std::string(name) + ": incarnation 4 promoted");
-	if (!c.nodes[leader]->call(g, [g, m = promoted(c.membership(leader, g), 4)](Driver<GroupSink> *d) { return changing(d, g, m); }, 10s))
-		return std::printf("%s: promoting 4 did not commit\n", name), false;
-	return true;
+	const auto start = steady::now();
+	for (int not_ready = 0;; ++not_ready) {
+		auto e = c.nodes[leader]->attempt(g, [g, m = promoted(c.membership(leader, g), 4)](Driver<GroupSink> *d) { return changing(d, g, m); }, 10s);
+		if (!e)
+			return std::printf("%s: 4 promoted after %d NotReady refusals\n", name, not_ready), true;
+		int why = -1;
+		try {
+			std::rethrow_exception(e);
+		} catch (const rejected &r) {
+			why = int(r.reason);
+		} catch (...) {
+		}
+		if (why != int(RejectReason::NotReady) || ms_since(start) >= 10'000)
+			return std::printf("%s: promoting 4 did not commit (reject reason %d, -1 for none; %d NotReady before it)\n", name, why, not_ready), false;
+		std::this_thread::sleep_for(10ms);
+	}
 }
 
 // The sum of a counter over a host's loops.

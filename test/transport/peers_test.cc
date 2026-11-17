@@ -1194,16 +1194,12 @@ asio::awaitable<void> fetch_failures(asio::io_context &io, const Certificates &c
 	std::printf("  frozen peer: fetch failed after %lld ms (deadline 500 ms)\n", waited);
 	CHECK(cluster.frozen && stalled->error == std::errc::timed_out && !stalled->bytes && waited >= 500);
 	CHECK(cluster.peers[0]->occupancy().fetches == 1); // the failed fetch keeps its slot until its reply ends
+	if (const char *env = std::getenv("PEERS_THAW_LAG_MS")) { // the peer stays hung this much longer
+		const auto hung = std::chrono::milliseconds(std::atoi(env));
+		(void)co_await cluster.until([&] { return Clock::now() - stalled->answered >= hung; }, hung + 1s);
+	}
 	cluster.frozen = false;
-	std::fprintf(stderr, "  frozen: failed at %lld ms, %zu connections, %llu admitted (was %llu), %llu reconnects, %zu fetches\n",
-				 waited, cluster.connections(0), (unsigned long long)cluster.peers[0]->stats().admitted,
-				 (unsigned long long)admitted, (unsigned long long)cluster.peers[0]->stats().reconnects,
-				 cluster.peers[0]->occupancy().fetches);
-	const auto thawed = Clock::now();
 	CHECK(co_await cluster.until([&] { return cluster.peers[0]->occupancy().fetches == 0; }, 3s));
-	std::fprintf(stderr, "  drain: %lld ms after the thaw, %zu connections, %llu admitted (was %llu), %llu reconnects\n",
-				 ms(Clock::now() - thawed), cluster.connections(0), (unsigned long long)cluster.peers[0]->stats().admitted,
-				 (unsigned long long)admitted, (unsigned long long)cluster.peers[0]->stats().reconnects);
 	if (const char *env = std::getenv("PEERS_RETRY_LAG_MS"))
 		lag = std::chrono::milliseconds(std::atoi(env));
 	auto retried = fetch(cluster, 0, 2, "history/table");

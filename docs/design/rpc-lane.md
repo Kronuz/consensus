@@ -103,9 +103,10 @@ to fuzz.
 
 The largest frame, 65,584 bytes, fits Bulk's existing bound of `maximum_transfer_bytes`, 65,688
 (`snapshot_transfer.h:37`). `Error` codes 1-6 are the lane's: `unknown_method`, `overloaded`,
-`deadline_exceeded`, `cancelled`, `message_size` and `handler_failed`. Codes 7-255 are reserved.
-Codes of 256 and above are the method's and reach the caller unchanged. `Cancel` codes are
-`cancelled`, `deadline_exceeded`, `message_size` and `source_failed`. Outcomes that never travel
+`deadline_exceeded`, `cancelled`, `message_size` and `handler_failed`. Code 7 is `source_failed`,
+which only `Cancel` carries, and codes 8-255 are reserved. Codes of 256 and above are the method's
+and reach the caller unchanged. `Cancel` codes are `cancelled`, `deadline_exceeded`,
+`message_size` and `source_failed` (7), from the same space as `Error`'s. Outcomes that never travel
 are `not_processed`, `connection_aborted`, `timed_out`, `not_connected` and
 `protocol_not_supported`. End is a flag rather than a kind, so a one-frame call stays one frame.
 

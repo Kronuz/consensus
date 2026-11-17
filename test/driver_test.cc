@@ -139,7 +139,10 @@ struct Loop {
 	// Completes every held primitive, and what they lead to.
 	void release() {
 		run();
-		while (held.held()) { held.complete(held.tickets().front()); run(); }
+		for (int n = 0; held.held(); ++n) {
+			if (n == 100000) { check(false, "held IO never runs out"); std::exit(1); }
+			held.complete(held.tickets().front()); run();
+		}
 	}
 	// Starts `work` and runs the loop with no clock advance.
 	template <class T> struct Started {
@@ -187,6 +190,7 @@ struct Loop {
 		driver->open(g, options({1}));
 		std::exception_ptr error;
 		check(settle(driver->create(g, j::Identity{'L', static_cast<char>(g)}), error) && !error, "create");
+		apply(g);
 	}
 };
 
@@ -248,6 +252,7 @@ void lone_voter() {
 // D8, row by row, on a lone voter.
 void rows() {
 	constexpr GroupId g = 21;
+	std::cerr << " rows: not admitted\n";
 	{  // a call not yet admitted: unlinked, never submitted
 		jt::Disk disk; Loop loop(disk);
 		loop.driver->open(g, options({1}));
@@ -263,6 +268,7 @@ void rows() {
 		loop.apply(g);
 		check(!committed_command(loop.sink, g, "never") && committed_command(loop.sink, g, "later"), "the cancelled call was never submitted");
 	}
+	std::cerr << " rows: staged\n";
 	{  // accepted by Core, staged, then cancelled: the record is still written and commits
 		jt::Disk disk; Loop loop(disk, true);
 		loop.lone(g);
@@ -274,6 +280,7 @@ void rows() {
 		loop.release(); loop.apply(g);
 		check(committed_command(loop.sink, g, "staged"), "the cancelled proposal's record is written and commits");
 	}
+	std::cerr << " rows: committed and read\n";
 	{  // committed: unlinked on cancel; read: unlinked on cancel while awaiting the apply
 		jt::Disk disk; Loop loop(disk);
 		loop.lone(g);
@@ -288,6 +295,7 @@ void rows() {
 		check(loop.settle(loop.driver->committed(g, *placed), error) && !error, "the entry is unaffected");
 		check(loop.settle(loop.driver->committed(g, Placement{placed->term + 1, placed->index}), error) && is<superseded>(error), "another term at the index is superseded");
 	}
+	std::cerr << " rows: transfer and repair\n";
 	{  // transfer_leadership on a lone voter is refused by Core; repair completes at RepairCompleted
 		jt::Disk disk; Loop loop(disk);
 		loop.lone(g);
@@ -300,6 +308,7 @@ void rows() {
 		check(loop.settle(loop.driver->repair(g, LogBoundary{placed->index, placed->term}), repaired, error) && !error && repaired, "repair completes at RepairCompleted");
 		check(repaired && repaired->boundary.index == placed->index && repaired->epoch == 1, "at its boundary, in a new epoch");
 	}
+	std::cerr << " rows: membership\n";
 	{  // change_membership is a proposal: it completes at ProposalPlaced
 		jt::Disk disk; Loop loop(disk);
 		loop.lone(g);
@@ -331,7 +340,8 @@ void checkpoints() {
 		loop.apply(g);
 		std::optional<CheckpointPublished> published;
 		Capture capture{std::string(100000, 'x'), 0, placed->index, placed->term};
-		check(loop.settle(loop.driver->checkpoint(g, 1 << 20, capture), published, error) && !error && published, "checkpoint completes at CheckpointPublished: " + what(error));
+		const bool done = loop.settle(loop.driver->checkpoint(g, 1 << 20, capture), published, error);
+		check(done && !error && published, "checkpoint completes at CheckpointPublished: done " + std::to_string(done) + ", " + what(error));
 		check(published && published->through == placed->index, "through the capture's boundary");
 		check(loop.sink.published.empty(), "the Sink hears nothing a caller awaited");
 	}

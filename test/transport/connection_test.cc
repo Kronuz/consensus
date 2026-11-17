@@ -518,9 +518,51 @@ class stall_watch {
 	}};
 };
 
+// The longest a socket's send queue held bytes without draining, sampled every 2 ms from its
+// own thread (on a dup of the fd, so the number stays this socket's): a host whose network stack
+// withholds the bytes, as macOS does to a background process's sockets, shows here.
+class drain_watch {
+  public:
+	explicit drain_watch(int fd) : fd_(::dup(fd)) {}
+	~drain_watch() {
+		stop_ = true;
+		thread_.join();
+		::close(fd_);
+	}
+	long long worst_ms() const { return worst_; }
+
+  private:
+	long queued() const {
+		int n = -1;
+#if defined(SIOCOUTQ)
+		(void)::ioctl(fd_, SIOCOUTQ, &n);
+#elif defined(SO_NWRITE)
+		socklen_t size = sizeof n;
+		(void)::getsockopt(fd_, SOL_SOCKET, SO_NWRITE, &n, &size);
+#elif defined(FIONWRITE)
+		(void)::ioctl(fd_, FIONWRITE, &n);
+#endif
+		return n;
+	}
+	int fd_;
+	std::atomic<bool> stop_{false};
+	std::atomic<long long> worst_{0};
+	std::thread thread_{[this] {
+		auto drained = std::chrono::steady_clock::now();
+		for (long last = 0; !stop_; std::this_thread::sleep_for(2ms)) {
+			const long now = queued();
+			const auto at = std::chrono::steady_clock::now();
+			if (now <= 0 || now < last)
+				drained = at;
+			last = now;
+			worst_ = std::max<long long>(worst_, std::chrono::duration_cast<std::chrono::milliseconds>(at - drained).count());
+		}
+	}};
+};
+
 // A reader on its own loop thread whose handler holds that loop `per_frame` for each frame.
-// With `coarse`, the kernel reports the writer's socket writable only after 1 MiB drained (its
-// send buffer 1 MiB, its low-water mark too where settable) and the reader's buffer is 64 KiB.
+// With `coarse`, the kernel reports the writer's socket writable only once 1.5 MiB drained (its
+// send buffer 1.5 MiB, its low-water mark too where settable) and the reader's buffer is 512 KiB.
 struct reader_load {
 	const char *name;
 	int frames;
@@ -530,7 +572,7 @@ struct reader_load {
 };
 struct reader_run {
 	int got;
-	long long ms, stalled_ms;
+	long long ms, stalled_ms, held_ms;
 	ConnectionEnd dialer, acceptor;
 	std::uint64_t keepalives, drained_expiries;
 	bool coarse_wakes;  // the writer's low-water mark took: it wakes only at an empty queue
@@ -546,7 +588,7 @@ reader_run read_slowly_once(const reader_load &load) {
 	tcp::socket a(l1.io), b(l2.io);
 	bool coarse_wakes = false;
 	if (load.coarse) {
-		const int buffer = 1 << 20, reading = 64 * 1024;
+		const int buffer = 3 << 19, reading = 512 * 1024;
 		a.open(tcp::v4());
 		::setsockopt(a.native_handle(), SOL_SOCKET, SO_SNDBUF, &buffer, sizeof buffer);
 		(void)::setsockopt(a.native_handle(), SOL_SOCKET, SO_SNDLOWAT, &buffer, sizeof buffer);  // Linux refuses it
@@ -609,6 +651,7 @@ reader_run read_slowly_once(const reader_load &load) {
 		assert(!e);
 		dialer_end = v;
 	});
+	std::optional<drain_watch> held(std::in_place, fd_of(dialer));
 	const auto start = std::chrono::steady_clock::now();
 	l1.call([&] {
 		for (int i = 0; i != count; ++i)
@@ -617,29 +660,36 @@ reader_run read_slowly_once(const reader_load &load) {
 	});
 	assert(l1.until([&] { return dialer_end && acceptor_done; }, 60s));
 	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+	const auto held_ms = held->worst_ms();
+	held.reset();
 	stop = true;
 	t2.join();
-	return {got, ms, watch.worst_ms(), *dialer_end, *acceptor_end, acceptor.keepalives_sent(), dialer.drained_expiries(),
-			coarse_wakes};
+	return {got, ms, watch.worst_ms(), held_ms, *dialer_end, *acceptor_end, acceptor.keepalives_sent(),
+			dialer.drained_expiries(), coarse_wakes};
 }
 // Both ends share this process, so a host stop silences the reader's keepalives too, which no
-// two hosts do: a failed run the host stalled for a third of dead_after or more runs again, at
-// most twice. Only a whole run passes, and any failure without such a stall fails at once.
+// two hosts do, and the host's network stack may withhold the bytes (macOS throttles a
+// background process's sockets): a failed run the host stalled for a third of dead_after, or a
+// coarse writer's run that ended stuck after its queue went half of dead_after without draining
+// (it writes only after a wait, so the sampled queue shows every drain), runs again, at most
+// twice. Only a whole run passes, and any other failure fails at once.
 void read_slowly(const reader_load &load) {
 	for (int attempt = 1;; ++attempt) {
 		const auto r = read_slowly_once(load);
 		std::printf("%s: %d of %d frames read in %lld ms against a %lld ms dead_after; dialer %d, acceptor %d; "
 					"%llu keepalives from the reader; %llu write waits expired with the queue drained%s; "
-					"the process stalled %lld ms at most\n",
+					"the process stalled %lld ms at most; the queue held %lld ms at most without draining\n",
 					load.name, r.got, load.frames, r.ms, (long long)load.dead_after.count(), int(r.dialer),
 					int(r.acceptor), (unsigned long long)r.keepalives, (unsigned long long)r.drained_expiries,
-					r.coarse_wakes ? " (wakes at an empty queue)" : "", r.stalled_ms);
+					r.coarse_wakes ? " (wakes at an empty queue)" : "", r.stalled_ms, r.held_ms);
 		if (r.got == load.frames && r.dialer == ConnectionEnd::closed && r.acceptor == ConnectionEnd::closed) {
 			assert(r.ms >= load.frames * load.per_frame.count());
 			assert(!r.coarse_wakes || r.drained_expiries > 0);  // the case reached the rule it tests
 			return;
 		}
-		assert(r.stalled_ms >= load.dead_after.count() / 3 && attempt < 3);
+		const bool stalled = r.stalled_ms >= load.dead_after.count() / 3;
+		const bool held = load.coarse && r.dialer == ConnectionEnd::failed && r.held_ms >= load.dead_after.count() / 2;
+		assert((stalled || held) && attempt < 3);
 	}
 }
 // N2: a peer reading steadily, slower than the queue drains, is not stuck: 20 ms per 512 KiB
@@ -650,10 +700,11 @@ void slow_reader() { read_slowly({"slow_reader", 64, 512 * 1024, 20ms, 300ms}); 
 // 800 ms apart, against a 600 ms dead_after.
 void busy_reader() { read_slowly({"busy_reader", 6, 64 * 1024, 400ms, 600ms}); }
 // The socket's queue draining keeps a write wait alive: a writer the kernel wakes only at an
-// empty 1 MiB queue (the low-water mark where settable; Linux wakes at a third free) to a reader
-// of 64 KiB every 125 ms waits about 2 s, twice its 1 s dead_after. The reader drains several
-// frames in every dead_after, even on a slow host whose timers coalesce 100 ms.
-void coarse_writer() { read_slowly({"coarse_writer", 40, 64 * 1024, 125ms, 1000ms, true}); }
+// empty 1.5 MiB queue (the low-water mark where settable; Linux wakes at a third free) to a
+// reader of 64 KiB every 125 ms or slower waits 3 s or more, against a 2 s dead_after. The queue
+// drains about once a frame: it went 133 ms without draining at most here, 643 ms under
+// background QoS, whose sockets macOS throttles.
+void coarse_writer() { read_slowly({"coarse_writer", 48, 64 * 1024, 125ms, 2000ms, true}); }
 
 // A loopback relay between a dialer (up) and its acceptor (down): down to up always flows, up
 // to down stops once `forward_up` goes false, so the acceptor still talks but never reads again.

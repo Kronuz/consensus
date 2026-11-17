@@ -15,6 +15,7 @@
 //            the receiver's counters; a refused group opens once stored; a store opens it again
 //   joiner   frame_admission: a joiner (empty membership) catches up as a learner and is promoted
 //   lagging  frame_admission: a follower that missed a voter's addition catches up from it
+//   leftover a read that fails partway hands its frames over under its own connection
 //   relayout a host restarted with another L serves every group from its new loop
 // A timing case the host stalled (a 250 ms oversleep) runs again, at most twice. Each step prints
 // as it starts; a case still running after 100 s prints its step, which loops stopped turning
@@ -694,11 +695,12 @@ struct Node {
 				o.admission = admission;
 				o.scheduling = WorkerLimits{16, 128};
 				driver->open(g, std::move(o));
-				host.transport->store(g, host.node, Host::test_open());
 				auto opening = journal->status(g) == j::GroupStatus::stored ? driver->recover(g, [](j::ArtifactReader &) {})
 																			: driver->create(g, j::Identity{'G', char('0' + host.node)});
-				task::spawn(task::scheduler_ref::of(host.loops[k]->scheduler), std::move(opening), [&opened](std::exception_ptr e) {
+				// stored once member_of answers for it (host-transport.md, Identity)
+				task::spawn(task::scheduler_ref::of(host.loops[k]->scheduler), std::move(opening), [this, g, &opened](std::exception_ptr e) {
 					assert(!e && "create or recover");
+					host.transport->store(g, host.node, Host::test_open());
 					opened.set_value();
 				});
 			});
@@ -1063,6 +1065,15 @@ void identity() {
 	two.stores({group}, differing([](GroupOpen &o) { o.group[15] = 'X'; }));
 	two.stores({epoch}, differing([](GroupOpen &o) { o.epoch[8] = 'X'; }));
 	two.stores({profile}, differing([](GroupOpen &o) { o.profile[31] ^= 1; }));
+	int zeros = 0;  // a zero cluster, group or epoch is refused at store
+	for (auto zero : {+[](GroupOpen &o) { o.cluster = {}; }, +[](GroupOpen &o) { o.group = {}; }, +[](GroupOpen &o) { o.epoch = {}; }})
+		try {
+			two.stores({late}, differing(zero));
+		} catch (const std::invalid_argument &) {
+			++zeros;
+		}
+	std::printf("identity: store refused %d of 3 opens with a zero cluster, group or epoch\n", zeros);
+	assert(zeros == 3);
 	std::mutex mutex;
 	std::map<std::pair<GroupId, std::string>, std::uint64_t> got;  // by group and payload
 	for (std::uint32_t k = 0; k != L; ++k)
@@ -1249,11 +1260,109 @@ void refill() {
 				after_restart ? "yes" : "NO (credit leaked)");
 	assert(refused >= 8 && after_refusals && after_restart);  // 8 frames: 5 windows
 }
+
+// leftover: frames a read handed over before it failed (an oversized length) leave under their
+// own connection, never under the next read's: node 1 never opens g, so g's frame is unopened.
+void leftover() {
+	Host two(2, 1), three(3, 1);
+	two.open(addresses({&three}));
+	three.open(addresses({&two}));
+	const GroupId g = 1001;
+	two.stores({g});
+	three.stores({g});
+	std::mutex mutex;
+	std::map<NodeId, std::uint64_t> by_source;
+	std::vector<std::string> seen;
+	two.transport->on_deliver(0, [&](const Received &r) {
+		std::lock_guard hold(mutex);
+		++by_source[r.route.source];
+		if (r.route.source == 1)
+			seen.push_back("source 1 over node " + std::to_string(r.node) + ": " + r.payload);
+		return true;
+	});
+	auto delivered = [&](NodeId source) {
+		std::lock_guard hold(mutex);
+		return by_source[source];
+	};
+	two.start();
+	three.start();
+	auto honest = [&] {
+		three.post(0, [&three, g] { three.transport->send(0, LinkLane::Control, FrameKind::control, {g, 3, 2}, 2, "honest"); });
+	};
+	step("leftover: host 3 opens g on host 2");
+	warm(honest, [&] { return delivered(3) > 0; });
+
+	step("leftover: node 1 connects over raw Links and never opens g");
+	Loop attacker;
+	auto tls = context(names[1]);
+	std::map<NodeId, Fingerprint> pins;
+	for (NodeId n = 1; n <= 4; ++n)
+		pins[n] = pin_of(names[n]);
+	Identity cluster{};
+	cluster.fill('K');
+	LinkOptions options;
+	options.connection.maximum_frame = 8 << 20;
+	auto links = std::make_unique<Links>(attacker.io.get_executor(), task::scheduler_ref::of(attacker.scheduler), tls,
+										 NodePins(1, pins, tls->native_handle()), cluster,
+										 std::map<NodeId, PeerAddress>{{2, {"127.0.0.1", two.port()}}}, options);
+	std::atomic<const Link *> link{nullptr};
+	std::atomic<bool> ended{false};
+	links->on_established = [&](const Link &l) { link = &l; };
+	links->on_ended = [&](const Link &) { ended = true; };
+	links->on_frame = [](const Link &, std::string_view) {};
+	attacker.start();
+	attacker.at([&] {
+		task::spawn(task::scheduler_ref::of(attacker.scheduler), links->dial(2, LinkLane::Control),
+					[](std::exception_ptr, std::optional<bool>) {});
+	});
+	const bool up = until([&] { return link.load() != nullptr; }, 10'000);
+	std::printf("leftover: node 1's connection to host 2 is up: %s\n", up ? "yes" : "NO");
+	assert(up);
+
+	step("leftover: node 1 sends a frame for g, then one over host 2's bound");
+	auto frame = [&](std::string payload) {
+		std::string f(1, char(FrameKind::control));
+		j::put64(f, g);
+		j::put64(f, 1);
+		j::put64(f, 2);
+		return f + payload;
+	};
+	const auto evil = frame("evil"), big = frame(std::string(5 << 20, 'B'));
+	attacker.at([&] {
+		link.load()->connection->send(evil);
+		link.load()->connection->send(big);
+	});
+	const bool failed = until([&] { return ended.load(); }, 10'000);
+	std::printf("leftover: host 2 ended node 1's connection: %s\n", failed ? "yes" : "NO");
+
+	step("leftover: host 3 sends 20 frames");
+	for (int i = 0; i != 20; ++i) {
+		honest();
+		std::this_thread::sleep_for(20ms);
+	}
+	std::this_thread::sleep_for(500ms);
+	std::uint64_t unopened = 0, received = 0;
+	for (std::uint32_t k = 0; k != two.transport->loops(); ++k)
+		unopened += two.transport->stats(k).unopened, received += two.transport->stats(k).received;
+	{
+		std::lock_guard hold(mutex);
+		for (auto &s : seen)
+			std::printf("leftover: host 2 delivered %s\n", s.c_str());
+	}
+	const auto bad = delivered(1);
+	std::printf("leftover: host 2 received %llu frames, refused %llu unopened; delivered from incarnation 1 (never opened g): %llu; from 3: %llu\n",
+				(unsigned long long)received, (unsigned long long)unopened, (unsigned long long)bad, (unsigned long long)delivered(3));
+	std::printf("leftover: %s\n", bad ? "node 1's frame was admitted under host 3's open" : "no frame of node 1 admitted");
+	attacker.at([&] { links->stop(); });
+	const bool stopped = until([&] { return attacker.at([&] { return links->drained(); }); }, 10'000);
+	attacker.at([&] { links.reset(); });
+	assert(failed && !bad && unopened >= 1 && delivered(3) > 0 && stopped);
+}
 } // namespace
 
 int main(int argc, char **argv) {
 	if (argc != 3) {
-		std::fprintf(stderr, "usage: %s <fixture dir> threads|credit|reader|upload|driver|refill|identity|joiner|lagging|relayout\n", argv[0]);
+		std::fprintf(stderr, "usage: %s <fixture dir> threads|credit|reader|upload|driver|refill|identity|joiner|lagging|leftover|relayout\n", argv[0]);
 		return 2;
 	}
 #ifndef SO_NOSIGPIPE
@@ -1282,6 +1391,8 @@ int main(int argc, char **argv) {
 		refill();
 	else if (which == "identity")
 		identity();
+	else if (which == "leftover")
+		leftover();
 	else if (which == "joiner")
 		joiner();
 	else if (which == "lagging")

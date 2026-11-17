@@ -100,6 +100,12 @@ MUTANTS = {
     "closed-ignored": (T + "host_transport.h", "\t\t\tif (at != lane.opened.end() && at->first == group)\n\t\t\t\tlane.opened.erase(at);\n\t\t\t++here.stats.closed;",
                        "\t\t\t++here.stats.closed;"),
     "open-once": (T + "host_transport.h", "at->first == group && at->second == g.open->serial)\n\t\t\treturn 0;", "at->first == group)\n\t\t\treturn 0;"),
+    # security review S1: a read that fails after handing frames over leaves them for the next read
+    "read-fails-unflushed": (T + "connection.h",
+                             "\t\t\t\tif (on_read)\n\t\t\t\t\ton_read();  // the frames this read handed over, even when it then failed\n\t\t\t\tif (failed)\n\t\t\t\t\tstd::rethrow_exception(failed);",
+                             "\t\t\t\tif (failed)\n\t\t\t\t\tstd::rethrow_exception(failed);\n\t\t\t\tif (on_read)\n\t\t\t\t\ton_read();"),
+    # security review N2: a zero identity stored
+    "store-zero": (T + "host_transport.h", "if (open.cluster == Identity{} || open.group == Identity{} || open.epoch == Identity{})", "if (false)"),
     # the control: Detent:73e96d6's rule, only a sender that votes in the receiver's membership
     "voters-only": (T + "host_transport.h", "source && source->node != node)",
                     "!source || source->role == kronuz::consensus::MemberRole::Learner || source->node != node)"),

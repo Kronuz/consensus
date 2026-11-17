@@ -75,7 +75,8 @@ its own buffer fills, and the next wait ends the connection. The cost is one `io
 stream is never taken for a complete one.
 
 A sender with queues of its own (the host transport) hooks two moments: `on_read`, after each
-read's frames went to the handler, and `on_drained`, when the queue is out and the writer would
+read's frames went to the handler (also when the read then fails, as on an oversized length,
+so no frame it handed over is left waiting for another connection's read), and `on_drained`, when the queue is out and the writer would
 wait, so it hands over a little at a time and keeps the order of what waits. `rehome()` moves
 a connection to another loop between its handshake and its hellos.
 

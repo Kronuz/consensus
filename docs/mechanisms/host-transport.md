@@ -43,7 +43,8 @@ carries entries is data, every other message (votes, pre-votes, heartbeats, resp
 
 The reader hands each frame to the transport synchronously. A credit frame applies on the
 spot. A message frame joins the batch of its group's loop for this read; once the read's frames
-are out (`Connection::on_read`), each non-empty batch goes to its loop in one post, and the
+are out (`Connection::on_read`, which also follows a read that fails partway, so a batch always
+leaves under the connection its frames came on), each non-empty batch goes to its loop in one post, and the
 reader's own loop's batch is delivered in place. The loop hands each frame to the host's
 `Deliver`, which returns false when the group cannot take it now: the frame is dropped and
 counted (Raft resends), exactly what D10's `reader_test` prototype assumes. The reader never
@@ -59,7 +60,9 @@ A connection authenticates a peer node, not a member of one group (async-drivers
 what Peers' per-group hello checked moves to the group-open exchange, and each frame is
 checked against what the receiving host stores. The host tells the transport, on the group's
 loop, which groups it stores: `store(group, incarnation, open)` and `forget(group)`. A group
-not stored sends nothing.
+not stored queues nothing; frames already queued on a connection when it is forgotten still go.
+A host stores a group once `member_of` answers for it: before that, every source is unnamed and
+admitted. `store` refuses a zero cluster, group or epoch, as a hello did.
 
 **The group-open exchange.** Before a group's first frame on a connection, the sender sends
 the group's open: its cluster, group identity, epoch and profile fingerprint, which every

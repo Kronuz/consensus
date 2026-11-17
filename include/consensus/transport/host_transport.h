@@ -171,16 +171,21 @@ class HostTransport {
 	void on_deliver(std::uint32_t loop, Deliver deliver) { loops_.at(loop).deliver = std::move(deliver); }
 	// On the group's loop: the host stores `group` as its incarnation `incarnation`. A peer's
 	// frames for it are admitted on a connection once that peer's open matches `open`; storing
-	// again replaces both and opens the group again on every connection.
+	// again replaces both and opens the group again on every connection. A zero cluster, group
+	// or epoch is refused, as a hello refused it.
 	void store(GroupId group, kronuz::consensus::NodeId incarnation, const GroupOpen &open) {
 		if (!incarnation)
 			throw std::invalid_argument("host transport: incarnation 0");
+		using kronuz::consensus::Identity;
+		if (open.cluster == Identity{} || open.group == Identity{} || open.epoch == Identity{})
+			throw std::invalid_argument("host transport: a zero identity in a group's open");
 		auto &stored = loops_[loop_of_group(group)].groups[group];
 		stored.incarnation = incarnation;
 		stored.open = std::make_shared<const Opening>(Opening{open, ++serial_});
 		stored.opened.clear();
 	}
-	// On the group's loop: the host no longer stores `group`; its frames are refused and not sent.
+	// On the group's loop: the host no longer stores `group`; its frames are refused, and it
+	// queues none (frames already queued on a connection still go).
 	void forget(GroupId group) { loops_[loop_of_group(group)].groups.erase(group); }
 
 	// Accepts on `acceptor`, a socket of loop 0, until stop().

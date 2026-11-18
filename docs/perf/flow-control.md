@@ -43,7 +43,23 @@ leads every group; each run measures after the group commits and a 1 s warm-up.
   the same clock; the stated bound is one data frame, one 64 KiB feed and the kernel's socket
   buffers (`tcp_wmem` and `tcp_rmem` maxima) at the measured data rate.
 
+To reproduce, from a checkout's root (CMakeLists.txt stays as it is: the hook runs at the end of
+`project(consensus)` and defers the target until `consensus::transport` exists):
+
+```sh
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PROJECT_consensus_INCLUDE=$PWD/bench/flow_bench.cmake
+ninja -C build consensus_flow_bench && (cd build && ctest -R consensus_tls_certificates)
+bench/flow_bench_vm.sh a1   # or smoke, a2, a3: the rows below, in the gate VM
+```
+
+The project-named variable is the one the jobs used; the plain `CMAKE_PROJECT_INCLUDE` would also
+run for each dependency's `project()` call and define the target twice.
+
 ## A1: one group's throughput
+
+Each row states committed MB/s and the group's commits per second (commands over the timed
+seconds) at `pipeline = 1` and pipelined side by side.
 
 PENDING
 

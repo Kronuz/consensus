@@ -26,7 +26,7 @@ trap 'exit 143' INT TERM
 for i in $(seq 60); do $VM ssh true 2>/dev/null && break; sleep 5; done
 if [[ $($VM ssh 'cat ~/consensus-flow-build/COMMIT 2>/dev/null || true') != "$commit" ]]; then
 	git archive --prefix=consensus-flow/ HEAD | $VM ssh 'rm -rf ~/consensus-flow && tar -xf - -C ~'
-	$VM ssh 'set -e; cd ~/consensus-flow; cmake -S . -B ~/consensus-flow-build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PROJECT_consensus_INCLUDE=$PWD/bench/flow_bench.cmake >/dev/null
+	$VM ssh 'set -e; [ -f /usr/include/openssl/ssl.h ] || sudo apt-get install -y -q libssl-dev >/dev/null; cd ~/consensus-flow; cmake -S . -B ~/consensus-flow-build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PROJECT_consensus_INCLUDE=$PWD/bench/flow_bench.cmake >/dev/null
 		ninja -C ~/consensus-flow-build consensus_flow_bench | tail -1
 		cd ~/consensus-flow-build && ctest -R consensus_tls_certificates >/dev/null'
 	$VM ssh "echo $commit > ~/consensus-flow-build/COMMIT"

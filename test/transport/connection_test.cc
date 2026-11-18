@@ -533,6 +533,12 @@ class drain_watch {
 	}
 	long long worst_ms() const { return worst_; }
 	long last() const { return last_; }  // the queue at the latest sample, bytes
+	// The longest stretch the queue was empty yet the socket not writable, and the queue, poll
+	// events and SO_ERROR where it peaked: a writer waiting on a socket that never wakes it.
+	long long wedged_ms() const { return wedged_; }
+	long wedge_queue() const { return wedge_queue_; }
+	int wedge_events() const { return wedge_events_; }
+	int wedge_error() const { return wedge_error_; }
 
   private:
 	long queued() const {
@@ -550,15 +556,31 @@ class drain_watch {
 	int fd_;
 	std::atomic<bool> stop_{false};
 	std::atomic<long long> worst_{0};
-	std::atomic<long> last_{0};
+	std::atomic<long> last_{0}, wedge_queue_{0};
+	std::atomic<long long> wedged_{0};
+	std::atomic<int> wedge_events_{0}, wedge_error_{0};
 	std::thread thread_{[this] {
-		auto drained = std::chrono::steady_clock::now();
+		auto drained = std::chrono::steady_clock::now(), wedge = drained;
 		for (long last = 0; !stop_; std::this_thread::sleep_for(2ms)) {
 			const long now = queued();
 			last_ = now;
+			pollfd p{fd_, POLLOUT, 0};
+			const bool writable = ::poll(&p, 1, 0) != 1 || (p.revents & POLLOUT);
+			int error = 0;
+			socklen_t size = sizeof error;
+			(void)::getsockopt(fd_, SOL_SOCKET, SO_ERROR, &error, &size);
 			const auto at = std::chrono::steady_clock::now();
 			if (now <= 0 || now < last)
 				drained = at;
+			if (writable || now < 0 || now > 16 * 1024)
+				wedge = at;
+			else if (const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(at - wedge).count();
+					 ms > wedged_) {
+				wedged_ = ms;
+				wedge_queue_ = now;
+				wedge_events_ = p.revents;
+				wedge_error_ = error;
+			}
 			last = now;
 			worst_ = std::max<long long>(worst_, std::chrono::duration_cast<std::chrono::milliseconds>(at - drained).count());
 		}
@@ -584,21 +606,22 @@ struct reader_run {
 	long queue_left;    // the send queue at the last sample, bytes
 	int sndbuf, lowat;  // the writer's socket's buffer and low-water mark once connected (coarse)
 	reader_load used;   // the load as run: a coarse one is sized from the socket's buffer
+	long long wedged_ms;  // the longest the queue was empty and the socket not writable (drain_watch)
+	long wedge_queue;
+	int wedge_events, wedge_error;
 };
 
 // Forcing knobs: an environment variable reproduces a cause on demand.
 //   READ_SLOWLY_BUILD_MS   the dialer's loop is held this long while the frames are queued, as a
 //                          slow allocator (TSan, a loaded host) holds it
 //   COARSE_WRITER_SNDBUF   the coarse writer's SO_SNDBUF and low-water mark, bytes
-//   COARSE_WRITER_SHRINK   SO_SNDBUF set to this after the low-water mark, so the mark exceeds the buffer
 long long knob(const char *name, long long fallback = 0) {
 	const char *v = std::getenv(name);
 	return v && *v ? std::atoll(v) : fallback;
 }
 
 // Runs the load once. A coarse load is sized from the writer's socket as the kernel left it: the
-// mark must not exceed the buffer (the socket would never be writable), and the reader must take
-// 1.5 dead_after to drain the mark, whatever the platform's buffer came to.
+// reader must take 1.5 dead_after to drain the mark, whatever the platform's buffer came to.
 reader_run read_slowly_once(reader_load load) {
 	stall_watch watch;
 	Loop l1, l2;
@@ -614,8 +637,6 @@ reader_run read_slowly_once(reader_load load) {
 		a.open(tcp::v4());
 		::setsockopt(a.native_handle(), SOL_SOCKET, SO_SNDBUF, &buffer, sizeof buffer);
 		(void)::setsockopt(a.native_handle(), SOL_SOCKET, SO_SNDLOWAT, &buffer, sizeof buffer);  // Linux refuses it
-		if (const int shrink = int(knob("COARSE_WRITER_SHRINK")))
-			::setsockopt(a.native_handle(), SOL_SOCKET, SO_SNDBUF, &shrink, sizeof shrink);
 		::setsockopt(listener.native_handle(), SOL_SOCKET, SO_RCVBUF, &reading, sizeof reading);
 	}
 	a.connect(listener.local_endpoint());
@@ -624,8 +645,6 @@ reader_run read_slowly_once(reader_load load) {
 	if (load.coarse) {
 		socklen_t len = sizeof sndbuf;
 		::getsockopt(a.native_handle(), SOL_SOCKET, SO_SNDBUF, &sndbuf, &len);
-		const int mark = sndbuf - 16 * 1024;
-		(void)::setsockopt(a.native_handle(), SOL_SOCKET, SO_SNDLOWAT, &mark, sizeof mark);  // Linux refuses it
 		len = sizeof lowat;
 		coarse_wakes = ::getsockopt(a.native_handle(), SOL_SOCKET, SO_SNDLOWAT, &lowat, &len) == 0 && lowat >= sndbuf / 2;
 		if (coarse_wakes) {
@@ -699,11 +718,15 @@ reader_run read_slowly_once(reader_load load) {
 	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 	const auto held_ms = held->worst_ms();
 	const auto queue_left = held->last();
+	const auto wedged_ms = held->wedged_ms();
+	const auto wedge_queue = held->wedge_queue();
+	const auto wedge_events = held->wedge_events(), wedge_error = held->wedge_error();
 	held.reset();
 	stop = true;
 	t2.join();
 	return {got, ms, watch.worst_ms(), held_ms, *dialer_end, *acceptor_end, acceptor.keepalives_sent(),
-			dialer.drained_expiries(), coarse_wakes, queue_left, sndbuf, lowat, load};
+			dialer.drained_expiries(), coarse_wakes, queue_left, sndbuf, lowat, load,
+			wedged_ms, wedge_queue, wedge_events, wedge_error};
 }
 // Both ends share this process, so a host stop silences the reader's keepalives too, which no
 // two hosts do, and the host's network stack may withhold the bytes (macOS throttles a
@@ -725,7 +748,12 @@ void read_slowly(const reader_load &load) {
 								   ", " + std::to_string(used.per_frame.count()) + " ms a frame, queue left " +
 								   std::to_string(r.queue_left) + "]").c_str()
 								: "");
-		if (r.got == used.frames && r.dialer == ConnectionEnd::closed && r.acceptor == ConnectionEnd::closed) {
+		const bool whole = r.got == used.frames && r.dialer == ConnectionEnd::closed && r.acceptor == ConnectionEnd::closed;
+		if (used.coarse && (!whole || (r.coarse_wakes && !r.drained_expiries)))  // what a coarse failure leaves to name its cause
+			std::printf("%s: socket buffer %d, low-water mark %d, queue %ld at the last sample; the queue was empty with "
+						"the socket not writable for %lld ms at most (then queue %ld, poll events 0x%x, SO_ERROR %d)\n",
+						used.name, r.sndbuf, r.lowat, r.queue_left, r.wedged_ms, r.wedge_queue, r.wedge_events, r.wedge_error);
+		if (whole) {
 			assert(r.ms >= used.frames * used.per_frame.count());
 			assert(!r.coarse_wakes || r.drained_expiries > 0);  // the case reached the rule it tests
 			return;

@@ -1162,6 +1162,18 @@ void identity() {
 	const bool agreed = until([&] { return send(ok, 1, 2, "agreed"), received(ok, "agreed") > 0; }, 20'000);
 	std::printf("identity: once both store the new epoch, frames arrive: %s\n", agreed ? "yes" : "NO");
 	assert(agreed);
+	step("identity: host 2 stores ok again under a third epoch");
+	two.loops[two.transport->loop_of_group(ok)]->at([&] { two.transport->store(ok, 2, differing([](GroupOpen &o) { o.epoch.fill('Z'); })); });
+	const auto restored = total(two, &HostTransportStats::mismatched);
+	for (int i = 0; i != 20; ++i) {
+		send(ok, 1, 2, "epoch3");
+		std::this_thread::sleep_for(20ms);
+	}
+	const bool closed_again = until([&] { return total(two, &HostTransportStats::mismatched) > restored; }, 20'000);
+	std::this_thread::sleep_for(300ms);
+	std::printf("identity: once host 2 stored another epoch, host 1's open no longer holds: refused %s, delivered %llu of 20\n",
+				closed_again ? "yes" : "NO", (unsigned long long)received(ok, "epoch3"));
+	assert(closed_again && !received(ok, "epoch3"));
 
 	step("identity: host 2 forgets ok");
 	two.loops[two.transport->loop_of_group(ok)]->at([&] { two.transport->forget(ok); });

@@ -106,6 +106,8 @@ MUTANTS = {
     "no-generation-clear": (T + "host_transport.h", "\t\t\tconnection.generation = batch.peer.generation;\n\t\t\tconnection.groups.clear();",
                             "\t\t\tconnection.generation = batch.peer.generation;"),
     "no-current": (T + "host_transport.h", "const bool current = batch.peer.generation == connection.generation;", "const bool current = true;"),
+    # transport-feed-scan review G1: owe's merge keeps only the first record's bytes per group
+    "coalesce-drops-credit": (T + "host_transport.h", "\t\t\t\tv[n - 1].bytes += v[i].bytes;\n", "\t\t\t\t(void)0;\n"),
     # security review S1: a read that fails after handing frames over leaves them for the next read
     "read-fails-unflushed": (T + "connection.h",
                              "\t\t\t\tif (on_read)\n\t\t\t\t\ton_read();  // the frames this read handed over, even when it then failed\n\t\t\t\tif (failed)\n\t\t\t\t\tstd::rethrow_exception(failed);",

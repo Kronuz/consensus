@@ -57,7 +57,7 @@ if search not in s: sys.exit("mutation point not found: " + search)
 open(p, "w").write(s.replace(search, replace, 1))
 PY
 	# shellcheck disable=SC2086
-	${compile/ -I/ -I$dir/include -I} "$root/test/simulation_test.cc" -o "$dir/simulation" 2>"$dir/build.log" || { echo "$name: build failed"; status=1; continue; }
+	${compile/ -I/ -I$dir/include -I} "$root/test/simulation_test.cc" "$root/test/driver_simulation.cc" -o "$dir/simulation" 2>"$dir/build.log" || { echo "$name: build failed"; status=1; continue; }
 	${compile_unit/ -I/ -I$dir/include -I} "$root/test/consensus_test.cc" -o "$dir/unit" 2>>"$dir/build.log" || { echo "$name: unit build failed"; status=1; continue; }
 	${compile_membership/ -I/ -I$dir/include -I} "$root/test/membership_test.cc" -o "$dir/membership" 2>>"$dir/build.log" || { echo "$name: membership build failed"; status=1; continue; }
 	# Each suite on its own, so the report shows whether the randomized harness catches the

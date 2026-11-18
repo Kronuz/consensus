@@ -165,6 +165,17 @@ job is the one that counts.
 The rows before transport-identity (consensus:0d92ef5, jobs 261117-122822-488d1f, -122836-fb319f,
 -122848-92c892) were 131 ns, 216 ns and 15.3 us: identity moved none of them outside its band.
 
+Against main's feed (consensus:edbb162), the same streams in one job, base, branch, branch,
+base, at 3 rounds each (strict, beside 26 light holds, job 261118-002026-757230,
+consensus:303cad1): data, same 1,041, 758, 531 and 747 ns of receiver CPU per frame, hop 1,186,
+936, 660 and 866 ns, so the branch is at or under main at each position; control, same 513, 605,
+429 and 331 ns, about 20-30% over main. The control cost is the group loop's two `GroupTable`
+lookups per frame (`stored` and the connection's opened set), against one `unordered_map` find
+and a short vector scan on main (profile job 261118-001853-9bb0ba). Before the receiver's credit
+became a vector of records (consensus:01e2c06, job 261117-205819-0701eb) the data stream cost
+1,575-1,608 ns against main's 644-647 ns: each batch built a credit table and a sender's record
+per credited group, then freed both.
+
 Beside it, the bare Asio hop with no TLS and no transport (Detent `run.sh hop_cost`, job
 261117-092732-0475d9, exclusive, Detent:d15d063): 793-851 ns per frame posted alone, 21-22 ns in
 batches of 64, and 7.2 us of CPU per batch that wakes an idle loop (2.7 us at 16 frames). D10's

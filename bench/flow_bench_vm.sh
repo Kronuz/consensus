@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs bench/flow_bench.cc's rows in the Linux gate VM, with netem on lo for the round trip
-# (docs/perf/flow-control.md): flow_bench_vm.sh smoke|diag|a1|a2|a3, from a checkout's root.
+# (docs/perf/flow-control.md): flow_bench_vm.sh build|smoke|diag|a1|a2|a3, from a checkout's root.
 # The VM is left as found: a job that started it stops it. The VM builds once per source tree.
 set -euo pipefail
 VM="${FLOW_VM:-$HOME/.scratch/vm-document-gate/vm.sh} linux"
@@ -31,6 +31,7 @@ if [[ $($VM ssh 'cat ~/consensus-flow-build/COMMIT 2>/dev/null || true') != "$co
 		cd ~/consensus-flow-build && ctest -R consensus_tls_certificates >/dev/null'
 	$VM ssh "echo $commit > ~/consensus-flow-build/COMMIT"
 fi
+[[ $what == build ]] && exit 0  # a light job builds; the measuring job finds it built
 $VM ssh "bash -s $what" <<'REMOTE'
 set -euo pipefail
 B=~/consensus-flow-build/consensus_flow_bench F=~/consensus-flow-build/tls-fixture D=~/flow-data

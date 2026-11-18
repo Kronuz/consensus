@@ -184,6 +184,10 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 		set_tests_properties(consensus_transport_${t} PROPERTIES TIMEOUT 30)
 	endforeach()
 	set_tests_properties(consensus_transport_peers PROPERTIES TIMEOUT 50)  # under TSan a run takes up to 25 s
+	# A scenario that throws with its voters running reports the failure instead of hanging.
+	add_test(NAME consensus_transport_peers_throwing COMMAND consensus_transport_peers_test throwing)
+	set_tests_properties(consensus_transport_peers_throwing PROPERTIES TIMEOUT 20
+		PASS_REGULAR_EXPRESSION "throwing: threw: thrown with the voters running")
 	add_test(NAME consensus_transport_tls COMMAND consensus_transport_tls_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture)
 	add_test(NAME consensus_transport_pipe COMMAND consensus_transport_tls_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture --pipes)
 	add_test(NAME consensus_transport_authentication COMMAND consensus_transport_authentication_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture)

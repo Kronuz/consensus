@@ -38,7 +38,8 @@
 // Bytes are counted exactly: OpenSSL's allocations (CRYPTO_set_mem_functions) and the C++ heap
 // (operator new), by usable size, on macOS and glibc without a sanitizer; zone statistics are
 // printed beside them only. cost exits nonzero when an idle group holds a descriptor, an armed
-// timer or a frame, or more than 230 + 40P bytes (D112); when an idle connection end holds more
+// timer or a frame, or more than 164 + 52P bytes (the minimum per group at the tables' worst
+// slack, docs/perf/transport-idle-cost.md); when an idle connection end holds more
 // than 48 KB (the fit's slope); or, without --quick, when a host is more than 10% over
 // 52 KB + 2P x 44 KB.
 #include "consensus/transport/host_transport.h"
@@ -46,6 +47,7 @@
 #include <asio/io_context.hpp>
 #include <openssl/crypto.h>
 #include <openssl/pem.h>
+#include <openssl/rand.h>
 #include <sys/resource.h>
 #include <unistd.h>
 
@@ -274,7 +276,7 @@ struct Loop {
 	~Loop() { join(); }
 };
 struct Totals {
-	std::uint64_t links = 0, sent = 0, received = 0, posts = 0, dropped = 0, refused = 0, malformed = 0;
+	std::uint64_t links = 0, sent = 0, received = 0, posts = 0, dropped = 0, refused = 0, malformed = 0, uncredited = 0;
 };
 
 // One host: L loops, a listener on loop 0 and the transport; it takes every frame.
@@ -353,6 +355,7 @@ struct Host {
 			s.dropped += t.dropped;
 			s.refused += t.refused + t.unstored + t.unopened + t.misrouted + t.spoofed + t.mismatched;
 			s.malformed += t.malformed;
+			s.uncredited += t.uncredited;
 		}
 		return s;
 	}
@@ -483,6 +486,16 @@ Cost cost(int H, std::uint32_t L, std::size_t G, double idle_seconds, bool print
 	for (int i = 1; i <= H; ++i)
 		hosts.push_back(std::make_unique<Host>(NodeId(i), L));
 	std::this_thread::sleep_for(20ms);
+	// Each loop's thread-local DRBGs, which OpenSSL makes on a thread's first TLS work: a cost per
+	// loop, set apart like its timer wheel, not on the first connection end each loop holds.
+	const auto threads0 = paused(hosts);
+	for (auto &h : hosts)
+		for (auto &l : h->loops)
+			l->at([] {
+				unsigned char b;
+				RAND_bytes(&b, 1);
+				RAND_priv_bytes(&b, 1);
+			});
 	const auto s0 = paused(hosts);
 	for (auto &h : hosts)
 		h->listen();
@@ -550,6 +563,16 @@ Cost cost(int H, std::uint32_t L, std::size_t G, double idle_seconds, bool print
 	expected += std::uint64_t(H) * G * std::uint64_t(P) * 2;
 	const bool arrived = wait_for([&] { return total() == expected; }, "every group's frames arrive", 60s, false);
 	// Credit returns, then nothing moves: sent and received stay put over 200 ms.
+	const auto t_arrived = steady_ns();
+	const bool credited = wait_for(
+		[&] {
+			std::uint64_t n = 0;
+			for (auto &h : hosts)
+				n += h->sum().uncredited;
+			return n == 0;
+		},
+		"every group's credit returns", 10s, false);
+	const double credit_ms = double(steady_ns() - t_arrived) / 1e6;
 	std::uint64_t moved = 0;
 	for (std::uint64_t last = ~0ull;;) {
 		std::this_thread::sleep_for(200ms);
@@ -610,31 +633,33 @@ Cost cost(int H, std::uint32_t L, std::size_t G, double idle_seconds, bool print
 	const auto end_timers = double(s2.timers - s1.timers) / double(ends), group_timers = double(s3.timers - before_groups.timers);
 	if (print) {
 		std::printf("cost hosts=%d peers=%d loops=%u groups=%zu: per host %.0f bytes, %.0f%% of 52 KB + 2P x 44 KB = %.0f (OpenSSL %.0f, C++ %.0f; "
-					"before any connection %.0f); timer wheels %.0f per host; %.2f descriptors (1 + 2P = %d); zone statistics %.0f per host\n",
+					"before any connection %.0f); timer wheels %.0f per host; OpenSSL thread state %.0f per loop; %.2f descriptors (1 + 2P = %d); "
+					"zone statistics %.0f per host\n",
 					H, P, L, G, host, 100 * host / budget, budget, double(s2.ssl - s0.ssl) / H, double(s2.cxx - s2.big - s0.cxx + s0.big) / H, before,
-					double(s2.big - s0.big) / H, host_fds, 1 + 2 * P, double(s2.heap - s0.heap) / H);
+					double(s2.big - s0.big) / H, (counted(s0) - counted(threads0)) / double(H * L), host_fds, 1 + 2 * P, double(s2.heap - s0.heap) / H);
 		std::printf("  per connection end: %.0f bytes (OpenSSL %.0f, C++ %.0f), %.2f armed timers; links %llu of %llu; C++ blocks:%s\n", end,
 					double(s2.ssl - s1.ssl) / double(ends), double(s2.cxx - s2.big - s1.cxx + s1.big) / double(ends), end_timers,
 					(unsigned long long)links, (unsigned long long)ends, sizes(s1, s2, double(ends)).c_str());
 		std::printf("  per idle group: %.1f bytes (OpenSSL %.1f, C++ %.1f; stored %.1f, then its frames %.1f; zone statistics %.1f), %.0f descriptors and %.0f armed timers in all; "
-					"frames %llu delivered of %llu, %llu dropped, %llu refused, %llu malformed; settled after %llu x 200 ms; C++ blocks per 100 groups:%s\n",
+					"frames %llu delivered of %llu, %llu dropped, %llu refused, %llu malformed; credit back %.1f ms after; settled after %llu x 200 ms; C++ blocks per 100 groups:%s\n",
 					group, double(s3.ssl - before_groups.ssl) / double(G * H), double(s3.cxx - before_groups.cxx) / double(G * H),
 					(counted(after_stores) - counted(before_groups)) / double(G * H), (counted(s3) - counted(after_stores)) / double(G * H),
 					double(s3.heap - before_groups.heap) / double(G * H), group_fds, group_timers, (unsigned long long)total(),
 					(unsigned long long)expected, (unsigned long long)dropped, (unsigned long long)refused, (unsigned long long)malformed,
-					(unsigned long long)moved, sizes(before_groups, s3, double(G * H) / 100).c_str());
+					credit_ms, (unsigned long long)moved, sizes(before_groups, s3, double(G * H) / 100).c_str());
 		if (idle_seconds > 0)
 			std::printf("  idle host: %.1f us of CPU per second, %.2f wakes per second (%.2f per connection end)\n", cpu_us_per_s, wakes_per_s,
 						wakes_per_s * H / double(ends));
 		const std::string at = " (hosts " + std::to_string(H) + ", loops " + std::to_string(L) + ")";
 		expect(links == ends && links_after == ends, "one connection per lane and pair" + at);
 		expect(total() == expected && dropped == 0 && refused == 0 && malformed == 0, "every frame delivered, none dropped" + at);
+		expect(credited, "every group's credit back within 10 s" + at);
 		expect(group_fds == 0, "no descriptor per idle group" + at);
 		expect(group_timers == 0, "no armed timer per idle group" + at);
 		expect(end_timers == 2, "two armed timers per idle connection end, keepalive and dead peer" + at);
 		expect(host_fds == 1 + 2 * P, "1 + 2P descriptors per host" + at);
 		if (heap_measured)
-			expect(std::abs(group) <= 230 + 40 * P, "an idle group within 230 + 40P bytes (D112)" + at);  // 206 B identity store + 40P; measured 253-368
+			expect(std::abs(group) <= 164 + 52 * P, "an idle group within 164 + 52P bytes" + at);
 	}
 	watched = nullptr;
 	return {P, L, host, false};

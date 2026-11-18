@@ -55,6 +55,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <future>
 #include <mutex>
@@ -90,13 +91,30 @@ inline std::size_t usable(void *p) {
 	return malloc_usable_size(p);
 #endif
 }
-// A block at least a timer wheel's size is a loop's wheel (task::asio_scheduler's timer_loop):
-// 40,960 or 45,056 usable bytes on macOS's older allocator, 65,536 on its newer one.
-inline void add(void *p, std::int64_t sign) {
+// A loop's timer wheel (task::asio_scheduler's timer_loop: a wheel, a steady_timer, a deadline,
+// padded to 64) is a block requested in that window; it is remembered by address, so no other
+// large block is set apart.
+constexpr std::size_t wheel_min = sizeof(wheel::timer_wheel), wheel_max = wheel_min + sizeof(asio::steady_timer) + 8 + 64;
+std::mutex wheels_lock;
+std::array<void *, 1024> wheels{};
+inline bool wheel_block(void *p, std::size_t requested, std::int64_t sign) {
+	if (sign > 0 && (requested < wheel_min || requested >= wheel_max))
+		return false;
+	std::lock_guard lock(wheels_lock);
+	auto at = std::find(wheels.begin(), wheels.end(), sign > 0 ? nullptr : p);
+	if (at == wheels.end()) {
+		if (sign > 0)
+			std::abort();  // more wheels than the table holds
+		return false;
+	}
+	*at = sign > 0 ? p : nullptr;
+	return true;
+}
+inline void add(void *p, std::int64_t sign, std::size_t requested = 0) {
 	const auto n = usable(p);
 	bytes.fetch_add(sign * std::int64_t(n), std::memory_order_relaxed);
 	count[std::min(n / 16, buckets - 1)].fetch_add(sign, std::memory_order_relaxed);
-	if (n >= sizeof(wheel::timer_wheel))
+	if (n >= wheel_min && wheel_block(p, requested, sign))
 		big.fetch_add(sign * std::int64_t(n), std::memory_order_relaxed);
 }
 void *ssl_malloc(std::size_t n, const char *, int) {
@@ -129,7 +147,7 @@ void *operator new(std::size_t n) {
 	void *p = std::malloc(n ? n : 1);
 	if (!p)
 		throw std::bad_alloc();
-	live::add(p, 1);
+	live::add(p, 1, n);
 	return p;
 }
 void *operator new[](std::size_t n) { return operator new(n); }
@@ -137,7 +155,7 @@ void *operator new(std::size_t n, std::align_val_t a) {
 	void *p = nullptr;
 	if (posix_memalign(&p, std::max(sizeof(void *), static_cast<std::size_t>(a)), n ? n : 1))
 		throw std::bad_alloc();
-	live::add(p, 1);
+	live::add(p, 1, n);
 	return p;
 }
 void *operator new[](std::size_t n, std::align_val_t a) { return operator new(n, a); }
@@ -276,7 +294,14 @@ struct Host {
 	std::uint32_t L() const { return std::uint32_t(loops.size()); }
 	void listen() { acceptor = std::make_unique<tcp::acceptor>(loops[0]->io, tcp::endpoint{asio::ip::address_v4::loopback(), 0}); }
 	std::uint16_t port() const { return acceptor->local_endpoint().port(); }
+	// The membership puts incarnation k on node k.
 	void open(const std::map<NodeId, PeerAddress> &addresses, HostTransportOptions options = {}) {
+		if (!options.member_of)
+			options.member_of = [](GroupId, NodeId incarnation) -> std::optional<kronuz::consensus::Member> {
+				if (incarnation < 1 || incarnation > max_node)
+					return std::nullopt;
+				return kronuz::consensus::Member{incarnation, incarnation, kronuz::consensus::MemberRole::Voter};
+			};
 		auto tls = context(node);
 		std::map<NodeId, Fingerprint> pins;
 		for (NodeId n = 1; n <= max_node; ++n)
@@ -296,6 +321,20 @@ struct Host {
 			});
 		loops[0]->at([this] { transport->serve(*acceptor); });
 	}
+	// On loop k, the groups': stores each as incarnation `node`, every group with its own open.
+	void stores(std::uint32_t k, const std::vector<GroupId> &groups) {
+		loops[k]->at([&] {
+			for (auto g : groups) {
+				GroupOpen o;
+				o.cluster.fill('T');
+				o.group.fill('G');
+				std::memcpy(o.group.data(), &g, sizeof g);
+				o.epoch.fill('E');
+				o.profile.fill(0x5A);
+				transport->store(g, node, o);
+			}
+		});
+	}
 	std::uint64_t total() const {
 		std::uint64_t n = 0;
 		for (std::uint32_t k = 0; k != L(); ++k)
@@ -311,7 +350,7 @@ struct Host {
 			s.received += t.received;
 			s.posts += t.posts;
 			s.dropped += t.dropped;
-			s.refused += t.refused;
+			s.refused += t.refused + t.unstored + t.unopened + t.misrouted + t.spoofed + t.mismatched;
 			s.malformed += t.malformed;
 		}
 		return s;
@@ -455,6 +494,8 @@ Cost cost(int H, std::uint32_t L, std::size_t G, double idle_seconds, bool print
 	// listener sees more than its 2 handshakes per source address (every host is 127.0.0.1); then
 	// every node sends back on them.
 	const GroupId warm = 1;
+	for (auto &h : hosts)
+		h->stores(h->transport->loop_of_group(warm), {warm});
 	auto total = [&] {
 		std::uint64_t n = 0;
 		for (auto &h : hosts)
@@ -492,6 +533,10 @@ Cost cost(int H, std::uint32_t L, std::size_t G, double idle_seconds, bool print
 	for (GroupId g = 1'000'000; g != 1'000'000 + G; ++g)
 		on_loop[j::host_detail::loop(j::host_detail::slot(g), L)].push_back(g);
 	const auto before_groups = paused(hosts);  // the lists above are the bench's own
+	for (auto &h : hosts)  // every host stores every group before any frame: its share of a group
+		for (std::uint32_t k = 0; k != L; ++k)
+			h->stores(k, on_loop[k]);
+	const auto after_stores = paused(hosts);
 	for (auto &from : hosts)
 		for (std::uint32_t k = 0; k != L; ++k)
 			from->on(k, [&host = *from, &hosts, &groups = on_loop[k], k] {
@@ -570,9 +615,10 @@ Cost cost(int H, std::uint32_t L, std::size_t G, double idle_seconds, bool print
 		std::printf("  per connection end: %.0f bytes (OpenSSL %.0f, C++ %.0f), %.2f armed timers; links %llu of %llu; C++ blocks:%s\n", end,
 					double(s2.ssl - s1.ssl) / double(ends), double(s2.cxx - s2.big - s1.cxx + s1.big) / double(ends), end_timers,
 					(unsigned long long)links, (unsigned long long)ends, sizes(s1, s2, double(ends)).c_str());
-		std::printf("  per idle group: %.1f bytes (OpenSSL %.1f, C++ %.1f; zone statistics %.1f), %.0f descriptors and %.0f armed timers in all; "
+		std::printf("  per idle group: %.1f bytes (OpenSSL %.1f, C++ %.1f; stored %.1f, then its frames %.1f; zone statistics %.1f), %.0f descriptors and %.0f armed timers in all; "
 					"frames %llu delivered of %llu, %llu dropped, %llu refused, %llu malformed; settled after %llu x 200 ms; C++ blocks per 100 groups:%s\n",
 					group, double(s3.ssl - before_groups.ssl) / double(G * H), double(s3.cxx - before_groups.cxx) / double(G * H),
+					(counted(after_stores) - counted(before_groups)) / double(G * H), (counted(s3) - counted(after_stores)) / double(G * H),
 					double(s3.heap - before_groups.heap) / double(G * H), group_fds, group_timers, (unsigned long long)total(),
 					(unsigned long long)expected, (unsigned long long)dropped, (unsigned long long)refused, (unsigned long long)malformed,
 					(unsigned long long)moved, sizes(before_groups, s3, double(G * H) / 100).c_str());
@@ -667,6 +713,15 @@ struct Hop {
 			if (arm.size() < 256)
 				arm.push_back(g);
 		}
+		for (auto &h : hosts)
+			for (std::uint32_t k = 0; k != h->L(); ++k) {
+				std::vector<GroupId> here;
+				for (auto &arm : groups)
+					for (auto g : arm)
+						if (h->transport->loop_of_group(g) == k)
+							here.push_back(g);
+				h->stores(k, here);
+			}
 		latency[0].reserve(4096);
 		latency[1].reserve(4096);
 		hosts[1]->hook = [this](std::uint32_t k, const Received &r) {

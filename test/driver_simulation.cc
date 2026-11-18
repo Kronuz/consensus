@@ -68,7 +68,10 @@ void fail(const std::string& what) {
 constexpr std::uint64_t ms = 1'000'000;
 constexpr NodeId witness_node = 3;
 const j::TurnLogOptions turn_options{16 * 1024, 1024, 1, 4, 4096};
-const j::AdmissionLimits admission{{4u << 20, 4096}, {64 * 1024, 3}, {256 * 1024, 4}, 16, 3};
+// The replacement pool covers a checkpoint's peak (its bundle bound from log_bytes, plus the
+// application cap): a smaller one never admits a checkpoint, which then blocks the group's calls.
+const j::AdmissionLimits admission{{8u << 20, 4096}, {64 * 1024, 3}, {4u << 20, 4}, 16, 3};
+constexpr std::uint64_t application_cap = 64 * 1024;
 constexpr Timing timing{20, 40, 100, 200, 60000};
 
 Limits limits() {
@@ -239,8 +242,8 @@ struct Simulation {
 			else if (pick < 858) { if (n.up && up_count() == 3) { crash(n); } }
 			else if (pick < 870) { if (!n.up) { boot(n); } }
 			else if (pick < 874) { toggle_partition(n.id); }
-			else if (pick < 889) { checkpoint(n, g); }
-			else if (pick < 904) { repair(n, g); }
+			else if (pick < 904) { checkpoint(n, g); }
+			else if (pick < 919) { repair_somewhere(n, g); }
 			else { for (auto& [id, m] : nodes_) { if (m.up) { for (auto& l : m.loops) { complete_io(*l, id); } for (auto h : groups_) { apply(m, h); } } } }
 			check_calls();
 		}
@@ -259,9 +262,11 @@ struct Simulation {
 				if (healed(g)) { continue; }
 				all = false;
 				auto& c = last[g];
-				// Proposes again once the last proposal failed or another term's entry took its place.
+				// Proposes again once the last proposal failed, or another term's entry took its
+				// place, or a later term leads (a deposed leader placed it).
 				auto took = c && c->placed ? sequences_[g].find(c->placed->index) : sequences_[g].end();
-				const bool superseded = took != sequences_[g].end() && took->second.term != c->placed->term;
+				bool superseded = took != sequences_[g].end() && took->second.term != c->placed->term;
+				for (auto& [id, n] : nodes_) { auto st = state(n, g); superseded |= c && c->placed && st && st->role == Role::Leader && st->term > c->placed->term; }
 				if (c && !superseded && !(c->completions && (c->error || !c->placed))) { continue; }
 				for (auto& [id, n] : nodes_) {
 					auto s = state(n, g);
@@ -585,11 +590,20 @@ private:
 		if (floor != r.applied.size() || floor <= r.base) { return; }
 		++checkpoints;
 		auto call = track(n, g, Call::checkpoint);
-		start(n, call, n.driver(g).checkpoint(g, 1 << 20, Capture{encode_image(r.applied), 0, floor, r.applied.back().term, r.epoch}, call->cancel.token()));
+		start(n, call, n.driver(g).checkpoint(g, application_cap, Capture{encode_image(r.applied), 0, floor, r.applied.back().term, r.epoch}, call->cancel.token()));
 		n.loop_of(g).run(n.id);
 	}
 	// Track C, D10: the application restores a boundary at or below what it applied, often
 	// below its latest checkpoint, which the Core must refuse.
+	// Half the repairs go to a replica that has a checkpoint, so many land below it.
+	void repair_somewhere(Node& n, GroupId g) {
+		if (random_() % 2) {
+			std::vector<std::pair<Node*, GroupId>> checkpointed;
+			for (auto& [id, m] : nodes_) { for (auto& [h, r] : m.replicas) { if (m.up && r.base) { checkpointed.emplace_back(&m, h); } } }
+			if (!checkpointed.empty()) { auto [m, h] = checkpointed[random_() % checkpointed.size()]; repair(*m, h); return; }
+		}
+		repair(n, g);
+	}
 	void repair(Node& n, GroupId g) {
 		if (!n.up || witness(n.id, g)) { return; }
 		auto& r = n.replicas[g];

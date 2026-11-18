@@ -225,6 +225,8 @@ public:
 		if (!g || g->closing) { count_drop(id); return; }
 		g->limits.push_back(limits); mark_ready(*g);
 	}
+	// An open group's own count; an id not open (closed, never opened) reads the count of plain
+	// calls dropped on every id not open.
 	std::uint64_t dropped(GroupId id) const {
 		auto found = groups_.find(id);
 		return found == groups_.end() ? dropped_unknown_ : found->second->dropped;

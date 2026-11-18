@@ -219,7 +219,7 @@ void fenced_row() {
 	check(loop.close(g, error) && !error && loop.driver->groups() == 0, "and closes again");
 }
 
-// A1: a Sink that throws mid-batch fences the row with a proposal's IO in flight; close still ends.
+// A1: a group fenced by its application with a proposal's IO in flight: close still ends.
 void fenced_in_flight() {
 	constexpr GroupId g = 12;
 	jt::Disk disk; Loop loop(disk, true);
@@ -231,7 +231,7 @@ void fenced_in_flight() {
 	auto closing = loop.start(loop.driver->close(g));
 	loop.release();
 	check(closing->done && !closing->error, "close completes with a record staged on a fenced row: " + what(closing->error));
-	check(proposal->done, "the staged proposal's caller completed");
+	check(proposal->done && (!proposal->error || is<closed>(proposal->error) || is<fenced>(proposal->error)), "the staged proposal's caller completed with a placement, closed or fenced: " + what(proposal->error));
 	check(loop.driver->groups() == 0, "the row is erased");
 }
 
@@ -321,7 +321,49 @@ void bytes() {
 	check(!COUNT_BYTES || after <= before + rows * sizeof(void*) * 2, "closed rows return their bytes: " + std::to_string(after) + " against " + std::to_string(before));
 }
 
+// Heap the simulated disk itself holds: not the process's (a real host's files are on disk).
+std::size_t disk_bytes(const jt::Disk& disk) {
+	std::size_t bytes = 0;
+	for (const auto& [id, inode] : disk.inodes) {
+		bytes += inode.durable.capacity() + sizeof(inode);
+		for (const auto& [sector, data] : inode.pending) { bytes += data.capacity() + sizeof(data); }
+	}
+	for (const auto& [name, inode] : disk.names) { bytes += name.capacity() + 48; }
+	for (const auto& [name, inode] : disk.durable_names) { bytes += name.capacity() + 48; }
+	return bytes;
+}
+
+// Report only: created rows (the rows Xapiand counts) opened, closed and left, with the share the
+// journal keeps per structure. `proposals` more records are written per row before the close.
+void created_pass(GroupId rows, int proposals) {
+	jt::Disk disk; Loop loop(disk);
+	std::exception_ptr error;
+	loop.lone(1); check(loop.close(1, error) && !error, "warm close");
+	const auto base = live_bytes, base_disk = disk_bytes(disk);
+	for (GroupId g = 2; g < 2 + rows; ++g) {
+		loop.lone(g);
+		for (int n = 0; n < proposals; ++n) { std::exception_ptr e; std::optional<Placement> placed; auto call = loop.start(loop.driver->propose(g, "p")); loop.release(); (void)placed; (void)e; check(call->done && !call->error, "proposal placed"); }
+	}
+	const auto opened = live_bytes, opened_disk = disk_bytes(disk);
+	std::uint64_t records = 0;
+	for (GroupId g = 2; g < 2 + rows; ++g) { records += loop.host->driver_of(g).sequence(g); }
+	for (GroupId g = 2; g < 2 + rows; ++g) { check(loop.close(g, error) && !error, "close"); }
+	loop.driver->open(1, options({1})); check(loop.close(1, error) && !error, "the purging row closes");
+	const auto closed = live_bytes, closed_disk = disk_bytes(disk);
+	for (GroupId g = 2; g < 2 + rows; ++g) { loop.host->driver_of(g).forget(g); }
+	const auto forgotten = live_bytes, forgotten_disk = disk_bytes(disk);
+	// The process's heap: the counted bytes less what the simulated disk holds.
+	auto process = [](std::size_t total, std::size_t disk_part) { return total > disk_part ? total - disk_part : std::size_t(0); };
+	const auto from = process(base, base_disk);
+	auto per = [&](std::size_t now) { return now > from ? (now - from) / std::size_t(rows) : std::size_t(0); };
+	std::printf("created rows=%u proposals=%d records/row=%.1f: process heap per row: open %zu, closed %zu, after the log forgets them %zu; simulated disk per row: %zu\n",
+		unsigned(rows), proposals, double(records) / double(rows), per(process(opened, opened_disk)), per(process(closed, closed_disk)),
+		per(process(forgotten, forgotten_disk)), (closed_disk - base_disk) / std::size_t(rows));
+}
+void created_bytes() { created_pass(2000, 0); created_pass(2000, 10); }
+
 const std::map<std::string, void (*)()> cases{
+	{"created_bytes", &created_bytes},
 	{"fenced_row", &fenced_row},
 	{"fenced_in_flight", &fenced_in_flight},
 	{"half_opened_row", &half_opened_row},

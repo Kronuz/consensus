@@ -80,7 +80,7 @@ public:
 
 	// Plain calls, on the loop's thread (Debug-asserted with runs_here()); from another thread,
 	// post_call them. Each only queues and marks the group ready: none steps inline, so a Sink
-	// may call them. On a closed group they are dropped and counted (dropped()).
+	// may call them. On an id that is not open, closed ones included, they are dropped and counted (dropped()).
 	void open(GroupId, GroupOptions);           // state only; throws if the id is open on this Driver
 	void receive(GroupId, Receive);
 	void applied(GroupId, Applied);
@@ -88,7 +88,7 @@ public:
 	void activated(GroupId, Token token);       // ActivateInstall::token
 	void activation_failed(GroupId, Token token, std::string reason);
 	void peer_limits(GroupId, PeerLimits);
-	std::uint64_t dropped(GroupId) const;       // plain calls dropped on a closed group, and inbox overflow
+	std::uint64_t dropped(GroupId) const;       // an open group's inbox overflow; for an id not open (closed, never opened), the Driver-wide count of plain calls dropped on ids not open
 
 	// Task calls, from any scheduler: a call made off the loop hops there (one post) and resumes
 	// the caller on its own scheduler. Each completes per its D8 row (below).
@@ -132,7 +132,7 @@ T run(Driver<Sink>& driver, task::blocking_scheduler& scheduler, task::task<T> w
 | `transfer_leadership` | the target leads (`RoleChanged`); `transfer_failed` when Core's transfer deadline passes or another node leads | `task::cancelled`; Core carries on | `closed` |
 | `repair` | `RepairCompleted` | `task::cancelled`; Core carries on, the Sink gets `RepairCompleted` | `closed` |
 | `checkpoint` | `CheckpointPublished` | before publication starts it is cancelled and its reservation reclaimed; after, publication finishes and the Sink gets `CheckpointPublished`; the caller gets `task::cancelled` either way | started publication: completes when published; else `closed` |
-| `close` | the group's state is freed; its table entry stays, so late plain calls are dropped and counted | no token | - |
+| `close` | the group's state is freed and its row erased: `groups()` no longer counts it, and the id opens again on this Driver; a late plain call is dropped and counted with the ids not open. Close completes on an open, fenced or never-created row, and on an id the Driver never held. The journal host still refuses `create` or `recover` of an id it created or recovered until the host reopens | no token | - |
 
 Every call completes with `fenced` once its group fences, and with `task::cancelled`
 (`cancel_reason::shutdown`) once the loop shuts down; a staged record is still written. A call on

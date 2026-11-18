@@ -70,8 +70,11 @@ member computes alike and none of which is membership. The receiver checks it on
 loop, in order with the group's frames: the group opens on that connection when it is stored
 and every field matches; otherwise it closes there, and the receiver answers `closed`. A group
 loop keeps, per connection (node and lane), the generation it last saw and the groups opened on
-it; a batch of a newer generation empties that set, since batches of one connection reach a
-group loop in generation order. Each direction opens on its own. A sender opens the group again
+it; a batch of a newer generation empties that set, and a batch of an older generation is
+stale: its frames are refused and its opens change nothing. Every connection of a node and lane
+lives on one loop, which posts its batches in order, and a host's connection drains only at the
+peer's `close_notify`, after which it reads nothing; so a stale batch would take a lane that
+drains while its replacement reads, which the transport never starts. Each direction opens on its own. A sender opens the group again
 after a `closed`, on a new connection, and after the host stores it again (a new epoch, say),
 so a group stored late, or stored again on both ends, opens at the next frame.
 
@@ -100,10 +103,15 @@ it is not checked.
 
 A Driver's `Send`s go to the transport on the group's loop. They collect per connection loop
 and go there in one post once the running work yields (one post per connection loop per
-Driver resume). On the connection's loop each group with something in flight has an `Active`
-record per connection: its control and data queues, its queued, uncredited and owed bytes, a
-`closed` to tell, and the open of its latest frame. It exists only while one of those is
-nonzero; an idle group keeps only the serial of the open the connection carries.
+Driver resume). On the connection's loop each group with something to send has an `Active`
+record per connection: its control and data queues, its queued and uncredited bytes, and the
+open of its latest frame. It exists only while one of those is nonzero. What the host owes the
+peer for the groups it receives is apart from it: each batch's credit and `closed`s come back
+to the connection's loop as one vector of 24 B `Owed` records (group, bytes, closed), a run of
+one group's frames in one record, and the lane repays them in order and frees them once all are
+repaid. While its connection cannot send, the records merge per group each time they double
+(at 4,096 at least), so a lane owes O(groups) records. Receiving builds no per-group table. An
+idle group keeps only the serial of the open the connection carries.
 
 The connection asks for frames when its own queue is out (`Connection::on_drained`), and the
 transport also feeds it when a frame arrives for an idle connection. Each feed hands over up
@@ -117,12 +125,11 @@ to 64 KiB, picking in this order:
    `window` (4 MiB) of data sent and not yet credited, and one frame always fits when nothing
    is outstanding.
 
-Each step is a ready ring, a FIFO of groups linked through their `Active` records: `owed`
-holds the groups owing credit or a `closed`, `control` those with a control frame, `data`
-those whose next data frame fits their credit. A group joins a ring where it becomes ready
-(a frame queued, credit arriving, a grant or refusal posted back, a connection beginning or
-ending, which rebuilds the rings from the `Active` records), and a feed pops one group per
-frame; a group still ready goes to the back. A feed's work is O(1) per frame whatever the
+Step 1 is the lane's `Owed` records, in order. Steps 2 and 3 are ready rings, FIFOs of groups
+linked through their `Active` records: `control` holds the groups with a control frame, `data`
+those whose next data frame fits their credit. A group joins a ring where it becomes ready (a frame queued, credit arriving, a
+connection beginning or ending, which rebuilds the rings from the `Active` records), and a
+feed pops one group per frame; a group still ready goes to the back. A feed's work is O(1) per frame whatever the
 groups a host stores, and round robin runs in the order groups became ready. A group blocked on
 credit is in no ring until its credit arrives.
 
@@ -152,7 +159,10 @@ entry into the hole). A set is `GroupTable<Empty>`, 8 B an entry.
 | `Loop::stored` | the group's | incarnation, serial, open (96 B) |
 | `Opened::groups`, per connection | the group's | the group (8 B) |
 | `Lane::opened` | the connection's | the serial of the open it carries (16 B) |
-| `Lane::active` | the connection's | `Active`, while something is in flight |
+| `Lane::active` | the connection's | `Active`, while it has something to send or uncredited |
+
+`Lane::owed`, what the host owes the peer, is a vector of records in arrival order, not a table
+(Send, above).
 
 What an idle group holds, field by field: its id (8), incarnation (8), serial (8) and open (80:
 cluster, group identity and epoch, 16 each, and the profile fingerprint, 32, which hashes the
@@ -191,6 +201,7 @@ encode and decode. `consensus_transport_groups_test <fixture> <case>`, each a ct
 | `lagging` | `frame_admission`: node 3 is cut off while 4 joins, is promoted and leads by transfer; 3's membership never names 4, and 3 catches up from leader 4 once the cut heals | `voters-only` |
 | `scan` | for 100, 1,000 and 10,000 groups on one loop, a control and a data frame each: the groups both hosts' feeds visit stay under 2 per frame sent at each count, and every group's credit returns (`uncredited` back to 0) | `main-feed`: the feed before the rings (consensus:edbb162) with `visited` counted in its scan; `uncredited-kept` |
 | `order` | one turn queues data and control frames for three groups; the receiver gets control first, round robin (a0 b0 c0 a1 b1 a2 b2), then data round robin (a0 b0 a1); with a 100-byte window and group a's loop stalled, all of b's frames arrive and exactly one of a's crosses, then a's arrive in order | `ring-at-front`, `bulk-ahead-of-control`, `no-credit` |
+| `reconnect` | node 1 over raw Links opens g on host 2 and its frame arrives; after that connection ends, g's frame on the next one without the open is refused (1 `unopened`) and closed back, and arrives once node 1 opens g there | `no-generation-clear`; `no-current` survives (a stale batch never reaches a group loop: see Identity) |
 | `relayout` | three nodes of 2 loops with on-disk journals commit four groups; node 1 restarts with 3 loops, its journal re-partitions, two groups move loop, and all four commit on all three with node 1's frames on each group's new loop | |
 
 A timing case that the host stalled 250 ms or more runs again, at most twice. Each step prints

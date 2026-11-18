@@ -486,13 +486,9 @@ Cost cost(int H, std::uint32_t L, std::size_t G, double idle_seconds, bool print
 	for (int i = 1; i <= H; ++i)
 		hosts.push_back(std::make_unique<Host>(NodeId(i), L));
 	std::this_thread::sleep_for(20ms);
-	const auto s0 = paused(hosts);
-	for (auto &h : hosts)
-		h->listen();
-	for (auto &h : hosts)
-		h->open(peers_of(hosts, h->node));
 	// Each loop's thread-local DRBGs, which OpenSSL makes on a thread's first TLS work: a cost per
-	// loop, counted before any connection rather than on the first connection end of each loop.
+	// loop, set apart like its timer wheel, not on the first connection end each loop holds.
+	const auto threads0 = paused(hosts);
 	for (auto &h : hosts)
 		for (auto &l : h->loops)
 			l->at([] {
@@ -500,6 +496,11 @@ Cost cost(int H, std::uint32_t L, std::size_t G, double idle_seconds, bool print
 				RAND_bytes(&b, 1);
 				RAND_priv_bytes(&b, 1);
 			});
+	const auto s0 = paused(hosts);
+	for (auto &h : hosts)
+		h->listen();
+	for (auto &h : hosts)
+		h->open(peers_of(hosts, h->node));
 	const auto s1 = paused(hosts);
 	watched = &hosts;
 
@@ -632,9 +633,10 @@ Cost cost(int H, std::uint32_t L, std::size_t G, double idle_seconds, bool print
 	const auto end_timers = double(s2.timers - s1.timers) / double(ends), group_timers = double(s3.timers - before_groups.timers);
 	if (print) {
 		std::printf("cost hosts=%d peers=%d loops=%u groups=%zu: per host %.0f bytes, %.0f%% of 52 KB + 2P x 44 KB = %.0f (OpenSSL %.0f, C++ %.0f; "
-					"before any connection %.0f); timer wheels %.0f per host; %.2f descriptors (1 + 2P = %d); zone statistics %.0f per host\n",
+					"before any connection %.0f); timer wheels %.0f per host; OpenSSL thread state %.0f per loop; %.2f descriptors (1 + 2P = %d); "
+					"zone statistics %.0f per host\n",
 					H, P, L, G, host, 100 * host / budget, budget, double(s2.ssl - s0.ssl) / H, double(s2.cxx - s2.big - s0.cxx + s0.big) / H, before,
-					double(s2.big - s0.big) / H, host_fds, 1 + 2 * P, double(s2.heap - s0.heap) / H);
+					double(s2.big - s0.big) / H, (counted(s0) - counted(threads0)) / double(H * L), host_fds, 1 + 2 * P, double(s2.heap - s0.heap) / H);
 		std::printf("  per connection end: %.0f bytes (OpenSSL %.0f, C++ %.0f), %.2f armed timers; links %llu of %llu; C++ blocks:%s\n", end,
 					double(s2.ssl - s1.ssl) / double(ends), double(s2.cxx - s2.big - s1.cxx + s1.big) / double(ends), end_timers,
 					(unsigned long long)links, (unsigned long long)ends, sizes(s1, s2, double(ends)).c_str());

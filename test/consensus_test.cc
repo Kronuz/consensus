@@ -1116,6 +1116,8 @@ void repair_at_or_below_commit() {
 	for (unsigned round = 0; round < 4; ++round) { cluster.tick(cluster.now + 10); cluster.pump(); }
 	check(follower.applying.has_value(), "repair setup: a delivery outstanding");
 	check(reason(follower.core->step(Repair{206, {through, term_at(through)}})) == RejectReason::Busy, "a repair waits for the outstanding delivery");
+	check(follower.core->applied() < follower.core->committed() && reason(follower.core->step(Repair{208, {follower.core->applied(), term_at(follower.core->applied())}})) == RejectReason::Busy,
+		"a repair while applied is below commit answers Busy");
 	cluster.complete_apply(2); follower.auto_apply = true;
 	// The voter keeps voting and following: a new leader commits, and the repaired voter applies it.
 	cluster.isolated.insert(1);

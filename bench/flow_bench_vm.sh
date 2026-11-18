@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs bench/flow_bench.cc's rows in the Linux gate VM, with netem on lo for the round trip
-# (docs/perf/flow-control.md): flow_bench_vm.sh smoke|a1|a2|a3, from a checkout's root.
+# (docs/perf/flow-control.md): flow_bench_vm.sh smoke|diag|a1|a2|a3, from a checkout's root.
 # The VM is left as found: a job that started it stops it. The VM builds once per source tree.
 set -euo pipefail
 VM="${FLOW_VM:-$HOME/.scratch/vm-document-gate/vm.sh} linux"
@@ -50,6 +50,14 @@ smoke)
 	$B barrier $D 1
 	FLOW_BARRIER=1000 $B one $F $D 4 262144 262144 1
 	FLOW_BARRIER=1000 $B many $F $D 10 1 1;;
+diag)  # what refuses the leader's proposals, at the default log limit and the bench's
+	for rtt in 0 10; do
+		net $rtt
+		for mib in 64 1024; do
+			FLOW_LOG_MIB=$mib FLOW_BARRIER=1000 $B one $F $D 1 262144 262144 3
+			FLOW_LOG_MIB=$mib FLOW_BARRIER=1000 $B one $F $D 4 262144 262144 3
+		done
+	done;;
 a1)
 	$B barrier $D 3
 	FLOW_BARRIER=1000 $B barrier $D 1

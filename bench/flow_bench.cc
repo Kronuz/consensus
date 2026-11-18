@@ -44,9 +44,11 @@
 #include <asio/steady_timer.hpp>
 #include <openssl/pem.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
@@ -81,6 +83,12 @@ std::atomic<bool> measuring{false};
 const long modeled_barrier_us = [] {
 	const char *v = std::getenv("FLOW_BARRIER");
 	return v && std::string_view(v) != "sync" ? std::stol(v) : -1L;
+}();
+// FLOW_LOG_MIB: the retained log's byte limit; the bench never checkpoints, so a group whose log
+// fills is refused LogFull for the rest of the run (64 MiB is the default Limits).
+const std::size_t log_mib = [] {
+	const char *v = std::getenv("FLOW_LOG_MIB");
+	return v ? std::size_t(std::stoul(v)) : std::size_t{1024};
 }();
 std::string barrier_name() { return modeled_barrier_us < 0 ? "fdatasync" : "modeled " + std::to_string(modeled_barrier_us) + " us"; }
 
@@ -298,7 +306,11 @@ std::uint64_t entry_bytes(const Message &m) {
 }
 
 struct Options {
-	Limits limits{};
+	Limits limits = [] {
+		Limits l;
+		l.log_bytes = log_mib << 20;
+		return l;
+	}();
 	Flow flow{};
 	std::size_t command = 4096;
 	std::uint64_t period_us = 0;  // between a group's proposals; 0: whenever its leader is not persisting
@@ -331,7 +343,8 @@ struct Group {
 	std::unordered_map<RequestId, std::uint64_t> asked;
 	// While measuring: the leader's commits, a node's applies, and inbox overflows.
 	Samples commit_us;
-	std::uint64_t committed = 0, commands = 0, inbox_drops = 0;
+	std::uint64_t committed = 0, commands = 0, inbox_drops = 0, proposals = 0;
+	std::array<std::uint64_t, 11> rejects{};  // by RejectReason
 };
 
 struct Node {
@@ -472,6 +485,8 @@ struct Node {
 			step(g, Applied{c->entries.back().index});
 		} else if (auto *r = std::get_if<Reject>(&a)) {
 			g.asked.erase(r->request);
+			if (measuring)
+				++g.rejects[std::size_t(r->reason)];
 		}
 	}
 	// Steps what arrived while the Core persisted, merging one leader's contiguous appends into
@@ -508,6 +523,8 @@ struct Node {
 			g.next_propose = std::max(g.next_propose + o.period_us, now - std::min(now, std::uint64_t{100'000}));
 		}
 		g.asked[++g.request] = now;
+		if (measuring)
+			++g.proposals;
 		step(g, Propose{g.request, std::string(hot ? o.hot_command : o.command, 'c')});
 	}
 };
@@ -581,6 +598,19 @@ std::string storage_line(Storage &s) {
 	return line;
 }
 
+// The leader's proposals while measuring, what refused them, and its log at the end.
+std::string proposals_line(Group &g) {
+	static const char *reasons[] = {"busy", "not leader", "not ready", "log full", "too large", "duplicate", "checkpoint", "repair", "must transfer", "membership", "target"};
+	std::string s = std::to_string(g.proposals) + " proposals";
+	for (std::size_t r = 0; r != g.rejects.size(); ++r)
+		if (g.rejects[r])
+			s += ", " + std::to_string(g.rejects[r]) + " refused " + reasons[r];
+	char tail[160];
+	std::snprintf(tail, sizeof tail, "; log %llu entries, %.0f MiB of %zu, %llu uncommitted", (unsigned long long)g.core->last_index(),
+				  double(g.core->retained_log_bytes()) / (1 << 20), log_mib, (unsigned long long)(g.core->last_index() - g.core->committed()));
+	return s + tail;
+}
+
 void one(const std::filesystem::path &dir, std::uint32_t pipeline, std::size_t frame, std::size_t command, unsigned seconds) {
 	Options o;
 	o.flow = Flow{pipeline, 4 << 20, frame};
@@ -594,16 +624,16 @@ void one(const std::filesystem::path &dir, std::uint32_t pipeline, std::size_t f
 	std::this_thread::sleep_for(std::chrono::seconds(seconds));
 	measuring = false;
 	const double secs = double(us_now() - start) / 1e6;
-	auto [committed, commands, p50, p99] = c.nodes[0]->at([&] {
+	auto [committed, commands, p50, p99, leader] = c.nodes[0]->at([&] {
 		auto &g = c.group(1, 1000);
-		return std::tuple{g.committed, g.commands, g.commit_us.at(0.5), g.commit_us.at(0.99)};
+		return std::tuple{g.committed, g.commands, g.commit_us.at(0.5), g.commit_us.at(0.99), proposals_line(g)};
 	});
 	std::printf("one: barrier %s, pipeline %u frame %zu command %zu: %.1f MB/s committed (%llu commands in %.2f s), commit p50 %llu us p99 %llu us\n", barrier_name().c_str(), pipeline,
 				frame, command, double(committed) / secs / 1e6, (unsigned long long)commands, secs, (unsigned long long)p50, (unsigned long long)p99);
 	for (NodeId n = 1; n <= 3; ++n)
 		std::printf("  node %llu storage: %s\n", (unsigned long long)n, storage_line(*c.nodes[n - 1]->storage).c_str());
 	const auto dropped = c.nodes[0]->transport->stats(0).dropped.load();
-	std::printf("  leader transport dropped %llu frames\n", (unsigned long long)dropped);
+	std::printf("  leader %s; transport dropped %llu frames\n", leader.c_str(), (unsigned long long)dropped);
 }
 
 void many(const std::filesystem::path &dir, unsigned slow, bool hot, unsigned seconds) {
@@ -648,6 +678,7 @@ void many(const std::filesystem::path &dir, unsigned slow, bool hot, unsigned se
 		});
 	};
 	auto lead = seen(1, false), apply = seen(2, false), lead0 = seen(1, true), apply0 = seen(2, true);
+	const auto leader0 = c.nodes[0]->at([&] { return proposals_line(c.group(1, ids[0])); });
 	std::printf("many: barrier %s, slow %u hot %d, 99 groups: leader commit %.2f MB/s p50 %llu us p99 %llu us; node 2 applies %.2f MB/s p50 %llu us p99 %llu us\n", barrier_name().c_str(), slow,
 				int(hot), double(lead.bytes) / secs / 1e6, (unsigned long long)lead.us.at(0.5), (unsigned long long)lead.us.at(0.99),
 				double(apply.bytes) / secs / 1e6, (unsigned long long)apply.us.at(0.5), (unsigned long long)apply.us.at(0.99));
@@ -658,7 +689,7 @@ void many(const std::filesystem::path &dir, unsigned slow, bool hot, unsigned se
 				(unsigned long long)HostTransportOptions{}.data_queue);
 	std::printf("  node 2 storage: %s; its slow storage: %s; inbox drops elsewhere at node 2: %llu\n", storage_line(*c.nodes[1]->storage).c_str(),
 				storage_line(*c.nodes[1]->slow_storage).c_str(), (unsigned long long)apply.drops);
-	std::printf("  leader transport dropped %llu frames\n", (unsigned long long)c.nodes[0]->transport->stats(0).dropped.load());
+	std::printf("  group 0 leader %s; transport dropped %llu frames\n", leader0.c_str(), (unsigned long long)c.nodes[0]->transport->stats(0).dropped.load());
 }
 
 // The first group ids from 1000 that place on loop `k` of L.
@@ -784,6 +815,7 @@ void gap(const std::string &lane, std::size_t frame, unsigned seconds) {
 
 int main(int argc, char **argv) {
 	std::setvbuf(stdout, nullptr, _IOLBF, 0);
+	::signal(SIGPIPE, SIG_IGN);  // the host's duty where SO_NOSIGPIPE is missing (connection.h)
 	const std::vector<std::string> a(argv + 1, argv + argc);
 	auto usage = [] {
 		std::fprintf(stderr, "usage: flow_bench barrier DIR SECONDS | one FIXTURE DIR PIPELINE FRAME COMMAND SECONDS | many FIXTURE DIR SLOW HOT SECONDS | gap FIXTURE LANE FRAME SECONDS\n");

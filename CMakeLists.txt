@@ -78,7 +78,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	add_test(NAME consensus_wave_open COMMAND consensus_wave_open_test 64)
 	# More than a segment's turn at once, and a power cut that fences every store outside its worker.
 	add_test(NAME consensus_wave_open_256 COMMAND consensus_wave_open_test 256)
-	add_test(NAME consensus_wave_open_cut COMMAND consensus_wave_open_test 64 64 cut)
+	add_test(NAME consensus_wave_open_cut COMMAND consensus_wave_open_test 128 128 cut)
 	set_tests_properties(consensus_wave_open consensus_wave_open_256 consensus_wave_open_cut PROPERTIES TIMEOUT 120)
 	add_executable(consensus_waiter_test test/waiter_test.cc)
 	target_link_libraries(consensus_waiter_test PRIVATE consensus::consensus)

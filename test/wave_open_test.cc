@@ -174,27 +174,29 @@ int main(int argc, char** argv) {
 	check(!host.driver(0).failed(), "the turn driver stays healthy");
 
 	if (cut) {
-		// Power goes out: the next turn fails in the turn driver, outside every worker.
+		// Power goes out: the next turn fails in the turn driver, outside every worker in it; a
+		// worker whose append comes after finds the turn driver failed and fences itself.
 		disk.cut = disk.operations;
 		std::map<GroupId, Row> late;
 		for (const auto& [id, row] : rows) {
 			task::spawn(ref, propose_row(driver, id, "Q|" + std::to_string(id)), [&late, id](std::exception_ptr e) { late[id] = Row{true, e}; });
 		}
 		run();
-		std::size_t outside = 0, roles = 0, failed = 0;
+		std::size_t outside = 0, inside = 0, roles = 0, failed = 0;
 		std::string other;
 		for (const auto& [id, row] : rows) {
 			auto found = sink.fenced.find(id);
 			if (found != sink.fenced.end() && found->second == "storage fenced outside worker") { ++outside; }
+			else if (found != sink.fenced.end() && found->second == "turn driver failed") { ++inside; }
 			else if (other.empty()) { other = "group " + std::to_string(id) + ": " + (found == sink.fenced.end() ? "not fenced" : found->second); }
 			auto state = driver.state(id);
 			roles += state && state->role == Role::Fenced;
 			failed += late[id].done && late[id].error;
 		}
-		std::printf("power cut: %zu fenced outside their worker, %zu with a fenced role, %zu proposals failed; turn driver %s\n", outside, roles, failed,
+		std::printf("power cut: %zu fenced outside their worker, %zu inside, %zu with a fenced role, %zu proposals failed; turn driver %s\n", outside, inside, roles, failed,
 			host.driver(0).failed() ? ("failed: " + what(turns_error)).c_str() : "healthy");
 		if (!other.empty()) { std::printf("first other: %s\n", other.c_str()); }
-		check(outside == groups, "every worker names the fence its store took outside it");
+		check(outside > 0 && outside + inside == groups, "every worker names the fence its store took outside it, or its own");
 		check(roles == groups, "every fenced worker's core is fenced");
 		check(failed == groups, "every proposal after the cut fails");
 	}

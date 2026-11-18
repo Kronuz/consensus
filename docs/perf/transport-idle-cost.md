@@ -14,8 +14,9 @@ Linux gate host, and this Mac stands in for it (Detent PLAN.md D111).
 
 CI's Linux runners gave only the counts that do not depend on timing. The ctest entry
 `consensus_transport_idle` runs `cost --quick` on every CI platform and fails when an idle group
-holds a descriptor, an armed timer or more than `230 + 40P` bytes on average (D112), when a frame is not
-delivered, or when an idle connection end holds more than 48 KB. In CI run 44139926700 (Kronuz/consensus, branch commit consensus:0264544) it passed on
+holds a descriptor, an armed timer or more than `164 + 52P` bytes on average (A1 below), when a
+frame is not delivered or its credit does not come back, or when an idle connection end holds more
+than 48 KB. In CI run 44139926700 (Kronuz/consensus, branch commit consensus:0264544) it passed on
 linux-x86_64-gcc, linux-x86_64-clang and linux-arm64-gcc, and under linux-tsan, linux-asan-ubsan
 and freebsd-x86_64, where bytes are not counted (a sanitizer's allocator pads every block) and only
 descriptors, timers and frames are checked. CI prints no numbers for a test that passes.
@@ -49,11 +50,21 @@ Per configuration: the mesh comes up one pair at a time (the lower node dials bo
 dials race and no listener sees more than its 2 handshakes per source address; every host is
 127.0.0.1), every node sends back, and 200 ms later the per-host and per-end counts are read.
 Then 1,000 groups per host each send a control and a data frame to every peer from their own
-loops; once every frame arrived and the transport's counters stopped moving for 200 ms, the
-per-group counts are read. Per host is the counted bytes over H; per end, the slope of a least
-squares fit of bytes per host against 2P, over H = 2, 3 and 5. Ten thousand groups per host is
-quest transport-feed-scan's check (D109), not this one's: `HostTransport::feed` scans every group
-per frame, and at 10,000 groups connections end (job 261117-092742-231632).
+loops; once every frame arrived, every group's credit came back (`HostTransportStats::uncredited`
+is 0 on every loop, waited for up to 10 s) and the transport's counters stopped moving for 200 ms,
+the per-group counts are read. The credit wait matters: a credit frame arriving moves neither the
+sent nor the received count, and a sending group still waiting for its credit holds its record and
+its queues' emptied blocks (2 x 4,112 B under libc++), so without it a run that read too early
+counted groups in flight, not idle ones. Per host is the counted bytes over H; per end, the slope
+of a least squares fit of bytes per host against 2P, over H = 2, 3 and 5.
+
+At 10,000 groups per host (D109), the configuration whose connections ended before the feed took
+ready rings (job 261117-092742-231632, 3 of 3), job 261118-003133-4c4eb0 (strict,
+consensus:303cad1) ran `one 5 1 10000` three times: no connection ended, 400,040 of 400,040 frames
+arrived each time, and an idle group held 298.2 B (stored 127.8 B, its frames 170.5 B), within
+`164 + 52P` (372 B at P = 4). Its credit came back 561-683 ms after the last frame arrived: at
+10,000 groups the last credit frames are still in flight, queued in the receivers' sockets behind
+the burst, when every message frame has arrived.
 
 The per-host count is the steady state after a host's TLS context is built. `cost` first runs an
 unprinted warm-up configuration (2 hosts, 1 loop, 100 groups), which absorbs what a process builds
@@ -65,32 +76,42 @@ cost (Detent PLAN.md D111).
 
 ## A1: idle cost
 
-Job 261117-172945-6b1b06 (exclusive, consensus:76bacd2) measured every row below and passed.
+Job 261118-003133-eee91a (`cost --quick`, consensus:303cad1) measured every row below and passed.
 
 Per idle group, over G x H = 1,000 x H groups, at H = 2, 3, 5 (P = 1, 2, 4 peers) and L = 1, 4:
 0 descriptors, 0 armed timers, every frame delivered (4,004 to 40,040 per configuration), 0
-dropped, refused or malformed. Its bytes are all C++ heap (OpenSSL 0), the identity store
-transport-identity added to the host transport (Detent PLAN.md D112) and not what traffic leaves
-(0.2 B before identity, D108's 64 B):
+dropped, refused or malformed. Its bytes are all C++ heap (OpenSSL 0): the identity store
+transport-identity added (Detent PLAN.md D112) and the records of the connections that carry
+its open.
 
-| L | P | Per idle group | Stored | Its frames | `230 + 40P` |
-|---|---|---|---|---|---|
-| 1 | 1 | 253.1 B | 204.8 | 48.3 | 270 |
-| 1 | 2 | 285.5 B | 204.8 | 80.7 | 310 |
-| 1 | 4 | 366.2 B | 204.8 | 161.5 | 390 |
-| 4 | 1 | 255.0 B | 206.3 | 48.7 | 270 |
-| 4 | 2 | 287.3 B | 206.3 | 81.0 | 310 |
-| 4 | 4 | 367.9 B | 206.3 | 161.5 | 390 |
+| L | P | Per idle group | Stored | Its frames | Minimum `104 + 24P` | Bound `164 + 52P` |
+|---|---|---|---|---|---|---|
+| 1 | 1 | 173.4 B | 136.8 | 36.7 | 128 | 216 |
+| 1 | 2 | 210.2 B | 136.8 | 73.4 | 152 | 268 |
+| 1 | 4 | 283.6 B | 136.8 | 146.8 | 200 | 372 |
+| 4 | 1 | 172.1 B | 130.6 | 41.4 | 128 | 216 |
+| 4 | 2 | 213.1 B | 130.6 | 82.5 | 152 | 268 |
+| 4 | 4 | 295.2 B | 130.6 | 164.6 | 200 | 372 |
 
-"Stored" is what a group holds the moment it is stored: 206 B at 4 loops, the identity store. The
-job's C++ block counts per 100 groups name it: the `Stored` node (80 B), its `Opening` (a
-`make_shared` of the 80 B `GroupOpen` and its serial, 112 B) and the rest in the per-loop
-`unordered_map` bucket arrays (12.8 or 14.3 B per group). "Its frames" is what its traffic then
-adds: the connections that open the group each record it, about 40 B per peer (the 32 B
-`Stored::opened` block and the lanes' sorted `opened` vectors). The bound is `230 + 40P` (D112):
-30 B over the fit `200 + 40P`, which the measured points exceed by 6-15 B; they sit 15-25 B under
-`230 + 40P`. D112 sends the shrinking to quest transport-feed-scan
-(A5: back to 64 B, or the minimum field by field).
+The bound is `164 + 52P` everywhere: in the bench, which fails a run over it, in CI's `cost
+--quick`, and here. It is per peer with the group's frames on one lane (the bench sends on
+Control); a group opened on both lanes of a peer holds the per-peer part twice. Where it comes
+from:
+
+1. The minimum, field by field (host-transport.md, Tables): what a group is stored as, its id,
+   incarnation and serial (8 each) and its open (80), 104 B; per peer, its id in the group
+   loop's set for that connection (8) and its id and serial in the connection's `Lane::opened`
+   (16), 24 B. So `104 + 24P`.
+2. The ceiling: each entry at the tables' worst slack, 1.5x its size (the dense vector grows by
+   1.5x) plus 8 B of index (`u32` slots at load 0.5). Stored: 104 x 1.5 + 8 = 164. Per peer: 8 x
+   1.5 + 8 = 20 and 16 x 1.5 + 8 = 32, 52. So `164 + 52P`.
+
+The measured fit sits between them: about `137 + 37P` at L = 1 and `131 + 41P` at L = 4. Stored
+is 27-33 B under 164, and each peer 11-15 B under 52.
+
+The per-end and per-host rows below are job 261117-172945-6b1b06 (exclusive, consensus:76bacd2,
+before this quest). Job 261118-003133-eee91a's fits at consensus:303cad1 are within 1.4% of them:
+`53,818 + 2P x 44,979` at L = 1 and `56,911 + 2P x 49,104` at L = 4.
 
 Per idle connection end, the fit's slope: 44,666 B at L = 1 and 48,792 B at L = 4 (inferred, not
 counted per thread: each loop that runs TLS adds per-thread OpenSSL state, which grows with the
@@ -143,6 +164,17 @@ job is the one that counts.
 
 The rows before transport-identity (consensus:0d92ef5, jobs 261117-122822-488d1f, -122836-fb319f,
 -122848-92c892) were 131 ns, 216 ns and 15.3 us: identity moved none of them outside its band.
+
+Against main's feed (consensus:edbb162), the same streams in one job, base, branch, branch,
+base, at 3 rounds each (strict, beside 26 light holds, job 261118-002026-757230,
+consensus:303cad1): data, same 1,041, 758, 531 and 747 ns of receiver CPU per frame, hop 1,186,
+936, 660 and 866 ns, so the branch is at or under main at each position; control, same 513, 605,
+429 and 331 ns, about 20-30% over main. The control cost is the group loop's two `GroupTable`
+lookups per frame (`stored` and the connection's opened set), against one `unordered_map` find
+and a short vector scan on main (profile job 261118-001853-9bb0ba). Before the receiver's credit
+became a vector of records (consensus:01e2c06, job 261117-205819-0701eb) the data stream cost
+1,575-1,608 ns against main's 644-647 ns: each batch built a credit table and a sender's record
+per credited group, then freed both.
 
 Beside it, the bare Asio hop with no TLS and no transport (Detent `run.sh hop_cost`, job
 261117-092732-0475d9, exclusive, Detent:d15d063): 793-851 ns per frame posted alone, 21-22 ns in

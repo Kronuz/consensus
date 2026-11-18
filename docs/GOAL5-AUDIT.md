@@ -10,7 +10,7 @@ below, each with the bound that keeps it finite, cited as `library:path:line`.
 |---|---|
 | completion | completion:d8b538c6778f |
 | journal | journal:ce05f0efd411 |
-| consensus | consensus:b7f48b2414d8 |
+| consensus | consensus:42019ebb7c1f |
 | task | task:95798a02f68c |
 | wheel | wheel:238b1ae9f58b |
 
@@ -67,8 +67,8 @@ TurnDriver's other per-group state is erased by `forget`: `refused_` (turn_drive
 | CN8 | `consensus:include/consensus/transport/links.h:247` | One accept root per accepted socket | Unauthenticated handshakes are capped at `handshakes` (4) and `handshakes_per_source` (2) (links.h:24); `admit` aborts the oldest over the cap (:365-378) |
 | CN9 | `consensus:include/consensus/transport/links.h:194` | An authenticated accept moves to its peer's loop as an `adopt` root | One per CN8 accept that authenticated; counted in `incoming_` (:192, :204) and `drained()` waits for it (:82) |
 | CN10 | `consensus:include/consensus/transport/links.h:346` | One `run` root per established link | One reserved slot per (peer, lane) (:220), released at the link's end (:336-340) |
-| CN11 | `consensus:include/consensus/transport/host_transport.h:192` | The accept loop root | One per `serve` call |
-| CN12 | `consensus:include/consensus/transport/host_transport.h:344` | One dial root per (node, lane) | Guarded by `lane.dialing`, with a redial backoff (host_transport.h:341-350) |
+| CN11 | `consensus:include/consensus/transport/host_transport.h:296` | The accept loop root | One per `serve` call |
+| CN12 | `consensus:include/consensus/transport/host_transport.h:565` | One dial root per (node, lane) | Guarded by `lane.dialing`, with a redial backoff (host_transport.h:561-572) |
 | CN13 | `consensus:include/consensus/transport/peers.h:456` | `Peers` co_spawns its accept loop, its dials and one root per incoming connection | Accept loop once (:125); two lanes per higher peer (:126-129); incoming refused past `handshakes` pending or `2 x peers + handshakes` connections (:487-495) |
 | CN14 | `consensus:include/consensus/core.h:96` `consensus:include/consensus/core.h:284` `consensus:include/consensus/worker.h:471` | Each step and each Worker turn retire the log's detached entries | 256 entries and `command_bytes` per call (core.h:96); the backlog counts against the log caps (`charged_entries`/`charged_bytes`, retained_log.h:163-164; checked at core.h:702, :708, :947) |
 | CN15 | `consensus:include/consensus/retained_log.h:134` `consensus:include/consensus/retained_log.h:228` `consensus:include/consensus/retained_log.h:235` `consensus:include/consensus/retained_log.h:236` | Removing a range detaches its subtree onto the retired list; `retire` frees nodes under a budget | One budget unit and the payload's bytes per node (:232, retirement.h:32-44) |
@@ -148,7 +148,7 @@ K=${K:-$HOME/code/Kronuz}
 DOC=${DOC:-docs/GOAL5-AUDIT.md}
 P='std::thread *\(|std::jthread|pthread_create|std::async *\(|\.detach\(\)|thread_local|Lookup::start\(|task::spawn\(|co_spawn\(|\.destroy\(\);|destroy_all\(\);|destroy_roots\(\);|delete (this|self|static_cast)|::operator delete|retired_\[|push_retired\(std|retire\((256|budget|shared)|retire_log\(\)|begin_retirement\(\)|retirement_step\(budget|retire_ring\(\);|reclaim\(\);|start_reclaim\((scan_)?budget|scanned >= budget_|fire\(\*e, false\)|wheel_?(->|\.)release\(\)|self->unfile\('
 hits=0 missing=0
-for spec in completion:d8b538c6778f journal:ce05f0efd411 consensus:b7f48b2414d8 task:95798a02f68c wheel:238b1ae9f58b; do
+for spec in completion:d8b538c6778f journal:ce05f0efd411 consensus:42019ebb7c1f task:95798a02f68c wheel:238b1ae9f58b; do
   lib=${spec%%:*} rev=${spec#*:}
   while IFS= read -r line; do
     site="$lib:$(printf '%s' "$line" | cut -d: -f2-3)"

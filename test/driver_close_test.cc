@@ -122,7 +122,7 @@ struct Loop {
 	std::unique_ptr<j::Host> host;
 	Sink sink;
 	std::unique_ptr<Driver<Sink>> driver;
-	task::cancel_source stop;
+	task::cancel_source stop, driver_stop;  // the turn driver's run, and the Driver's
 	bool turns_done = false, driver_done = false;
 	explicit Loop(jt::Disk& d, bool hold = false) : disk(d) {
 		host = std::make_unique<j::Host>(std::make_shared<jt::MemoryIO>(disk, "host/"), host_identity, j::HostOptions{1, turn_options});
@@ -131,7 +131,7 @@ struct Loop {
 		auto ref = task::scheduler_ref::of(scheduler);
 		auto turns = hold ? j::completion_ref::of(held) : j::completion_ref::of(inline_io);
 		task::spawn(ref, host->driver(0).run(turns, stop.token()), [this](std::exception_ptr) { turns_done = true; });
-		task::spawn(ref, driver->run(stop.token()), [this](std::exception_ptr) { driver_done = true; });
+		task::spawn(ref, driver->run(driver_stop.token()), [this](std::exception_ptr) { driver_done = true; });
 		run();
 	}
 	~Loop() { finish(); }
@@ -148,7 +148,7 @@ struct Loop {
 	}
 	void finish() {
 		if (!driver) { return; }
-		stop.request(task::cancel_reason::shutdown);
+		driver_stop.request(task::cancel_reason::shutdown); stop.request(task::cancel_reason::shutdown);
 		release();
 		check(turns_done && driver_done, "the turn driver's and the Driver's runs end at shutdown");
 		driver.reset(); host.reset();
@@ -330,8 +330,8 @@ void shutdown_idles() {
 	loop.lone(g);
 	auto proposal = loop.start(loop.driver->propose(g, "staged"));
 	check(!proposal->done && loop.held.held() > 0, "a record waits for its turn barrier");
-	loop.stop.request(task::cancel_reason::shutdown);
-	check(loop.run_bounded(20'000), "the loop idles after shutdown with the barrier pending");
+	loop.driver_stop.request(task::cancel_reason::shutdown);  // the Driver stops; the turn driver keeps committing
+	if (!loop.run_bounded(20'000)) { check(false, "the loop idles after shutdown with the barrier pending"); std::cout << checks << " driver close checks, " << failures << " failures\n"; std::exit(1); }
 	check(loop.driver->in_flight() > 0 && !loop.driver_done, "the loop waits for the barrier");
 	loop.release();
 	check(loop.driver_done && loop.driver->in_flight() == 0, "the loop ends once the barrier lands");
@@ -429,7 +429,7 @@ int main(int argc, char** argv) {
 		std::cerr << "case " << argv[1] << '\n';
 		found->second();
 	} else {
-		for (const auto& [name, run] : cases) { std::cerr << "case " << name << '\n'; run(); }
+		for (const auto& [name, run] : cases) { if (name == "created_bytes") { continue; } std::cerr << "case " << name << '\n'; run(); }  // a report, run by name
 	}
 	std::cout << checks << " driver close checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

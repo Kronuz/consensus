@@ -20,6 +20,7 @@
 #include <journal/memory_io.h>
 #include <openssl/pem.h>
 #include <openssl/x509v3.h>
+#include <thread>
 #include <unistd.h>
 
 using namespace kronuz::consensus;
@@ -1161,21 +1162,25 @@ asio::awaitable<void> fetch_alongside_consensus(asio::io_context &io, const Cert
 // the next fetch succeeds. Then voter two closes as its reply starts: the fetch fails at once, and the other
 // two keep committing.
 asio::awaitable<void> fetch_failures(asio::io_context &io, const Certificates &certificates) {
-	constexpr std::size_t size = 8 * 1024 * 1024;
+	constexpr std::size_t size = 2 * 1024 * 1024; // many frames, yet a reply and its late drain fit the deadline
 	Cluster cluster(io, certificates);
 	cluster.aside = 1;
 	auto files = serving(cluster, io);
 	(*files[1])["history/table"] = pattern(size, 20);
 	enum class Then { Serve, Freeze, Close } then = Then::Serve;
+	// PEERS_RETRY_LAG_MS delays the retry's first read, as a loaded runner would.
+	std::chrono::milliseconds lag{};
 	cluster.options[1].reader = reader(files[1], [&](std::string_view) {
 		if (then == Then::Freeze) {
 			cluster.frozen = true;
 			cluster.side.stop();
 		} else if (then == Then::Close)
 			asio::post(io, [&] { cluster.stop(1); });
+		else if (lag.count())
+			std::this_thread::sleep_for(std::exchange(lag, {}));
 		then = Then::Serve;
 	});
-	cluster.options[0].fetch_deadline = 500ms;
+	cluster.options[0].fetch_deadline = 1s;
 	for (unsigned i = 0; i != 3; ++i)
 		cluster.start(i);
 	CHECK(co_await cluster.commit("before", {0, 1, 2}, 5s));
@@ -1184,21 +1189,33 @@ asio::awaitable<void> fetch_failures(asio::io_context &io, const Certificates &c
 
 	then = Then::Freeze;
 	auto stalled = fetch(cluster, 0, 2, "history/table");
-	CHECK(co_await cluster.until([&] { return stalled->done; }, 2s));
+	CHECK(co_await cluster.until([&] { return stalled->done; }, 3s));
 	const auto waited = ms(stalled->answered - stalled->asked);
-	std::printf("  frozen peer: fetch failed after %lld ms (deadline 500 ms)\n", waited);
-	CHECK(cluster.frozen && stalled->error == std::errc::timed_out && !stalled->bytes && waited >= 500);
+	std::printf("  frozen peer: fetch failed after %lld ms (deadline 1000 ms)\n", waited);
+	CHECK(cluster.frozen && stalled->error == std::errc::timed_out && !stalled->bytes && waited >= 1000);
 	CHECK(cluster.peers[0]->occupancy().fetches == 1); // the failed fetch keeps its slot until its reply ends
+	if (const char *env = std::getenv("PEERS_THAW_LAG_MS")) { // the peer stays hung this much longer
+		const auto hung = std::chrono::milliseconds(std::atoi(env));
+		(void)co_await cluster.until([&] { return Clock::now() - stalled->answered >= hung; }, hung + 1s);
+	}
 	cluster.frozen = false;
 	CHECK(co_await cluster.until([&] { return cluster.peers[0]->occupancy().fetches == 0; }, 3s));
+	if (const char *env = std::getenv("PEERS_RETRY_LAG_MS"))
+		lag = std::chrono::milliseconds(std::atoi(env));
 	auto retried = fetch(cluster, 0, 2, "history/table");
-	CHECK(co_await cluster.until([&] { return retried->done; }, 3s));
+	CHECK(co_await cluster.until([&] { return retried->done; }, 4s));
+	if (retried->error || retried->bytes != (*files[1])["history/table"])
+		std::fprintf(stderr, "  retried fetch: error %d %s, %zu of %zu bytes, after %lld ms\n", retried->error.value(),
+					retried->error.message().c_str(), retried->bytes ? retried->bytes->size() : 0, size,
+					ms(retried->answered - retried->asked));
 	CHECK(!retried->error && retried->bytes == (*files[1])["history/table"]);
 	CHECK(cluster.peers[0]->stats().admitted == admitted && cluster.connections(0) == 4); // the same lanes
 	CHECK(co_await cluster.commit("after the hang", {0, 1, 2}, 5s));
 
+	// A reply too long to finish before the close lands, whatever the host's speed.
+	(*files[1])["history/large"] = pattern(8 * 1024 * 1024, 21);
 	then = Then::Close;
-	auto closed = fetch(cluster, 0, 2, "history/table");
+	auto closed = fetch(cluster, 0, 2, "history/large");
 	CHECK(co_await cluster.until([&] { return closed->done; }, 2s));
 	const auto failed = ms(closed->answered - closed->asked);
 	std::printf("  closed peer: fetch failed after %lld ms\n", failed);

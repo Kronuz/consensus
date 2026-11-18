@@ -106,6 +106,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	# Each seeded fault in tools/mutants.sh must fail the simulation (it reads Ninja's commands).
 	if(CMAKE_GENERATOR MATCHES "Ninja")
 		add_test(NAME consensus_mutants COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/mutants.sh ${CMAKE_BINARY_DIR} 400 10000)
+		set_tests_properties(consensus_mutants PROPERTIES TIMEOUT 1800)  # 14 faults, each built three ways: about 800 s on a busy host
 	endif()
 	# Its real-file cases are flush-bound on macOS (F_FULLFSYNC): 145-170 s alone, more on a busy disk.
 	set_tests_properties(consensus_worker PROPERTIES TIMEOUT 600)

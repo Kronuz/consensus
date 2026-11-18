@@ -1,16 +1,47 @@
+# Probe for groups-upload-stall (never lands): groups_upload N times on macos-15-intel beside a
+# looping connection_test, with the kernel's TCP counters around each failure.
 name: CI
 on:
-  push:
-    branches: [main, master, 'quest/**']
-  pull_request:
   workflow_dispatch:
     inputs:
       nightly: { type: boolean, default: false }
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
 jobs:
-  ci:
-    uses: Kronuz/cpp-libraries/.github/workflows/cmake.yml@main
-    with:
-      nightly: ${{ inputs.nightly || false }}
+  probe:
+    name: probe-${{ matrix.shard }}
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Configure
+        env: { CC: clang, CXX: clang++ }
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo "-DCMAKE_C_FLAGS_RELWITHDEBINFO=-O2 -g" "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=-O2 -g -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE"
+      - name: Build
+        run: cmake --build build --parallel 4 --target consensus_transport_groups_test consensus_transport_connection_test
+      - name: Probe
+        run: |
+          set +e
+          ctest --test-dir build -R '^consensus_tls_certificates$' --output-on-failure
+          fx=build/tls-fixture
+          (while true; do build/consensus_transport_connection_test $fx > /dev/null 2>&1; done) &
+          bg=$!
+          fails=0
+          for i in $(seq 1 24); do
+            netstat -s -p tcp > before.txt
+            build/consensus_transport_groups_test $fx upload > out.txt 2>&1
+            rc=$?
+            netstat -s -p tcp > after.txt
+            echo "== iteration $i rc $rc $(date -u +%H:%M:%S) $(grep -E '^upload: [0-9.]+ MiB' out.txt)"
+            if [ $rc -ne 0 ]; then
+              fails=$((fails+1))
+              cat out.txt
+              echo "-- tcp counters that moved"
+              diff before.txt after.txt
+              uptime; vm_stat | head -8
+            fi
+          done
+          kill $bg
+          echo "probe: $fails of 24 failed"

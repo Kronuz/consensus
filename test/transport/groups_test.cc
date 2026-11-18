@@ -38,6 +38,10 @@
 #include <future>
 #include <mutex>
 #include <openssl/pem.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
@@ -544,6 +548,50 @@ bool reader() {
 	return ok;
 }
 
+// The sum of a counter over a host's loops.
+std::uint64_t total(Host &h, std::atomic<std::uint64_t> HostTransportStats::*counter) {
+	std::uint64_t sum = 0;
+	for (std::uint32_t k = 0; k != h.transport->loops(); ++k)
+		sum += (h.transport->stats(k).*counter).load();
+	return sum;
+}
+// Each loopback TCP socket of this process on `ports`: local and peer port, bytes unread
+// (FIONREAD), bytes in its send buffer, and on macOS the windows, cwnd, RTO and retransmits.
+std::string sockets(std::initializer_list<std::uint16_t> ports) {
+	std::string r;
+	for (int fd = 3; fd != 1024; ++fd) {
+		sockaddr_in local{}, peer{};
+		socklen_t a = sizeof local, b = sizeof peer;
+		if (::getsockname(fd, reinterpret_cast<sockaddr *>(&local), &a) != 0 || local.sin_family != AF_INET ||
+			::getpeername(fd, reinterpret_cast<sockaddr *>(&peer), &b) != 0)
+			continue;
+		const auto lp = ntohs(local.sin_port), pp = ntohs(peer.sin_port);
+		if (std::find(ports.begin(), ports.end(), lp) == ports.end() && std::find(ports.begin(), ports.end(), pp) == ports.end())
+			continue;
+		int unread = -1, unsent = -1;
+		::ioctl(fd, FIONREAD, &unread);
+#if defined(SO_NWRITE)
+		socklen_t n = sizeof unsent;
+		::getsockopt(fd, SOL_SOCKET, SO_NWRITE, &unsent, &n);
+#elif defined(SIOCOUTQ)
+		::ioctl(fd, SIOCOUTQ, &unsent);
+#endif
+		char line[256];
+		std::snprintf(line, sizeof line, " [%u>%u unread %d sndq %d", lp, pp, unread, unsent);
+		r += line;
+#if defined(TCP_CONNECTION_INFO)
+		tcp_connection_info i{};
+		socklen_t m = sizeof i;
+		if (::getsockopt(fd, IPPROTO_TCP, TCP_CONNECTION_INFO, &i, &m) == 0) {
+			std::snprintf(line, sizeof line, " sndwnd %u rcvwnd %u cwnd %u rto %u srtt %u rexmit %llu", i.tcpi_snd_wnd, i.tcpi_rcv_wnd,
+						  i.tcpi_snd_cwnd, i.tcpi_rto, i.tcpi_srtt, (unsigned long long)i.tcpi_txretransmitpackets);
+			r += line;
+		}
+#endif
+		r += "]";
+	}
+	return r;
+}
 // A2: four groups upload 2 MiB appends of two 1 MiB commands (types.h's command and RPC caps) on
 // the Control connection, faster than the receiver reads them (25 ms a MiB, 40 MB/s, on the
 // connection's own loop). A follower group's heartbeat every 100 ms and a vote every 300 ms on
@@ -586,6 +634,18 @@ bool upload() {
 	step("upload: 4 s of uploads, heartbeats and votes");
 	const auto before = beats.count.load();
 	const auto start = steady::now();
+	std::vector<std::string> samples;  // every 250 ms: progress, each host's reads, the sockets
+	std::atomic<bool> sampling{true};
+	std::thread sampler([&] {
+		while (sampling) {
+			std::this_thread::sleep_for(250ms);
+			char line[160];
+			std::snprintf(line, sizeof line, "upload: %5llu ms %6.1f MiB %3llu beats; reads %llu/%llu;", (unsigned long long)ms_since(start),
+						  double(uploaded) / (1 << 20), (unsigned long long)(beats.count - before),
+						  (unsigned long long)total(one, &HostTransportStats::reads), (unsigned long long)total(two, &HostTransportStats::reads));
+			samples.push_back(line + sockets({one.port(), two.port()}));
+		}
+	});
 	for (std::int64_t tick = 0; ms_since(start) < 4000; ++tick) {  // signed: see reader()
 		for (auto g : uploads) {
 			const auto k = one.transport->loop_of_group(g);
@@ -597,6 +657,8 @@ bool upload() {
 		std::this_thread::sleep_until(start + (tick + 1) * 100ms);
 	}
 	const auto elapsed = ms_since(start);
+	sampling = false;
+	sampler.join();
 	two.post(other, [&] { beats.beat(); });  // a silence at the end counts
 	std::this_thread::sleep_for(100ms);
 	step("upload: the hosts stop");
@@ -607,6 +669,9 @@ bool upload() {
 	std::printf("upload: %.1f MiB uploaded in %llu ms on the shared connection; %llu heartbeats and votes, longest gap %llu ms %s\n",
 				double(uploaded) / (1 << 20), (unsigned long long)elapsed, (unsigned long long)controls, (unsigned long long)gap,
 				ok ? "ok" : "FAILS: a follower would start an election");
+	if (!ok)
+		for (auto &s : samples)
+			std::printf("%s\n", s.c_str());
 	return ok;
 }
 
@@ -932,13 +997,6 @@ bool add_voter_4(Cluster &c, NodeId leader, GroupId g, const std::string &seen, 
 	}
 }
 
-// The sum of a counter over a host's loops.
-std::uint64_t total(Host &h, std::atomic<std::uint64_t> HostTransportStats::*counter) {
-	std::uint64_t sum = 0;
-	for (std::uint32_t k = 0; k != h.transport->loops(); ++k)
-		sum += (h.transport->stats(k).*counter).load();
-	return sum;
-}
 std::uint64_t misplaced(Cluster &c) {
 	std::uint64_t sum = 0;
 	for (auto &n : c.nodes)

@@ -14,8 +14,9 @@ Linux gate host, and this Mac stands in for it (Detent PLAN.md D111).
 
 CI's Linux runners gave only the counts that do not depend on timing. The ctest entry
 `consensus_transport_idle` runs `cost --quick` on every CI platform and fails when an idle group
-holds a descriptor, an armed timer or more than `230 + 40P` bytes on average (D112), when a frame is not
-delivered, or when an idle connection end holds more than 48 KB. In CI run 44139926700 (Kronuz/consensus, branch commit consensus:0264544) it passed on
+holds a descriptor, an armed timer or more than `164 + 52P` bytes on average (A1 below), when a
+frame is not delivered or its credit does not come back, or when an idle connection end holds more
+than 48 KB. In CI run 44139926700 (Kronuz/consensus, branch commit consensus:0264544) it passed on
 linux-x86_64-gcc, linux-x86_64-clang and linux-arm64-gcc, and under linux-tsan, linux-asan-ubsan
 and freebsd-x86_64, where bytes are not counted (a sanitizer's allocator pads every block) and only
 descriptors, timers and frames are checked. CI prints no numbers for a test that passes.
@@ -49,11 +50,21 @@ Per configuration: the mesh comes up one pair at a time (the lower node dials bo
 dials race and no listener sees more than its 2 handshakes per source address; every host is
 127.0.0.1), every node sends back, and 200 ms later the per-host and per-end counts are read.
 Then 1,000 groups per host each send a control and a data frame to every peer from their own
-loops; once every frame arrived and the transport's counters stopped moving for 200 ms, the
-per-group counts are read. Per host is the counted bytes over H; per end, the slope of a least
-squares fit of bytes per host against 2P, over H = 2, 3 and 5. Ten thousand groups per host is
-quest transport-feed-scan's check (D109), not this one's: `HostTransport::feed` scans every group
-per frame, and at 10,000 groups connections end (job 261117-092742-231632).
+loops; once every frame arrived, every group's credit came back (`HostTransportStats::uncredited`
+is 0 on every loop, waited for up to 10 s) and the transport's counters stopped moving for 200 ms,
+the per-group counts are read. The credit wait matters: a credit frame arriving moves neither the
+sent nor the received count, and a sending group still waiting for its credit holds its record and
+its queues' emptied blocks (2 x 4,112 B under libc++), so without it a run that read too early
+counted groups in flight, not idle ones. Per host is the counted bytes over H; per end, the slope
+of a least squares fit of bytes per host against 2P, over H = 2, 3 and 5.
+
+At 10,000 groups per host (D109), the configuration whose connections ended before the feed took
+ready rings (job 261117-092742-231632, 3 of 3), job 261117-205722-8d9231 (strict,
+consensus:01e2c06) ran `one 5 1 10000` three times: no connection ended, 400,040 of 400,040 frames
+arrived each time, and an idle group held 298.2 B (stored 127.8 B, its frames 170.5 B), within
+`164 + 52P` (372 B at P = 4). Its credit came back 363-438 ms after the last frame arrived: a receiver's reader
+parked at `connection.h`'s per-read `co_await task::yield()` is not resumed for that long, with the
+last credit frames unread in its socket (quest transport-feed-scan's journal, "Finding").
 
 The per-host count is the steady state after a host's TLS context is built. `cost` first runs an
 unprinted warm-up configuration (2 hosts, 1 loop, 100 groups), which absorbs what a process builds

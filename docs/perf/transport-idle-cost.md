@@ -84,11 +84,12 @@ transport-identity added to the host transport (Detent PLAN.md D112) and not wha
 
 "Stored" is what a group holds the moment it is stored: 206 B at 4 loops, the identity store. The
 job's C++ block counts per 100 groups name it: the `Stored` node (80 B), its `Opening` (a
-`make_shared` of the 80 B `GroupOpen` and its serial, 112 B) and the rest in 16 B and 32 B
-blocks. "Its frames" is what its traffic then adds: the connections that open the group each
-record it, about 40 B per peer (`Stored::opened` and the lanes' maps). The bound is D112's
-`200 + 40P` plus 30 B, because the measured points sit 6-15 B above `200 + 40P` itself; the
-points are 15-25 B under `230 + 40P`. D112 sends the shrinking to quest transport-feed-scan
+`make_shared` of the 80 B `GroupOpen` and its serial, 112 B) and the rest in the per-loop
+`unordered_map` bucket arrays (12.8 or 14.3 B per group). "Its frames" is what its traffic then
+adds: the connections that open the group each record it, about 40 B per peer (the 32 B
+`Stored::opened` block and the lanes' sorted `opened` vectors). The bound is `230 + 40P` (D112):
+30 B over the fit `200 + 40P`, which the measured points exceed by 6-15 B; they sit 15-25 B under
+`230 + 40P`. D112 sends the shrinking to quest transport-feed-scan
 (A5: back to 64 B, or the minimum field by field).
 
 Per idle connection end, the fit's slope: 44,666 B at L = 1 and 48,792 B at L = 4 (inferred, not

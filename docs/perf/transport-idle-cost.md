@@ -8,8 +8,8 @@ the per-host budget Detent PLAN.md D108 set, `52 KB + 2P x 44 KB`.
 ## Where it was measured
 
 Every number here was measured on this Mac: Intel Core i9-9980HK (8 cores, 16 threads), macOS
-15.8.1, Apple clang 17.0.0, x86-64 binaries (checked with `file`), OpenSSL 4.1.0, in exclusive
-campaign jobs. No Linux gate host was used and nothing here was timed on Linux: A2 names the
+15.8.1, Apple clang 17.0.0, x86-64 binaries (checked with `file`), OpenSSL 4.1.0, timings in
+exclusive campaign jobs (byte counts, which load does not move, also in light ones). No Linux gate host was used and nothing here was timed on Linux: A2 names the
 Linux gate host, and this Mac stands in for it (Detent PLAN.md D111).
 
 CI's Linux runners gave only the counts that do not depend on timing. The ctest entry
@@ -37,7 +37,10 @@ loopback mutual TLS with the test fixture's certificates. Bytes are counted exac
 usable size: OpenSSL's allocations through `CRYPTO_set_mem_functions`, and the C++ heap through
 `operator new`. Blocks at least a timer wheel's size are set apart: they are the loops' timer
 wheels (`task::asio_scheduler`'s `timer_loop`, one per loop that armed a timer), which a host's
-Drivers arm whatever the transport does. Every count is read while every loop is parked, so no
+Drivers arm whatever the transport does. Each loop's OpenSSL thread state is set apart too: before
+the first count the bench draws OpenSSL's public and private DRBGs on every loop, which OpenSSL
+otherwise makes on a thread's first TLS work, and prints those bytes per loop (9,408-9,412 B under
+OpenSSL 4.1.0). Every count is read while every loop is parked, so no
 loop is in a write or a handshake. On glibc, Asio's handler memory goes through
 `std::aligned_alloc`, which the bench's `operator new` does not see; on this Mac that hides nothing
 at idle (review probe 261117-133750-4b45cc), and Linux byte counts are not verified.
@@ -109,28 +112,47 @@ from:
 The measured fit sits between them: about `137 + 37P` at L = 1 and `131 + 41P` at L = 4. Stored
 is 27-33 B under 164, and each peer 11-15 B under 52.
 
-The per-end and per-host rows below are job 261117-172945-6b1b06 (exclusive, consensus:76bacd2,
-before this quest). Job 261118-003133-eee91a's fits at consensus:303cad1 are within 1.4% of them:
-`53,818 + 2P x 44,979` at L = 1 and `56,911 + 2P x 49,104` at L = 4.
+The per-end and per-host rows below are job 261118-075717-797949 (light, consensus:33f8540, Release
+and no build type, 3 runs each; byte counts do not depend on load).
 
-Per idle connection end, the fit's slope: 44,666 B at L = 1 and 48,792 B at L = 4 (inferred, not
-counted per thread: each loop that runs TLS adds per-thread OpenSSL state, which grows with the
-ends). Budget: 48 KB (49,152 B). Two armed timers per end, keepalive and dead peer.
+Per idle connection end, the fit's slope: 44,978 B at L = 1 and 46,681-46,686 B at L = 4 in a
+Release build; 45,128 B and 46,736-46,737 B with no build type. Budget: 48 KB (49,152 B). Two
+armed timers per end, keepalive and dead peer. The L = 4 slope still sits about 1.7 KB above
+L = 1's: per end, the C++ heap holds 400-600 B more at L = 4 (Asio's per-thread handler memory,
+not set apart), while OpenSSL's per-end bytes match L = 1's within 300 B.
 
-Per host, against `52 KB + 2P x 44 KB` (53,248 + 90,112 P bytes), within 10%:
+### Each loop's thread state, set apart
+
+A host's connections to a peer sit on that peer node's loop (`loop_of_node`), so at L = 4 the
+number of loops that ever run TLS grows with P, and each brings its own DRBGs. Counted per host,
+that per-loop cost grew with P and the fit put it in the slope: 49,107-49,109 B at L = 4 in a
+Release build and 49,154-49,159 B with no build type, at main consensus:5923b6c (job
+261118-073615-da90ae, 3 runs each). The ctest entry passed in a Release suite (job
+261118-051311-f0eff6) and failed in jobs that configured no build type (261118-072938-1fb596), by
+2 to 7 bytes. Counting the DRBGs per host instead (consensus:d2eeb0d, job 261118-074432-acdca6)
+charges every loop's, used or not: 30 KB per 4-loop host, which puts those hosts 11-26% over
+`52 KB + 2P x 44 KB`. Set apart per loop, beside the timer wheels, neither the host nor the end
+carries them.
+
+A connection end 4 KB larger fails the check in both builds: job 261118-075718-7593b8 adds a
+4,096-byte member to `Connection` and reads L = 4 slopes of 50,829 B (Release) and 50,874 B (no
+build type). At L = 1 the same mutant reads 49,121 B in Release, 31 B under the budget, so only
+the L = 4 fit catches it there.
+
+Per host, against `52 KB + 2P x 44 KB` (53,248 + 90,112 P bytes), within 10% (Release):
 
 | L | P | Counted bytes per host | Budget | Against it |
 |---|---|---|---|---|
-| 1 | 1 | 142,712 | 143,360 | 0.5% under |
-| 1 | 2 | 232,379 | 233,472 | 0.5% under |
-| 1 | 4 | 410,778 | 413,696 | 0.7% under |
-| 4 | 1 | 153,064 | 143,360 | 6.8% over |
-| 4 | 2 | 252,341 | 233,472 | 8.1% over |
-| 4 | 4 | 446,154 | 413,696 | 7.8% over |
+| 1 | 1 | 134,232 | 143,360 | 6.4% under |
+| 1 | 2 | 224,523 | 233,472 | 3.8% under |
+| 1 | 4 | 404,170 | 413,696 | 2.3% under |
+| 4 | 1 | 142,648 | 143,360 | 0.5% under |
+| 4 | 2 | 237,019 | 233,472 | 1.5% over |
+| 4 | 4 | 422,941 | 413,696 | 2.2% over |
 
-Fits: `53,513 + 2P x 44,666` at L = 1, `56,158 + 2P x 48,792` at L = 4. Besides these, each loop
-that armed a timer holds one 64 KiB timer wheel, the scheduler's. Descriptors per host: 1 + 2P.
-The host rows are 1.5 KB (1%) above the job before identity at both L; that is not attributed.
+Fits: `44,410 + 2P x 44,978` at L = 1, `49,689 + 2P x 46,681` at L = 4. Besides these, each loop
+that armed a timer holds one 64 KiB timer wheel, the scheduler's, and each loop that ran TLS about
+9.4 KB of OpenSSL thread state. Descriptors per host: 1 + 2P.
 
 An idle host spends 289-981 us of CPU per second (0.03-0.10% of a core) at H = 2 to 5: the
 keepalives, one per connection end per second. macOS reports no voluntary context switches through

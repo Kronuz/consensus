@@ -48,31 +48,35 @@ case $1 in
 smoke)
 	net 10
 	$B barrier $D 1
-	$B one $F $D 4 262144 262144 1
-	$B many $F $D 10 1 1
-	$B gap $F control 262144 1
-	$B gap $F bulk 262144 1;;
+	FLOW_BARRIER=1000 $B one $F $D 4 262144 262144 1
+	FLOW_BARRIER=1000 $B many $F $D 10 1 1;;
 a1)
 	$B barrier $D 3
+	FLOW_BARRIER=1000 $B barrier $D 1
 	for rtt in 0 1 10; do
 		net $rtt
 		for t in 1 2 3; do
-			$B one $F $D 1 262144 262144 3
-			$B one $F $D 4 262144 262144 3
+			FLOW_BARRIER=1000 $B one $F $D 1 262144 262144 3
+			FLOW_BARRIER=1000 $B one $F $D 4 262144 262144 3
 		done
-		$B one $F $D 1 0 262144 3
-		$B one $F $D 4 0 262144 3
+		FLOW_BARRIER=1000 $B one $F $D 1 0 262144 3
+		FLOW_BARRIER=1000 $B one $F $D 4 0 262144 3
+		$B one $F $D 1 262144 262144 3
+		$B one $F $D 4 262144 262144 3
 	done;;
 a2)
 	for rtt in 1 10; do
 		net $rtt
 		for t in 1 2 3; do
-			$B many $F $D 1 1 3
-			$B many $F $D 10 1 3
+			FLOW_BARRIER=1000 $B many $F $D 1 1 3
+			FLOW_BARRIER=1000 $B many $F $D 10 1 3
 		done
-		$B many $F $D 1 0 3
-		$B many $F $D 10 0 3
-	done;;
+		FLOW_BARRIER=1000 $B many $F $D 1 0 3
+		FLOW_BARRIER=1000 $B many $F $D 10 0 3
+	done
+	net 1
+	$B many $F $D 1 1 3
+	$B many $F $D 10 1 3;;
 a3)
 	for rtt in 0 1 10; do
 		for rate in "" 1gbit; do

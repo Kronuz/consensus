@@ -76,6 +76,13 @@ const steady::time_point began = steady::now();
 std::uint64_t us_now() { return std::uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(steady::now() - began).count()); }
 std::uint64_t ms_now() { return us_now() / 1000 + 1; }
 std::atomic<bool> measuring{false};
+// FLOW_BARRIER: unset or "sync", each barrier is an fdatasync; a number, a modeled barrier that
+// sleeps that many microseconds after the writes reach the page cache.
+const long modeled_barrier_us = [] {
+	const char *v = std::getenv("FLOW_BARRIER");
+	return v && std::string_view(v) != "sync" ? std::stol(v) : -1L;
+}();
+std::string barrier_name() { return modeled_barrier_us < 0 ? "fdatasync" : "modeled " + std::to_string(modeled_barrier_us) + " us"; }
 
 Fingerprint pin_of(const std::string &name) {
 	std::unique_ptr<BIO, decltype(&BIO_free)> input(BIO_new_file((fixture / (name + ".pem")).c_str(), "r"), BIO_free);
@@ -221,6 +228,10 @@ class Storage {
 		}
 	}
 	void barrier() {
+		if (modeled_barrier_us >= 0) {
+			std::this_thread::sleep_for(std::chrono::microseconds(modeled_barrier_us));
+			return;
+		}
 #ifdef __APPLE__
 		const int r = ::fcntl(fd_, F_FULLFSYNC);
 #else
@@ -557,7 +568,7 @@ void barrier_bench(const std::filesystem::path &dir, unsigned seconds) {
 	measuring = false;
 	const double secs = double(us_now() - std::uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(start - began).count())) / 1e6;
 	std::lock_guard hold(s.stats_mutex);
-	std::printf("barrier: %llu barriers of 2 MiB in %.2f s: %.1f MB/s; barrier p50 %llu us p99 %llu us\n", (unsigned long long)s.count, secs,
+	std::printf("barrier: %s: %llu barriers of 2 MiB in %.2f s: %.1f MB/s; barrier p50 %llu us p99 %llu us\n", barrier_name().c_str(), (unsigned long long)s.count, secs,
 				double(s.bytes) / secs / 1e6, (unsigned long long)s.barriers.at(0.5), (unsigned long long)s.barriers.at(0.99));
 }
 
@@ -587,7 +598,7 @@ void one(const std::filesystem::path &dir, std::uint32_t pipeline, std::size_t f
 		auto &g = c.group(1, 1000);
 		return std::tuple{g.committed, g.commands, g.commit_us.at(0.5), g.commit_us.at(0.99)};
 	});
-	std::printf("one: pipeline %u frame %zu command %zu: %.1f MB/s committed (%llu commands in %.2f s), commit p50 %llu us p99 %llu us\n", pipeline,
+	std::printf("one: barrier %s, pipeline %u frame %zu command %zu: %.1f MB/s committed (%llu commands in %.2f s), commit p50 %llu us p99 %llu us\n", barrier_name().c_str(), pipeline,
 				frame, command, double(committed) / secs / 1e6, (unsigned long long)commands, secs, (unsigned long long)p50, (unsigned long long)p99);
 	for (NodeId n = 1; n <= 3; ++n)
 		std::printf("  node %llu storage: %s\n", (unsigned long long)n, storage_line(*c.nodes[n - 1]->storage).c_str());
@@ -637,7 +648,7 @@ void many(const std::filesystem::path &dir, unsigned slow, bool hot, unsigned se
 		});
 	};
 	auto lead = seen(1, false), apply = seen(2, false), lead0 = seen(1, true), apply0 = seen(2, true);
-	std::printf("many: slow %u hot %d, 99 groups: leader commit %.2f MB/s p50 %llu us p99 %llu us; node 2 applies %.2f MB/s p50 %llu us p99 %llu us\n", slow,
+	std::printf("many: barrier %s, slow %u hot %d, 99 groups: leader commit %.2f MB/s p50 %llu us p99 %llu us; node 2 applies %.2f MB/s p50 %llu us p99 %llu us\n", barrier_name().c_str(), slow,
 				int(hot), double(lead.bytes) / secs / 1e6, (unsigned long long)lead.us.at(0.5), (unsigned long long)lead.us.at(0.99),
 				double(apply.bytes) / secs / 1e6, (unsigned long long)apply.us.at(0.5), (unsigned long long)apply.us.at(0.99));
 	std::printf("  group 0: leader commit %.2f MB/s p99 %llu us; node 2 applies %.2f MB/s p99 %llu us, inbox drops %llu; most bytes sent to node 2 and not delivered %llu (Flow window %llu, transport window %llu + queue %llu)\n",

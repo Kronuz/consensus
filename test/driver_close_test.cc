@@ -140,6 +140,12 @@ struct Loop {
 		scheduler.run_until([&] { return --budget == 0; });
 		if (!budget) { check(false, "the loop spins"); std::exit(1); }
 	}
+	// Runs what is queued within `steps` turns of the scheduler: false if it is still busy.
+	bool run_bounded(std::size_t steps) {
+		std::size_t budget = steps;
+		scheduler.run_until([&] { return --budget == 0; });
+		return budget != 0;
+	}
 	void finish() {
 		if (!driver) { return; }
 		stop.request(task::cancel_reason::shutdown);
@@ -302,15 +308,33 @@ void erase_queued() {
 	loop.lone(g); loop.lone(h);
 	std::size_t calls = 0;
 	loop.sink.on_fenced = [&](GroupId id) { ++calls; loop.driver->applied(id, Applied{1}); };
+	// close is queued ahead of the fence, so one step both fences the group and closes it.
+	bool closing_done = false; std::exception_ptr closing_error;
+	task::spawn(task::scheduler_ref::of(loop.scheduler), loop.driver->close(g), [&](std::exception_ptr e) { closing_done = true; closing_error = e; });
 	loop.driver->application_failed(g, 1, "the application failed");
-	auto closing = loop.start(loop.driver->close(g));
+	loop.run();
 	check(calls == 1, "the Sink queued the group again in its closing step");
-	check(closing->done && !closing->error, "close completes: " + what(closing->error));
+	check(closing_done && !closing_error, "close completes: " + what(closing_error));
 	check(loop.driver->groups() == 1 && !loop.driver->state(g) && loop.driver->state(h), "only the closed row is erased");
 	std::exception_ptr error;
 	check(loop.close(h, error) && !error && loop.driver->groups() == 0, "and the ready list still serves the other row");
 	loop.driver->open(g, options({1}));
 	check(loop.driver->groups() == 1, "the id opens again");
+}
+
+// A6: after shutdown a group awaiting its turn barrier is watched once, not in a loop that
+// wakes itself: the loop idles until the barrier lands, then ends.
+void shutdown_idles() {
+	constexpr GroupId g = 61;
+	jt::Disk disk; Loop loop(disk, true);
+	loop.lone(g);
+	auto proposal = loop.start(loop.driver->propose(g, "staged"));
+	check(!proposal->done && loop.held.held() > 0, "a record waits for its turn barrier");
+	loop.stop.request(task::cancel_reason::shutdown);
+	check(loop.run_bounded(20'000), "the loop idles after shutdown with the barrier pending");
+	check(loop.driver->in_flight() > 0 && !loop.driver_done, "the loop waits for the barrier");
+	loop.release();
+	check(loop.driver_done && loop.driver->in_flight() == 0, "the loop ends once the barrier lands");
 }
 
 // A3: 10,000 rows opened and closed leave the Driver's heap where it was.
@@ -386,6 +410,7 @@ void created_bytes() { created_pass(2000, 0); created_pass(2000, 10); }
 const std::map<std::string, void (*)()> cases{
 	{"created_bytes", &created_bytes},
 	{"erase_queued", &erase_queued},
+	{"shutdown_idles", &shutdown_idles},
 	{"fenced_row", &fenced_row},
 	{"fenced_in_flight", &fenced_in_flight},
 	{"half_opened_row", &half_opened_row},

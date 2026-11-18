@@ -62,9 +62,9 @@ At 10,000 groups per host (D109), the configuration whose connections ended befo
 ready rings (job 261117-092742-231632, 3 of 3), job 261117-205722-8d9231 (strict,
 consensus:01e2c06) ran `one 5 1 10000` three times: no connection ended, 400,040 of 400,040 frames
 arrived each time, and an idle group held 298.2 B (stored 127.8 B, its frames 170.5 B), within
-`164 + 52P` (372 B at P = 4). Its credit came back 363-438 ms after the last frame arrived: a receiver's reader
-parked at `connection.h`'s per-read `co_await task::yield()` is not resumed for that long, with the
-last credit frames unread in its socket (quest transport-feed-scan's journal, "Finding").
+`164 + 52P` (372 B at P = 4). Its credit came back 363-438 ms after the last frame arrived: at
+10,000 groups the last credit frames are still in flight, queued in the receivers' sockets behind
+the burst, when every message frame has arrived.
 
 The per-host count is the steady state after a host's TLS context is built. `cost` first runs an
 unprinted warm-up configuration (2 hosts, 1 loop, 100 groups), which absorbs what a process builds

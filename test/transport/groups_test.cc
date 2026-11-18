@@ -16,6 +16,8 @@
 //   joiner   frame_admission: a joiner (empty membership) catches up as a learner and is promoted
 //   lagging  frame_admission: a follower that missed a voter's addition catches up from it
 //   leftover a read that fails partway hands its frames over under its own connection
+//   reconnect a peer's open holds on its connection only: on the next one, its frames are refused
+//            until it opens the group again
 //   relayout a host restarted with another L serves every group from its new loop
 //   scan     the groups a feed visits per frame stay constant at 100, 1,000 and 10,000 groups
 //   order    control first, round robin across ready groups and per-group credit, as values
@@ -1335,6 +1337,66 @@ void refill() {
 	assert(refused >= 8 && after_refusals && after_restart);  // 8 frames: 5 windows
 }
 
+// A node over raw Links, not a HostTransport, on its own loop: it sends the frames a case writes,
+// and counts the closed frames it hears.
+struct RawPeer {
+	Loop loop;
+	std::unique_ptr<Links> links;
+	std::atomic<const Link *> link{nullptr};
+	std::atomic<int> ended{0};
+	std::atomic<std::uint64_t> closed{0};
+	RawPeer(NodeId node, NodeId to, std::uint16_t port, LinkOptions options = {}) {
+		auto tls = context(names[node]);
+		std::map<NodeId, Fingerprint> pins;
+		for (NodeId n = 1; n <= 4; ++n)
+			pins[n] = pin_of(names[n]);
+		Identity cluster{};
+		cluster.fill('K');
+		links = std::make_unique<Links>(loop.io.get_executor(), task::scheduler_ref::of(loop.scheduler), tls,
+										NodePins(node, pins, tls->native_handle()), cluster,
+										std::map<NodeId, PeerAddress>{{to, {"127.0.0.1", port}}}, options);
+		links->on_established = [this](const Link &l) { link = &l; };
+		links->on_ended = [this](const Link &l) {
+			if (link == &l)
+				link = nullptr;
+			++ended;
+		};
+		links->on_frame = [this](const Link &, std::string_view f) { closed += f.size() == closed_frame && f[0] == char(FrameKind::closed); };
+		loop.start();
+	}
+	// Dials `to` on Control: whether the connection came up within 10 s.
+	bool dial(NodeId to) {
+		loop.at([&] {
+			task::spawn(task::scheduler_ref::of(loop.scheduler), links->dial(to, LinkLane::Control),
+						[](std::exception_ptr, std::optional<bool>) {});
+		});
+		return until([&] { return link.load() != nullptr; }, 10'000);
+	}
+	void send(const std::string &frame) {
+		loop.at([&] { link.load()->connection->send(frame); });
+	}
+	// Closes the connection gracefully: whether it ended within 10 s.
+	bool retire(NodeId to) {
+		const int before = ended;
+		loop.at([&] { links->retire(to, LinkLane::Control); });
+		return until([&] { return ended > before; }, 10'000);
+	}
+	// A control frame of `g` from incarnation `source` to `destination`.
+	static std::string frame(GroupId g, NodeId source, NodeId destination, const std::string &payload) {
+		std::string f(1, char(FrameKind::control));
+		j::put64(f, g);
+		j::put64(f, source);
+		j::put64(f, destination);
+		return f + payload;
+	}
+	~RawPeer() {
+		loop.at([&] { links->stop(); });
+		const bool stopped = until([&] { return loop.at([&] { return links->drained(); }); }, 10'000);
+		assert(stopped && "the raw peer's links drain");
+		loop.at([&] { links.reset(); });
+	}
+};
+
 // leftover: frames a read handed over before it failed (an oversized length) leave under their
 // own connection, never under the next read's: node 1 never opens g, so g's frame is unopened.
 void leftover() {
@@ -1367,46 +1429,17 @@ void leftover() {
 	warm(honest, [&] { return delivered(3) > 0; });
 
 	step("leftover: node 1 connects over raw Links and never opens g");
-	Loop attacker;
-	auto tls = context(names[1]);
-	std::map<NodeId, Fingerprint> pins;
-	for (NodeId n = 1; n <= 4; ++n)
-		pins[n] = pin_of(names[n]);
-	Identity cluster{};
-	cluster.fill('K');
 	LinkOptions options;
 	options.connection.maximum_frame = 8 << 20;
-	auto links = std::make_unique<Links>(attacker.io.get_executor(), task::scheduler_ref::of(attacker.scheduler), tls,
-										 NodePins(1, pins, tls->native_handle()), cluster,
-										 std::map<NodeId, PeerAddress>{{2, {"127.0.0.1", two.port()}}}, options);
-	std::atomic<const Link *> link{nullptr};
-	std::atomic<bool> ended{false};
-	links->on_established = [&](const Link &l) { link = &l; };
-	links->on_ended = [&](const Link &) { ended = true; };
-	links->on_frame = [](const Link &, std::string_view) {};
-	attacker.start();
-	attacker.at([&] {
-		task::spawn(task::scheduler_ref::of(attacker.scheduler), links->dial(2, LinkLane::Control),
-					[](std::exception_ptr, std::optional<bool>) {});
-	});
-	const bool up = until([&] { return link.load() != nullptr; }, 10'000);
+	auto attacker = std::make_unique<RawPeer>(1, 2, two.port(), options);
+	const bool up = attacker->dial(2);
 	std::printf("leftover: node 1's connection to host 2 is up: %s\n", up ? "yes" : "NO");
 	assert(up);
 
 	step("leftover: node 1 sends a frame for g, then one over host 2's bound");
-	auto frame = [&](std::string payload) {
-		std::string f(1, char(FrameKind::control));
-		j::put64(f, g);
-		j::put64(f, 1);
-		j::put64(f, 2);
-		return f + payload;
-	};
-	const auto evil = frame("evil"), big = frame(std::string(5 << 20, 'B'));
-	attacker.at([&] {
-		link.load()->connection->send(evil);
-		link.load()->connection->send(big);
-	});
-	const bool failed = until([&] { return ended.load(); }, 10'000);
+	attacker->send(RawPeer::frame(g, 1, 2, "evil"));
+	attacker->send(RawPeer::frame(g, 1, 2, std::string(5 << 20, 'B')));
+	const bool failed = until([&] { return attacker->ended > 0; }, 10'000);
 	std::printf("leftover: host 2 ended node 1's connection: %s\n", failed ? "yes" : "NO");
 
 	step("leftover: host 3 sends 20 frames");
@@ -1427,10 +1460,56 @@ void leftover() {
 	std::printf("leftover: host 2 received %llu frames, refused %llu unopened; delivered from incarnation 1 (never opened g): %llu; from 3: %llu\n",
 				(unsigned long long)received, (unsigned long long)unopened, (unsigned long long)bad, (unsigned long long)delivered(3));
 	std::printf("leftover: %s\n", bad ? "node 1's frame was admitted under host 3's open" : "no frame of node 1 admitted");
-	attacker.at([&] { links->stop(); });
-	const bool stopped = until([&] { return attacker.at([&] { return links->drained(); }); }, 10'000);
-	attacker.at([&] { links.reset(); });
-	assert(failed && !bad && unopened >= 1 && delivered(3) > 0 && stopped);
+	attacker.reset();
+	assert(failed && !bad && unopened >= 1 && delivered(3) > 0);
+}
+
+// reconnect: a peer's open holds on the connection it came on only. Node 1, over raw Links,
+// opens g and its frame arrives; on its next connection, g's frame without the open is refused
+// as unopened and closed back, and arrives once node 1 opens g there again.
+void reconnect() {
+	Host two(2, 1);
+	two.open({});
+	const GroupId g = 1001;
+	two.stores({g});
+	std::atomic<std::uint64_t> delivered{0};
+	two.transport->on_deliver(0, [&](const Received &r) {
+		delivered += r.route.source == 1;
+		return true;
+	});
+	two.start();
+	const auto open = encode_open(g, Host::test_open());
+	const auto &stats = two.transport->stats(0);
+	RawPeer one(1, 2, two.port());
+
+	step("reconnect: node 1 opens g and sends a frame");
+	const bool up = one.dial(2);
+	assert(up);
+	one.send(open);
+	one.send(RawPeer::frame(g, 1, 2, "first"));
+	const bool first = until([&] { return delivered == 1; }, 10'000);
+	std::printf("reconnect: on the first connection, g's frame arrives: %s\n", first ? "yes" : "NO");
+
+	step("reconnect: node 1 ends the connection and dials again");
+	const bool retired = one.retire(2), again = one.dial(2);
+	std::printf("reconnect: the first connection ended: %s; the second is up: %s\n", retired ? "yes" : "NO", again ? "yes" : "NO");
+	assert(first && retired && again);
+
+	step("reconnect: node 1 sends g's frame without its open");
+	one.send(RawPeer::frame(g, 1, 2, "second"));
+	const bool refused = until([&] { return stats.unopened >= 1 && one.closed >= 1; }, 5'000);
+	std::this_thread::sleep_for(200ms);
+	std::printf("reconnect: refused unopened %llu, closed back %llu, delivered %llu of 2\n", (unsigned long long)stats.unopened.load(),
+				(unsigned long long)one.closed.load(), (unsigned long long)delivered.load());
+	assert(refused && delivered == 1);
+
+	step("reconnect: node 1 opens g on the second connection");
+	one.send(open);
+	one.send(RawPeer::frame(g, 1, 2, "third"));
+	const bool reopened = until([&] { return delivered == 2; }, 10'000);
+	std::printf("reconnect: once opened again, g's frame arrives: %s; opens %llu, mismatched %llu\n", reopened ? "yes" : "NO",
+				(unsigned long long)stats.opens.load(), (unsigned long long)stats.mismatched.load());
+	assert(reopened && stats.opens == 2 && stats.mismatched == 0 && stats.unopened == 1);
 }
 // scan: the feed's work per frame. Host 1 stores N groups and sends a control and a data frame
 // per group to host 2, for N = 100, 1,000 and 10,000, every group on one loop: the groups both
@@ -1642,7 +1721,7 @@ void order() {
 
 int main(int argc, char **argv) {
 	if (argc != 3) {
-		std::fprintf(stderr, "usage: %s <fixture dir> threads|credit|reader|upload|driver|refill|identity|joiner|lagging|leftover|relayout|scan|order\n", argv[0]);
+		std::fprintf(stderr, "usage: %s <fixture dir> threads|credit|reader|upload|driver|refill|identity|joiner|lagging|leftover|reconnect|relayout|scan|order\n", argv[0]);
 		return 2;
 	}
 #ifndef SO_NOSIGPIPE
@@ -1673,6 +1752,8 @@ int main(int argc, char **argv) {
 		identity();
 	else if (which == "leftover")
 		leftover();
+	else if (which == "reconnect")
+		reconnect();
 	else if (which == "joiner")
 		joiner();
 	else if (which == "lagging")

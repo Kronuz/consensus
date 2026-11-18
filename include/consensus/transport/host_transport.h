@@ -370,18 +370,24 @@ class HostTransport {
 		Peer peer;
 		std::vector<std::pair<Received, bool>> frames;  // the frame and whether it is an open
 	};
-	// The ready rings of a lane: owed (credit, then closed), control, data.
-	enum : int { owed_ring = 0, control_ring = 1, data_ring = 2 };
-	// A group with something in flight on a lane; an idle group has none.
+	// The ready rings of a lane's sending groups: control, data.
+	enum : int { control_ring = 0, data_ring = 1 };
+	// A group with something to send on a lane, or data sent and not yet credited; an idle group has none.
 	struct Active {
 		std::deque<std::string> control, data;
-		std::uint64_t queued = 0, outstanding = 0, owed = 0;  // data bytes queued; sent and not yet credited; credit owed to the peer
-		Opening open;                                          // the open of the latest frame queued
-		GroupId next[3] = {};                                  // the next group in each ring
-		std::uint8_t in = 0;                                   // the rings it is in, a bit each
-		bool close = false;                                    // the peer's frames were refused here: tell it
+		std::uint64_t queued = 0, outstanding = 0;  // data bytes queued; sent and not yet credited
+		Opening open;                               // the open of the latest frame queued
+		GroupId next[2] = {};                       // the next group in each ring
+		std::uint8_t in = 0;                        // the rings it is in, a bit each
 	};
-	// A FIFO of groups, linked through their Active records.
+	// What this host owes the peer for a group it receives: credit, then a closed when the
+	// peer's frames were refused here. Present while owed, in the lane's `owing` FIFO.
+	struct Owed {
+		std::uint64_t bytes = 0;
+		GroupId next = 0;
+		bool close = false;
+	};
+	// A FIFO of groups, linked through their records.
 	struct Ring {
 		GroupId head = 0, tail = 0;
 		std::size_t size = 0;
@@ -390,7 +396,8 @@ class HostTransport {
 	struct Lane {
 		GroupTable<std::uint64_t> opened;  // the groups whose open the connection carries, by serial
 		GroupTable<Active> active;
-		Ring rings[3];
+		GroupTable<Owed> owed;
+		Ring rings[2], owing;
 		const Link *link = nullptr;
 		std::uint64_t generation = 0, dial_after = 0;
 		bool dialing = false;
@@ -433,9 +440,8 @@ class HostTransport {
 		}
 	}
 
-	// The rings. A group is in `control` while it has a control frame, in `data` while its next
-	// data frame fits its credit (one always fits when nothing is outstanding), in `owed` while
-	// it owes credit or a closed.
+	// The rings. A group is in `control` while it has a control frame, and in `data` while its
+	// next data frame fits its credit (one always fits when nothing is outstanding).
 	bool data_ready(const Active &a) const noexcept {
 		return !a.data.empty() && (!a.outstanding || a.outstanding + a.data.front().size() <= options_.window);
 	}
@@ -462,19 +468,30 @@ class HostTransport {
 	}
 	// An Active with nothing left and in no ring goes.
 	static void settle(Lane &lane, GroupId id) {
-		if (const auto *a = lane.active.find(id);
-			a && !a->in && a->control.empty() && a->data.empty() && !a->outstanding && !a->owed && !a->close)
+		if (const auto *a = lane.active.find(id); a && !a->in && a->control.empty() && a->data.empty() && !a->outstanding)
 			lane.active.erase(id);
+	}
+	// The group's record of what this host owes the peer, joining `owing` when new.
+	static Owed &owe(Lane &lane, GroupId id) {
+		if (auto *o = lane.owed.find(id))
+			return *o;
+		auto &r = lane.owing;
+		if (r.size++)
+			lane.owed.find(r.tail)->next = id;
+		else
+			r.head = id;
+		r.tail = id;
+		return lane.owed[id];
 	}
 	// A connection begins or ends: it carries no open, nothing is outstanding or owed, and the
 	// rings are rebuilt from what is queued.
 	void reset(Lane &lane, HostTransportStats &stats) {
 		lane.opened.clear();
+		lane.owed.clear();
+		lane.owing = {};
 		for (auto &r : lane.rings)
 			r = {};
 		for (auto &[id, a] : lane.active) {
-			a.owed = 0;
-			a.close = false;
 			stats.uncredited -= a.outstanding;
 			a.outstanding = 0;
 			a.in = 0;
@@ -549,25 +566,12 @@ class HostTransport {
 			return;
 		auto &stats = loops_[k].stats;
 		for (std::size_t fed = 0; fed < options_.feed;) {
+			if (lane.owing.size) {
+				fed += repay(k, lane, stats);
+				continue;
+			}
 			GroupId id;
-			if (lane.rings[owed_ring].size) {
-				id = pop(lane, owed_ring, stats);
-				auto &a = *lane.active.find(id);
-				std::string frame;
-				if (a.owed) {
-					frame.push_back(char(FrameKind::credit));
-					kronuz::journal::put64(frame, id);
-					kronuz::journal::put64(frame, a.owed);
-					a.owed = 0;
-					fed += put(k, lane, frame);
-				}
-				if (a.close) {
-					frame.assign(1, char(FrameKind::closed));
-					kronuz::journal::put64(frame, id);
-					a.close = false;
-					fed += put(k, lane, frame);
-				}
-			} else if (lane.rings[control_ring].size) {
+			if (lane.rings[control_ring].size) {
 				id = pop(lane, control_ring, stats);
 				auto &a = *lane.active.find(id);
 				fed += open_first(k, lane, id, a);
@@ -593,6 +597,29 @@ class HostTransport {
 			}
 			settle(lane, id);
 		}
+	}
+	// The head of `owing`: its credit, then its closed; the record goes.
+	std::size_t repay(std::uint32_t k, Lane &lane, HostTransportStats &stats) {
+		const auto id = lane.owing.head;
+		const auto o = *lane.owed.find(id);
+		++stats.visited;
+		if (--lane.owing.size)
+			lane.owing.head = o.next;
+		lane.owed.erase(id);
+		std::size_t fed = 0;
+		std::string frame;
+		if (o.bytes) {
+			frame.push_back(char(FrameKind::credit));
+			kronuz::journal::put64(frame, id);
+			kronuz::journal::put64(frame, o.bytes);
+			fed += put(k, lane, frame);
+		}
+		if (o.close) {
+			frame.assign(1, char(FrameKind::closed));
+			kronuz::journal::put64(frame, id);
+			fed += put(k, lane, frame);
+		}
+		return fed;
 	}
 	// Before a group's frame: its open, unless the connection carries the group's latest one.
 	std::size_t open_first(std::uint32_t k, Lane &lane, GroupId group, const Active &a) {
@@ -710,7 +737,7 @@ class HostTransport {
 			connection.groups.clear();
 		}
 		const bool current = batch.peer.generation == connection.generation;
-		GroupTable<std::uint64_t> credit;
+		std::vector<std::pair<GroupId, std::uint64_t>> credit;  // a run of one group's frames coalesced
 		std::vector<GroupId> closes;
 		for (auto &[r, open] : batch.frames) {
 			const auto *stored = here.stored.find(r.route.group);
@@ -745,8 +772,15 @@ class HostTransport {
 			} catch (...) {
 				++here.stats.refused;
 			}
-			if (r.data)
-				credit[r.route.group] += frame_header + r.payload.size();
+			if (r.data) {
+				const std::uint64_t bytes = frame_header + r.payload.size();
+				if (credit.empty())
+					credit.reserve(batch.frames.size());
+				if (!credit.empty() && credit.back().first == r.route.group)
+					credit.back().second += bytes;
+				else
+					credit.emplace_back(r.route.group, bytes);
+			}
 		}
 		if (credit.empty() && closes.empty())
 			return;
@@ -754,16 +788,10 @@ class HostTransport {
 			auto &lane = loops_[from].lanes[{peer.node, peer.lane}];
 			if (lane.generation != peer.generation || !lane.link)
 				return;  // the connection the frames came on ended; its credit went with it
-			for (auto &[group, bytes] : credit) {
-				auto &a = lane.active[group];
-				a.owed += bytes;
-				push(lane, owed_ring, group, a);
-			}
-			for (auto group : closes) {
-				auto &a = lane.active[group];
-				a.close = true;
-				push(lane, owed_ring, group, a);
-			}
+			for (auto [group, bytes] : credit)
+				owe(lane, group).bytes += bytes;
+			for (auto group : closes)
+				owe(lane, group).close = true;
 			feed(from, lane);
 		};
 		if (batch.from == k)
@@ -780,8 +808,12 @@ class HostTransport {
 			++here.stats.unstored;
 			return false;
 		}
+		if (!current) {
+			++here.stats.mismatched;
+			return false;  // a stale connection's open changes nothing on the current one
+		}
 		connection.groups.erase(group);
-		if (!current || !open || open_fault(stored->open.open, open->second)) {
+		if (!open || open_fault(stored->open.open, open->second)) {
 			++here.stats.mismatched;
 			return false;
 		}

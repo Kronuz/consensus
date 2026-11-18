@@ -73,15 +73,15 @@ MUTANTS = {
     "dial-one-expression": (T + "links.h", "\t\tif (!connection)\n\t\t\tco_return false;\n\t\tco_return co_await offer(",
                             "\t\tco_return connection && co_await offer("),
     # host_transport.h, links.h (transport-groups A1, A2)
-    "bulk-ahead-of-control": (T + "host_transport.h", "} else if (lane.rings[control_ring].size) {",
-                              "} else if (lane.rings[control_ring].size && !lane.rings[data_ring].size) {"),
+    "bulk-ahead-of-control": (T + "host_transport.h", "\t\t\tif (lane.rings[control_ring].size) {",
+                              "\t\t\tif (lane.rings[control_ring].size && !lane.rings[data_ring].size) {"),
     "no-credit": (T + "host_transport.h", "return !a.data.empty() && (!a.outstanding || a.outstanding + a.data.front().size() <= options_.window);",
                   "return !a.data.empty();"),
     "reader-loop-delivers": (T + "host_transport.h", "\t\t\tif (to == k) {\n\t\t\t\tdeliver(k, std::move(moved));",
                              "\t\t\tif (true) {\n\t\t\t\tdeliver(k, std::move(moved));"),
     "no-hand-off": (T + "links.h", "Links *home = owner ? owner(peer) : nullptr;", "Links *home = nullptr;"),
     # host_transport.h (transport-groups review F3: credit comes back)
-    "no-credit-on-refuse": (T + "host_transport.h", "\t\t\tif (r.data)\n\t\t\t\tcredit[", "\t\t\tif (r.data && taken)\n\t\t\t\tcredit["),
+    "no-credit-on-refuse": (T + "host_transport.h", "\t\t\tif (r.data) {", "\t\t\tif (r.data && taken) {"),
     "no-reset-on-end": (T + "host_transport.h", "\t\t\ta.outstanding = 0;\n\t\t\ta.in = 0;", "\t\t\ta.in = 0;"),
     # host_transport.h (transport-identity A1: the per-frame rule, R7, and the group-open exchange)
     "admit-unstored": (T + "host_transport.h", "\tif (!held)\n\t\treturn Admission::unstored;\n", ""),
@@ -102,6 +102,10 @@ MUTANTS = {
     "uncredited-kept": (T + "host_transport.h", "\t\t\t\there.stats.uncredited -= credited;\n", ""),
     "store-keeps-opens": (T + "host_transport.h", "\t\there.stored[group] = {incarnation, {open, ++here.serial}};\n\t\tunopen(here, group);",
                           "\t\there.stored[group] = {incarnation, {open, ++here.serial}};"),
+    # transport-feed-scan review F3: the per-connection generation rule on the group loop
+    "no-generation-clear": (T + "host_transport.h", "\t\t\tconnection.generation = batch.peer.generation;\n\t\t\tconnection.groups.clear();",
+                            "\t\t\tconnection.generation = batch.peer.generation;"),
+    "no-current": (T + "host_transport.h", "const bool current = batch.peer.generation == connection.generation;", "const bool current = true;"),
     # security review S1: a read that fails after handing frames over leaves them for the next read
     "read-fails-unflushed": (T + "connection.h",
                              "\t\t\t\tif (on_read)\n\t\t\t\t\ton_read();  // the frames this read handed over, even when it then failed\n\t\t\t\tif (failed)\n\t\t\t\t\tstd::rethrow_exception(failed);",

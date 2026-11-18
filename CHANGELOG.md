@@ -30,7 +30,8 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
   so a feed's work no longer grows with the groups a host stores (at 10,000 groups a loop
   stalled past `dead_after`). Round robin is in the order groups became ready. Every per-group
   table is one `GroupTable`, an idle group's open is held by value, and its opens matched per
-  connection, so an idle group holds less (Tables).
+  connection, so an idle group holds less (Tables). What the receiver owes back, credit and
+  `closed`, goes as each batch's vector of records, repaid in order, with no per-group table.
 
 - The RPC lane's codec and call machinery ([docs/mechanisms/rpc-lane.md](docs/mechanisms/rpc-lane.md)):
   `transport/rpc.h` encodes and checks its six frame kinds, keeps one connection's call table

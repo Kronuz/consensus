@@ -6,6 +6,12 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#consensus) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-18
+
+### Fixed
+
+- A wave of groups opened at once no longer fences them: the journal pin moves to journal:4272229, whose turns are bounded to one segment (a turn takes what one fresh segment encodes; a record that can't encode alone fails only its group). `test/wave_open_test.cc` opens 64 and 256 groups at once, all committed, 0 fenced.
+
 ## 2026-11-17
 
 ### Added

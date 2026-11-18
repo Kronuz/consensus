@@ -6,9 +6,19 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#consensus) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-18
+
+### Fixed
+
+- A wave of groups opened at once no longer fences them: the journal pin moves to journal:4272229, whose turns are bounded to one segment (a turn takes what one fresh segment encodes; a record that can't encode alone fails only its group). `test/wave_open_test.cc` opens 64 and 256 groups at once, all committed, 0 fenced.
+
 ## 2026-11-17
 
 ### Added
+
+- The host transport's `HostTransportStats::visited`: the groups a feed examined to choose its
+  frames, one per frame; and `HostTransportStats::uncredited`, a level: the data bytes a loop's
+  connections sent that their peers have not credited yet.
 
 - Identity on the host transport ([docs/mechanisms/host-transport.md](docs/mechanisms/host-transport.md),
   Identity): the host stores its groups (`store`, `forget`); each group opens per connection by
@@ -18,6 +28,16 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
   required) names it (R7). `admit` and `open_fault` are the rule as values. `store` refuses a
   zero cluster, group or epoch, and a connection's `on_read` also follows a read that fails
   after handing frames over, so they leave under their own connection.
+
+### Changed
+
+- The host transport feeds a connection from ready rings ([docs/mechanisms/host-transport.md](docs/mechanisms/host-transport.md),
+  Send): one pop per frame instead of a walk of every group with something queued or uncredited,
+  so a feed's work no longer grows with the groups a host stores (at 10,000 groups a loop
+  stalled past `dead_after`). Round robin is in the order groups became ready. Every per-group
+  table is one `GroupTable`, an idle group's open is held by value, and its opens matched per
+  connection, so an idle group holds less (Tables). What the receiver owes back, credit and
+  `closed`, goes as each batch's vector of records, repaid in order, with no per-group table.
 
 - The RPC lane's codec and call machinery ([docs/mechanisms/rpc-lane.md](docs/mechanisms/rpc-lane.md)):
   `transport/rpc.h` encodes and checks its six frame kinds, keeps one connection's call table

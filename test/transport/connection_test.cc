@@ -14,6 +14,7 @@
 #include <cassert>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
@@ -531,6 +532,7 @@ class drain_watch {
 		::close(fd_);
 	}
 	long long worst_ms() const { return worst_; }
+	long last() const { return last_; }  // the queue at the latest sample, bytes
 
   private:
 	long queued() const {
@@ -548,10 +550,12 @@ class drain_watch {
 	int fd_;
 	std::atomic<bool> stop_{false};
 	std::atomic<long long> worst_{0};
+	std::atomic<long> last_{0};
 	std::thread thread_{[this] {
 		auto drained = std::chrono::steady_clock::now();
 		for (long last = 0; !stop_; std::this_thread::sleep_for(2ms)) {
 			const long now = queued();
+			last_ = now;
 			const auto at = std::chrono::steady_clock::now();
 			if (now <= 0 || now < last)
 				drained = at;
@@ -577,7 +581,19 @@ struct reader_run {
 	ConnectionEnd dialer, acceptor;
 	std::uint64_t keepalives, drained_expiries;
 	bool coarse_wakes;  // the writer's low-water mark took: it wakes only at an empty queue
+	long queue_left;    // the send queue at the last sample, bytes
+	int sndbuf, lowat;  // the writer's socket's buffer and low-water mark once connected (coarse)
 };
+
+// Forcing knobs: an environment variable reproduces a cause on demand (docs/mechanisms/host-connection.md).
+//   READ_SLOWLY_BUILD_MS   the dialer's loop is held this long while the frames are queued, as a
+//                          slow allocator (TSan, a loaded host) holds it
+//   COARSE_WRITER_SNDBUF   the coarse writer's SO_SNDBUF and low-water mark, bytes
+//   COARSE_WRITER_SHRINK   SO_SNDBUF set to this after the low-water mark, so the mark exceeds the buffer
+long long knob(const char *name, long long fallback = 0) {
+	const char *v = std::getenv(name);
+	return v && *v ? std::atoll(v) : fallback;
+}
 
 reader_run read_slowly_once(const reader_load &load) {
 	stall_watch watch;
@@ -589,10 +605,12 @@ reader_run read_slowly_once(const reader_load &load) {
 	tcp::socket a(l1.io), b(l2.io);
 	bool coarse_wakes = false;
 	if (load.coarse) {
-		const int buffer = 3 << 19, reading = 512 * 1024;
+		const int buffer = int(knob("COARSE_WRITER_SNDBUF", 3 << 19)), reading = 512 * 1024;
 		a.open(tcp::v4());
 		::setsockopt(a.native_handle(), SOL_SOCKET, SO_SNDBUF, &buffer, sizeof buffer);
 		(void)::setsockopt(a.native_handle(), SOL_SOCKET, SO_SNDLOWAT, &buffer, sizeof buffer);  // Linux refuses it
+		if (const int shrink = int(knob("COARSE_WRITER_SHRINK")))
+			::setsockopt(a.native_handle(), SOL_SOCKET, SO_SNDBUF, &shrink, sizeof shrink);
 		::setsockopt(listener.native_handle(), SOL_SOCKET, SO_RCVBUF, &reading, sizeof reading);
 		int lowat = 0;
 		socklen_t size = sizeof lowat;
@@ -601,6 +619,14 @@ reader_run read_slowly_once(const reader_load &load) {
 	}
 	a.connect(listener.local_endpoint());
 	listener.accept(b);
+	int sndbuf = 0, lowat = 0;
+	if (load.coarse) {
+		socklen_t size = sizeof sndbuf;
+		::getsockopt(a.native_handle(), SOL_SOCKET, SO_SNDBUF, &sndbuf, &size);
+		size = sizeof lowat;
+		if (::getsockopt(a.native_handle(), SOL_SOCKET, SO_SNDLOWAT, &lowat, &size) != 0)
+			lowat = -1;
+	}
 	Connection dialer(l1.ref(), std::move(a), context("one"), true, options);
 	Connection acceptor(l2.ref(), std::move(b), context("two"), false, options);
 	auto one = pins_of(1, "one"), two = pins_of(2, "two");
@@ -655,6 +681,7 @@ reader_run read_slowly_once(const reader_load &load) {
 	std::optional<drain_watch> held(std::in_place, fd_of(dialer));
 	const auto start = std::chrono::steady_clock::now();
 	l1.call([&] {
+		std::this_thread::sleep_for(std::chrono::milliseconds(knob("READ_SLOWLY_BUILD_MS")));
 		for (int i = 0; i != count; ++i)
 			dialer.send(std::string(size, char('a' + i % 26)));
 		dialer.close();
@@ -662,11 +689,12 @@ reader_run read_slowly_once(const reader_load &load) {
 	assert(l1.until([&] { return dialer_end && acceptor_done; }, 60s));
 	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 	const auto held_ms = held->worst_ms();
+	const auto queue_left = held->last();
 	held.reset();
 	stop = true;
 	t2.join();
 	return {got, ms, watch.worst_ms(), held_ms, *dialer_end, *acceptor_end, acceptor.keepalives_sent(),
-			dialer.drained_expiries(), coarse_wakes};
+			dialer.drained_expiries(), coarse_wakes, queue_left, sndbuf, lowat};
 }
 // Both ends share this process, so a host stop silences the reader's keepalives too, which no
 // two hosts do, and the host's network stack may withhold the bytes (macOS throttles a
@@ -679,10 +707,13 @@ void read_slowly(const reader_load &load) {
 		const auto r = read_slowly_once(load);
 		std::printf("%s: %d of %d frames read in %lld ms against a %lld ms dead_after; dialer %d, acceptor %d; "
 					"%llu keepalives from the reader; %llu write waits expired with the queue drained%s; "
-					"the process stalled %lld ms at most; the queue held %lld ms at most without draining\n",
+					"the process stalled %lld ms at most; the queue held %lld ms at most without draining%s\n",
 					load.name, r.got, load.frames, r.ms, (long long)load.dead_after.count(), int(r.dialer),
 					int(r.acceptor), (unsigned long long)r.keepalives, (unsigned long long)r.drained_expiries,
-					r.coarse_wakes ? " (wakes at an empty queue)" : "", r.stalled_ms, r.held_ms);
+					r.coarse_wakes ? " (wakes at an empty queue)" : "", r.stalled_ms, r.held_ms,
+					load.coarse ? (" [sndbuf " + std::to_string(r.sndbuf) + ", lowat " + std::to_string(r.lowat) +
+								   ", queue left " + std::to_string(r.queue_left) + "]").c_str()
+								: "");
 		if (r.got == load.frames && r.dialer == ConnectionEnd::closed && r.acceptor == ConnectionEnd::closed) {
 			assert(r.ms >= load.frames * load.per_frame.count());
 			assert(!r.coarse_wakes || r.drained_expiries > 0);  // the case reached the rule it tests

@@ -28,6 +28,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <new>
@@ -97,13 +98,14 @@ GroupOptions options(std::vector<NodeId> voters, NodeId local = 1) {
 
 struct Sink {
 	std::size_t fenced = 0;
+	std::function<void(GroupId)> on_fenced;  // a Sink may call the Driver's plain calls
 	void operator()(GroupId, Send) {}
 	void operator()(GroupId, Committed) {}
 	void operator()(GroupId, RoleChanged) {}
 	void operator()(GroupId, ActivateInstall) {}
 	void operator()(GroupId, CheckpointPublished) {}
 	void operator()(GroupId, RepairCompleted) {}
-	void operator()(GroupId, Fenced) { ++fenced; }
+	void operator()(GroupId g, Fenced) { ++fenced; if (on_fenced) { on_fenced(g); } }
 	void operator()(GroupId, SnapshotNeeded) {}
 	void operator()(GroupId, SnapshotTransmit) {}
 	void operator()(GroupId, SnapshotReleased) {}
@@ -292,6 +294,25 @@ void close_in_flight() {
 	check(loop.driver->groups() == 0 && loop.driver->in_flight() == 0, "the row is erased with no IO in flight");
 }
 
+// A group the Sink queues again in its own closing step is erased off the ready list: the Sink's
+// Fenced callback calls applied(), which marks the group ready while it closes in that step.
+void erase_queued() {
+	constexpr GroupId g = 51, h = 52;
+	jt::Disk disk; Loop loop(disk);
+	loop.lone(g); loop.lone(h);
+	std::size_t calls = 0;
+	loop.sink.on_fenced = [&](GroupId id) { ++calls; loop.driver->applied(id, Applied{1}); };
+	loop.driver->application_failed(g, 1, "the application failed");
+	auto closing = loop.start(loop.driver->close(g));
+	check(calls == 1, "the Sink queued the group again in its closing step");
+	check(closing->done && !closing->error, "close completes: " + what(closing->error));
+	check(loop.driver->groups() == 1 && !loop.driver->state(g) && loop.driver->state(h), "only the closed row is erased");
+	std::exception_ptr error;
+	check(loop.close(h, error) && !error && loop.driver->groups() == 0, "and the ready list still serves the other row");
+	loop.driver->open(g, options({1}));
+	check(loop.driver->groups() == 1, "the id opens again");
+}
+
 // A3: 10,000 rows opened and closed leave the Driver's heap where it was.
 void bytes() {
 	constexpr GroupId rows = 10'000;
@@ -364,6 +385,7 @@ void created_bytes() { created_pass(2000, 0); created_pass(2000, 10); }
 
 const std::map<std::string, void (*)()> cases{
 	{"created_bytes", &created_bytes},
+	{"erase_queued", &erase_queued},
 	{"fenced_row", &fenced_row},
 	{"fenced_in_flight", &fenced_in_flight},
 	{"half_opened_row", &half_opened_row},

@@ -634,15 +634,17 @@ bool upload() {
 	step("upload: 4 s of uploads, heartbeats and votes");
 	const auto before = beats.count.load();
 	const auto start = steady::now();
-	std::vector<std::string> samples;  // every 250 ms: progress, each host's reads, the sockets
+	std::vector<std::string> samples;  // every 250 ms: progress, links, host 1's frames, host 2's reads, the sockets
 	std::atomic<bool> sampling{true};
 	std::thread sampler([&] {
 		while (sampling) {
 			std::this_thread::sleep_for(250ms);
-			char line[160];
-			std::snprintf(line, sizeof line, "upload: %5llu ms %6.1f MiB %3llu beats; reads %llu/%llu;", (unsigned long long)ms_since(start),
-						  double(uploaded) / (1 << 20), (unsigned long long)(beats.count - before),
-						  (unsigned long long)total(one, &HostTransportStats::reads), (unsigned long long)total(two, &HostTransportStats::reads));
+			char line[256];
+			std::snprintf(line, sizeof line, "upload: %5llu ms %6.1f MiB %3llu beats; links %llu/%llu sent %llu dropped %llu reads %llu;",
+						  (unsigned long long)ms_since(start), double(uploaded) / (1 << 20), (unsigned long long)(beats.count - before),
+						  (unsigned long long)total(one, &HostTransportStats::links), (unsigned long long)total(two, &HostTransportStats::links),
+						  (unsigned long long)total(one, &HostTransportStats::sent), (unsigned long long)total(one, &HostTransportStats::dropped),
+						  (unsigned long long)total(two, &HostTransportStats::reads));
 			samples.push_back(line + sockets({one.port(), two.port()}));
 		}
 	});

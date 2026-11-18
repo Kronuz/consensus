@@ -22,8 +22,10 @@
 
 // Many lone voters opened at once on one host's loop: each opens, creates, proposes one
 // command and applies it, all of a wave started before the loop runs, as a host opening
-// its groups does. Every group must commit its command with no fence.
-//   wave_open_test [groups [wave]]   (64 groups, all in one wave, by default)
+// its groups does. Every group must commit its command with no fence. With `cut`, the disk
+// then loses power under the turn driver: every store fences outside its worker, and each
+// worker must name that as its fence (worker.h's check).
+//   wave_open_test [groups [wave [cut]]]   (64 groups, all in one wave, by default)
 #include "consensus/driver.h"
 #include "journal/memory_io.h"
 
@@ -93,11 +95,16 @@ task::task<void> open_row(Driver<Sink>& driver, GroupId id, j::Identity identity
 	co_await driver.propose(id, "P|" + std::to_string(id));
 }
 
+task::task<void> propose_row(Driver<Sink>& driver, GroupId id, std::string command) {
+	co_await driver.propose(id, std::move(command));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
 	const std::size_t groups = argc > 1 ? std::stoull(argv[1]) : 64;
 	const std::size_t wave = argc > 2 ? std::stoull(argv[2]) : groups;
+	const bool cut = argc > 3 && std::string(argv[3]) == "cut";
 	if (!groups || !wave) { std::fprintf(stderr, "groups and wave must be positive\n"); return 2; }
 
 	jt::Disk disk;
@@ -165,6 +172,32 @@ int main(int argc, char** argv) {
 	check(opened == groups, "every group opens, creates and commits its one command");
 	check(fenced == 0, "no group fences");
 	check(!host.driver(0).failed(), "the turn driver stays healthy");
+
+	if (cut) {
+		// Power goes out: the next turn fails in the turn driver, outside every worker.
+		disk.cut = disk.operations;
+		std::map<GroupId, Row> late;
+		for (const auto& [id, row] : rows) {
+			task::spawn(ref, propose_row(driver, id, "Q|" + std::to_string(id)), [&late, id](std::exception_ptr e) { late[id] = Row{true, e}; });
+		}
+		run();
+		std::size_t outside = 0, roles = 0, failed = 0;
+		std::string other;
+		for (const auto& [id, row] : rows) {
+			auto found = sink.fenced.find(id);
+			if (found != sink.fenced.end() && found->second == "storage fenced outside worker") { ++outside; }
+			else if (other.empty()) { other = "group " + std::to_string(id) + ": " + (found == sink.fenced.end() ? "not fenced" : found->second); }
+			auto state = driver.state(id);
+			roles += state && state->role == Role::Fenced;
+			failed += late[id].done && late[id].error;
+		}
+		std::printf("power cut: %zu fenced outside their worker, %zu with a fenced role, %zu proposals failed; turn driver %s\n", outside, roles, failed,
+			host.driver(0).failed() ? ("failed: " + what(turns_error)).c_str() : "healthy");
+		if (!other.empty()) { std::printf("first other: %s\n", other.c_str()); }
+		check(outside == groups, "every worker names the fence its store took outside it");
+		check(roles == groups, "every fenced worker's core is fenced");
+		check(failed == groups, "every proposal after the cut fails");
+	}
 
 	stop.request(task::cancel_reason::shutdown);
 	run();

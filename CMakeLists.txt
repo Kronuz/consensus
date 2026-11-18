@@ -72,6 +72,11 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	target_link_libraries(consensus_shared_cluster_test PRIVATE consensus::consensus)
 	add_test(NAME consensus_shared_cluster COMMAND consensus_shared_cluster_test)
 	set_tests_properties(consensus_shared_cluster PROPERTIES TIMEOUT 600)
+	# 64 lone voters opened in one wave on one loop, as a host opens its groups.
+	add_executable(consensus_wave_open_test test/wave_open_test.cc)
+	target_link_libraries(consensus_wave_open_test PRIVATE consensus::consensus)
+	add_test(NAME consensus_wave_open COMMAND consensus_wave_open_test 64)
+	set_tests_properties(consensus_wave_open PROPERTIES TIMEOUT 120)
 	add_executable(consensus_waiter_test test/waiter_test.cc)
 	target_link_libraries(consensus_waiter_test PRIVATE consensus::consensus)
 	# One entry per case, so each stays well inside its timeout under ASan on a CI runner.

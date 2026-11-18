@@ -26,12 +26,14 @@
 #include "consensus/driver.h"
 #include "journal/memory_io.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <iostream>
 #include <map>
 #include <new>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -98,9 +100,10 @@ GroupOptions options(std::vector<NodeId> voters, NodeId local = 1) {
 
 struct Sink {
 	std::size_t fenced = 0;
+	std::map<GroupId, Index> committed;  // each group's last committed index
 	std::function<void(GroupId)> on_fenced;  // a Sink may call the Driver's plain calls
 	void operator()(GroupId, Send) {}
-	void operator()(GroupId, Committed) {}
+	void operator()(GroupId g, Committed c) { if (!c.entries.empty()) { committed[g] = c.entries.back().index; } }
 	void operator()(GroupId, RoleChanged) {}
 	void operator()(GroupId, ActivateInstall) {}
 	void operator()(GroupId, CheckpointPublished) {}
@@ -122,7 +125,7 @@ struct Loop {
 	std::unique_ptr<j::Host> host;
 	Sink sink;
 	std::unique_ptr<Driver<Sink>> driver;
-	task::cancel_source stop, driver_stop;  // the turn driver's run, and the Driver's
+	task::cancel_source stop;
 	bool turns_done = false, driver_done = false;
 	explicit Loop(jt::Disk& d, bool hold = false) : disk(d) {
 		host = std::make_unique<j::Host>(std::make_shared<jt::MemoryIO>(disk, "host/"), host_identity, j::HostOptions{1, turn_options});
@@ -131,7 +134,7 @@ struct Loop {
 		auto ref = task::scheduler_ref::of(scheduler);
 		auto turns = hold ? j::completion_ref::of(held) : j::completion_ref::of(inline_io);
 		task::spawn(ref, host->driver(0).run(turns, stop.token()), [this](std::exception_ptr) { turns_done = true; });
-		task::spawn(ref, driver->run(driver_stop.token()), [this](std::exception_ptr) { driver_done = true; });
+		task::spawn(ref, driver->run(stop.token()), [this](std::exception_ptr) { driver_done = true; });
 		run();
 	}
 	~Loop() { finish(); }
@@ -148,7 +151,7 @@ struct Loop {
 	}
 	void finish() {
 		if (!driver) { return; }
-		driver_stop.request(task::cancel_reason::shutdown); stop.request(task::cancel_reason::shutdown);
+		stop.request(task::cancel_reason::shutdown);
 		release();
 		check(turns_done && driver_done, "the turn driver's and the Driver's runs end at shutdown");
 		driver.reset(); host.reset();
@@ -322,19 +325,40 @@ void erase_queued() {
 	check(loop.driver->groups() == 1, "the id opens again");
 }
 
+// A checkpoint's capture of the application: `image`, through `through` in `term`.
+struct Capture {
+	std::string image; std::size_t at = 0; Index through; Term term;
+	CaptureMetadata metadata() const { return {0, through, term, 0}; }
+	std::size_t read(std::span<char> out) {
+		auto n = std::min(out.size(), image.size() - at);
+		std::copy_n(image.data() + at, n, out.data()); at += n; return n;
+	}
+};
+
 // A6: after shutdown a group awaiting its turn barrier is watched once, not in a loop that
-// wakes itself: the loop idles until the barrier lands, then ends.
+// wakes itself while another group's IO keeps the loop running: the loop idles until the IO
+// and the barrier land, then ends. The turn driver and the Driver stop at once, as in
+// Xapiand's shutdown; the turn driver still writes what is staged.
 void shutdown_idles() {
-	constexpr GroupId g = 61;
+	constexpr GroupId g = 61, h = 62;
 	jt::Disk disk; Loop loop(disk, true);
-	loop.lone(g);
-	auto proposal = loop.start(loop.driver->propose(g, "staged"));
-	check(!proposal->done && loop.held.held() > 0, "a record waits for its turn barrier");
-	loop.driver_stop.request(task::cancel_reason::shutdown);  // the Driver stops; the turn driver keeps committing
-	if (!loop.run_bounded(20'000)) { check(false, "the loop idles after shutdown with the barrier pending"); std::cout << checks << " driver close checks, " << failures << " failures\n"; std::exit(1); }
-	check(loop.driver->in_flight() > 0 && !loop.driver_done, "the loop waits for the barrier");
+	loop.lone(h);
+	auto placed = loop.start(loop.driver->propose(h, "k"));
 	loop.release();
-	check(loop.driver_done && loop.driver->in_flight() == 0, "the loop ends once the barrier lands");
+	check(placed->done && placed->value, "placed");
+	if (!placed->value) { return; }
+	for (Index done = 0; loop.sink.committed[h] > done;) { done = loop.sink.committed[h]; loop.driver->applied(h, Applied{done}); loop.release(); }
+	loop.lone(g);
+	auto checkpoint = loop.start(loop.driver->checkpoint(h, 1 << 20, Capture{std::string(1000, 'y'), 0, placed->value->index, placed->value->term}));
+	const auto io = loop.held.held();
+	auto proposal = loop.start(loop.driver->propose(g, "staged"));
+	check(!checkpoint->done && io > 0, "another group's IO is held");
+	check(!proposal->done && loop.held.held() > io && loop.driver->in_flight() > 1, "a record waits for its turn barrier");
+	loop.stop.request(task::cancel_reason::shutdown);
+	if (!loop.run_bounded(20'000)) { check(false, "the loop idles after shutdown with the barrier pending"); std::cout << checks << " driver close checks, " << failures << " failures\n"; std::exit(1); }
+	check(loop.driver->in_flight() > 0 && !loop.driver_done, "the loop waits for the IO");
+	loop.release();
+	check(loop.driver_done && loop.driver->in_flight() == 0, "the loop ends once the IO and the barrier land");
 }
 
 // A3: 10,000 rows opened and closed leave the Driver's heap where it was.

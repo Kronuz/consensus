@@ -183,6 +183,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 		add_test(NAME consensus_transport_${t} COMMAND consensus_transport_${t}_test)
 		set_tests_properties(consensus_transport_${t} PROPERTIES TIMEOUT 30)
 	endforeach()
+	set_tests_properties(consensus_transport_peers PROPERTIES TIMEOUT 50)  # under TSan a run takes up to 25 s
 	add_test(NAME consensus_transport_tls COMMAND consensus_transport_tls_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture)
 	add_test(NAME consensus_transport_pipe COMMAND consensus_transport_tls_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture --pipes)
 	add_test(NAME consensus_transport_authentication COMMAND consensus_transport_authentication_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture)

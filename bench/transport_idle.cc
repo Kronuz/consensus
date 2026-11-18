@@ -47,6 +47,7 @@
 #include <asio/io_context.hpp>
 #include <openssl/crypto.h>
 #include <openssl/pem.h>
+#include <openssl/rand.h>
 #include <sys/resource.h>
 #include <unistd.h>
 
@@ -490,6 +491,15 @@ Cost cost(int H, std::uint32_t L, std::size_t G, double idle_seconds, bool print
 		h->listen();
 	for (auto &h : hosts)
 		h->open(peers_of(hosts, h->node));
+	// Each loop's thread-local DRBGs, which OpenSSL makes on a thread's first TLS work: a cost per
+	// loop, counted before any connection rather than on the first connection end of each loop.
+	for (auto &h : hosts)
+		for (auto &l : h->loops)
+			l->at([] {
+				unsigned char b;
+				RAND_bytes(&b, 1);
+				RAND_priv_bytes(&b, 1);
+			});
 	const auto s1 = paused(hosts);
 	watched = &hosts;
 

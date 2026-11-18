@@ -722,8 +722,8 @@ void gap(const std::string &lane, std::size_t frame, unsigned seconds) {
 	auto top_up = [&] {
 		if (lane == "none")
 			return;
-		// Each group keeps its window and two frames more queued: the feed never runs dry.
-		const std::uint64_t target = bulk.size() * (HostTransportOptions{}.window + 2 * frame);
+		// The groups keep their windows and a frame each more queued: the feed never runs dry.
+		const std::uint64_t target = bulk.size() * (HostTransportOptions{}.window + frame);
 		while (sent - std::min(sent.load(), delivered.load()) < target)
 			for (auto g : bulk) {
 				const auto k = one->loop_of_group(g);

@@ -142,6 +142,12 @@ struct Loop {
 		std::exception_ptr error;
 		std::optional<T> value;
 	};
+	template <class T> std::shared_ptr<Started<T>> start(task::task<T> work) {
+		auto state = std::make_shared<Started<T>>();
+		task::spawn(task::scheduler_ref::of(scheduler), std::move(work), [state](std::exception_ptr e, std::optional<T> v) { state->done = true; state->error = e; state->value = std::move(v); });
+		run();
+		return state;
+	}
 	std::shared_ptr<Started<bool>> start(task::task<void> work) {
 		auto state = std::make_shared<Started<bool>>();
 		auto wrapped = [](task::task<void> inner) -> task::task<bool> { co_await std::move(inner); co_return true; };
@@ -289,7 +295,7 @@ void bytes() {
 	}
 	const auto after = live_bytes;
 	check(loop.driver->groups() == 0, "no row held after the closes");
-	std::printf("per row: %zu bytes held open, %zu bytes left after close (10,000 rows)\n", (opened - before) / rows, after > before ? (after - before) / rows : std::size_t(0));
+	std::printf("per row: %zu bytes held open, %zu bytes left after close (10,000 rows)\n", (opened - before) / std::size_t(rows), after > before ? (after - before) / std::size_t(rows) : std::size_t(0));
 	// What stays is the row table's bucket array, which an unordered_map never shrinks: a pointer a row.
 	check(after <= before + rows * sizeof(void*) * 2, "closed rows return their bytes: " + std::to_string(after) + " against " + std::to_string(before));
 }

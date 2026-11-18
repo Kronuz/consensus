@@ -657,7 +657,7 @@ private:
 			fail_all(g, std::make_exception_ptr(fenced(fence_reason(g))));
 		}
 		if (g.closed) { return; }
-		if (w.awaiting_turn() && !g.watching) { watch(g); }
+		if (w.awaiting_turn() && !g.watching && !stopping_) { watch(g); }  // after shutdown, never again: D8
 		if (exhausted) { mark_ready(g); return; }
 		arm(g);
 	}
@@ -936,12 +936,11 @@ private:
 		});
 	}
 	// A shared append or publication completes at its turn's barrier: wait for the group's
-	// next record to be durable there.
-	// After shutdown the watch is uncancellable: a cancelled one would end at once and wake the
-	// group to watch again, spinning until the barrier lands; landing IO wakes the loop (D8).
+	// next record to be durable there. Shutdown cancels the watch and step never starts
+	// another, so the loop neither spins on it nor waits for a turn no one may write (D8).
 	void watch(Group& g) {
 		g.watching = true; ++g.io; ++in_flight_;
-		task::spawn(scheduler_, turns_.durable(g.id, turns_.sequence(g.id) + 1, stopping_ ? task::cancel_token{} : shutdown_.token()), [this, &g](std::exception_ptr) {
+		task::spawn(scheduler_, turns_.durable(g.id, turns_.sequence(g.id) + 1, shutdown_.token()), [this, &g](std::exception_ptr) {
 			g.watching = false; --g.io; --in_flight_;
 			mark_ready(g);
 		});

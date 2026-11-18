@@ -242,7 +242,7 @@ void fenced_in_flight() {
 	auto closing = loop.start(loop.driver->close(g));
 	loop.release();
 	check(closing->done && !closing->error, "close completes with a record staged on a fenced row: " + what(closing->error));
-	check(proposal->done && (!proposal->error || is<closed>(proposal->error) || is<fenced>(proposal->error)), "the staged proposal's caller completed with a placement, closed or fenced: " + what(proposal->error));
+	check(proposal->done && is<fenced>(proposal->error), "the staged proposal's caller completes with fenced: " + what(proposal->error));
 	check(loop.driver->groups() == 0, "the row is erased");
 }
 
@@ -335,10 +335,10 @@ struct Capture {
 	}
 };
 
-// A6: after shutdown a group awaiting its turn barrier is watched once, not in a loop that
-// wakes itself while another group's IO keeps the loop running: the loop idles until the IO
-// and the barrier land, then ends. The turn driver and the Driver stop at once, as in
-// Xapiand's shutdown; the turn driver still writes what is staged.
+// A6: after shutdown a group awaiting its turn barrier is not watched again, so the loop does
+// not wake itself while another group's IO keeps it running: it idles until that IO lands,
+// then ends. The turn driver and the Driver stop at once, as in Xapiand's shutdown; the turn
+// driver still writes what is staged.
 void shutdown_idles() {
 	constexpr GroupId g = 61, h = 62;
 	jt::Disk disk; Loop loop(disk, true);
@@ -354,11 +354,48 @@ void shutdown_idles() {
 	auto proposal = loop.start(loop.driver->propose(g, "staged"));
 	check(!checkpoint->done && io > 0, "another group's IO is held");
 	check(!proposal->done && loop.held.held() > io && loop.driver->in_flight() > 1, "a record waits for its turn barrier");
+	auto& turns = loop.host->driver(0);
+	const auto durable = turns.sequence(g);
+	check(turns.staged(g), "the proposal's record is staged");
 	loop.stop.request(task::cancel_reason::shutdown);
 	if (!loop.run_bounded(20'000)) { check(false, "the loop idles after shutdown with the barrier pending"); std::cout << checks << " driver close checks, " << failures << " failures\n"; std::exit(1); }
 	check(loop.driver->in_flight() > 0 && !loop.driver_done, "the loop waits for the IO");
 	loop.release();
-	check(loop.driver_done && loop.driver->in_flight() == 0, "the loop ends once the IO and the barrier land");
+	check(loop.driver_done && loop.driver->in_flight() == 0, "the loop ends once the IO lands");
+	check(loop.turns_done && !turns.staged(g) && turns.sequence(g) > durable, "the record staged before shutdown is durable: sequence " + std::to_string(turns.sequence(g)) + " after " + std::to_string(durable));
+	check(proposal->done && is<task::cancelled>(proposal->error), "the proposal completes with task::cancelled: " + what(proposal->error));
+	check(checkpoint->done && is<task::cancelled>(checkpoint->error), "the checkpoint completes with task::cancelled: " + what(checkpoint->error));
+}
+
+// A6: a step after the turn driver returned stages a record (a higher-term VoteRequest to a
+// follower) while another group's IO holds the loop. run() does not wait for that record's
+// barrier, which no turn driver will write: it ends once the IO lands, and the record stays staged.
+void shutdown_ends() {
+	constexpr GroupId g = 71, h = 72;
+	jt::Disk disk; Loop loop(disk, true);
+	loop.lone(h);
+	auto placed = loop.start(loop.driver->propose(h, "k"));
+	loop.release();
+	check(placed->done && placed->value, "placed");
+	if (!placed->value) { return; }
+	for (Index done = 0; loop.sink.committed[h] > done;) { done = loop.sink.committed[h]; loop.driver->applied(h, Applied{done}); loop.release(); }
+	loop.driver->open(g, options({1, 2}));  // a follower: its peer never answers
+	std::exception_ptr error;
+	check(loop.settle(loop.driver->create(g, j::Identity{'T', 'V'}), error) && !error, "the two-voter group is created: " + what(error));
+	auto checkpoint = loop.start(loop.driver->checkpoint(h, 1 << 20, Capture{std::string(1000, 'y'), 0, placed->value->index, placed->value->term}));
+	check(!checkpoint->done && loop.held.held() > 0, "another group's IO is held");
+	loop.stop.request(task::cancel_reason::shutdown);
+	check(loop.run_bounded(20'000) && loop.turns_done && !loop.driver_done, "the turn driver returns; the Driver waits for the IO");
+	auto& turns = loop.host->driver(0);
+	const auto durable = turns.sequence(g);
+	loop.driver->receive(g, Receive{2, VoteRequest{5, 100, 5}});
+	check(loop.run_bounded(20'000), "the loop idles after the step");
+	check(loop.driver->state(g) && loop.driver->state(g)->term == 5 && turns.staged(g), "the step staged the new term after the turn driver returned");
+	loop.release();
+	for (int n = 0; n < 20 && !loop.driver_done; ++n) { loop.scheduler.advance(50'000'000); loop.run_bounded(200'000); }
+	if (!loop.driver_done) { check(false, "the Driver's run ends once the IO lands: in_flight " + std::to_string(loop.driver->in_flight())); std::cout << checks << " driver close checks, " << failures << " failures\n"; std::exit(1); }
+	check(loop.driver->in_flight() == 0, "no IO in flight");
+	check(turns.staged(g) && turns.sequence(g) == durable, "the record stays staged, reported not durable");
 }
 
 // A3: 10,000 rows opened and closed leave the Driver's heap where it was.
@@ -435,6 +472,7 @@ const std::map<std::string, void (*)()> cases{
 	{"created_bytes", &created_bytes},
 	{"erase_queued", &erase_queued},
 	{"shutdown_idles", &shutdown_idles},
+	{"shutdown_ends", &shutdown_ends},
 	{"fenced_row", &fenced_row},
 	{"fenced_in_flight", &fenced_in_flight},
 	{"half_opened_row", &half_opened_row},

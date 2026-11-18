@@ -140,7 +140,9 @@ an id that is not open, or is closing or closed, completes with `closed` and sub
 
 **Shutdown order.** A host closes its groups while `run()` steps the loop, then requests `stop`.
 After `stop`, `close` completes with `task::cancelled` like every other call and frees nothing;
-`~Driver` frees what the groups still hold.
+`~Driver` frees what the groups still hold. `run()` does not wait for a turn barrier after `stop`:
+the turn driver writes what is staged while it runs, and a record a step stages after it returns
+stays staged (`TurnDriver::staged`) until a turn driver runs again.
 
 **The Sink must not throw.** A throw out of a Sink call fences the group: the rest of that step's
 actions are lost, so its waiters complete with `fenced` and the Sink hears `Fenced`.

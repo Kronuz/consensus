@@ -1416,6 +1416,10 @@ void scan() {
 				break;
 			last = now;
 		}
+		for (const auto credit_start = steady::now(); one.transport->stats(0).uncredited || two.transport->stats(0).uncredited;) {
+			assert(ms_since(credit_start) < 10'000 && "every group's credit returns");
+			std::this_thread::sleep_for(1ms);
+		}
 		const auto after = totals();
 		const double visited = double(after.first - before.first), sent = double(after.second - before.second);
 		ratios.push_back(visited / sent);

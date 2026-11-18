@@ -217,6 +217,9 @@ struct HostTransportStats {
 	std::atomic<std::uint64_t> opens{0}, mismatched{0}, closed{0}, unstored{0}, unopened{0}, misrouted{0}, spoofed{0};
 	// Groups a feed examined to choose its frames: one per frame, whatever the group count.
 	std::atomic<std::uint64_t> visited{0};
+	// A level, not a count: data bytes this loop's connections sent that their peers have not
+	// credited yet. Zero once every group's credit is back.
+	std::atomic<std::uint64_t> uncredited{0};
 };
 
 // A loop of the host: where its tasks run and its sockets wait.
@@ -465,13 +468,14 @@ class HostTransport {
 	}
 	// A connection begins or ends: it carries no open, nothing is outstanding or owed, and the
 	// rings are rebuilt from what is queued.
-	void reset(Lane &lane) {
+	void reset(Lane &lane, HostTransportStats &stats) {
 		lane.opened.clear();
 		for (auto &r : lane.rings)
 			r = {};
 		for (auto &[id, a] : lane.active) {
 			a.owed = 0;
 			a.close = false;
+			stats.uncredited -= a.outstanding;
 			a.outstanding = 0;
 			a.in = 0;
 		}
@@ -580,6 +584,7 @@ class HostTransport {
 				a.data.pop_front();
 				a.queued -= frame.size();
 				a.outstanding += frame.size();
+				stats.uncredited += frame.size();
 				fed += put(k, lane, frame);
 				if (data_ready(a))
 					push(lane, data_ring, id, a);
@@ -603,7 +608,7 @@ class HostTransport {
 		++loops_[k].stats.links;
 		lane.link = &link;
 		const auto generation = ++lane.generation;
-		reset(lane);
+		reset(lane, loops_[k].stats);
 		link.connection->on_read = [this, k, &link, generation] { read(k, link, generation); };
 		link.connection->on_drained = [this, k, node = link.peer, which = link.lane] {
 			auto &lane = loops_[k].lanes[{node, which}];
@@ -617,7 +622,7 @@ class HostTransport {
 		if (lane.link != &link)
 			return;
 		lane.link = nullptr;
-		reset(lane);
+		reset(lane, loops_[k].stats);
 		if (!lane.active.empty())
 			pump(k, link.peer, link.lane);
 	}
@@ -646,7 +651,9 @@ class HostTransport {
 			const auto group = kronuz::journal::get64(rest);
 			const auto bytes = kronuz::journal::get64(rest);
 			if (auto *a = lane.active.find(group)) {
-				a->outstanding -= std::min(bytes, a->outstanding);
+				const auto credited = std::min(bytes, a->outstanding);
+				a->outstanding -= credited;
+				here.stats.uncredited -= credited;
 				if (data_ready(*a))
 					push(lane, data_ring, group, *a);
 				settle(lane, group);

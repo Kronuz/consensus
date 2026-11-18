@@ -99,6 +99,7 @@ MUTANTS = {
     "ring-at-front": (T + "host_transport.h",
                       "\t\tif (r.size++)\n\t\t\tlane.active.find(r.tail)->next[ring] = id;\n\t\telse\n\t\t\tr.head = id;\n\t\tr.tail = id;",
                       "\t\ta.next[ring] = r.head;\n\t\tr.head = id;\n\t\tif (!r.size++)\n\t\t\tr.tail = id;"),
+    "uncredited-kept": (T + "host_transport.h", "\t\t\t\there.stats.uncredited -= credited;\n", ""),
     "store-keeps-opens": (T + "host_transport.h", "\t\there.stored[group] = {incarnation, {open, ++here.serial}};\n\t\tunopen(here, group);",
                           "\t\there.stored[group] = {incarnation, {open, ++here.serial}};"),
     # security review S1: a read that fails after handing frames over leaves them for the next read

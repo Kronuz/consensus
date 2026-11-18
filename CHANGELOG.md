@@ -11,7 +11,8 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 ### Added
 
 - The host transport's `HostTransportStats::visited`: the groups a feed examined to choose its
-  frames, one per frame.
+  frames, one per frame; and `HostTransportStats::uncredited`, a level: the data bytes a loop's
+  connections sent that their peers have not credited yet.
 
 - Identity on the host transport ([docs/mechanisms/host-transport.md](docs/mechanisms/host-transport.md),
   Identity): the host stores its groups (`store`, `forget`); each group opens per connection by

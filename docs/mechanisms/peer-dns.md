@@ -33,17 +33,22 @@ threads; only 16 hung at once stall the lookups after them.
 The thread hands its answer back through a delivery function under the lookup's mutex. The
 delivery posts the answer to the executor with a weak reference to the `Peers`. `stop()`
 and the destructor call `abandon()`. A queued lookup leaves the queue, and its resolver
-never runs. A running one has its delivery cleared under the lookup's mutex; after that, its
-thread touches nothing of the transport's, not even the executor, and drops the answer when
-the resolver returns. The thread holds no executor work, so a hung lookup never keeps
-`io_context::run()` from returning.
+never runs. A running one has its delivery cleared under the lookup's mutex, so `abandon()`
+returns only after a delivery in progress returns (`resolve_test.cc`, case `abandon_waits`);
+after that, its thread touches nothing of the transport's, not even the executor, and drops
+the answer when the resolver returns. The thread holds no executor work, so a hung lookup
+never keeps `io_context::run()` from returning.
 
-The process's `LookupThreads` is destroyed at exit. It drops the queue, starts no further
-delivery, waits for each running resolver to return, and joins every thread, so no lookup
-thread outlives it. A stuck `getaddrinfo` therefore delays exit by up to the system
-resolver's timeout. `test/transport/resolve_test.cc` measures the wait: destruction with a
-resolver stuck until 300 ms later took 307 ms, and exit with a 200 ms lookup in its resolver
-waited 206 ms.
+The process's `LookupThreads` is never destroyed: an atexit handler, registered when it is
+built, closes it. Closing drops the queue, starts no further delivery, waits for each running
+resolver to return, and joins every thread, so no lookup thread outlives it. A lookup started
+during or after exit, by a thread still dialing or by a later atexit handler or static
+destructor, throws `operation_canceled`, which `Links` and `Peers` catch. A stuck
+`getaddrinfo` delays exit by up to the system resolver's timeout. `std::exit` called on a
+lookup thread, from a resolver or a delivery, never returns, since closing waits for that
+thread; resolvers and deliveries must not exit the process. `test/transport/resolve_test.cc`
+measures the wait: destruction with a resolver stuck until 300 ms later took 307 ms, and exit
+with a 200 ms lookup in its resolver waited 206 ms.
 
 A peer has at most one lookup in flight, and a new lookup of a name starts only once the
 last one's deadline has passed. A dial that finds a lookup already running, or one started
@@ -132,7 +137,6 @@ It costs nothing else:
 
 `test/transport/peers_test.cc` runs three Workers over TLS and checks each of these
 properties. `test/transport/dns_mutants.sh` seeds the faults the test must catch: a dial
-that waits for its lookup with no deadline, every lookup queued on one shared thread (a
-bound of 1), a
-refused address that does not move the next dial past it, a cached dial that waits for its
-lookup, and a lookup started on every dial.
+that waits for its lookup with no deadline, every lookup queued on one shared thread (a bound
+of 1), a refused address that does not move the next dial past it, a cached dial that waits
+for its lookup, and a lookup started on every dial.

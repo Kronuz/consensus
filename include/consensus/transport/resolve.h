@@ -5,6 +5,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <list>
@@ -82,6 +83,7 @@ class LookupThreads;
 // One lookup on a thread of a LookupThreads. The answer goes to `deliver` (called on that
 // thread) unless abandon() ran first. Abandoning a queued lookup frees it unstarted; a
 // running one touches nothing of its caller's after abandon() and ends with its resolver.
+// Neither the resolver nor `deliver` may call std::exit: exit waits for their thread.
 class Lookup {
   public:
 	using Delivery = std::function<void(std::vector<asio::ip::address>)>;
@@ -154,15 +156,22 @@ struct Lookup::Owner {
 
 // The threads lookups run on: at most `bound` at once, later lookups queue in order. A thread
 // starts when a lookup queues and no thread is free, and returns once the queue is empty.
-// getaddrinfo cannot be cancelled, so destruction drops the queue, stops every delivery, and
-// waits for each running resolver to return before it joins its thread.
+// getaddrinfo cannot be cancelled, so closing (destruction, or the process's at exit) drops the
+// queue, stops every delivery, and waits for each running resolver to return before it joins its
+// thread; start() throws from then on.
 class LookupThreads {
   public:
 	// Lookups past this many at once in the process queue for a thread.
 	static constexpr std::size_t process_bound = 16;
-	// The process's, which Lookup::start uses; destroyed at exit.
+	// The process's, which Lookup::start uses. Never destroyed: an atexit handler registered when
+	// it is built closes it, so a start() during or after exit throws operation_canceled.
 	static LookupThreads &process() {
-		static LookupThreads threads(process_bound);
+		static LookupThreads &threads = []() -> LookupThreads & {
+			auto built = std::make_unique<LookupThreads>(process_bound);
+			if (std::atexit([] { process().close(); }) != 0)
+				throw std::system_error(std::make_error_code(std::errc::not_enough_memory), "LookupThreads: atexit");
+			return *built.release();
+		}();
 		return threads;
 	}
 
@@ -173,29 +182,7 @@ class LookupThreads {
 	}
 	LookupThreads(const LookupThreads &) = delete;
 	LookupThreads &operator=(const LookupThreads &) = delete;
-	~LookupThreads() {
-		auto &owner = *owner_;
-		std::list<std::shared_ptr<Lookup>> dropped;
-		std::list<std::thread> threads;
-		{
-			std::unique_lock lock(owner.mutex);
-			owner.closing = true;
-			for (auto &lookup : owner.queue)
-				lookup->queued_ = false;
-			dropped.swap(owner.queue);
-			owner.idle.wait(lock, [&] { return owner.running.empty(); });
-			threads.swap(owner.exited);
-		}
-		for (auto &thread : threads)
-			thread.join();
-		for (auto &lookup : dropped) {
-			// No thread holds these any longer: unqueued above, under the owner's mutex.
-			lookup->resolver_ = nullptr;
-			lookup->host_.clear();
-			std::lock_guard lock(lookup->mutex_);
-			lookup->deliver_ = nullptr;
-		}
-	}
+	~LookupThreads() { close(); }
 
 	// Queues the lookup and starts a thread for it when none is free and fewer than `bound`
 	// run. Throws std::system_error when closed, or when no thread runs and none can start.
@@ -244,6 +231,31 @@ class LookupThreads {
 
   private:
 	std::shared_ptr<Lookup::Owner> owner_;
+
+	// Destruction's, and the process's at exit; idempotent.
+	void close() {
+		auto &owner = *owner_;
+		std::list<std::shared_ptr<Lookup>> dropped;
+		std::list<std::thread> threads;
+		{
+			std::unique_lock lock(owner.mutex);
+			owner.closing = true;
+			for (auto &lookup : owner.queue)
+				lookup->queued_ = false;
+			dropped.swap(owner.queue);
+			owner.idle.wait(lock, [&] { return owner.running.empty(); });
+			threads.swap(owner.exited);
+		}
+		for (auto &thread : threads)
+			thread.join();
+		for (auto &lookup : dropped) {
+			// No thread holds these any longer: unqueued above, under the owner's mutex.
+			lookup->resolver_ = nullptr;
+			lookup->host_.clear();
+			std::lock_guard lock(lookup->mutex_);
+			lookup->deliver_ = nullptr;
+		}
+	}
 };
 
 inline std::shared_ptr<Lookup> Lookup::start(PeerResolver resolver, std::string host, Delivery deliver) {

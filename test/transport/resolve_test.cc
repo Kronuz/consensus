@@ -1,7 +1,8 @@
 // Lookup threads (resolve.h): lookups deliver; an abandoned lookup's late answer is never
-// delivered and a queued one is freed unstarted; transport rebuilds over a resolver that never
-// answers keep the process's threads within the bound; destruction, and the process's exit,
-// join every lookup thread, waiting for a stuck resolver (docs/mechanisms/peer-dns.md).
+// delivered, a queued one is freed unstarted, and abandon() waits for a delivery in progress;
+// transport rebuilds over a resolver that never answers keep the process's threads within the
+// bound; destruction, and the process's exit, join every lookup thread, waiting for a stuck
+// resolver, and a lookup started after exit closed them throws (docs/mechanisms/peer-dns.md).
 #include "consensus/transport/resolve.h"
 
 #include <atomic>
@@ -176,6 +177,47 @@ void abandoned() {
 	std::printf("abandoned: the late answer was dropped; the queued lookup was freed unstarted\n");
 }
 
+// A3: abandon() during a delivery returns only after that delivery returns, so the caller's
+// state outlives every delivery to it.
+void abandon_waits() {
+	std::mutex mutex;
+	std::condition_variable wake;
+	bool in_delivery = false, open = false, delivery_returned = false;
+	LookupThreads threads(1);
+	auto lookup = threads.start([](const std::string &) { return std::vector<asio::ip::address>{}; }, "delivering",
+								[&](std::vector<asio::ip::address>) {
+									std::unique_lock lock(mutex);
+									in_delivery = true;
+									wake.notify_all();
+									wake.wait(lock, [&] { return open; });
+									delivery_returned = true;
+								});
+	{
+		std::unique_lock lock(mutex);
+		CHECK(wake.wait_for(lock, 5s, [&] { return in_delivery; }));
+	}
+	std::atomic<bool> abandoning{false}, abandoned{false};
+	bool returned_first = false;
+	std::thread abandoner([&] {
+		abandoning = true;
+		lookup->abandon();
+		abandoned = true;
+		std::lock_guard lock(mutex);
+		returned_first = delivery_returned;
+	});
+	CHECK(until([&] { return abandoning.load(); }));
+	const bool early = until([&] { return abandoned.load(); }, 200ms);
+	{
+		std::lock_guard lock(mutex);
+		open = true;
+		wake.notify_all();
+	}
+	abandoner.join();
+	std::printf("abandon_waits: abandon() %s the delivery in progress returned\n",
+				early ? "returned before" : "waited until");
+	CHECK(!early && returned_first);
+}
+
 // A2: destruction drops the queue, delivers nothing, and joins every thread, waiting for a
 // resolver that returns 300 ms after destruction began.
 void shutdown() {
@@ -244,15 +286,24 @@ void rebuilds() {
 	CHECK(answers->size() == 0 && gate->returned == bound);
 }
 
-// A2 at exit: runs after the process's LookupThreads is destroyed (registered before it was
-// built); every thread it ran has been joined.
+// A2 at exit: runs after the process's LookupThreads is closed (registered before it was
+// built); every thread it ran has been joined, and a lookup started now throws.
 void exited() {
 	const auto took = Clock::now() - returned_at;
 	const bool joined = until([] { return os_threads() == baseline; }, 1s);
 	std::printf("exit: waited %lld ms for the lookup in flight; %s\n", ms(took),
 				joined ? "every lookup thread joined" : "a lookup thread is left");
+	bool canceled = false;
+	try {
+		Lookup::start([](const std::string &) { return std::vector<asio::ip::address>{}; }, "after exit",
+					  [](std::vector<asio::ip::address>) {});
+	} catch (const std::system_error &error) {
+		canceled = error.code() == std::errc::operation_canceled;
+	}
+	std::printf("exit: a lookup started after exit closed the threads %s\n",
+				canceled ? "threw operation_canceled" : "did not throw it");
 	std::fflush(stdout);
-	if (!joined || took < 150ms)
+	if (!joined || took < 150ms || !canceled)
 		std::_Exit(1);
 }
 } // namespace
@@ -262,7 +313,8 @@ int main(int argc, char **argv) {
 	baseline = os_threads();
 	std::atexit(exited);
 	const std::pair<const char *, void (*)()> cases[] = {
-		{"delivers", delivers}, {"abandoned", abandoned}, {"shutdown", shutdown}, {"rebuilds", rebuilds}};
+		{"delivers", delivers}, {"abandoned", abandoned}, {"abandon_waits", abandon_waits},
+		{"shutdown", shutdown}, {"rebuilds", rebuilds}};
 	bool ran = false;
 	for (const auto &[name, run] : cases)
 		if (argc < 2 || std::strcmp(argv[1], name) == 0) {

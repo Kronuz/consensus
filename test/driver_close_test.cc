@@ -39,7 +39,19 @@ namespace j = kronuz::journal;
 namespace jt = kronuz::journal::testing;
 
 // Live heap bytes, counted at the allocation and the sized free, each block carrying its size.
-// Single-threaded: the loop is an inline scheduler.
+// Single-threaded: the loop is an inline scheduler. TSan's runtime defines operator new, so
+// there the count is off and the bytes case only reports.
+#if defined(__SANITIZE_THREAD__)
+#define COUNT_BYTES 0
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define COUNT_BYTES 0
+#endif
+#endif
+#ifndef COUNT_BYTES
+#define COUNT_BYTES 1
+#endif
+#if COUNT_BYTES
 namespace {
 std::size_t live_bytes = 0;
 constexpr std::size_t header = alignof(std::max_align_t);
@@ -57,6 +69,9 @@ void operator delete(void* p) noexcept {
 	std::free(raw);
 }
 void operator delete(void* p, std::size_t) noexcept { operator delete(p); }
+#else
+namespace { std::size_t live_bytes = 0; }
+#endif
 
 namespace {
 
@@ -303,7 +318,7 @@ void bytes() {
 	std::printf("per row: %zu bytes held open, %zu left after close before the Host's purge, %zu after\n", (opened - before) / std::size_t(rows),
 		unpurged > before ? (unpurged - before) / std::size_t(rows) : std::size_t(0), after > before ? (after - before) / std::size_t(rows) : std::size_t(0));
 	// What stays is the row table's bucket array, which an unordered_map never shrinks: a pointer a row.
-	check(after <= before + rows * sizeof(void*) * 2, "closed rows return their bytes: " + std::to_string(after) + " against " + std::to_string(before));
+	check(!COUNT_BYTES || after <= before + rows * sizeof(void*) * 2, "closed rows return their bytes: " + std::to_string(after) + " against " + std::to_string(before));
 }
 
 const std::map<std::string, void (*)()> cases{

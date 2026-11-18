@@ -38,8 +38,9 @@
 // Bytes are counted exactly: OpenSSL's allocations (CRYPTO_set_mem_functions) and the C++ heap
 // (operator new), by usable size, on macOS and glibc without a sanitizer; zone statistics are
 // printed beside them only. cost exits nonzero when an idle group holds a descriptor, an armed
-// timer, a frame or more than 64 bytes; when an idle connection end holds more than 48 KB (the
-// fit's slope); or, without --quick, when a host is more than 10% over 52 KB + 2P x 44 KB.
+// timer or a frame, or more than 230 + 40P bytes (D112); when an idle connection end holds more
+// than 48 KB (the fit's slope); or, without --quick, when a host is more than 10% over
+// 52 KB + 2P x 44 KB.
 #include "consensus/transport/host_transport.h"
 #include <asio/executor_work_guard.hpp>
 #include <asio/io_context.hpp>
@@ -633,7 +634,7 @@ Cost cost(int H, std::uint32_t L, std::size_t G, double idle_seconds, bool print
 		expect(end_timers == 2, "two armed timers per idle connection end, keepalive and dead peer" + at);
 		expect(host_fds == 1 + 2 * P, "1 + 2P descriptors per host" + at);
 		if (heap_measured)
-			expect(std::abs(group) <= 64, "an idle group within 64 bytes" + at);
+			expect(std::abs(group) <= 230 + 40 * P, "an idle group within 230 + 40P bytes (D112)" + at);  // 206 B identity store + 40P; measured 253-368
 	}
 	watched = nullptr;
 	return {P, L, host, false};

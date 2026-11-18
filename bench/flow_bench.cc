@@ -695,7 +695,8 @@ void gap(const std::string &lane, std::size_t frame, unsigned seconds) {
 	two->on_deliver(other, [&](const Received &r) {
 		const auto now = us_now();
 		if (r.payload.size() == 8 && measuring) {
-			delay.add(now - kronuz::journal::get64(r.payload));
+			std::string_view sent_at = r.payload;
+			delay.add(now - kronuz::journal::get64(sent_at));
 			if (last)
 				worst_gap = std::max(worst_gap, now - last);
 			last = now;

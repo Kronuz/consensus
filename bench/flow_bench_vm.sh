@@ -6,16 +6,24 @@ set -euo pipefail
 VM="${FLOW_VM:-$HOME/.scratch/vm-document-gate/vm.sh} linux"
 what=$1
 commit=$(git rev-parse HEAD:bench HEAD:include HEAD:CMakeLists.txt | tr "\n" -)
+# The marker names a VM this script started, so a job stopped before its cleanup leaves it to the next.
+marker=$HOME/.scratch/flow-bench-vm-started
 started=0
 if [[ $($VM status) != running ]]; then
+	touch "$marker"
 	$VM start
-	started=1
 fi
+[[ -f $marker ]] && started=1
 cleanup() {
 	$VM ssh 'sudo tc qdisc del dev lo root 2>/dev/null; true' || true
-	if ((started)); then $VM stop; fi
+	if ((started)); then
+		$VM stop
+		rm -f "$marker"
+	fi
 }
 trap cleanup EXIT
+trap 'exit 143' INT TERM
+for i in $(seq 60); do $VM ssh true 2>/dev/null && break; sleep 5; done
 if [[ $($VM ssh 'cat ~/consensus-flow-build/COMMIT 2>/dev/null || true') != "$commit" ]]; then
 	git archive --prefix=consensus-flow/ HEAD | $VM ssh 'rm -rf ~/consensus-flow && tar -xf - -C ~'
 	$VM ssh 'set -e; cd ~/consensus-flow; cmake -S . -B ~/consensus-flow-build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PROJECT_consensus_INCLUDE=$PWD/bench/flow_bench.cmake >/dev/null

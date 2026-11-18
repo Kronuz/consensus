@@ -14,7 +14,7 @@ Linux gate host, and this Mac stands in for it (Detent PLAN.md D111).
 
 CI's Linux runners gave only the counts that do not depend on timing. The ctest entry
 `consensus_transport_idle` runs `cost --quick` on every CI platform and fails when an idle group
-holds a descriptor, an armed timer or more than 64 bytes on average, when a frame is not
+holds a descriptor, an armed timer or more than `230 + 40P` bytes on average (D112), when a frame is not
 delivered, or when an idle connection end holds more than 48 KB. In CI run 44139926700 (Kronuz/consensus, branch commit consensus:0264544) it passed on
 linux-x86_64-gcc, linux-x86_64-clang and linux-arm64-gcc, and under linux-tsan, linux-asan-ubsan
 and freebsd-x86_64, where bytes are not counted (a sanitizer's allocator pads every block) and only
@@ -65,35 +65,52 @@ cost (Detent PLAN.md D111).
 
 ## A1: idle cost
 
-Job 261117-122812-45a7bf (exclusive, consensus:0d92ef5) measured every row below and passed
-against D108. The earlier job 261117-092707-067ee0 (consensus:2c8e710) gave the same bytes and
-failed only against the old per-host formula, `29 KB + 2P x 41 KB`.
+Job 261117-172945-6b1b06 (exclusive, consensus:76bacd2) measured every row below and passed.
 
-Per idle group, at H = 2, 3, 5 and L = 1, 4: at most 0.2 bytes on average over G x H groups
-(OpenSSL 0), 0 descriptors, 0
-armed timers; every frame delivered (4,004 to 40,040 per configuration), 0 dropped, refused or
-malformed. Budget: 64 bytes and none of the rest.
+Per idle group, over G x H = 1,000 x H groups, at H = 2, 3, 5 (P = 1, 2, 4 peers) and L = 1, 4:
+0 descriptors, 0 armed timers, every frame delivered (4,004 to 40,040 per configuration), 0
+dropped, refused or malformed. Its bytes are all C++ heap (OpenSSL 0), the identity store
+transport-identity added to the host transport (Detent PLAN.md D112) and not what traffic leaves
+(0.2 B before identity, D108's 64 B):
 
-Per idle connection end, the fit's slope: 44,454 B at L = 1 (OpenSSL about 40.8 KB, the
-transport's C++ about 3.6 KB: Connection 464 B, Link 176 B, coroutine frames, deadlines) and
-48,394 B at L = 4 (inferred, not counted per thread: each loop that runs TLS adds
-per-thread OpenSSL state, which grows with the ends). Budget: 48 KB (49,152 B). Two armed timers per end, keepalive and dead peer.
+| L | P | Per idle group | Stored | Its frames | `230 + 40P` |
+|---|---|---|---|---|---|
+| 1 | 1 | 253.1 B | 204.8 | 48.3 | 270 |
+| 1 | 2 | 285.5 B | 204.8 | 80.7 | 310 |
+| 1 | 4 | 366.2 B | 204.8 | 161.5 | 390 |
+| 4 | 1 | 255.0 B | 206.3 | 48.7 | 270 |
+| 4 | 2 | 287.3 B | 206.3 | 81.0 | 310 |
+| 4 | 4 | 367.9 B | 206.3 | 161.5 | 390 |
+
+"Stored" is what a group holds the moment it is stored: 206 B at 4 loops, the identity store. The
+job's C++ block counts per 100 groups name it: the `Stored` node (80 B), its `Opening` (a
+`make_shared` of the 80 B `GroupOpen` and its serial, 112 B) and the rest in 16 B and 32 B
+blocks. "Its frames" is what its traffic then adds: the connections that open the group each
+record it, about 40 B per peer (`Stored::opened` and the lanes' maps). The bound is D112's
+`200 + 40P` plus 30 B, because the measured points sit 6-15 B above `200 + 40P` itself; the
+points are 15-25 B under `230 + 40P`. D112 sends the shrinking to quest transport-feed-scan
+(A5: back to 64 B, or the minimum field by field).
+
+Per idle connection end, the fit's slope: 44,666 B at L = 1 and 48,792 B at L = 4 (inferred, not
+counted per thread: each loop that runs TLS adds per-thread OpenSSL state, which grows with the
+ends). Budget: 48 KB (49,152 B). Two armed timers per end, keepalive and dead peer.
 
 Per host, against `52 KB + 2P x 44 KB` (53,248 + 90,112 P bytes), within 10%:
 
 | L | P | Counted bytes per host | Budget | Against it |
 |---|---|---|---|---|
-| 1 | 1 | 141,160 | 143,360 | 1.5% under |
-| 1 | 2 | 230,117 | 233,472 | 1.4% under |
-| 1 | 4 | 407,891 | 413,696 | 1.4% under |
-| 4 | 1 | 151,608 | 143,360 | 5.8% over |
-| 4 | 2 | 249,536 | 233,472 | 6.9% over |
-| 4 | 4 | 442,198 | 413,696 | 6.9% over |
+| 1 | 1 | 142,712 | 143,360 | 0.5% under |
+| 1 | 2 | 232,379 | 233,472 | 0.5% under |
+| 1 | 4 | 410,778 | 413,696 | 0.7% under |
+| 4 | 1 | 153,064 | 143,360 | 6.8% over |
+| 4 | 2 | 252,341 | 233,472 | 8.1% over |
+| 4 | 4 | 446,154 | 413,696 | 7.8% over |
 
-Fits: `52,273 + 2P x 44,454` at L = 1, `55,277 + 2P x 48,394` at L = 4. Besides these, each loop
+Fits: `53,513 + 2P x 44,666` at L = 1, `56,158 + 2P x 48,792` at L = 4. Besides these, each loop
 that armed a timer holds one 64 KiB timer wheel, the scheduler's. Descriptors per host: 1 + 2P.
+The host rows are 1.5 KB (1%) above the job before identity at both L; that is not attributed.
 
-An idle host spends 284-1,291 us of CPU per second (0.03-0.13% of a core) at H = 2 to 5: the
+An idle host spends 289-981 us of CPU per second (0.03-0.10% of a core) at H = 2 to 5: the
 keepalives, one per connection end per second. macOS reports no voluntary context switches through
 `getrusage`, so the bench's wake count reads 0 here and counts nothing.
 
@@ -107,24 +124,30 @@ difference of any round. An effect counts only when its median clears that band.
 
 | Row | Job | Same | Hop | Hop - same, median [range] | A/A band | Verdict |
 |---|---|---|---|---|---|---|
-| Per frame, control stream | 261117-122822-488d1f | 290 ns | 421 ns | 131 ns [90, 169] | 77 ns | clears |
-| Per frame, data stream | 261117-122836-fb319f | 603 ns | 813 ns | 216 ns [185, 255] | 70 ns | clears |
-| Per idle wake, a frame alone every 1 ms | 261117-122848-92c892 | 52.9 us | 68.4 us | 15.3 us [12.9, 20.8] | 8.7 us | clears |
+| Per frame, control stream | 261117-172946-981ce0 | 296 ns | 448 ns | 153 ns [137, 172] | 62 ns | clears |
+| Per frame, data stream | 261117-172946-bbf981 | 642 ns | 863 ns | 222 ns [182, 232] | 66 ns | clears |
+| Per idle wake, a frame alone every 1 ms | 261117-172946-10ce1e | 46.6 us | 59.0 us | 12.5 us [10.3, 16.2] | 10.1 us | clears |
 
-Each row is one exclusive job at consensus:0d92ef5: 7 rounds for the streams, 9 rounds of 8,000
-frames per run for the idle wake. In the streams the reader posts 204.8 frames per hop, so the
-hop's post is spread over them; what is left is 131-216 ns per frame. A frame alone costs the
-receiver about 53 us of CPU on its own loop (a TLS record read, the wake, the dispatch), and the
-hop adds the group loop's wake, 15.3 us, which clears its band; its p50 latency from send to
-delivery is 157.2 us against 138.1 us. The earlier 7-round job 261117-092717-30ce96 (2,000
-frames per run, consensus:2c8e710) put the wake at 11.8 us [1.8, 19.3], within its 15.3 us band:
-2,000 frames per run were too few to separate it from run-to-run noise.
+Each row is one exclusive job at consensus:76bacd2: 7 rounds for the streams, 9 rounds of 8,000
+frames per run for the idle wake. All three costs clear their bands. In the streams the reader
+posts 204.8 frames per hop, so the hop's post is spread over them; what is left is 153-222 ns per
+frame. A frame alone costs the receiver about 47 us of CPU on its own loop (a TLS record read, the
+wake, the dispatch), and the hop adds the group loop's wake, 12.5 us; its p50 latency from send to
+delivery is 141.3 us against 120.9 us. The full-bench job 261117-172946-7024b4 (7 rounds of 2,000
+frames per run in the same pass) agrees on the streams (162 ns [134, 183], band 86; 209 ns [189,
+215], band 31) and puts the wake at 14.4 us [11.6, 23.3], within its 15.7 us band: 2,000 frames
+per run are too few to separate it from run-to-run noise, as the earlier 7-round job
+261117-092717-30ce96 found (11.8 us [1.8, 19.3], band 15.3 us). The wake row's 8,000-frame
+job is the one that counts.
+
+The rows before transport-identity (consensus:0d92ef5, jobs 261117-122822-488d1f, -122836-fb319f,
+-122848-92c892) were 131 ns, 216 ns and 15.3 us: identity moved none of them outside its band.
 
 Beside it, the bare Asio hop with no TLS and no transport (Detent `run.sh hop_cost`, job
 261117-092732-0475d9, exclusive, Detent:d15d063): 793-851 ns per frame posted alone, 21-22 ns in
 batches of 64, and 7.2 us of CPU per batch that wakes an idle loop (2.7 us at 16 frames). D10's
 design job 261111-012904-94206c measured 832 ns, 22 ns and 6.5-7.8 us on the same Mac. The
-transport's per-frame hop, 131-216 ns at about 205 frames per post, sits above `hop_cost`'s batched
+transport's per-frame hop, 153-222 ns at about 205 frames per post, sits above `hop_cost`'s batched
 figure; this bench does not split that difference further.
 
-At 100,000 streamed frames a second, the hop costs 1.3-2.2% of a core.
+At 100,000 streamed frames a second, the hop costs 1.5-2.2% of a core.

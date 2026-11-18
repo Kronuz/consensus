@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Runs bench/flow_bench.cc's rows in the Linux gate VM, with netem on lo for the round trip
 # (docs/perf/flow-control.md): flow_bench_vm.sh smoke|a1|a2|a3, from a checkout's root.
-# The VM is left as found: a job that started it stops it. The VM builds this commit once.
+# The VM is left as found: a job that started it stops it. The VM builds once per source tree.
 set -euo pipefail
 VM="${FLOW_VM:-$HOME/.scratch/vm-document-gate/vm.sh} linux"
 what=$1
-commit=$(git rev-parse HEAD)
+commit=$(git rev-parse HEAD:bench HEAD:include HEAD:CMakeLists.txt | tr "\n" -)
 started=0
 if [[ $($VM status) != running ]]; then
 	$VM start

@@ -1176,7 +1176,8 @@ asio::awaitable<void> fetch_alongside_consensus(asio::io_context &io, const Cert
 	const auto quiet_end = Clock::now() + 500ms;
 	const auto [quiet_commits, quiet_slowest] = co_await commits([&] { return Clock::now() < quiet_end; }, 1s);
 	const auto quiet = since(cluster, before);
-	const auto quiet_gap = cluster.worst_gap, quiet_off = cluster.worst_off, quiet_host = ms(host.take());
+	const auto quiet_gap = cluster.worst_gap, quiet_off = cluster.worst_off;
+	const auto quiet_host = ms(host.take());
 
 	// Rounds of four fetches, each round once the last one's bytes checked out.
 	before = appends(cluster);
@@ -1202,7 +1203,8 @@ asio::awaitable<void> fetch_alongside_consensus(asio::io_context &io, const Cert
 	const auto [busy_commits, busy_slowest] = co_await commits(fetching, 20s);
 	const auto elapsed = ms(Clock::now() - started);
 	const auto busy = since(cluster, before);
-	const auto busy_gap = cluster.worst_gap, busy_off = cluster.worst_off, busy_host = ms(host.take());
+	const auto busy_gap = cluster.worst_gap, busy_off = cluster.worst_off;
+	const auto busy_host = ms(host.take());
 	CHECK(round == rounds && fetches.empty());
 	std::size_t high_water = 0;
 	for (unsigned i = 0; i != 3; ++i) {

@@ -94,6 +94,11 @@ barrier measures p50 2.56 ms in the VM.
 | fdatasync, 256 KiB | 2.8 ms | 61.2 MB/s, 234/s, 1.65 s | 112.2 MB/s, 428/s, 7.4 ms | 1.83× faster |
 | fdatasync, 256 KiB | 12.2 ms | 17.1 MB/s, 65/s, 2.28 s | 77.5 MB/s, 296/s, 1.40 s | 4.53× faster |
 
+Track C T7's gate for this row is pipelined at least 4× `pipeline = 1` at 10 ms; the row here is
+12.2 ms measured. The 256 KiB rows read 3.70× with the modeled barrier, below the gate, and
+4.53× with `fdatasync` (one run), above it. T7's gates are judged in track-c-gates; this quest's
+criteria (throughput measured at each RTT) govern this quest.
+
 At R19's 256 KiB frame, `pipeline = 1` moves one append per round trip and follower barrier, so
 it falls with RTT (48.6 to 14.8 MB/s), while `pipeline = 4` holds 54-56 MB/s from 0 to 12.2 ms.
 The commit latencies at `pipeline = 1` are queue age: the bench proposes whenever the leader is
@@ -127,6 +132,12 @@ others and fdatasync). The 99 other groups offer 40.55 MB/s (4 KiB every 10 ms e
 | 12.2 ms | 4 KiB, slow 10× | 40.57 MB/s | 49.0 ms | 0.41 MB/s, p99 89 ms | 12 KiB |
 | 2.8 ms, fdatasync | hot, slow 1× | 39.68 MB/s | 108 ms | 36.2 MB/s, p99 953 ms | 1 MiB |
 | 2.8 ms, fdatasync | hot, slow 10× | 39.96 MB/s | 69 ms | 25.0 MB/s, p99 2.24 s | 1 MiB |
+
+T7's gate for A2 is the other groups' commit p99 within 1.5× of the unslowed arm. The table's
+comparable column is node 2's apply p99 for the other 99 groups (with three voters the leader's
+commit p99 does not see node 2, so apply is the stricter head-of-line signal): 35.7-36.7 ms
+slowed against 37.3-52.0 ms unslowed at 2.8 ms, and 49.8-50.3 ms against 49.8-51.1 ms at
+12.2 ms. The slowed arm is within 1.5× of the unslowed one at both RTTs.
 
 The slowed barrier stays with its group. The other 99 groups commit all they offer in every
 arm, and node 2 applies them no later with group 0 slowed than without (p99 35.7-36.7 ms against

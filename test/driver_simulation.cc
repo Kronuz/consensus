@@ -37,7 +37,9 @@
 #include "consensus/driver.h"
 #include "journal/memory_io.h"
 
+#include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <map>
 #include <random>
@@ -55,6 +57,15 @@ namespace {
 std::uint64_t failures = 0, current_seed = 0;
 void fail(const std::string& what) {
 	if (failures++ < 20) { std::fprintf(stderr, "driver seed %llu: %s\n", (unsigned long long)current_seed, what.c_str()); }
+}
+// SIM_DRIVER_TRACE=1 logs each step's apply, delivery and fault events to stderr.
+const bool tracing = std::getenv("SIM_DRIVER_TRACE") != nullptr;
+std::uint64_t trace_step = 0;
+void trace(const char* format, ...) {
+	if (!tracing) { return; }
+	std::fprintf(stderr, "[%llu] ", (unsigned long long)trace_step);
+	va_list args; va_start(args, format); std::vfprintf(stderr, format, args); va_end(args);
+	std::fputc('\n', stderr);
 }
 
 constexpr GroupId group = 7;
@@ -147,6 +158,7 @@ struct Simulation {
 
 	void run(std::size_t steps) {
 		for (std::size_t step = 0; step < steps && !failures; ++step) {
+			trace_step = step;
 			advance(1 + random_() % 4);
 			auto& n = std::next(nodes_.begin(), std::ptrdiff_t(random_() % nodes_.size()))->second;
 			const auto pick = random_() % 1000;
@@ -172,6 +184,7 @@ struct Simulation {
 		for (auto& [id, n] : nodes_) { if (!n.up) { boot(n); } }
 		std::shared_ptr<Call> last;
 		for (int round = 0; round < 4000 && !failures; ++round) {
+			trace_step = 1'000'000 + std::uint64_t(round);
 			quiet_round();
 			if (!last || (last->completions && (last->error || !last->placed))) {
 				for (auto& [id, n] : nodes_) {
@@ -183,6 +196,14 @@ struct Simulation {
 		}
 		if (!last || !last->placed || !healed_everywhere(*last->placed)) {
 			fail("the healed group did not apply a new entry on every data voter");
+			if (last) {
+				std::fprintf(stderr, "  last healed proposal on node %llu: completions %d error %d placed %llu:%llu\n", (unsigned long long)last->node, last->completions, bool(last->error),
+					last->placed ? (unsigned long long)last->placed->term : 0ull, last->placed ? (unsigned long long)last->placed->index : 0ull);
+				if (last->placed) {
+					auto e = sequence_.find(last->placed->index);
+					if (e != sequence_.end()) { std::fprintf(stderr, "  committed at %llu: term %llu payload %s\n", (unsigned long long)e->first, (unsigned long long)e->second.term, e->second.payload.c_str()); }
+				}
+			}
 			for (auto& [id, n] : nodes_) {
 				auto s = n.up ? n.driver->state(group) : std::nullopt;
 				std::fprintf(stderr, "  node %llu up %d role %d term %llu committed %llu applied %llu (application %zu) held %zu\n", (unsigned long long)id, n.up, s ? int(s->role) : -1,
@@ -212,6 +233,8 @@ struct Simulation {
 	}
 	void on_committed(Node& n, Committed notice) {
 		++n.committed_notices;
+		trace("node %llu Committed %llu..%llu (application had %zu)", (unsigned long long)n.id, (unsigned long long)notice.first,
+			(unsigned long long)(notice.entries.empty() ? 0 : notice.entries.back().index), n.applied.size());
 		if (n.witness) { fail("a witness member's Sink received a Committed range"); }
 		if (notice.first != n.applied.size() + 1) { fail("node " + std::to_string(n.id) + " received a range from " + std::to_string(notice.first) + " after applying " + std::to_string(n.applied.size())); }
 		for (auto& entry : notice.entries) {
@@ -224,6 +247,7 @@ struct Simulation {
 		n.applying = n.applied.empty() ? 0 : n.applied.back().index;
 	}
 	void on_role(Node& n, RoleChanged notice) {
+		trace("node %llu role %d term %llu", (unsigned long long)n.id, int(notice.role), (unsigned long long)notice.term);
 		if (notice.role != Role::Leader) { return; }
 		++elections;
 		auto [it, fresh] = leaders_.emplace(notice.term, n.id);
@@ -242,6 +266,7 @@ private:
 		task::spawn(n.ref(), n.driver->run(n.stop->token()), [&n](std::exception_ptr) { n.driver_done = true; });
 		n.applied.clear(); n.applying.reset();
 		n.up = true;
+		trace("node %llu boots", (unsigned long long)n.id);
 		GroupOptions o;
 		o.configuration.local = n.id; o.configuration.voters = {1, 2, 3};
 		o.configuration.cluster[0] = 'D'; o.configuration.configuration[0] = 'S';
@@ -271,7 +296,7 @@ private:
 		if (power_cut) { n.disk.power_loss(); }
 		n.up = false;
 	}
-	void crash(Node& n) { ++crashes; shut(n, true); }
+	void crash(Node& n) { ++crashes; trace("node %llu crashes", (unsigned long long)n.id); shut(n, true); }
 
 	void advance(std::uint64_t dt) {
 		now_ += dt;
@@ -319,6 +344,7 @@ private:
 	}
 	void apply(Node& n) {
 		if (!n.applying) { return; }
+		trace("node %llu applied(%llu)", (unsigned long long)n.id, (unsigned long long)*n.applying);
 		n.driver->applied(group, Applied{*n.applying});
 		n.applying.reset();
 		n.run();
@@ -337,6 +363,10 @@ private:
 	template <class T> void start(Node& n, std::shared_ptr<Call> call, task::task<T> work) {
 		task::spawn(n.ref(), std::move(work), [call](std::exception_ptr error, std::optional<T> value) {
 			++call->completions; call->error = error;
+			if constexpr (std::is_same_v<T, Placement>) {
+				trace("node %llu propose %s: %s %llu:%llu", (unsigned long long)call->node, call->command.c_str(), error ? "error" : "placed",
+					value ? (unsigned long long)value->term : 0ull, value ? (unsigned long long)value->index : 0ull);
+			}
 			if constexpr (std::is_same_v<T, Placement>) { call->placed = value; }
 			if constexpr (std::is_same_v<T, ReadReady>) { call->ready = value; }
 		});
@@ -382,6 +412,7 @@ private:
 			if (target == id) { target = target == 1 ? 2 : 1; }
 			if (!witness_) { target = 1 + random_() % 3; if (target == id) { target = 1 + target % 3; } }
 			++transfers;
+			trace("node %llu transfers to %llu", (unsigned long long)id, (unsigned long long)target);
 			auto call = track(n, Call::transfer);
 			start(n, call, n.driver->transfer_leadership(group, target, call->cancel.token()));
 			n.run();
@@ -394,6 +425,7 @@ private:
 		if (live.empty()) { return; }
 		auto call = live[random_() % live.size()];
 		call->cancel_requested = true; ++cancelled;
+		trace("cancel a call of kind %d on node %llu", int(call->kind), (unsigned long long)call->node);
 		call->cancel.request();
 		nodes_.at(call->node).run();
 	}

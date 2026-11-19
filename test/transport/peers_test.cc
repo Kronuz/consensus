@@ -17,6 +17,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
 #include <functional>
 #include <journal/journal.h>
@@ -318,11 +319,26 @@ struct Cluster {
 		start(i);
 	}
 	// The longest between two pumps: how long the executor went without running the scenario.
-	Clock::duration worst_gap{};
+	// Its CPU time says whether the gap was the executor's work or time spent off the CPU.
+	struct Gap {
+		Clock::duration wall{}, cpu{}, off{};
+	} worst_gap, worst_off;
 	Clock::time_point last_pump = Clock::now();
+	Clock::duration last_cpu = thread_cpu();
+	static Clock::duration thread_cpu() {
+		timespec spent{};
+		::clock_gettime(CLOCK_THREAD_CPUTIME_ID, &spent);
+		return std::chrono::seconds(spent.tv_sec) + std::chrono::nanoseconds(spent.tv_nsec);
+	}
 	void pump() {
 		const auto at = Clock::now();
-		worst_gap = std::max(worst_gap, at - std::exchange(last_pump, at));
+		const auto cpu = thread_cpu();
+		Gap gap{at - std::exchange(last_pump, at), cpu - std::exchange(last_cpu, cpu)};
+		gap.off = gap.wall - gap.cpu;
+		if (gap.wall > worst_gap.wall)
+			worst_gap = gap;
+		if (gap.off > worst_off.off)
+			worst_off = gap;
 		const auto now = static_cast<std::uint64_t>(ms(at - origin));
 		if (!frozen) {
 			side.restart();
@@ -1155,16 +1171,16 @@ asio::awaitable<void> fetch_alongside_consensus(asio::io_context &io, const Cert
 	};
 	HostStall host;
 	auto before = appends(cluster);
-	cluster.worst_gap = {};
+	cluster.worst_gap = cluster.worst_off = {};
 	(void)host.take();
 	const auto quiet_end = Clock::now() + 500ms;
 	const auto [quiet_commits, quiet_slowest] = co_await commits([&] { return Clock::now() < quiet_end; }, 1s);
 	const auto quiet = since(cluster, before);
-	const auto quiet_gap = ms(cluster.worst_gap), quiet_host = ms(host.take());
+	const auto quiet_gap = cluster.worst_gap, quiet_off = cluster.worst_off, quiet_host = ms(host.take());
 
 	// Rounds of four fetches, each round once the last one's bytes checked out.
 	before = appends(cluster);
-	cluster.worst_gap = {};
+	cluster.worst_gap = cluster.worst_off = {};
 	const auto started = Clock::now();
 	const std::vector<std::pair<unsigned, NodeId>> pairs{{0, 2}, {0, 3}, {2, 1}, {1, 3}};
 	constexpr unsigned rounds = 4;
@@ -1186,7 +1202,7 @@ asio::awaitable<void> fetch_alongside_consensus(asio::io_context &io, const Cert
 	const auto [busy_commits, busy_slowest] = co_await commits(fetching, 20s);
 	const auto elapsed = ms(Clock::now() - started);
 	const auto busy = since(cluster, before);
-	const auto busy_gap = ms(cluster.worst_gap), busy_host = ms(host.take());
+	const auto busy_gap = cluster.worst_gap, busy_off = cluster.worst_off, busy_host = ms(host.take());
 	CHECK(round == rounds && fetches.empty());
 	std::size_t high_water = 0;
 	for (unsigned i = 0; i != 3; ++i) {
@@ -1201,8 +1217,10 @@ asio::awaitable<void> fetch_alongside_consensus(asio::io_context &io, const Cert
 	std::printf("  fetching: %u commits, slowest %lld ms; %llu round trips, slowest bucket <= %llu us, %llu timeouts\n",
 				busy_commits, busy_slowest, (unsigned long long)busy.count, (unsigned long long)(busy.slowest_ns / 1000),
 				(unsigned long long)busy.timeouts);
-	std::printf("  stalls (quiet/fetching): pump gap %lld/%lld ms, host %lld/%lld ms\n", quiet_gap, busy_gap, quiet_host,
-				busy_host);
+	std::printf("  stalls (quiet/fetching): longest pump gap %lld ms (cpu %lld) / %lld ms (cpu %lld); most off cpu %lld / "
+				"%lld ms; host %lld/%lld ms\n",
+				ms(quiet_gap.wall), ms(quiet_gap.cpu), ms(busy_gap.wall), ms(busy_gap.cpu), ms(quiet_off.off),
+				ms(busy_off.off), quiet_host, busy_host);
 	std::printf("  fetching buckets (>=64us):");
 	for (std::size_t i = 3; i != busy.buckets.size(); ++i)
 		std::printf(" %llu", (unsigned long long)busy.buckets[i]);

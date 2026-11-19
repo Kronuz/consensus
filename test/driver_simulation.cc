@@ -45,6 +45,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace kronuz::consensus::driver_simulation {
@@ -186,12 +187,14 @@ struct Simulation {
 		for (int round = 0; round < 4000 && !failures; ++round) {
 			trace_step = 1'000'000 + std::uint64_t(round);
 			quiet_round();
-			if (!last || (last->completions && (last->error || !last->placed))) {
-				for (auto& [id, n] : nodes_) {
-					auto s = n.up ? n.driver->state(group) : std::nullopt;
-					if (s && s->role == Role::Leader) { last = start_propose(n, "healed"); break; }
-				}
+			Node* leader = nullptr; Term term = 0;
+			for (auto& [id, n] : nodes_) {
+				auto s = n.up ? n.driver->state(group) : std::nullopt;
+				if (s && s->role == Role::Leader) { leader = &n; term = s->term; break; }
 			}
+			// A placement a later term replaced may never commit: propose again under the new leader.
+			const bool replaced = last && last->placed && term > last->placed->term && !healed_everywhere(*last->placed);
+			if (leader && (!last || (last->completions && (last->error || !last->placed)) || replaced)) { last = start_propose(*leader, "healed"); }
 			if (last && last->placed && healed_everywhere(*last->placed)) { break; }
 		}
 		if (!last || !last->placed || !healed_everywhere(*last->placed)) {
@@ -498,19 +501,30 @@ void NodeSink::operator()(GroupId, ActivateInstall) {
 
 }  // namespace
 
-// Runs `seeds` seeds of `steps` steps from `first`; odd seeds found a 2 + witness group.
+// Seeds that once failed, each at its failing step count, run beside every range of seeds:
+// 399 at 3,000 steps placed its healed entry in a term a later leader replaced.
+constexpr std::pair<std::uint64_t, std::uint64_t> regressions[] = {{399, 3000}};
+
+// Runs `seeds` seeds of `steps` steps from `first`, then the regression seeds outside that range;
+// odd seeds found a 2 + witness group.
 bool run(std::uint64_t seeds, std::uint64_t steps, std::uint64_t first) {
 	std::uint64_t proposals = 0, placed = 0, commits = 0, superseded_count = 0, reads = 0, cancelled = 0, crashes = 0, transfers = 0, elections = 0;
-	for (std::uint64_t seed = first; seed < first + seeds && !failures; ++seed) {
+	auto one = [&](std::uint64_t seed, std::uint64_t length) {
 		current_seed = seed;
 		Simulation sim(seed, seed % 2 == 1);
-		sim.run(steps);
+		sim.run(length);
 		if (!failures) { sim.heal(); }
 		proposals += sim.proposals; placed += sim.placed; commits += sim.commits; superseded_count += sim.superseded_count;
 		reads += sim.reads; cancelled += sim.cancelled; crashes += sim.crashes; transfers += sim.transfers; elections += sim.elections;
+	};
+	for (std::uint64_t seed = first; seed < first + seeds && !failures; ++seed) { one(seed, steps); }
+	std::uint64_t replayed = 0;
+	for (auto [seed, length] : regressions) {
+		if (failures || (seed >= first && seed < first + seeds && steps == length)) { continue; }
+		one(seed, length); ++replayed;
 	}
-	std::printf("driver simulation: %llu seeds x %llu steps, %llu elections, %llu crashes, %llu proposals (%llu placed), %llu commits awaited (%llu superseded), %llu reads, %llu transfers, %llu cancels: %s\n",
-		(unsigned long long)seeds, (unsigned long long)steps, (unsigned long long)elections, (unsigned long long)crashes, (unsigned long long)proposals, (unsigned long long)placed,
+	std::printf("driver simulation: %llu seeds x %llu steps (+%llu regression seeds), %llu elections, %llu crashes, %llu proposals (%llu placed), %llu commits awaited (%llu superseded), %llu reads, %llu transfers, %llu cancels: %s\n",
+		(unsigned long long)seeds, (unsigned long long)steps, (unsigned long long)replayed, (unsigned long long)elections, (unsigned long long)crashes, (unsigned long long)proposals, (unsigned long long)placed,
 		(unsigned long long)commits, (unsigned long long)superseded_count, (unsigned long long)reads, (unsigned long long)transfers, (unsigned long long)cancelled, failures ? "FAILED" : "ok");
 	return failures == 0;
 }

@@ -14,8 +14,7 @@ no-deadline) # a dial awaits its lookup with no deadline
 	edits=($'auto timer = std::make_shared<asio::steady_timer>(executor_, route.answer_by);\tauto timer = std::make_shared<asio::steady_timer>(executor_, std::chrono::steady_clock::time_point::max());') ;;
 shared-thread) # every lookup queues on one shared resolver thread, as asio's async_resolve does
 	file=resolve.h
-	edits=($'#include <thread>\n\t#include <thread>\n#include <asio/post.hpp>\n#include <asio/thread_pool.hpp>\n'
-		$'std::thread(std::move(work)).detach();\tstatic asio::thread_pool shared(1); asio::post(shared, std::move(work));') ;;
+	edits=($'static constexpr std::size_t process_bound = 16;\tstatic constexpr std::size_t process_bound = 1;') ;;
 no-skip) # a dial refused by the pin does not move the next dial past that address (N1)
 	file=peers.h
 	edits=($'skip_past(peer, dialed->endpoint);\t(void)0;') ;;

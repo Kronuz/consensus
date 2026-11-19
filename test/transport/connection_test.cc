@@ -14,16 +14,20 @@
 #include <cassert>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
 #include <netinet/in.h>
 #include <openssl/pem.h>
+#include <mutex>
 #include <optional>
 #include <poll.h>
 #include <sys/ioctl.h>
+#include <string>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 
 using namespace kronuz::consensus::transport;
 using namespace std::chrono_literals;
@@ -524,13 +528,30 @@ class stall_watch {
 // withholds the bytes, as macOS does to a background process's sockets, shows here.
 class drain_watch {
   public:
-	explicit drain_watch(int fd) : fd_(::dup(fd)) {}
+	// `peer` is the reader's socket: its SO_RCVBUF is sampled too.
+	drain_watch(int fd, int peer) : fd_(::dup(fd)), peer_(::dup(peer)) {}
 	~drain_watch() {
 		stop_ = true;
 		thread_.join();
 		::close(fd_);
+		::close(peer_);
 	}
 	long long worst_ms() const { return worst_; }
+	long last() const { return last_; }  // the queue at the latest sample, bytes
+	long peak() const { return peak_; }  // the largest queue sampled, bytes
+	int peer_rcvbuf() const { return peer_rcvbuf_; }  // the reader's largest SO_RCVBUF sampled
+	// The longest stretch the queue was empty yet the socket not writable, and the queue, poll
+	// events and SO_ERROR where it peaked: a writer waiting on a socket that never wakes it.
+	long long wedged_ms() const { return wedged_; }
+	long wedge_queue() const { return wedge_queue_; }
+	int wedge_events() const { return wedge_events_; }
+	int wedge_error() const { return wedge_error_; }
+	// Each write burst the queue took (ms from the start: queue before -> after): the gaps are
+	// the writer's waits.
+	std::string refills() const {
+		std::lock_guard lock(mutex_);
+		return refills_;
+	}
 
   private:
 	long queued() const {
@@ -545,16 +566,54 @@ class drain_watch {
 #endif
 		return n;
 	}
-	int fd_;
+	int fd_, peer_;
 	std::atomic<bool> stop_{false};
+	std::atomic<long> peak_{0};
+	std::atomic<int> peer_rcvbuf_{0};
 	std::atomic<long long> worst_{0};
+	std::atomic<long> last_{0}, wedge_queue_{0};
+	std::atomic<long long> wedged_{0};
+	std::atomic<int> wedge_events_{0}, wedge_error_{0};
+	mutable std::mutex mutex_;
+	std::string refills_;
 	std::thread thread_{[this] {
-		auto drained = std::chrono::steady_clock::now();
+		const auto begin = std::chrono::steady_clock::now();
+		auto drained = begin, wedge = drained, burst = begin - 1s;
 		for (long last = 0; !stop_; std::this_thread::sleep_for(2ms)) {
 			const long now = queued();
+			last_ = now;
+			peak_ = std::max<long>(peak_, now);
+			int rcv = 0;
+			socklen_t rcv_size = sizeof rcv;
+			if (::getsockopt(peer_, SOL_SOCKET, SO_RCVBUF, &rcv, &rcv_size) == 0)
+				peer_rcvbuf_ = std::max(int(peer_rcvbuf_), rcv);
+			pollfd p{fd_, POLLOUT, 0};
+			const bool writable = ::poll(&p, 1, 0) != 1 || (p.revents & (POLLOUT | POLLHUP));  // HUP: shut down
+			int error = 0;
+			socklen_t size = sizeof error;
+			(void)::getsockopt(fd_, SOL_SOCKET, SO_ERROR, &error, &size);
 			const auto at = std::chrono::steady_clock::now();
 			if (now <= 0 || now < last)
 				drained = at;
+			if (now > last + 16 * 1024) {
+				const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(at - begin).count();
+				std::lock_guard lock(mutex_);
+				if (at - burst > 6ms)
+					refills_ += " " + std::to_string(ms) + ":" + std::to_string(last) + "->";
+				else
+					refills_.erase(refills_.rfind("->") + 2);
+				refills_ += std::to_string(now);
+				burst = at;
+			}
+			if (writable || now < 0 || now > 16 * 1024)
+				wedge = at;
+			else if (const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(at - wedge).count();
+					 ms > wedged_) {
+				wedged_ = ms;
+				wedge_queue_ = now;
+				wedge_events_ = p.revents;
+				wedge_error_ = error;
+			}
 			last = now;
 			worst_ = std::max<long long>(worst_, std::chrono::duration_cast<std::chrono::milliseconds>(at - drained).count());
 		}
@@ -562,8 +621,8 @@ class drain_watch {
 };
 
 // A reader on its own loop thread whose handler holds that loop `per_frame` for each frame.
-// With `coarse`, the kernel reports the writer's socket writable only once 1.5 MiB drained (its
-// send buffer 1.5 MiB, its low-water mark too where settable) and the reader's buffer is 512 KiB.
+// With `coarse`, the kernel reports the writer's socket writable only once its queue drained (its
+// low-water mark set to its send buffer where settable) and the reader's buffer is pinned at 128 KiB.
 struct reader_load {
 	const char *name;
 	int frames;
@@ -577,9 +636,65 @@ struct reader_run {
 	ConnectionEnd dialer, acceptor;
 	std::uint64_t keepalives, drained_expiries;
 	bool coarse_wakes;  // the writer's low-water mark took: it wakes only at an empty queue
+	long queue_left;    // the send queue at the last sample, bytes
+	int sndbuf, lowat;  // the writer's socket's buffer and low-water mark once connected (coarse)
+	reader_load used;   // the load as run: a coarse one is sized from the socket's buffer
+	long long wedged_ms;  // the longest the queue was empty and the socket not writable (drain_watch)
+	long wedge_queue;
+	int wedge_events, wedge_error;
+	std::string refills;  // drain_watch::refills
+	int rcvbuf, rcvbuf_end, sndbuf_end;  // the reader's SO_RCVBUF once accepted and at the end; the writer's SO_SNDBUF
+	long long pulled_max;  // the most the reader pulled from its socket in any dead_after, bytes
+	long peak;             // the writer's largest send queue, bytes
+	int rcvbuf_max;        // the reader's largest SO_RCVBUF sampled
+	int capacity;          // the most the reader's socket holds at its pin (reader_capacity)
 };
 
-reader_run read_slowly_once(const reader_load &load) {
+// Forcing knobs: an environment variable reproduces a cause on demand.
+//   READ_SLOWLY_BUILD_MS   the dialer's loop is held this long while the frames are queued, as a
+//                          slow allocator (TSan, a loaded host) holds it
+//   COARSE_WRITER_SNDBUF   the coarse writer's SO_SNDBUF and low-water mark, bytes
+//   COARSE_WRITER_TRACE    prints the coarse writer's buffers and write bursts on every run
+long long knob(const char *name, long long fallback = 0) {
+	const char *v = std::getenv(name);
+	return v && *v ? std::atoll(v) : fallback;
+}
+
+// The most a loopback reader socket holds with its SO_RCVBUF set to `pin`, measured by filling one
+// that never reads: the kernel may hold more than the readback (macOS adds about 510 KiB).
+int reader_capacity(int pin) {
+	const int listener = ::socket(AF_INET, SOCK_STREAM, 0), writer = ::socket(AF_INET, SOCK_STREAM, 0);
+	sockaddr_in at{};
+	at.sin_family = AF_INET;
+	at.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	socklen_t len = sizeof at;
+	::setsockopt(listener, SOL_SOCKET, SO_RCVBUF, &pin, sizeof pin);
+	assert(::bind(listener, (sockaddr *)&at, sizeof at) == 0 && ::listen(listener, 1) == 0);
+	::getsockname(listener, (sockaddr *)&at, &len);
+	assert(::connect(writer, (sockaddr *)&at, sizeof at) == 0);
+	const int reader = ::accept(listener, nullptr, nullptr);
+	::setsockopt(reader, SOL_SOCKET, SO_RCVBUF, &pin, sizeof pin);
+	::fcntl(writer, F_SETFL, ::fcntl(writer, F_GETFL) | O_NONBLOCK);
+	const std::string chunk(64 * 1024, 'c');
+	int held = 0, readback = 0;
+	for (int last = -1; held != last;) {  // until a round moves nothing more into the reader
+		last = held;
+		while (::send(writer, chunk.data(), chunk.size(), 0) > 0) {
+		}
+		std::this_thread::sleep_for(20ms);
+		::ioctl(reader, FIONREAD, &held);
+	}
+	len = sizeof readback;
+	::getsockopt(reader, SOL_SOCKET, SO_RCVBUF, &readback, &len);
+	::close(reader);
+	::close(writer);
+	::close(listener);
+	return std::max(held, readback);
+}
+
+// Runs the load once. A coarse load is sized from the reader's measured capacity and the writer's
+// socket as the kernel left it: the reader must take 2 dead_after to drain the mark past that capacity.
+reader_run read_slowly_once(reader_load load) {
 	stall_watch watch;
 	Loop l1, l2;
 	ConnectionOptions options;
@@ -587,24 +702,64 @@ reader_run read_slowly_once(const reader_load &load) {
 	options.dead_after = load.dead_after;
 	tcp::acceptor listener(l1.io, tcp::endpoint(asio::ip::address_v4::loopback(), 0));
 	tcp::socket a(l1.io), b(l2.io);
+	// A coarse load pins the reader's SO_RCVBUF (a set buffer is not autotuned past what it holds) and
+	// sizes the writer's buffer and mark from the capacity measured at that pin: 1 MiB past it.
+	int reading = 0, capacity = 0;
 	bool coarse_wakes = false;
 	if (load.coarse) {
-		const int buffer = 3 << 19, reading = 512 * 1024;
+		reading = 128 * 1024;
+		capacity = reader_capacity(reading);
+		const int buffer = int(knob("COARSE_WRITER_SNDBUF", capacity + (1 << 20)));
 		a.open(tcp::v4());
 		::setsockopt(a.native_handle(), SOL_SOCKET, SO_SNDBUF, &buffer, sizeof buffer);
 		(void)::setsockopt(a.native_handle(), SOL_SOCKET, SO_SNDLOWAT, &buffer, sizeof buffer);  // Linux refuses it
 		::setsockopt(listener.native_handle(), SOL_SOCKET, SO_RCVBUF, &reading, sizeof reading);
-		int lowat = 0;
-		socklen_t size = sizeof lowat;
-		coarse_wakes = ::getsockopt(a.native_handle(), SOL_SOCKET, SO_SNDLOWAT, &lowat, &size) == 0 &&
-					   lowat >= buffer / 2;
 	}
 	a.connect(listener.local_endpoint());
 	listener.accept(b);
+	// Set on the connected socket: macOS autotunes an accepted socket's buffer to 1 MiB unless it was
+	// set on that socket itself.
+	if (load.coarse)
+		::setsockopt(b.native_handle(), SOL_SOCKET, SO_RCVBUF, &reading, sizeof reading);
+	int sndbuf = 0, lowat = 0;
+	const auto buffer_of = [](int fd, int option) {
+		int n = 0;
+		socklen_t len = sizeof n;
+		(void)::getsockopt(fd, SOL_SOCKET, option, &n, &len);
+		return n;
+	};
+	const int reader_fd = ::dup(b.native_handle()), writer_fd = ::dup(a.native_handle());
+	const int rcvbuf = buffer_of(reader_fd, SO_RCVBUF);
+	if (load.coarse) {
+		socklen_t len = sizeof sndbuf;
+		::getsockopt(a.native_handle(), SOL_SOCKET, SO_SNDBUF, &sndbuf, &len);
+		len = sizeof lowat;
+		coarse_wakes = ::getsockopt(a.native_handle(), SOL_SOCKET, SO_SNDLOWAT, &lowat, &len) == 0 && lowat >= sndbuf / 2;
+		if (coarse_wakes) {
+			// The writer wakes once the queue holds at most sndbuf - lowat. The reader's buffer takes
+			// `capacity` of it unread and the reader pulls at most size / per_frame after that, so the
+			// pace is set for the rest (lowat - capacity) to outlast two dead_after.
+			const long long rest = (long long)lowat - capacity, room = rest - (sndbuf - lowat);
+			const long long pace = (2 * load.dead_after.count() * (long long)load.size + std::max(rest, 1LL) - 1) /
+								   std::max(rest, 1LL);
+			load.per_frame = std::max(load.per_frame, std::chrono::milliseconds(pace));
+			// The most the reader can pull in a dead_after at that pace (as read_slowly counts it: the
+			// frames taken, one half-read, a record) must leave the queue above the wake level.
+			const long long window = (load.dead_after.count() + load.per_frame.count() - 1) / load.per_frame.count();
+			const long long pulled = (window + 1) * (long long)load.size + 16 * 1024;
+			if (pulled >= room)
+				std::printf("%s: precondition broken: a mark of %d over the reader's capacity %d leaves %lld B above the "
+							"wake level, and the reader pulls up to %lld B in a dead_after\n",
+							load.name, lowat, capacity, room, pulled);
+			assert(pulled < room && "the writer's mark is too small to outlast the reader");
+			load.frames = std::max(load.frames, int((sndbuf + capacity) / load.size) + 16);
+		}
+	}
 	Connection dialer(l1.ref(), std::move(a), context("one"), true, options);
 	Connection acceptor(l2.ref(), std::move(b), context("two"), false, options);
 	auto one = pins_of(1, "one"), two = pins_of(2, "two");
 	std::atomic<bool> stop{false};
+	std::vector<std::chrono::steady_clock::time_point> took;  // when the reader's handler took each frame
 	std::thread t2([&] {
 		while (!stop) {
 			l2.io.restart();
@@ -636,9 +791,20 @@ reader_run read_slowly_once(const reader_load &load) {
 	std::atomic<int> got{0};
 	std::atomic<bool> acceptor_done{false};
 	std::optional<ConnectionEnd> acceptor_end, dialer_end;
+	// The backlog is queued before either end runs: built on the dialer's loop while it runs, 32 MiB
+	// holds that loop, and its keepalive, past the reader's dead_after.
+	l1.call([&] {
+		std::this_thread::sleep_for(std::chrono::milliseconds(knob("READ_SLOWLY_BUILD_MS")));
+		for (int i = 0; i != count; ++i)
+			dialer.send(std::string(size, char('a' + i % 26)));
+		dialer.close();
+	});
+	std::optional<drain_watch> held(std::in_place, fd_of(dialer), reader_fd);
+	const auto start = std::chrono::steady_clock::now();
 	asio::post(l2.io, [&] {
 		task::spawn(l2.ref(), acceptor.run([&](std::string_view f) {
 			assert(f.size() == size);
+			took.push_back(std::chrono::steady_clock::now());
 			std::this_thread::sleep_for(load.per_frame);
 			++got;
 		}),
@@ -652,21 +818,35 @@ reader_run read_slowly_once(const reader_load &load) {
 		assert(!e);
 		dialer_end = v;
 	});
-	std::optional<drain_watch> held(std::in_place, fd_of(dialer));
-	const auto start = std::chrono::steady_clock::now();
-	l1.call([&] {
-		for (int i = 0; i != count; ++i)
-			dialer.send(std::string(size, char('a' + i % 26)));
-		dialer.close();
-	});
 	assert(l1.until([&] { return dialer_end && acceptor_done; }, 60s));
+	l1.until([] { return false; }, 5ms);
 	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 	const auto held_ms = held->worst_ms();
+	const auto queue_left = held->last();
+	const auto wedged_ms = held->wedged_ms();
+	const auto wedge_queue = held->wedge_queue();
+	const auto wedge_events = held->wedge_events(), wedge_error = held->wedge_error();
+	const auto refills = held->refills();
+	const long peak = held->peak();
+	const int rcvbuf_max = held->peer_rcvbuf();
+	const int rcvbuf_end = buffer_of(reader_fd, SO_RCVBUF), sndbuf_end = buffer_of(writer_fd, SO_SNDBUF);
+	::close(reader_fd);
+	::close(writer_fd);
 	held.reset();
 	stop = true;
 	t2.join();
+	// The most the reader pulled from the socket in any dead_after: the frames its handler took in
+	// that window, one more the reader holds half-read, and a record (fill reads 16 KiB at a time).
+	long long pulled_max = 0;
+	for (std::size_t i = 0, j = 0; i != took.size(); ++i) {
+		j = std::max(j, i);
+		while (j != took.size() && took[j] - took[i] < load.dead_after)
+			++j;
+		pulled_max = std::max<long long>(pulled_max, (long long)(j - i + 1) * (long long)size + 16 * 1024);
+	}
 	return {got, ms, watch.worst_ms(), held_ms, *dialer_end, *acceptor_end, acceptor.keepalives_sent(),
-			dialer.drained_expiries(), coarse_wakes};
+			dialer.drained_expiries(), coarse_wakes, queue_left, sndbuf, lowat, load,
+			wedged_ms, wedge_queue, wedge_events, wedge_error, refills, rcvbuf, rcvbuf_end, sndbuf_end, pulled_max, peak, rcvbuf_max, capacity};
 }
 // Both ends share this process, so a host stop silences the reader's keepalives too, which no
 // two hosts do, and the host's network stack may withhold the bytes (macOS throttles a
@@ -677,14 +857,43 @@ reader_run read_slowly_once(const reader_load &load) {
 void read_slowly(const reader_load &load) {
 	for (int attempt = 1;; ++attempt) {
 		const auto r = read_slowly_once(load);
+		const auto &used = r.used;
 		std::printf("%s: %d of %d frames read in %lld ms against a %lld ms dead_after; dialer %d, acceptor %d; "
 					"%llu keepalives from the reader; %llu write waits expired with the queue drained%s; "
-					"the process stalled %lld ms at most; the queue held %lld ms at most without draining\n",
-					load.name, r.got, load.frames, r.ms, (long long)load.dead_after.count(), int(r.dialer),
+					"the process stalled %lld ms at most; the queue held %lld ms at most without draining%s\n",
+					used.name, r.got, used.frames, r.ms, (long long)used.dead_after.count(), int(r.dialer),
 					int(r.acceptor), (unsigned long long)r.keepalives, (unsigned long long)r.drained_expiries,
-					r.coarse_wakes ? " (wakes at an empty queue)" : "", r.stalled_ms, r.held_ms);
-		if (r.got == load.frames && r.dialer == ConnectionEnd::closed && r.acceptor == ConnectionEnd::closed) {
-			assert(r.ms >= load.frames * load.per_frame.count());
+					r.coarse_wakes ? " (wakes at an empty queue)" : "", r.stalled_ms, r.held_ms,
+					used.coarse ? (" [sndbuf " + std::to_string(r.sndbuf) + ", lowat " + std::to_string(r.lowat) +
+								   ", " + std::to_string(used.per_frame.count()) + " ms a frame, queue left " +
+								   std::to_string(r.queue_left) + "]").c_str()
+								: "");
+		if (r.coarse_wakes) {
+			// What makes the coarse writer wait out dead_after: the reader's buffer stays within its
+			// measured capacity and the reader pulls less than the queue holds above that and the wake
+			// level. Named by value.
+			const long wake = r.sndbuf - r.lowat;
+			const long long spare = r.peak - r.capacity - r.pulled_max - wake;
+			const bool broken = r.rcvbuf_max > r.capacity || spare <= 0;
+			std::printf("%s: precondition %s: reader SO_RCVBUF %d pinned, %d sampled at most, %d measured capacity; "
+						"the reader pulled %lld B in a dead_after at most, from a queue of %ld B that wakes the writer "
+						"at %ld B: %lld B spare\n",
+						used.name, broken ? "broken" : "holds", r.rcvbuf, r.rcvbuf_max, r.capacity, r.pulled_max, r.peak,
+						wake, spare);
+			assert(r.rcvbuf_max <= r.capacity && "the reader's receive buffer grew past its measured capacity");
+			assert(spare > 0 && "the reader pulled faster than the writer's wait outlasts");
+		}
+		const bool whole = r.got == used.frames && r.dialer == ConnectionEnd::closed && r.acceptor == ConnectionEnd::closed;
+		if (used.coarse && (knob("COARSE_WRITER_TRACE") || !whole || (r.coarse_wakes && !r.drained_expiries)))
+			std::printf("%s: reader SO_RCVBUF %d, %d at the end; writer SO_SNDBUF %d at the end; "
+						"write bursts (ms: queue before->after):%s\n",
+						used.name, r.rcvbuf, r.rcvbuf_end, r.sndbuf_end, r.refills.c_str());
+		if (used.coarse && (!whole || (r.coarse_wakes && !r.drained_expiries)))  // what a coarse failure leaves to name its cause
+			std::printf("%s: socket buffer %d, low-water mark %d, queue %ld at the last sample; the queue was empty with "
+						"the socket not writable for %lld ms at most (then queue %ld, poll events 0x%x, SO_ERROR %d)\n",
+						used.name, r.sndbuf, r.lowat, r.queue_left, r.wedged_ms, r.wedge_queue, r.wedge_events, r.wedge_error);
+		if (whole) {
+			assert(r.ms >= used.frames * used.per_frame.count());
 			assert(!r.coarse_wakes || r.drained_expiries > 0);  // the case reached the rule it tests
 			return;
 		}
@@ -701,10 +910,10 @@ void slow_reader() { read_slowly({"slow_reader", 64, 512 * 1024, 20ms, 300ms}); 
 // 800 ms apart, against a 600 ms dead_after.
 void busy_reader() { read_slowly({"busy_reader", 6, 64 * 1024, 400ms, 600ms}); }
 // The socket's queue draining keeps a write wait alive: a writer the kernel wakes only at an
-// empty 1.5 MiB queue (the low-water mark where settable; Linux wakes at a third free) to a
-// reader of 64 KiB every 125 ms or slower waits 3 s or more, against a 2 s dead_after. The queue
-// drains about once a frame: it went 133 ms without draining at most here, 643 ms under
-// background QoS, whose sockets macOS throttles.
+// empty queue (the low-water mark where settable; Linux wakes at a third free) waits against a 2 s
+// dead_after. The queue is 1 MiB past the reader's measured capacity and the pace is sized from both
+// (read_slowly_once): the reader takes at most half of the rest in 2 s, 256 KB/s for 64 KiB frames,
+// and read_slowly asserts both preconditions by value.
 void coarse_writer() { read_slowly({"coarse_writer", 48, 64 * 1024, 125ms, 2000ms, true}); }
 
 // A loopback relay between a dialer (up) and its acceptor (down): down to up always flows, up

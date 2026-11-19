@@ -42,6 +42,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <mutex>
 #include <openssl/pem.h>
@@ -609,6 +610,59 @@ std::string sockets(std::initializer_list<std::uint16_t> ports) {
 	}
 	return r;
 }
+// Kernel stacks of a stuck loop (macOS on a CI runner, or GROUPS_PROBE_SPINDUMP naming the file):
+// the first stuck sample starts `sudo -n spindump` on this process for 3 s in the background, and
+// a failed run prints the report's threads that are in write, a socket call or the probe.
+class Spindump {
+  public:
+	void start() {
+#ifdef __APPLE__
+		const char *named = std::getenv("GROUPS_PROBE_SPINDUMP"), *ci = std::getenv("GITHUB_ACTIONS");
+		if (started_ || !((named && *named) || (ci && std::strcmp(ci, "true") == 0)))
+			return;
+		started_ = true;
+		path_ = named && *named ? named : "spindump-upload-" + std::to_string(::getpid()) + ".txt";
+		const std::string command = "(sudo -n spindump " + std::to_string(::getpid()) + " 3 10 -o '" + path_ + "' > /dev/null 2>&1; touch '" +
+									path_ + ".done') &";
+		(void)std::system(command.c_str());
+#endif
+	}
+	// Waits up to 30 s for the report, then prints its threads that match.
+	void print() const {
+		if (!started_)
+			return;
+		for (int i = 0; i != 300 && !std::filesystem::exists(path_ + ".done"); ++i)
+			std::this_thread::sleep_for(100ms);
+		std::ifstream in(path_);
+		if (!in) {
+			std::printf("upload: spindump %s: no report (sudo -n spindump failed)\n", path_.c_str());
+			return;
+		}
+		std::printf("upload: spindump %s, the threads in write, a socket call or the probe:\n", path_.c_str());
+		std::string line, block;
+		int printed = 0;
+		const auto flush = [&] {
+			for (const char *mark : {"write", "flush", "getsockopt", "ioctl", "getsockname", "getpeername", "sample"})
+				if (block.find(mark) != std::string::npos && printed < 400) {
+					std::fputs(block.c_str(), stdout);
+					printed += int(std::count(block.begin(), block.end(), '\n'));
+					break;
+				}
+			block.clear();
+		};
+		while (std::getline(in, line)) {
+			if (line.rfind("  Thread 0x", 0) == 0)
+				flush();
+			if (!block.empty() || line.rfind("  Thread 0x", 0) == 0)
+				block += line + "\n";
+		}
+		flush();
+	}
+
+  private:
+	bool started_ = false;
+	std::string path_;
+};
 // Each loop of the hosts, every sample: how long the stamp posted to it last has waited (0 once
 // it ran), its thread's CPU ms since the last sample, its run state on macOS (R runnable, W
 // waiting, U uninterruptible, S stopped) and, once a stamp waits 250 ms, the thread's stack.
@@ -638,12 +692,15 @@ class LoopProbe {
 						  (unsigned long long)((cpu - std::min(cpu, l.cpu)) / 1000), state);
 			l.cpu = cpu;
 			r += line;
-			if (age >= 250)
+			if (age >= 250) {
+				spindump_.start();
 				r += stack(*l.loop);
+			}
 			r += "}";
 		}
 		return r;
 	}
+	const Spindump &spindump() const noexcept { return spindump_; }
 
   private:
 	struct Probed {
@@ -731,6 +788,7 @@ class LoopProbe {
 		return r;
 	}
 	std::vector<Probed> loops_;
+	Spindump spindump_;
 };
 // The kernel's network memory and pages each sample, counters as deltas (macOS): mbuf
 // allocations that waited or drained the protocols, the 16 KB clusters active of those created
@@ -858,7 +916,12 @@ bool upload() {
 			samples.push_back(line + sockets({one.port(), two.port()}) + loops.sample() + kernel.sample());
 		}
 	});
+	// GROUPS_UPLOAD_HOLD_MS holds host 1's connection loop that long at 300 ms: a stuck loop on demand.
+	const char *hold = std::getenv("GROUPS_UPLOAD_HOLD_MS");
+	const auto hold_ms = std::chrono::milliseconds(hold ? std::atoll(hold) : 0);
 	for (std::int64_t tick = 0; ms_since(start) < 4000; ++tick) {  // signed: see reader()
+		if (tick == 3 && hold_ms.count() > 0)
+			one.post(one.transport->loop_of_node(2), [hold_ms] { std::this_thread::sleep_for(hold_ms); });
 		for (auto g : uploads) {
 			const auto k = one.transport->loop_of_group(g);
 			one.post(k, [&, g, k] { send_message(*one.transport, k, g, 1, 2, Send{2, chunk}); });
@@ -888,6 +951,7 @@ bool upload() {
 					(unsigned long long)upload_bound_ms(options.window, uploaded, elapsed), (unsigned long long)gap, (unsigned long long)controls);
 		for (auto &s : samples)
 			std::printf("%s\n", s.c_str());
+		loops.spindump().print();
 	}
 	return ok;
 }

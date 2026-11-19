@@ -598,8 +598,8 @@ std::string sockets(std::initializer_list<std::uint16_t> ports) {
 	return r;
 }
 // A control frame waits behind at most `window` bytes of the reader's data, so its gap is that
-// window over the reader's delivery rate across the run: up to 1.6 times it, never under the
-// 1,000 ms election timeout. On macos-15-intel the rate runs 6-26 MiB/s against the nominal 38,
+// window over the reader's delivery rate across the run: up to 1.6 times it (the highest of 216
+// probe runs is 1.44, so 11% headroom), never under the 1,000 ms election timeout. On macos-15-intel the rate runs 6-26 MiB/s against the nominal 38,
 // and 216 probe runs put the gap at 0.34-1.44 of it. A run delivering under two windows is a
 // dead connection, not a slow reader.
 constexpr bool upload_gap_ok(std::uint64_t gap_ms, std::uint64_t window, std::uint64_t uploaded, std::uint64_t elapsed_ms) {

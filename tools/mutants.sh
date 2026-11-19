@@ -30,6 +30,8 @@ mutants=(
 	$'a follower checks entries by its node limits, not by position\tif (!fits(entry, running)) {\tif (!fits(entry, limits_)) {'
 	$'a leader grants pre-votes\treturn role_ == Role::Leader || (role_ == Role::Follower\treturn (role_ == Role::Follower'
 	$'learners refuse votes\tbool grant = request.term == hard_.term && (!hard_.voted_for\tbool grant = request.term == hard_.term && is_voter(configuration_.local) && (!hard_.voted_for'
+	$'repair ignores the term at the base boundary\t(b.index == base_index_ ? b.term != base_term_ : log_term(b.index) != b.term)\t(b.index == base_index_ ? false : log_term(b.index) != b.term)'
+	$'repair above the commit index\tif (b.index < base_index_ || b.index > durable_.commit_index ||\tif (b.index < base_index_ ||'
 	$'repair below base_index\tif (b.index < base_index_ || b.index > durable_.commit_index ||\tif (b.index > durable_.commit_index ||'
 	$'a leader ignores members\' node limits\t\t\tif (auto found = peer_limits_.find(member); found != peer_limits_.end()) { cap(found->second); }\t\t\t(void)member;'
 	$'commit of an earlier term by counting\tif (candidate <= durable_.commit_index || log_term(candidate) != hard_.term) { return; }\tif (candidate <= durable_.commit_index) { return; }'

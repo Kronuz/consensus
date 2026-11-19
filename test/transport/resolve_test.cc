@@ -12,10 +12,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
+#include <pthread.h>
 #include <string>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #elif defined(__FreeBSD__)
@@ -40,16 +43,29 @@ namespace {
 
 long long ms(Clock::duration d) { return std::chrono::duration_cast<std::chrono::milliseconds>(d).count(); }
 
-// The process's threads, as the system counts them.
-std::size_t os_threads() {
+// The process's threads as the system lists them: each one's name and run state.
+struct OsThread {
+	std::string name;
+	int state = 0;
+};
+std::vector<OsThread> os_thread_list() {
+	std::vector<OsThread> found;
 #if defined(__APPLE__)
 	thread_act_array_t list = nullptr;
 	mach_msg_type_number_t count = 0;
 	CHECK(task_threads(mach_task_self(), &list, &count) == KERN_SUCCESS);
-	for (mach_msg_type_number_t i = 0; i != count; ++i)
+	for (mach_msg_type_number_t i = 0; i != count; ++i) {
+		thread_extended_info_data_t info{};
+		mach_msg_type_number_t size = THREAD_EXTENDED_INFO_COUNT;
+		OsThread thread;
+		if (thread_info(list[i], THREAD_EXTENDED_INFO, reinterpret_cast<thread_info_t>(&info), &size) == KERN_SUCCESS) {
+			thread.name = info.pth_name;
+			thread.state = info.pth_run_state;
+		}
+		found.push_back(std::move(thread));
 		mach_port_deallocate(mach_task_self(), list[i]);
+	}
 	vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(list), count * sizeof(*list));
-	return count;
 #elif defined(__FreeBSD__)
 	int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID | KERN_PROC_INC_THREAD, getpid()};
 	std::size_t size = 0;
@@ -57,12 +73,25 @@ std::size_t os_threads() {
 	std::vector<kinfo_proc> procs(size / sizeof(kinfo_proc) + 8);
 	size = procs.size() * sizeof(kinfo_proc);
 	CHECK(sysctl(mib, 4, procs.data(), &size, nullptr, 0) == 0);
-	return size / sizeof(kinfo_proc);
+	for (std::size_t i = 0; i != size / sizeof(kinfo_proc); ++i)
+		found.push_back({procs[i].ki_tdname, procs[i].ki_stat});
 #else
-	std::size_t count = 0;
-	for ([[maybe_unused]] const auto &entry : std::filesystem::directory_iterator("/proc/self/task"))
-		++count;
-	return count;
+	for (const auto &entry : std::filesystem::directory_iterator("/proc/self/task")) {
+		OsThread thread;
+		std::ifstream(entry.path() / "comm") >> thread.name;
+		found.push_back(std::move(thread));
+	}
+#endif
+	return found;
+}
+std::size_t os_threads() { return os_thread_list().size(); }
+
+// Names the calling thread, so that a thread listing tells the test's threads apart.
+void name_thread(const char *name) {
+#if defined(__APPLE__)
+	pthread_setname_np(name);
+#else
+	pthread_setname_np(pthread_self(), name);
 #endif
 }
 
@@ -76,6 +105,30 @@ template <class Done> bool until(Done done, Clock::duration limit = 5s) {
 	return true;
 }
 
+std::size_t before_warmup = 0;  // the process's threads before the warm-up thread
+std::size_t baseline = 0;       // the process's threads before any lookup
+
+// Waits up to `limit` for the process to have `expected` threads. When it does not, prints how
+// the count moved, and each thread's name and run state.
+bool settles(std::size_t expected, Clock::duration limit = 5s) {
+	const auto start = Clock::now();
+	std::string trace;
+	std::size_t last = SIZE_MAX;
+	const bool done = until([&] {
+		const auto count = os_threads();
+		if (count != last)
+			trace += " " + std::to_string(ms(Clock::now() - start)) + "ms:" + std::to_string(last = count);
+		return count == expected;
+	}, limit);
+	if (!done) {
+		std::fprintf(stderr, "threads: expected %zu (baseline %zu, %zu before the warm-up thread); count over time:%s\n",
+					 expected, baseline, before_warmup, trace.c_str());
+		for (const auto &thread : os_thread_list())
+			std::fprintf(stderr, "  thread \"%s\" run state %d\n", thread.name.c_str(), thread.state);
+	}
+	return done;
+}
+
 // A resolver that parks every call until open(), counting calls entered and returned.
 struct Gate {
 	std::mutex mutex;
@@ -83,6 +136,7 @@ struct Gate {
 	bool opened = false;
 	std::atomic<unsigned> entered{0}, returned{0};
 	std::vector<asio::ip::address> resolve(const std::string &) {
+		name_thread("lookup");
 		++entered;
 		{
 			std::unique_lock lock(mutex);
@@ -117,7 +171,6 @@ struct Answers {
 	}
 };
 
-std::size_t baseline = 0;  // the process's threads before any lookup
 Clock::time_point returned_at;
 
 // A3: a lookup delivers its resolver's answer, in order and whole; a throwing resolver
@@ -125,6 +178,7 @@ Clock::time_point returned_at;
 void delivers() {
 	const auto v4 = asio::ip::make_address("192.0.2.1"), v6 = asio::ip::make_address("2001:db8::1");
 	PeerResolver answering = [&](const std::string &host) {
+		name_thread("lookup");
 		if (host == "throws")
 			throw std::runtime_error("SERVFAIL");
 		return host == "two" ? std::vector<asio::ip::address>{v4, v6} : std::vector<asio::ip::address>{};
@@ -184,7 +238,12 @@ void abandon_waits() {
 	std::condition_variable wake;
 	bool in_delivery = false, open = false, delivery_returned = false;
 	LookupThreads threads(1);
-	auto lookup = threads.start([](const std::string &) { return std::vector<asio::ip::address>{}; }, "delivering",
+	auto lookup = threads.start(
+		[](const std::string &) {
+			name_thread("lookup");
+			return std::vector<asio::ip::address>{};
+		},
+		"delivering",
 								[&](std::vector<asio::ip::address>) {
 									std::unique_lock lock(mutex);
 									in_delivery = true;
@@ -199,6 +258,7 @@ void abandon_waits() {
 	std::atomic<bool> abandoning{false}, abandoned{false};
 	bool returned_first = false;
 	std::thread abandoner([&] {
+		name_thread("abandoner");
 		abandoning = true;
 		lookup->abandon();
 		abandoned = true;
@@ -224,15 +284,17 @@ void shutdown() {
 	auto gate = std::make_shared<Gate>();
 	auto answers = std::make_shared<Answers>();
 	std::vector<std::shared_ptr<Lookup>> lookups;
-	CHECK(until([&] { return os_threads() == baseline; }));
+	CHECK(settles(baseline));
 	auto threads = std::make_unique<LookupThreads>(4);
 	for (unsigned i = 0; i != 6; ++i)
 		lookups.push_back(threads->start(Gate::resolver(gate), "host" + std::to_string(i), answers->delivery(answers)));
-	CHECK(until([&] { return gate->entered == 4 && os_threads() == baseline + 4; }));
+	CHECK(until([&] { return gate->entered == 4; }));
+	CHECK(settles(baseline + 4));
 	CHECK(threads->threads() == 4 && threads->queued() == 2);
 	lookups.front()->abandon();  // abandon() before and after destruction is harmless
 	const auto start = Clock::now();
 	std::thread opener([gate] {
+		name_thread("opener");
 		std::this_thread::sleep_for(300ms);
 		gate->open();
 	});
@@ -242,7 +304,7 @@ void shutdown() {
 	for (auto &lookup : lookups)
 		lookup->abandon();
 	// A joined thread may linger in the system's count for a moment after the join returns.
-	CHECK(until([&] { return os_threads() == baseline; }, 1s));
+	CHECK(settles(baseline, 1s));
 	std::printf("shutdown: a resolver stuck until 300 ms after destruction began held it %lld ms\n", ms(took));
 	CHECK(took >= 290ms && gate->entered == 4 && gate->returned == 4 && answers->size() == 0);
 }
@@ -255,7 +317,7 @@ void rebuilds() {
 	auto answers = std::make_shared<Answers>();
 	auto &process = LookupThreads::process();
 	const auto bound = LookupThreads::process_bound;
-	CHECK(until([&] { return os_threads() == baseline; }));
+	CHECK(settles(baseline));
 	std::size_t peak = 0;
 	for (unsigned rebuild = 0; rebuild != 1000; ++rebuild) {
 		std::vector<std::shared_ptr<Lookup>> transport;
@@ -282,7 +344,7 @@ void rebuilds() {
 				peak, LookupThreads::process_bound, queued, gate->entered.load());
 	CHECK(peak <= bound && queued == 0 && gate->entered == bound);
 	gate->open();
-	CHECK(until([&] { return os_threads() == baseline; }));
+	CHECK(settles(baseline));
 	CHECK(answers->size() == 0 && gate->returned == bound);
 }
 
@@ -290,7 +352,7 @@ void rebuilds() {
 // built); every thread it ran has been joined, and a lookup started now throws.
 void exited() {
 	const auto took = Clock::now() - returned_at;
-	const bool joined = until([] { return os_threads() == baseline; }, 1s);
+	const bool joined = settles(baseline, 1s);
 	std::printf("exit: waited %lld ms for the lookup in flight; %s\n", ms(took),
 				joined ? "every lookup thread joined" : "a lookup thread is left");
 	bool canceled = false;
@@ -309,7 +371,8 @@ void exited() {
 } // namespace
 
 int main(int argc, char **argv) {
-	std::thread([] {}).join();  // a sanitizer's own threads start with the first one
+	before_warmup = os_threads();
+	std::thread([] { name_thread("warm-up"); }).join();  // a sanitizer's own threads start with the first one
 	baseline = os_threads();
 	std::atexit(exited);
 	const std::pair<const char *, void (*)()> cases[] = {
@@ -326,6 +389,7 @@ int main(int argc, char **argv) {
 	static std::atomic<bool> entered{false};
 	Lookup::start(
 		[](const std::string &) {
+			name_thread("lookup");
 			entered = true;
 			std::this_thread::sleep_for(200ms);
 			return std::vector<asio::ip::address>{};

@@ -41,7 +41,7 @@ leads every group; each run measures after the group commits and a 1 s warm-up.
   head-of-line block on the shared connection would move. Group 0's undelivered bytes are the
   entry bytes its leader sent to node 2 less those node 2's loop was handed, sampled every 2 ms.
 - `gap`: two nodes of two loops; a control frame every 10 ms carries its send time, while four
-  groups keep their 4 MiB window and two frames more queued on the Control lane (the same
+  groups keep their 4 MiB window and one frame more queued on the Control lane (the same
   connection) or the Bulk lane. Each control frame's delay is its arrival less its send time on
   the same clock; the stated bound is one data frame, one 64 KiB feed and the kernel's socket
   buffers (`tcp_wmem` and `tcp_rmem` maxima) at the measured data rate.
@@ -130,4 +130,60 @@ data queue. No inbox overflowed and the leader's transport dropped no frame.
 
 ## A3: the longest control-frame wait behind data (R19)
 
-PENDING
+Job `261118-135806-e23693`, one 3 s run per row (300 control frames each), netem on `lo` at 0, 1
+and 10 ms of added round trip, with and without a 1 Gb/s rate. "Delay" is a control frame's send
+to arrival; "longest gap" is the longest time between two consecutive arrivals, which includes
+the 10 ms cadence (idle, it reads 11.6-13.1 ms). The stated bound is one data frame, one 64 KiB
+feed and the kernel's socket buffers (4 MiB `tcp_wmem` and 6 MiB `tcp_rmem` maxima) at the
+measured data rate; `election_min` is 1,000 ms.
+
+| RTT | Rate | Data lane, frame | Data MB/s | Delay p50 | Delay p99 | Delay max | Longest gap | Stated bound |
+|---|---|---|---|---|---|---|---|---|
+| 0 ms | none | idle | 0 | 0.33 ms | 0.83 ms | 1.0 ms | 11.6 ms | |
+| 0 ms | none | Bulk, 2 MiB | 830 | 0.43 ms | 2.65 ms | 6.5 ms | 15.1 ms | 15.2 ms |
+| 0 ms | none | Control, 2 MiB | 893 | 6.9 ms | 9.8 ms | 14.1 ms | 13.9 ms | 14.2 ms |
+| 0 ms | none | Control, 256 KiB | 906 | 0.72 ms | 1.48 ms | 13.6 ms | 12.3 ms | 11.9 ms |
+| 0 ms | 1 Gb/s | idle | 0 | 0.74 ms | 2.7 ms | 3.1 ms | 12.8 ms | |
+| 0 ms | 1 Gb/s | Bulk, 2 MiB | 124 | 12.8 ms | 19.1 ms | 21.5 ms | 22.7 ms | 101.7 ms |
+| 0 ms | 1 Gb/s | Control, 2 MiB | 123 | 25.7 ms | 42.3 ms | 43.9 ms | 36.2 ms | 102.9 ms |
+| 0 ms | 1 Gb/s | Control, 256 KiB | 121 | 19.4 ms | 35.4 ms | 38.7 ms | 37.3 ms | 89.4 ms |
+| 1 ms | none | idle | 0 | 1.97 ms | 2.6 ms | 3.1 ms | 11.8 ms | |
+| 1 ms | none | Bulk, 2 MiB | 739 | 6.5 ms | 8.3 ms | 9.6 ms | 16.2 ms | 17.1 ms |
+| 1 ms | none | Control, 2 MiB | 665 | 7.1 ms | 17.1 ms | 33.8 ms | 31.7 ms | 19.0 ms |
+| 1 ms | none | Control, 256 KiB | 693 | 1.5 ms | 2.8 ms | 10.1 ms | 12.5 ms | 15.6 ms |
+| 1 ms | 1 Gb/s | idle | 0 | 1.94 ms | 2.7 ms | 3.2 ms | 11.9 ms | |
+| 1 ms | 1 Gb/s | Bulk, 2 MiB | 119 | 17.5 ms | 30.1 ms | 33.4 ms | 36.2 ms | 106.4 ms |
+| 1 ms | 1 Gb/s | Control, 2 MiB | 124 | 27.1 ms | 44.5 ms | 45.3 ms | 35.5 ms | 101.8 ms |
+| 1 ms | 1 Gb/s | Control, 256 KiB | 119 | 19.5 ms | 36.6 ms | 38.9 ms | 37.4 ms | 90.7 ms |
+| 10 ms | none | idle | 0 | 6.65 ms | 7.8 ms | 8.3 ms | 13.1 ms | |
+| 10 ms | none | Bulk, 2 MiB | 307 | 5.6 ms | 8.4 ms | 9.1 ms | 14.2 ms | 41.3 ms |
+| 10 ms | none | Control, 2 MiB | 300 | 12.4 ms | 20.9 ms | 23.0 ms | 18.4 ms | 42.2 ms |
+| 10 ms | none | Control, 256 KiB | 314 | 13.6 ms | 21.0 ms | 21.4 ms | 14.9 ms | 34.4 ms |
+| 10 ms | 1 Gb/s | idle | 0 | 6.63 ms | 7.6 ms | 7.65 ms | 12.8 ms | |
+| 10 ms | 1 Gb/s | Bulk, 2 MiB | 104 | 19.6 ms | 36.2 ms | 37.4 ms | 38.9 ms | 121.9 ms |
+| 10 ms | 1 Gb/s | Control, 2 MiB | 104 | 33.8 ms | 54.8 ms | 56.1 ms | 41.9 ms | 121.9 ms |
+| 10 ms | 1 Gb/s | Control, 256 KiB | 104 | 25.3 ms | 44.4 ms | 46.3 ms | 41.2 ms | 103.8 ms |
+
+Behind Bulk the longest delay is 6.5-37.4 ms and the longest gap 14.2-38.9 ms, against bounds of
+15-122 ms and 1,000 ms for `election_min`: the largest gap is 3.9% of it, and every one of the
+300 control frames of every row arrived. Where the link is the limit (1 Gb/s, 104-124 MB/s) the
+bound is 2.9-4.5 times the longest gap and 3.2-4.7 times the longest delay. Unrated, the
+bound is the loosest estimate: it shrinks as the loopback rate climbs (15 ms at 830 MB/s), and
+the 0 ms Bulk row's longest gap, 15.1 ms, is 99% of its 15.2 ms bound; as that gap includes the
+10 ms cadence, the wait it adds is about 5 ms and the row's longest delay is 6.5 ms. The 1 ms
+row's 16.2 ms gap against 17.1 ms reads the same way (longest delay 9.6 ms).
+
+The control-lane rows are the foil: data frames on the Control lane share the control ring,
+and a control frame waits for the frames queued ahead of it. With 2 MiB frames that costs
+1.6-2.0 times Bulk's p50 on the 1 Gb/s link (25.7 against 12.8 ms at 0 ms, 33.8 against 19.6 ms at
+10 ms), and without a rate 7.1 ms p50 against 6.5 ms at 1 ms, with a 33.8 ms worst delay (31.7 ms
+gap) above Bulk's 9.6 ms, past its 19.0 ms bound (a bound the Control lane does not claim for data). At 0 ms unrated the Control rows' p50
+(6.9 ms) is 16 times Bulk's (0.43 ms). Frames of 256 KiB on the Control lane sit between the two.
+One run per row: the unrated Control worst cases (one frame in 300) are single events and the
+tails of the idle rows (3 ms at most, with an 11.6-13.1 ms gap) are the VM's own jitter (not isolated further), so
+read p50 and p99 for the lane comparison and the maxima as the bound's check.
+
+The leader's transport dropped 0-2 frames per row: none in the idle and 256 KiB Control rows, up
+to two where the bench queues 2 MiB frames (`top_up` holds a window and a frame per group, and a
+group queues at most 64 control frames or 8 MiB of data frames). All 300 control frames of every row arrived in the measured window, so
+those were the bench's data frames, not a heartbeat.

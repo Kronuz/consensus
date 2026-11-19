@@ -44,6 +44,7 @@ namespace j = kronuz::journal;
 namespace jt = kronuz::journal::testing;
 
 // Live heap bytes, counted at the allocation and the sized free, each block carrying its size.
+// A block allocated in an Uncounted scope (a test disk's own) carries a mark and never counts.
 // Single-threaded: the loop is an inline scheduler. TSan's runtime defines operator new, so
 // there the count is off and the bytes case only reports.
 #if defined(__SANITIZE_THREAD__)
@@ -59,24 +60,34 @@ namespace jt = kronuz::journal::testing;
 #if COUNT_BYTES
 namespace {
 std::size_t live_bytes = 0;
-constexpr std::size_t header = alignof(std::max_align_t);
+bool uncounted = false;
+constexpr std::size_t header = alignof(std::max_align_t), mark = ~(~std::size_t(0) >> 1);
 }
 void* operator new(std::size_t n) {
 	void* raw = std::malloc(n + header);
 	if (!raw) { throw std::bad_alloc(); }
-	*static_cast<std::size_t*>(raw) = n; live_bytes += n;
+	*static_cast<std::size_t*>(raw) = uncounted ? n | mark : n;
+	if (!uncounted) { live_bytes += n; }
 	return static_cast<char*>(raw) + header;
 }
 void operator delete(void* p) noexcept {
 	if (!p) { return; }
 	void* raw = static_cast<char*>(p) - header;
-	live_bytes -= *static_cast<std::size_t*>(raw);
+	const auto size = *static_cast<std::size_t*>(raw);
+	if (!(size & mark)) { live_bytes -= size; }
 	std::free(raw);
 }
 void operator delete(void* p, std::size_t) noexcept { operator delete(p); }
 #else
-namespace { std::size_t live_bytes = 0; }
+namespace { std::size_t live_bytes = 0; bool uncounted = false; }
 #endif
+namespace {
+struct Uncounted {
+	bool was = uncounted;
+	Uncounted() { uncounted = true; }
+	~Uncounted() { uncounted = was; }
+};
+}
 
 namespace {
 
@@ -122,6 +133,81 @@ struct Sink {
 };
 static_assert(sink<Sink>);
 
+// A flat in-memory directory whose own allocations never count: a host's files are on disk,
+// not in its heap. No power-loss model, and every operation is O(log names).
+class HeapIO final : public j::IO {
+	struct Data { std::string bytes; };
+	class File final : public j::File {
+	public:
+		explicit File(std::shared_ptr<Data> data) : data_(std::move(data)) {}
+		std::uint64_t size() override { return data_->bytes.size(); }
+		std::size_t read_at(std::uint64_t offset, std::span<char> bytes) override {
+			if (offset >= data_->bytes.size()) { return 0; }
+			const auto n = std::min<std::size_t>(bytes.size(), data_->bytes.size() - offset);
+			std::copy_n(data_->bytes.data() + offset, n, bytes.data()); return n;
+		}
+		std::size_t write_at(std::uint64_t offset, std::string_view bytes) override {
+			Uncounted scope;
+			if (data_->bytes.size() < offset + bytes.size()) { data_->bytes.resize(offset + bytes.size(), '\0'); }
+			data_->bytes.replace(offset, bytes.size(), bytes); return bytes.size();
+		}
+		void truncate(std::uint64_t size) override { Uncounted scope; data_->bytes.resize(size, '\0'); }
+		void sync() override {}
+	private:
+		std::shared_ptr<Data> data_;
+	};
+	class Cursor final : public j::DirectoryCursor {
+	public:
+		explicit Cursor(std::vector<std::string> names) : names_(std::move(names)) {}
+		std::optional<std::string> next() override { Uncounted scope; if (at_ == names_.size()) { return std::nullopt; } return names_[at_++]; }
+	private:
+		std::vector<std::string> names_; std::size_t at_ = 0;
+	};
+	std::map<std::string, std::shared_ptr<Data>, std::less<>> names_;
+	std::unique_ptr<j::File> open(std::string_view name, bool required) {
+		Uncounted scope;
+		auto found = names_.find(name);
+		if (found == names_.end()) { if (required) { throw std::runtime_error("no such file"); } return nullptr; }
+		return std::make_unique<File>(found->second);
+	}
+public:
+	~HeapIO() override { Uncounted scope; names_.clear(); }
+	std::unique_ptr<j::OwnerLock> acquire_owner(bool) override { Uncounted scope; return std::make_unique<j::OwnerLock>(); }
+	std::unique_ptr<j::File> open_existing(std::string_view name) override { return open(name, true); }
+	std::unique_ptr<j::File> open_existing_read_only(std::string_view name) override { return open(name, true); }
+	std::unique_ptr<j::File> open_reclaim_candidate_read_only(std::string_view name) override { return open(name, false); }
+	void open_existing_read_only_into(std::string_view, j::File&) override { throw std::logic_error("reusable file open unsupported"); }
+	bool open_reclaim_candidate_read_only_into(std::string_view, j::File&) override { throw std::logic_error("reusable candidate open unsupported"); }
+	std::unique_ptr<j::File> create_exclusive(std::string_view name) override {
+		Uncounted scope;
+		auto [at, fresh] = names_.try_emplace(std::string(name), std::make_shared<Data>());
+		if (!fresh) { throw std::runtime_error("file exists"); }
+		return std::make_unique<File>(at->second);
+	}
+	void replace(std::string_view source, std::string_view destination) override {
+		Uncounted scope;
+		auto found = names_.find(source);
+		if (found == names_.end()) { throw std::runtime_error("no such file"); }
+		auto data = found->second; names_.erase(found); names_[std::string(destination)] = std::move(data);
+	}
+	void remove(std::string_view name) override { Uncounted scope; if (auto found = names_.find(name); found != names_.end()) { names_.erase(found); } }
+	std::unique_ptr<j::DirectoryCursor> scan_directory() override {
+		Uncounted scope;
+		std::vector<std::string> names;
+		for (const auto& [name, data] : names_) { names.push_back(name); }
+		return std::make_unique<Cursor>(std::move(names));
+	}
+	std::optional<j::EntryFootprint> entry_footprint(std::string_view name) override {
+		auto found = names_.find(name);
+		if (found == names_.end()) { return std::nullopt; }
+		j::EntryFootprint footprint; footprint.kind = j::EntryKind::Regular; footprint.logical_bytes = found->second->bytes.size();
+		return footprint;
+	}
+	void sync_directory() override {}
+protected:
+	std::unique_ptr<j::OwnerLock> lock_owner(const j::OwnerLockOptions&) override { Uncounted scope; return std::make_unique<j::OwnerLock>(); }
+};
+
 // One host and one loop on an inline_scheduler; the Worker's IO and the turns go through
 // InlineCompletion, or through a HeldCompletion the case completes by hand.
 struct Loop {
@@ -134,8 +220,9 @@ struct Loop {
 	std::unique_ptr<Driver<Sink>> driver;
 	task::cancel_source stop;
 	bool turns_done = false, driver_done = false;
-	explicit Loop(jt::Disk& d, bool hold = false) : disk(d) {
-		host = std::make_unique<j::Host>(std::make_shared<jt::MemoryIO>(disk, "host/"), host_identity, j::HostOptions{1, turn_options});
+	explicit Loop(jt::Disk& d, bool hold = false, std::shared_ptr<j::IO> storage = {}) : disk(d) {
+		if (!storage) { storage = std::make_shared<jt::MemoryIO>(disk, "host/"); }
+		host = std::make_unique<j::Host>(std::move(storage), host_identity, j::HostOptions{1, turn_options});
 		auto io = hold ? j::completion_ref::of(held) : j::completion_ref::of(inline_io);
 		driver = std::make_unique<Driver<Sink>>(Seams{task::scheduler_ref::of(scheduler), io, *host, 0, 7}, sink);
 		auto ref = task::scheduler_ref::of(scheduler);
@@ -431,6 +518,21 @@ void shutdown_ends() {
 	check(turns.staged(g) && turns.sequence(g) == durable, "the record stays staged, reported not durable");
 }
 
+// The Host's per-loop range table keeps an expired entry per view a closed row held until it
+// doubles since its last sweep (journal host.h, Ranges): spare ids from `first`, each opened
+// and closed once, grow it to that size, and the first open whose sweep returns the rows'
+// entries ends it. What is left after is what the rows keep.
+void sweep_ranges(Loop& loop, GroupId first, std::size_t rows) {
+	std::exception_ptr error;
+	for (GroupId spare = first; spare < first + 4 * rows + 64; ++spare) {  // past twice the most rows it held
+		const auto before = live_bytes;
+		loop.driver->open(spare, options({1}));
+		if (!loop.close(spare, error) || error) { check(false, "the sweeping row closes: " + what(error)); return; }
+		if (live_bytes + rows * 64 < before) { return; }
+	}
+	check(!COUNT_BYTES, "the range table sweeps");
+}
+
 // A3: 10,000 rows opened and closed leave the Driver's heap where it was.
 void bytes() {
 	constexpr GroupId rows = 10'000;
@@ -448,13 +550,10 @@ void bytes() {
 		if (!closing->done || closing->error) { check(false, "close " + std::to_string(g) + " completes: " + what(closing->error)); break; }
 	}
 	check(loop.driver->groups() == 0, "no row held after the closes");
-	// The Host keeps an expired weak entry per group it handed an IO, until its next group_io
-	// call purges them: opening one more row is that call.
 	const auto unpurged = live_bytes;
-	loop.driver->open(rows + 1, options({1}));
-	check(loop.close(rows + 1, error) && !error, "the purging row closes");
+	sweep_ranges(loop, rows + 1, rows);
 	const auto after = live_bytes;
-	std::printf("per row: %zu bytes held open, %zu left after close before the Host's purge, %zu after\n", (opened - before) / std::size_t(rows),
+	std::printf("per row: %zu bytes held open, %zu left after close before the Host's range sweep, %zu after\n", (opened - before) / std::size_t(rows),
 		unpurged > before ? (unpurged - before) / std::size_t(rows) : std::size_t(0), after > before ? (after - before) / std::size_t(rows) : std::size_t(0));
 	// What stays is the row table's bucket array, which an unordered_map never shrinks: a pointer a row.
 	check(!COUNT_BYTES || after <= before + rows * sizeof(void*) * 2, "closed rows return their bytes: " + std::to_string(after) + " against " + std::to_string(before));
@@ -593,14 +692,15 @@ void reopen_rows() {
 }
 
 // A2: 10,000 created rows, each with a record and a checkpoint covering it, opened together and
-// closed: the process heap per row (net of the simulated disk) returns to its pre-open value,
+// closed: the process heap per row (HeapIO's files left out) returns to its pre-open value,
 // the Driver's and the journal's alike. Then 10,000 rows closed with a record after their
 // checkpoint, which the host releases: each is parked, and what that keeps is reported.
 void closed_bytes() {
-	constexpr GroupId rows = 10'000;
-	jt::Disk disk; Loop loop(disk);
+	const char* scale = std::getenv("CLOSE_BYTES_ROWS");  // another count, for timing
+	const GroupId rows = scale ? std::stoull(scale) : 10'000;
+	jt::Disk unused; Loop loop(unused, false, std::make_shared<HeapIO>());
 	std::exception_ptr error;
-	auto process = [&] { const auto d = disk_bytes(disk); return live_bytes > d ? live_bytes - d : std::size_t(0); };
+	auto process = [] { return live_bytes; };
 	auto open = [&](GroupId g, bool covered) {
 		loop.lone(g);
 		loop.propose(g, "p"); loop.apply(g);
@@ -609,26 +709,44 @@ void closed_bytes() {
 		if (!published->done || published->error) { check(false, "checkpoint " + std::to_string(g) + ": " + what(published->error)); }
 		if (!covered) { loop.propose(g, "q"); }
 	};
-	auto close = [&](GroupId g) { if (!loop.close(g, error) || error) { check(false, "close " + std::to_string(g) + ": " + what(error)); } };
+	// The test's Sink keeps what it heard per row: dropped with the row, it is not the library's.
+	auto close = [&](GroupId g) {
+		if (!loop.close(g, error) || error) { check(false, "close " + std::to_string(g) + ": " + what(error)); }
+		loop.sink.committed.erase(g); loop.sink.commands.erase(g);
+	};
 	open(1, true); close(1);  // one warm round
-	const auto before = process();
-	for (GroupId g = 2; g < 2 + rows; ++g) { open(g, true); }
-	const auto opened = process();
-	for (GroupId g = 2; g < 2 + rows; ++g) { close(g); }
-	const auto closed = process();
-	std::size_t table = 0;
-	for (GroupId g = 2; g < 2 + rows; ++g) { table += loop.host->status(g) == j::GroupStatus::closed; }
-	check(table == rows && loop.driver->groups() == 0, "every covered row closes into the host's table: " + std::to_string(table));
 	auto per = [&](std::size_t now, std::size_t from) { return double(now) / double(rows) - double(from) / double(rows); };
-	std::printf("closed_bytes: %u covered rows, process heap per row: %.1f B open, %.1f B after close\n", unsigned(rows), per(opened, before), per(closed, before));
-	// What stays is the Driver's row table's bucket array, which an unordered_map never shrinks.
-	check(!COUNT_BYTES || closed <= before + rows * sizeof(void*) * 2, "closed rows return the heap: " + std::to_string(closed) + " B against " + std::to_string(before) + " B before");
+	// A pass opens `rows` covered rows from `first` together, then closes them: the heap open,
+	// after close, and after the Host's range table sweeps.
+	auto pass = [&](GroupId first, GroupId spare) {
+		const auto from = process();
+		for (GroupId g = first; g < first + rows; ++g) { open(g, true); }
+		const auto opened = process();
+		for (GroupId g = first; g < first + rows; ++g) { close(g); }
+		const auto unswept = process();
+		sweep_ranges(loop, spare, rows);
+		const auto closed = process();
+		std::size_t table = 0;
+		for (GroupId g = first; g < first + rows; ++g) { table += loop.host->status(g) == j::GroupStatus::closed; }
+		check(table == rows && loop.driver->groups() == 0, "every covered row closes into the host's table: " + std::to_string(table));
+		std::printf("closed_bytes: %u covered rows from %u, process heap per row: %.1f B open, %.1f B after close before the Host's range sweep, %.1f B after\n",
+			unsigned(rows), unsigned(first), per(opened, from), per(unswept, from), per(closed, from));
+		return closed;
+	};
+	const auto before = process();
+	const auto first = pass(2, 10 * rows);
+	// What the first pass keeps is capacity: the Driver's row table's bucket array, which an
+	// unordered_map sizes to its most rows and never shrinks. A second pass adds nothing.
+	check(!COUNT_BYTES || first <= before + rows * sizeof(void*) * 3, "closed rows return the heap: " + std::to_string(first) + " B against " + std::to_string(before) + " B before");
+	const auto second = pass(2 + rows, 11 * rows);
+	check(!COUNT_BYTES || second <= first + rows, "a second pass of closed rows keeps nothing more: " + std::to_string(second) + " B against " + std::to_string(first) + " B");
 	const auto released_before = process();
-	for (GroupId g = 2 + rows; g < 2 + 2 * rows; ++g) { open(g, false); }
-	for (GroupId g = 2 + rows; g < 2 + 2 * rows; ++g) { close(g); }
+	for (GroupId g = 2 + 2 * rows; g < 2 + 3 * rows; ++g) { open(g, false); }
+	for (GroupId g = 2 + 2 * rows; g < 2 + 3 * rows; ++g) { close(g); }
+	sweep_ranges(loop, 20 * rows, rows);
 	const auto released = process();
 	std::size_t parked = 0;
-	for (GroupId g = 2 + rows; g < 2 + 2 * rows; ++g) { parked += loop.host->driver(0).parked(g); }
+	for (GroupId g = 2 + 2 * rows; g < 2 + 3 * rows; ++g) { parked += loop.host->driver(0).parked(g); }
 	check(parked == rows, "every row with a record after its checkpoint is released and parked: " + std::to_string(parked));
 	std::printf("closed_bytes: %u released rows, process heap per row after close: %.1f B\n", unsigned(rows), per(released, released_before));
 }
@@ -638,6 +756,7 @@ void closed_bytes() {
 // close it into the table, or go on; each close recovers the row in the live Host. After the
 // cut, a new Host recovers every acknowledged record and nothing unattempted: none lost, none
 // that a table close dropped replayed again.
+std::uint64_t crash_tables = 0, crash_releases = 0;  // the closes a sweep's runs completed, by kind
 bool close_crash_run(std::uint64_t seed, std::uint64_t cut) {
 	constexpr GroupId g = 91;
 	jt::Disk disk; disk.random.seed(seed * 7919 + cut);
@@ -667,9 +786,11 @@ bool close_crash_run(std::uint64_t seed, std::uint64_t cut) {
 				if (!published->done || published->error) { alive = false; break; }
 			}
 			if (!ok(loop.start(loop.driver->close(g)))) { alive = false; break; }
+			++(loop.host->status(g) == j::GroupStatus::closed ? crash_tables : crash_releases);
 			const auto image = loop.recover(g, error, options({1}));
-			if (error) { alive = false; break; }
 			loop.apply(g);
+			// Without power nothing commits after the recover, so the state shows only before the cut.
+			if (error || disk.dead()) { alive = false; break; }
 			const auto state = recovered(loop, g, image);
 			check(state == attempted, "a recover in the live Host holds every attempted record: " + at + " " + join(state));
 		}
@@ -695,7 +816,8 @@ void close_crash() {
 	for (std::uint64_t seed = 1; seed <= seeds; ++seed) {
 		for (std::uint64_t cut = 1; !close_crash_run(seed, cut); ++cut) { ++runs; if (failures) { return; } }
 	}
-	std::printf("close_crash: %u seeds, %u power cuts\n", unsigned(seeds), unsigned(runs));
+	std::printf("close_crash: %u seeds, %u power cuts; %u closes into the table, %u releases\n", unsigned(seeds), unsigned(runs), unsigned(crash_tables), unsigned(crash_releases));
+	check(crash_tables && crash_releases, "the sweep closes rows both ways");
 }
 
 // A5: a checkpoint whose peak exceeds the replacement pool fails at once with

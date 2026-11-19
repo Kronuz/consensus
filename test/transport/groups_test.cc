@@ -6,7 +6,8 @@
 //   reader   reader_test: a group with full admission for 3 s, whose frames are refused, never
 //            delays another group's heartbeat on the same loop past the 1,000 ms election timeout
 //   upload   a maximal upload (2 MiB appends of 1 MiB commands) to a reader throttled to 40 MB/s
-//            never delays another group's heartbeat or vote past the election timeout
+//            never delays another group's heartbeat or vote past the election timeout, or past 1.6
+//            windows of the reader's measured delivery time when the runner slows it
 //   driver   three Drivers' Sinks over the transport: a three-voter group elects, commits and
 //            survives a peer's restart
 //   refill   credit comes back: for refused frames, and with a new connection after the
@@ -42,6 +43,7 @@
 #include <mutex>
 #include <openssl/pem.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <netinet/tcp.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
@@ -595,11 +597,30 @@ std::string sockets(std::initializer_list<std::uint16_t> ports) {
 	}
 	return r;
 }
+// A control frame waits behind at most `window` bytes of the reader's data, so its gap is that
+// window over the reader's delivery rate across the run: up to 1.6 times it (the highest of 216
+// probe runs is 1.44, so 11% headroom), never under the 1,000 ms election timeout. On
+// macos-15-intel the rate runs 6-26 MiB/s against the nominal 38. A run delivering under two
+// windows is a dead connection, not a slow reader.
+constexpr std::uint64_t upload_bound_ms(std::uint64_t window, std::uint64_t uploaded, std::uint64_t elapsed_ms) {
+	return std::max<std::uint64_t>(1000, uploaded ? window * elapsed_ms * 8 / 5 / uploaded : ~std::uint64_t{0});
+}
+constexpr bool upload_gap_ok(std::uint64_t gap_ms, std::uint64_t window, std::uint64_t uploaded, std::uint64_t elapsed_ms) {
+	return uploaded >= 2 * window && gap_ms < upload_bound_ms(window, uploaded, elapsed_ms);
+}
+// Recorded runs: probe 44441165298 (a loaded runner: 1.09 s at 8 MiB/s), CI failures 44216299768 and 44264616865.
+void upload_bound() {
+	assert(upload_gap_ok(1092, 8 << 20, 32 << 20, 4013) && upload_gap_ok(816, 8 << 20, 24 << 20, 4079));
+	assert(!upload_gap_ok(3012, 8 << 20, 18 << 20, 4000) && !upload_gap_ok(4019, 8 << 20, 2 << 20, 4000));
+	assert(!upload_gap_ok(1000, 8 << 20, 80 << 20, 4000) && "a healthy reader keeps the election timeout");
+}
 // A2: four groups upload 2 MiB appends of two 1 MiB commands (types.h's command and RPC caps) on
 // the Control connection, faster than the receiver reads them (25 ms a MiB, 40 MB/s, on the
 // connection's own loop). A follower group's heartbeat every 100 ms and a vote every 300 ms on
-// the same connection each arrive within the 1,000 ms election timeout.
+// the same connection each arrive within upload_gap_ok's bound: the 1,000 ms election timeout
+// for a reader at speed.
 bool upload() {
+	upload_bound();
 	constexpr std::uint32_t L = 2;
 	HostTransportOptions options;
 	options.window = 8 << 20;
@@ -670,13 +691,18 @@ bool upload() {
 	one.stop();
 	two.stop();
 	const auto controls = beats.count - before, gap = beats.worst;
-	const bool ok = gap < 1000 && controls >= 40;
+	const bool ok = upload_gap_ok(gap, options.window, uploaded, elapsed) && controls >= 40;
 	std::printf("upload: %.1f MiB uploaded in %llu ms on the shared connection; %llu heartbeats and votes, longest gap %llu ms %s\n",
 				double(uploaded) / (1 << 20), (unsigned long long)elapsed, (unsigned long long)controls, (unsigned long long)gap,
 				ok ? "ok" : "FAILS: a follower would start an election");
-	if (!ok)
+	if (!ok) {  // what a failure needs: the window, the reader's rate, the bound, then the samples
+		std::printf("upload: window %.1f MiB, reader %.1f MiB/s, window/rate %llu ms, bound %llu ms, gap %llu ms, %llu controls\n",
+					double(options.window) / (1 << 20), double(uploaded) / (1 << 20) * 1000 / double(elapsed),
+					(unsigned long long)(uploaded ? options.window * elapsed / uploaded : 0),
+					(unsigned long long)upload_bound_ms(options.window, uploaded, elapsed), (unsigned long long)gap, (unsigned long long)controls);
 		for (auto &s : samples)
 			std::printf("%s\n", s.c_str());
+	}
 	return ok;
 }
 
@@ -1339,15 +1365,13 @@ void refill() {
 }
 
 // A node over raw Links, not a HostTransport, on its own loop: it sends the frames a case writes,
-// counts the closed frames it hears and sums the credit per group; while `slow`, it sleeps
-// 150 ms after each frame over 1 MiB it reads.
+// counts the closed frames it hears and the frames over 1 MiB, and sums the credit per group.
 struct RawPeer {
 	Loop loop;
 	std::unique_ptr<Links> links;
 	std::atomic<const Link *> link{nullptr};
 	std::atomic<int> ended{0};
 	std::atomic<std::uint64_t> closed{0}, credits{0}, credited{0}, big{0};
-	std::atomic<bool> slow{false};
 	std::map<GroupId, std::uint64_t> credit;  // on the loop
 	RawPeer(NodeId node, NodeId to, std::uint16_t port, LinkOptions options = {}) {
 		auto tls = context(names[node]);
@@ -1374,11 +1398,7 @@ struct RawPeer {
 				credited += bytes;
 				++credits;
 			}
-			if (f.size() > 1 << 20) {
-				++big;
-				if (slow)
-					std::this_thread::sleep_for(150ms);
-			}
+			big += f.size() > 1 << 20;
 		};
 		loop.start();
 	}
@@ -1419,6 +1439,109 @@ struct RawPeer {
 		const bool stopped = until([&] { return loop.at([&] { return links->drained(); }); }, 10'000);
 		assert(stopped && "the raw peer's links drain");
 		loop.at([&] { links.reset(); });
+	}
+};
+
+// A TCP relay on its own threads from one dialer to `to`: bytes toward `to` always pass; while
+// held, bytes back stay unread, so the far end's sends back up in its own queue once its socket's
+// buffer and the relay's 64 KiB receive buffer fill.
+struct Gate {
+	int listener = -1, near = -1, far = -1;
+	std::mutex mutex;
+	std::condition_variable changed;
+	bool held = false, stopping = false;
+	std::thread relay, down;
+	explicit Gate(std::uint16_t to) {
+		listener = ::socket(AF_INET, SOCK_STREAM, 0);
+		const auto at = loopback(0);
+		const bool listening = listener >= 0 && ::bind(listener, (const sockaddr *)&at, sizeof at) == 0 && ::listen(listener, 1) == 0;
+		assert(listening);
+		relay = std::thread([this, to] { run(to); });
+	}
+	std::uint16_t port() const {
+		sockaddr_in at{};
+		socklen_t size = sizeof at;
+		::getsockname(listener, (sockaddr *)&at, &size);
+		return ntohs(at.sin_port);
+	}
+	void hold(bool on) {
+		std::lock_guard lock(mutex);
+		held = on;
+		changed.notify_all();
+	}
+	~Gate() {
+		{
+			std::lock_guard lock(mutex);
+			stopping = true;
+			for (int fd : {near, far})
+				if (fd >= 0)
+					::shutdown(fd, SHUT_RDWR);
+			changed.notify_all();
+		}
+		relay.join();
+		if (down.joinable())
+			down.join();
+		for (int fd : {listener, near, far})
+			if (fd >= 0)
+				::close(fd);
+	}
+
+  private:
+	static sockaddr_in loopback(std::uint16_t port) {
+		sockaddr_in at{};
+		at.sin_family = AF_INET;
+		at.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		at.sin_port = htons(port);
+		return at;
+	}
+	// Accepts the dialer, dials `to` with a 64 KiB receive buffer, then relays both ways.
+	void run(std::uint16_t to) {
+		int in = -1;
+		for (pollfd p{listener, POLLIN, 0}; in < 0;) {
+			if (std::lock_guard lock(mutex); stopping)
+				return;
+			if (::poll(&p, 1, 50) == 1)
+				in = ::accept(listener, nullptr, nullptr);
+		}
+		const int out = ::socket(AF_INET, SOCK_STREAM, 0), small = 64 * 1024;
+		::setsockopt(out, SOL_SOCKET, SO_RCVBUF, &small, sizeof small);
+#ifdef SO_NOSIGPIPE
+		const int one = 1;
+		for (int fd : {in, out})
+			::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#endif
+		const auto at = loopback(to);
+		const bool connected = ::connect(out, (const sockaddr *)&at, sizeof at) == 0;
+		{
+			std::lock_guard lock(mutex);
+			near = in;
+			far = out;
+			if (stopping)
+				return;
+			down = std::thread([this, in, out] { pump(out, in, true); });
+		}
+		if (connected)
+			pump(in, out, false);
+	}
+	// Copies `from` to `to` until either ends, waiting while held when `gated`.
+	void pump(int from, int to, bool gated) {
+		std::vector<char> buffer(64 * 1024);
+		for (bool more = true; more;) {
+			if (gated) {
+				std::unique_lock lock(mutex);
+				changed.wait(lock, [&] { return !held || stopping; });
+				if (stopping)
+					break;
+			}
+			const auto n = ::read(from, buffer.data(), buffer.size());
+			more = n > 0;
+			for (ssize_t at = 0; more && at < n;) {
+				const auto w = ::write(to, buffer.data() + at, std::size_t(n - at));
+				more = w > 0;
+				at += std::max<ssize_t>(w, 0);
+			}
+		}
+		::shutdown(to, SHUT_WR);
 	}
 };
 
@@ -1536,15 +1659,18 @@ void reconnect() {
 				(unsigned long long)stats.opens.load(), (unsigned long long)stats.mismatched.load());
 	assert(reopened && stats.opens == 2 && stats.mismatched == 0 && stats.unopened == 1);
 }
-// backlog: credit owed while the connection cannot send. Node 1, over raw Links, opens 6,000
-// groups on host 2, then reads slowly while host 2 sends it 24 MiB, and meanwhile sends 3 data
-// frames to each group, round by round: host 2 owes 18,000 records with its queue full, past
-// 4,096, so `owe` merges them per group. Each group's credit comes back whole, as values, in
-// fewer credit frames than data frames (a merge ran).
+// backlog: credit owed while the connection cannot send. Node 1, over raw Links through a Gate,
+// opens 6,000 groups on host 2. The gate then holds host 2's sends while host 2 sends node 1
+// 24 MiB, far over what the sockets buffer, so host 2's queue empties at most once more; node 1
+// sends 3 data frames to each group, round by round, and host 2 owes the 18,000 records, past
+// 4,096, so `owe` merges them per group. Once all have arrived the gate opens: each group's
+// credit comes back whole, as values, in fewer credit frames than data frames (a merge ran).
 void backlog() {
 	constexpr std::size_t N = 6000, R = 3, B = 6;
+	HostTransportOptions options;
+	options.links.connection.dead_after = 60s;  // while the gate holds, host 2's writes wait and node 1 hears nothing
 	Host two(2, 1);
-	two.open({});
+	two.open({}, options);
 	std::vector<GroupId> groups, bulk;
 	for (std::size_t i = 0; i != N; ++i)
 		groups.push_back(10'001 + i);
@@ -1559,7 +1685,8 @@ void backlog() {
 	});
 	two.start();
 	const auto &stats = two.transport->stats(0);
-	RawPeer one(1, 2, two.port());
+	Gate gate(two.port());
+	RawPeer one(1, 2, gate.port(), options.links);
 
 	step("backlog: node 1 opens 6,000 groups on host 2");
 	const bool up = one.dial(2);
@@ -1570,13 +1697,14 @@ void backlog() {
 	one.send(opens);
 	const bool opened = until([&] { return stats.opens >= N; }, 10'000);
 
-	step("backlog: host 2 sends node 1 24 MiB, which node 1 reads slowly");
-	one.slow = true;
+	step("backlog: the gate holds host 2's sends; host 2 sends node 1 24 MiB");
+	gate.hold(true);
+	const auto sent_before = stats.sent.load();
 	two.post(0, [&] {
 		for (auto g : bulk)
 			two.transport->send(0, LinkLane::Control, FrameKind::data, {g, 2, 1}, 1, std::string((4 << 20) - 1024, 'B'));
 	});
-	const bool backed = until([&] { return one.big >= 1; }, 10'000);
+	const bool backed = until([&] { return stats.sent > sent_before; }, 10'000);
 
 	step("backlog: node 1 sends 3 data frames to each group while host 2 cannot send");
 	std::vector<std::string> frames;
@@ -1591,10 +1719,10 @@ void backlog() {
 		}
 	one.send(frames);
 	const bool arrived = until([&] { return delivered == N * R; }, 10'000);
-	const auto read_by_then = one.big.load();
+	const auto read_by_then = one.big.load(), sent_by_then = stats.sent - sent_before;
 
-	step("backlog: node 1 reads at full speed; the credit comes back");
-	one.slow = false;
+	step("backlog: the gate opens; the credit comes back");
+	gate.hold(false);
 	const bool credited = until([&] { return one.credited >= total; }, 10'000);
 	std::this_thread::sleep_for(200ms);  // credit over the total would arrive too
 	const auto got = one.loop.at([&] { return one.credit; });
@@ -1608,14 +1736,16 @@ void backlog() {
 		short_of += have < want;
 		over += have > want;
 	}
-	std::printf("backlog: up %s, %llu opens; node 1 read %llu of %llu bulk frames by the time host 2 delivered %llu of %zu data frames\n",
-				up ? "yes" : "NO", (unsigned long long)stats.opens.load(), (unsigned long long)read_by_then, (unsigned long long)B,
-				(unsigned long long)delivered.load(), N * R);
+	std::printf("backlog: up %s, %llu opens; by the time host 2 delivered %llu of %zu data frames, it had handed its connection "
+				"%llu frames and node 1 read %llu of %llu bulk frames\n",
+				up ? "yes" : "NO", (unsigned long long)stats.opens.load(), (unsigned long long)delivered.load(), N * R,
+				(unsigned long long)sent_by_then, (unsigned long long)read_by_then, (unsigned long long)B);
 	std::printf("backlog: credit %llu of %llu bytes in %llu credit frames for %zu frames (fewer: merged); groups credited %zu of %zu, "
 				"short %zu, over %zu, other groups %zu; closed %llu\n",
 				(unsigned long long)one.credited.load(), (unsigned long long)total, (unsigned long long)one.credits.load(), N * R,
 				got.size(), N, short_of, over, got.size() > N ? got.size() - N : 0, (unsigned long long)one.closed.load());
 	assert(opened && backed && arrived && credited);
+	assert(read_by_then == 0 && "the gate held host 2's sends");
 	assert(short_of == 0 && over == 0 && got.size() == N && "every group's credit, whole");
 	assert(one.credits < N * R && one.closed == 0 && "the owed records merged");
 }

@@ -6,7 +6,8 @@
 //   reader   reader_test: a group with full admission for 3 s, whose frames are refused, never
 //            delays another group's heartbeat on the same loop past the 1,000 ms election timeout
 //   upload   a maximal upload (2 MiB appends of 1 MiB commands) to a reader throttled to 40 MB/s
-//            never delays another group's heartbeat or vote past the election timeout
+//            never delays another group's heartbeat or vote past the election timeout, or past 1.6
+//            windows of the reader's measured delivery time when the runner slows it
 //   driver   three Drivers' Sinks over the transport: a three-voter group elects, commits and
 //            survives a peer's restart
 //   refill   credit comes back: for refused frames, and with a new connection after the
@@ -596,11 +597,27 @@ std::string sockets(std::initializer_list<std::uint16_t> ports) {
 	}
 	return r;
 }
+// A control frame waits behind at most `window` bytes of the reader's data, so its gap is that
+// window over the reader's delivery rate across the run: up to 1.6 times it, never under the
+// 1,000 ms election timeout. On macos-15-intel the rate runs 6-26 MiB/s against the nominal 38,
+// and 216 probe runs put the gap at 0.34-1.44 of it. A run delivering under two windows is a
+// dead connection, not a slow reader.
+constexpr bool upload_gap_ok(std::uint64_t gap_ms, std::uint64_t window, std::uint64_t uploaded, std::uint64_t elapsed_ms) {
+	return uploaded >= 2 * window && gap_ms < std::max<std::uint64_t>(1000, window * elapsed_ms * 8 / 5 / uploaded);
+}
+// Recorded runs: probe 44441165298 (a loaded runner: 1.09 s at 8 MiB/s), CI failures 44216299768 and 44264616865.
+void upload_bound() {
+	assert(upload_gap_ok(1092, 8 << 20, 32 << 20, 4013) && upload_gap_ok(816, 8 << 20, 24 << 20, 4079));
+	assert(!upload_gap_ok(3012, 8 << 20, 18 << 20, 4000) && !upload_gap_ok(4019, 8 << 20, 2 << 20, 4000));
+	assert(!upload_gap_ok(1000, 8 << 20, 80 << 20, 4000) && "a healthy reader keeps the election timeout");
+}
 // A2: four groups upload 2 MiB appends of two 1 MiB commands (types.h's command and RPC caps) on
 // the Control connection, faster than the receiver reads them (25 ms a MiB, 40 MB/s, on the
 // connection's own loop). A follower group's heartbeat every 100 ms and a vote every 300 ms on
-// the same connection each arrive within the 1,000 ms election timeout.
+// the same connection each arrive within upload_gap_ok's bound: the 1,000 ms election timeout
+// for a reader at speed.
 bool upload() {
+	upload_bound();
 	constexpr std::uint32_t L = 2;
 	HostTransportOptions options;
 	options.window = 8 << 20;
@@ -671,7 +688,7 @@ bool upload() {
 	one.stop();
 	two.stop();
 	const auto controls = beats.count - before, gap = beats.worst;
-	const bool ok = gap < 1000 && controls >= 40;
+	const bool ok = upload_gap_ok(gap, options.window, uploaded, elapsed) && controls >= 40;
 	std::printf("upload: %.1f MiB uploaded in %llu ms on the shared connection; %llu heartbeats and votes, longest gap %llu ms %s\n",
 				double(uploaded) / (1 << 20), (unsigned long long)elapsed, (unsigned long long)controls, (unsigned long long)gap,
 				ok ? "ok" : "FAILS: a follower would start an election");

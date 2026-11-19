@@ -29,6 +29,7 @@
 //   consensus_transport_groups_test <fixture dir> case
 #include "consensus/driver.h"
 #include "consensus/transport/host_transport.h"
+#include "../support/ports.h"
 #include <completion/posix.h>
 #include <asio/executor_work_guard.hpp>
 #include <asio/io_context.hpp>
@@ -62,6 +63,7 @@
 
 using namespace kronuz::consensus::transport;
 using namespace kronuz::consensus;
+using namespace kronuz::consensus::testing;
 using namespace std::chrono_literals;
 using tcp = asio::ip::tcp;
 using steady = std::chrono::steady_clock;
@@ -1033,10 +1035,9 @@ struct Cluster {
 	Cluster(const std::string &name, std::vector<GroupId> ids)
 		: root(std::filesystem::current_path() / ("groups-" + name)), groups(std::move(ids)) {
 		std::filesystem::remove_all(root);
+		asio::io_context io;
 		for (NodeId n = 1; n <= 4; ++n) {
-			asio::io_context io;
-			tcp::acceptor probe(io, {asio::ip::address_v4::loopback(), 0});
-			ports[n] = probe.local_endpoint().port();
+			ports[n] = free_port(io, asio::ip::address_v4::loopback());
 			std::filesystem::create_directories(directory(n));
 			::chmod(directory(n).c_str(), 0700);
 		}
@@ -1418,9 +1419,10 @@ void refill() {
 	constexpr std::uint32_t L = 2;
 	HostTransportOptions options;
 	options.window = 64 * 1024;
+	asio::io_context io;
+	const auto port = free_port(io, asio::ip::address_v4::loopback());  // kept over two's restart
 	auto one = std::make_unique<Host>(1, L);
-	auto two = std::make_unique<Host>(2, L);
-	const auto port = two->port();
+	auto two = std::make_unique<Host>(2, L, port);
 	one->open(addresses({two.get()}), options);
 	two->open(addresses({one.get()}), options);
 	const GroupId g = groups_on(L, 1, 1)[0];

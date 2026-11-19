@@ -8,7 +8,9 @@
 // mid-fetch (docs/mechanisms/peer-fetch.md). Peers is also instantiated over a minimal host.
 #include "consensus/transport/peers.h"
 #include "consensus/transport/profile.h"
+#include "../support/ports.h"
 
+#include <algorithm>
 #include <array>
 #include <condition_variable>
 #include <csignal>
@@ -25,6 +27,7 @@
 
 using namespace kronuz::consensus;
 using namespace kronuz::consensus::transport;
+using namespace kronuz::consensus::testing;
 using namespace std::chrono_literals;
 using Clock = std::chrono::steady_clock;
 using Tcp = asio::ip::tcp;
@@ -221,14 +224,6 @@ struct Node {
 const asio::ip::address loopback = asio::ip::make_address("127.0.0.1");
 const std::array<std::string, 3> names{"one", "two", "three"};
 
-bool bindable(asio::io_context &io, Tcp::endpoint endpoint) {
-	asio::error_code error;
-	Tcp::acceptor probe(io);
-	probe.open(endpoint.protocol(), error);
-	if (!error)
-		probe.bind(endpoint, error);
-	return !error;
-}
 // The second loopback address: 127.0.0.2 where the system routes all of 127/8, else ::1.
 asio::ip::address alternate_loopback(asio::io_context &io) {
 	for (const char *candidate : {"127.0.0.2", "::1"})
@@ -236,10 +231,6 @@ asio::ip::address alternate_loopback(asio::io_context &io) {
 			return asio::ip::make_address(candidate);
 	std::fprintf(stderr, "no second loopback address\n");
 	std::abort();
-}
-std::uint16_t free_port(asio::io_context &io, asio::ip::address address) {
-	Tcp::acceptor acceptor(io, Tcp::endpoint(address, 0));
-	return acceptor.local_endpoint().port();
 }
 // A port free on both addresses, so a voter can move between them and keep its port.
 std::uint16_t shared_port(asio::io_context &io, asio::ip::address a, asio::ip::address b) {
@@ -286,6 +277,13 @@ struct Cluster {
 			options[i].resolve_deadline = 200ms;
 			options[i].stagger = 100ms;
 		}
+	}
+	// A scenario that throws unwinds here with its voters running: stopped, they drain and let
+	// io.run() return, instead of redialing forever.
+	~Cluster() {
+		for (unsigned i = 0; i != 3; ++i)
+			if (running[i])
+				peers[i]->stop();
 	}
 	void name_peers(const std::array<std::uint16_t, 3> &ports, const std::array<std::string, 3> &hosts = names) {
 		for (unsigned i = 0; i != 3; ++i) {
@@ -443,16 +441,26 @@ struct Cluster {
 };
 
 using Scenario = asio::awaitable<void> (*)(asio::io_context &, const Certificates &);
-void run(const char *name, const Certificates &certificates, Scenario scenario) {
+// Reports a scenario's exception, which unwound its Cluster, instead of rethrowing it.
+bool run(const char *name, const Certificates &certificates, Scenario scenario) {
 	asio::io_context io;
 	const auto start = Clock::now();
 	std::exception_ptr failure;
 	asio::co_spawn(io, scenario(io, certificates), [&](std::exception_ptr error) { failure = error; });
 	io.run();
-	if (failure)
-		std::rethrow_exception(failure);
+	if (failure) {
+		try {
+			std::rethrow_exception(failure);
+		} catch (const std::exception &error) {
+			std::fprintf(stderr, "%s: threw: %s\n", name, error.what());
+		} catch (...) {
+			std::fprintf(stderr, "%s: threw\n", name);
+		}
+		return false;
+	}
 	std::printf("%s: ok (%lld ms)\n", name, ms(Clock::now() - start));
 	std::fflush(stdout);
+	return true;
 }
 
 // Every voter resolves every name to `address` through its own FakeDns.
@@ -1321,6 +1329,51 @@ asio::awaitable<void> late_append(asio::io_context &io, const Certificates &cert
 	CHECK(committed);
 	CHECK(co_await cluster.stop_all(5s));
 }
+
+// A scenario's ports stay its own from pick to its last restart. A contender listens first on
+// each port the system could hand to its bind(0) or connect(), as a test beside this one did
+// (bind: Address already in use); none can be, so every voter binds, restarts and serves.
+asio::awaitable<void> taken_ports(asio::io_context &io, const Certificates &certificates) {
+	Cluster cluster(io, certificates);
+	const std::array<std::uint16_t, 3> ports{free_port(io, loopback), free_port(io, loopback),
+											 free_port(io, loopback)};
+	std::vector<Tcp::acceptor> contender;
+	for (auto port : ports)
+		if (ephemeral(port)) {
+			contender.emplace_back(io, Tcp::endpoint(loopback, port));
+			contender.back().listen();
+		}
+	cluster.name_peers(ports);
+	auto dns = answering(cluster, loopback);
+	for (unsigned i = 0; i != 3; ++i) {
+		cluster.options[i].listen = {loopback, ports[i]};
+		cluster.start(i);
+	}
+	CHECK(co_await cluster.commit("own ports", {0, 1, 2}, 5s));
+	for (auto port : ports)
+		CHECK(!ephemeral(port) && !claim(port)); // a picker beside this one skips it
+	cluster.restart(2);
+	CHECK(co_await cluster.fully_connected(3s));
+	CHECK(co_await cluster.stop_all(2s));
+	for (auto &resolver : dns)
+		resolver->quiesce();
+}
+
+// A scenario that throws with its voters connected ends its run with the failure (by name only;
+// ctest's consensus_transport_peers_throwing expects the report).
+asio::awaitable<void> throwing(asio::io_context &io, const Certificates &certificates) {
+	Cluster cluster(io, certificates);
+	const std::array<std::uint16_t, 3> ports{free_port(io, loopback), free_port(io, loopback),
+											 free_port(io, loopback)};
+	cluster.name_peers(ports);
+	auto dns = answering(cluster, loopback);
+	for (unsigned i = 0; i != 3; ++i) {
+		cluster.options[i].listen = {loopback, ports[i]};
+		cluster.start(i);
+	}
+	CHECK(co_await cluster.fully_connected(3s));
+	throw std::runtime_error("thrown with the voters running");
+}
 } // namespace
 
 static_assert(PeerHost<MinimalHost> && PeerHost<Node>);
@@ -1344,8 +1397,10 @@ int main(int argc, char **argv) {
 		{"lookup-spacing", lookup_spacing},   {"membership", membership},
 		{"fetch-exact", fetch_exact},         {"fetch-alongside-consensus", fetch_alongside_consensus},
 		{"fetch-failures", fetch_failures},   {"fetch-hung-peer", fetch_hung_peer},
-		{"late-append", late_append},
+		{"late-append", late_append},         {"taken-ports", taken_ports},
 	};
+	if (only == "throwing")
+		return run("throwing", certificates, throwing) ? EXIT_SUCCESS : EXIT_FAILURE;
 	// The macOS x86_64 CI VM stops the process mid-fetch; today's Peers miss that deadline.
 	// Detent's consensus-transport quest replaces Peers and carries the case; run it by name.
 #if defined(__APPLE__) && defined(__x86_64__)
@@ -1358,8 +1413,8 @@ int main(int argc, char **argv) {
 			std::printf("%s: skipped on macOS x86_64 CI (consensus-transport carries it)\n", name);
 			continue;
 		}
-		if (only.empty() || only == name)
-			run(name, certificates, scenario);
+		if ((only.empty() || only == name) && !run(name, certificates, scenario))
+			return EXIT_FAILURE;
 	}
 	std::printf("peers: ok\n");
 	return EXIT_SUCCESS;

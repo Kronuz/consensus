@@ -681,6 +681,10 @@ reader_run read_slowly_once(reader_load load) {
 	}
 	a.connect(listener.local_endpoint());
 	listener.accept(b);
+	// Set on the connected socket: macOS autotunes an accepted socket's buffer to 1 MiB unless it was
+	// set on that socket itself.
+	if (load.coarse)
+		::setsockopt(b.native_handle(), SOL_SOCKET, SO_RCVBUF, &reading, sizeof reading);
 	int sndbuf = 0, lowat = 0;
 	const auto buffer_of = [](int fd, int option) {
 		int n = 0;

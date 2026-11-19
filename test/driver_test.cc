@@ -534,6 +534,98 @@ void truncated_promotion() {
 	}
 }
 
+// D9 both ways on one joiner, node 4: a learner at 2, promoted to witness at 4 (replacing
+// witness 3), removed at 7. Leader 1, term 1, sends two entries per request, its data voters
+// matched through the commit index; Core delivers two entries per Committed range.
+namespace witness_case {
+const Membership founding{{{1, 1, MemberRole::Voter}, {2, 2, MemberRole::Voter}, {3, 3, MemberRole::Witness}}, 4, 0};
+const Membership learner{{{1, 1, MemberRole::Voter}, {2, 2, MemberRole::Voter}, {3, 3, MemberRole::Witness}, {4, 4, MemberRole::Learner}}, 5, 0};
+const Membership promoted{{{1, 1, MemberRole::Voter}, {2, 2, MemberRole::Voter}, {3, 3, MemberRole::Witness}, {4, 4, MemberRole::Witness}}, 5, 3};
+const Membership removed{{{1, 1, MemberRole::Voter}, {2, 2, MemberRole::Voter}, {3, 3, MemberRole::Witness}}, 5, 0};
+Entry configuration(Index index, const Membership& m) { return Entry{index, 1, EntryKind::Configuration, encode_membership(m)}; }
+Entry command(Index index) { return Entry{index, 1, EntryKind::Command, "c" + std::to_string(index)}; }
+GroupOptions group_options() { auto o = options({}, 4); o.limits.rpc_entries = 2; return o; }
+void append(Loop& loop, GroupId g, Token rpc, Index previous, Index commit, std::vector<Entry> entries) {
+	loop.driver->receive(g, Receive{1, AppendRequest{1, rpc, previous, previous ? 1u : 0u, commit, 0, std::move(entries), commit}});
+	loop.release();
+}
+// Ranges [1..2] (a learner's), [3..4] (ending at the promotion) and [5..6], all committed.
+void promote(Loop& loop, GroupId g) {
+	loop.current = g;
+	loop.driver->open(g, group_options());
+	std::exception_ptr error;
+	check(loop.settle(loop.driver->create(g, j::Identity{'W', 'R'}), error) && !error, "a joiner creates its group");
+	append(loop, g, 1, 0, 0, {Entry{1, 1, EntryKind::NoOp, {}}, configuration(2, learner)});
+	append(loop, g, 2, 2, 0, {command(3), configuration(4, promoted)});
+	append(loop, g, 3, 4, 0, {command(5), command(6)});
+	append(loop, g, 4, 6, 6, {});
+	loop.apply(g);
+}
+// The application received exactly `through` (1..through, contiguous) and the apply index is `applied`.
+void expect(Loop& loop, GroupId g, Index first, Index through, Index applied, const std::string& when) {
+	auto s = loop.driver->state(g);
+	std::string ranges;
+	Index next = first;
+	bool contiguous = true;
+	for (const auto& [id, c] : loop.sink.committed) {
+		if (id != g || c.entries.empty()) { continue; }
+		ranges += " [" + std::to_string(c.first) + ".." + std::to_string(c.entries.back().index) + "]";
+		contiguous = contiguous && c.first == next;
+		next = c.entries.back().index + 1;
+	}
+	const auto delivered = loop.sink.last_committed(g);
+	const auto seen = when + ": committed " + std::to_string(s ? s->committed : 0) + ", applied " + std::to_string(s ? s->applied : 0) + ", Sink" + ranges;
+	check(contiguous, seen + "; each range the Sink received starts after the last");
+	check(delivered == through, seen + "; the Sink received through " + std::to_string(through));
+	check(s && s->committed == applied && s->applied == applied, seen + "; the apply index reaches " + std::to_string(applied));
+}
+}  // namespace witness_case
+
+// A promotion counts from the range that ends at it: [3..4] is the witness's, [1..2] the
+// application's. Judging at a range's first index or at the commit index fails this.
+void witness_promotion() {
+	constexpr GroupId g = 81;
+	jt::Disk disk; Loop loop(disk);
+	witness_case::promote(loop, g);
+	witness_case::expect(loop, g, 1, 2, 6, "promoted at 4");
+}
+
+// The witness's removal at 7 is in force at the ends of [7..8] and [9..9]: both are the witness's
+// own, so the application, which holds nothing past 2, receives neither.
+void witness_removal() {
+	constexpr GroupId g = 82;
+	jt::Disk disk; Loop loop(disk);
+	witness_case::promote(loop, g);
+	witness_case::append(loop, g, 5, 6, 6, {witness_case::configuration(7, witness_case::removed), witness_case::command(8)});
+	witness_case::append(loop, g, 6, 8, 9, {witness_case::command(9)});
+	loop.apply(g);
+	auto s = loop.driver->state(g);
+	check(s && !find_member(s->membership, 4), "node 4 is removed at 7");
+	witness_case::expect(loop, g, 1, 2, 9, "removed at 7");
+}
+
+// After a restart from the witness's checkpoint at 6, its removal's range [7..7] is still its own.
+void witness_removal_restart() {
+	constexpr GroupId g = 83;
+	jt::Disk disk;
+	{
+		Loop loop(disk);
+		witness_case::promote(loop, g);
+		std::exception_ptr error; std::optional<CheckpointPublished> published;
+		check(loop.settle(loop.driver->checkpoint(g, 1 << 20, Capture{"witness", 0, 6, 1}), published, error) && !error && published && published->through == 6,
+			"the witness checkpoints at 6: " + what(error));
+	}
+	Loop loop(disk);
+	loop.current = g;
+	loop.driver->open(g, witness_case::group_options());
+	std::exception_ptr error;
+	check(loop.settle(loop.driver->recover(g, [](j::ArtifactReader&) {}), error) && !error, "recover: " + what(error));
+	loop.apply(g);
+	witness_case::append(loop, g, 7, 6, 7, {witness_case::configuration(7, witness_case::removed)});
+	loop.apply(g);
+	witness_case::expect(loop, g, 7, 0, 7, "removed at 7 after a restart at 6");
+}
+
 const std::map<std::string, void (*)()> cases{
 	{"lone_voter", &lone_voter},
 	{"rows", &rows},
@@ -543,6 +635,9 @@ const std::map<std::string, void (*)()> cases{
 	{"fence", &fence_and_shutdown},
 	{"sink_throws", &sink_throws},
 	{"truncated_promotion", &truncated_promotion},
+	{"witness_promotion", &witness_promotion},
+	{"witness_removal", &witness_removal},
+	{"witness_removal_restart", &witness_removal_restart},
 };
 
 }  // namespace

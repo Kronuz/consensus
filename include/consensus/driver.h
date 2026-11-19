@@ -374,6 +374,7 @@ private:
 		std::uint64_t dropped = 0;
 		unsigned io = 0;  // IO tasks and turn watches in flight
 		bool queued = false, opened = false, started = false, closing = false, retiring = false, closed = false, watching = false, fence_seen = false;
+		bool witnessed = false;  // acknowledged a range as a witness's own: acknowledges every later one
 	};
 
 	// A call's frame state: its waiter, its token's callback, and the hops between the caller's
@@ -538,14 +539,22 @@ private:
 		return false;
 	}
 
-	// Whether this node is a witness in the membership in force at `index` (D9). A committed
-	// range's own position decides, so an appended promotion a later term may truncate does not.
-	bool witness(const Group& g, Index index) const {
+	// This node's role in the membership in force at `index`; none when it is not a member.
+	std::optional<MemberRole> role_at(const Group& g, Index index) const {
 		const auto& w = *g.worker;
 		auto membership = w.membership_at(index);
-		if (!membership) { return false; }
-		auto self = find_member(*membership, w.configuration().local);
-		return self && self->role == MemberRole::Witness;
+		const auto* self = membership ? find_member(*membership, w.configuration().local) : nullptr;
+		return self ? std::optional<MemberRole>(self->role) : std::nullopt;
+	}
+	// Whether a Committed range is a witness's own (D9): this node is a witness at the range's last
+	// index (committed, so no term truncates it), or was one at the apply index and has left since.
+	// A witness incarnation never applies again, so every range after its first is its own too.
+	bool witness_range(Group& g, const Committed& range) {
+		if (g.witnessed) { return true; }
+		auto role = role_at(g, range.entries.back().index);
+		if (!role) { role = role_at(g, range.first - 1); }
+		g.witnessed = role == MemberRole::Witness;
+		return g.witnessed;
 	}
 
 	void link(Group& g, Waiter& w) noexcept {
@@ -828,7 +837,7 @@ private:
 					if (!g.fence_seen) { g.fence_seen = true; sink_(g.id, std::move(value)); }
 				} else if constexpr (std::is_same_v<T, Committed>) {
 					// A witness keeps the log but no application state: it acknowledges its own ranges.
-					if (witness(g, value.entries.back().index)) { g.applied = Applied{value.entries.back().index}; mark_ready(g); } else { sink_(g.id, std::move(value)); }
+					if (witness_range(g, value)) { g.applied = Applied{value.entries.back().index}; mark_ready(g); } else { sink_(g.id, std::move(value)); }
 				} else if constexpr (std::is_same_v<T, Send> || std::is_same_v<T, RoleChanged> ||
 					std::is_same_v<T, SnapshotNeeded> || std::is_same_v<T, SnapshotTransmit> || std::is_same_v<T, SnapshotReleased>) {
 					sink_(g.id, std::move(value));

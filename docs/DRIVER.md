@@ -53,8 +53,8 @@ struct Seams {
 // dispatch; a generic `template <class N> void operator()(GroupId, N&&)` satisfies it.
 //   Send               a message for a peer incarnation (the transport's)
 //   Committed          the next committed range for the application; Core holds it until applied().
-//                      Never for a range whose last index is in a membership that makes this node
-//                      a witness: it keeps the log, no application state, so the Driver
+//                      Never for a witness's range (from its promotion's range on, its removal's
+//                      included): it keeps the log, no application state, so the Driver
 //                      acknowledges that range itself
 //   RoleChanged        role, term and leader changes
 //   ActivateInstall    an installed image to activate; answer with activated() or activation_failed()
@@ -183,12 +183,22 @@ the end of the range the Sink delivered last; Core fences any other (`invalid ap
 completion`). Otherwise the apply index moves only to the boundary of a checkpoint the application
 restored (`recover`), an image it activated (`ActivateInstall`) or a `repair` it asked for.
 
-The one exception is a witness's range. The Driver acknowledges a Committed range itself when this
-node is a witness in the membership in force at the range's last index, a committed Configuration
-entry that no later term can truncate. A promotion to witness that is appended but not committed at
-the range's end does not count, so the range goes to the Sink. From its first acknowledged range
-on, a witness's apply index follows its commit index while its application holds no more entries,
-and the incarnation never becomes a data member again ("A witness stays a witness").
+The one exception is a witness's range, which the Driver acknowledges itself instead of handing it
+to the Sink. The witness transitions, both ways:
+
+1. Learner to witness. A range is the witness's from the first one whose last index is in a
+   membership that makes this node a witness, a committed Configuration entry that no later term
+   can truncate. A range ending below the promotion goes to the Sink, and so does one ending while
+   the promotion is appended but not committed, which a later term may truncate.
+2. Witness to no member. The incarnation never becomes a data member again ("A witness stays a
+   witness"), so every range after its first is its own too: its removal's and any past it. A
+   range whose last index is past the removal is also the witness's when this node was a witness
+   at the index before it (the apply index), as after a restart from the witness's checkpoint.
+
+From its first acknowledged range on, a witness's apply index follows its commit index, and its
+application receives no further range. A restart from a checkpoint taken after the removal finds
+this node a witness at neither index, so its later ranges go to the Sink, which restored that
+checkpoint and continues from its boundary.
 
 ## The blocking entry
 

@@ -39,6 +39,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -62,6 +63,7 @@ struct superseded : std::runtime_error { superseded() : std::runtime_error("anot
 struct compacted : std::runtime_error { compacted() : std::runtime_error("the placement is below the retained log") {} };
 struct transfer_failed : std::runtime_error { transfer_failed() : std::runtime_error("leadership transfer failed") {} };
 struct needs_peer : std::runtime_error { needs_peer() : std::runtime_error("the call needs another voting member") {} };
+struct close_in_doubt : std::runtime_error { close_in_doubt() : std::runtime_error("the group's close failed: it reopens once the host restarts") {} };
 using stalled = kronuz::journal::stalled;
 
 struct GroupOptions {
@@ -414,6 +416,7 @@ private:
 			if (!g || g->closing) { return fail(std::make_exception_ptr(closed{})); }
 			if (g->worker->fenced()) { return fail(std::make_exception_ptr(fenced(driver.fence_reason(*g)))); }
 			if (needs_peer_check && driver.holder_ == Holder::entry && driver.has_peer(*g)) { return fail(std::make_exception_ptr(needs_peer{})); }
+			if (waiter.kind == Kind::open && driver.in_doubt_.contains(id)) { return fail(std::make_exception_ptr(close_in_doubt{})); }
 			if (waiter.kind != Kind::open && waiter.kind != Kind::committed) { waiter.request = driver.next_request(); }
 			link(*g);
 			return true;
@@ -929,6 +932,9 @@ private:
 		if (!g.retiring) { g.retiring = true; w.close(); }
 		if (!w.drained() || g.io || g.watching) { return; }
 		disarm(g);
+		// A failed close may have left the table holding the group closed: a live reopen would
+		// append past a base a restart restores, so only a restart resolves it, from the disk.
+		if (w.close_failed()) { in_doubt_.insert(g.id); }
 		g.worker.reset(); g.closed = true;
 		for (auto* x = g.head; x;) { auto* next = x->next; complete(g, *x); x = next; }
 	}
@@ -994,6 +1000,7 @@ private:
 	Sink& sink_;
 	std::mt19937_64 random_;
 	std::unordered_map<GroupId, std::unique_ptr<Group>> groups_;
+	std::unordered_set<GroupId> in_doubt_;  // ids whose close failed: create and recover refuse them
 	Group *ready_head_ = nullptr, *ready_tail_ = nullptr;
 	Waiter* sleeper_ = nullptr;
 	task::cancel_source shutdown_;

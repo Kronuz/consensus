@@ -820,6 +820,82 @@ void close_crash() {
 	check(crash_tables && crash_releases, "the sweep closes rows both ways");
 }
 
+// A MemoryIO whose directory sync fails once, the n-th after `fail_sync` is armed.
+class FlakyIO final : public j::IO {
+public:
+	explicit FlakyIO(jt::Disk& disk) : backend(disk, "host/") {}
+	jt::MemoryIO backend;
+	int fail_sync = 0, failed_syncs = 0;
+	std::unique_ptr<j::OwnerLock> acquire_owner(bool create) override { return backend.acquire_owner(create); }
+	std::unique_ptr<j::File> open_existing(std::string_view n) override { return backend.open_existing(n); }
+	std::unique_ptr<j::File> open_existing_read_only(std::string_view n) override { return backend.open_existing_read_only(n); }
+	std::unique_ptr<j::File> open_reclaim_candidate_read_only(std::string_view n) override { return backend.open_reclaim_candidate_read_only(n); }
+	void open_existing_read_only_into(std::string_view n, j::File& d) override { backend.open_existing_read_only_into(n, d); }
+	bool open_reclaim_candidate_read_only_into(std::string_view n, j::File& d) override { return backend.open_reclaim_candidate_read_only_into(n, d); }
+	std::unique_ptr<j::File> create_exclusive(std::string_view n) override { return backend.create_exclusive(n); }
+	void replace(std::string_view s, std::string_view d) override { backend.replace(s, d); }
+	void remove(std::string_view n) override { backend.remove(n); }
+	std::unique_ptr<j::DirectoryCursor> scan_directory() override { return backend.scan_directory(); }
+	std::optional<j::EntryFootprint> entry_footprint(std::string_view n) override { return backend.entry_footprint(n); }
+	void sync_directory() override {
+		if (fail_sync && --fail_sync == 0) { ++failed_syncs; throw std::runtime_error("injected directory sync failure"); }
+		backend.sync_directory();
+	}
+protected:
+	std::unique_ptr<j::OwnerLock> lock_owner(const j::OwnerLockOptions&) override { return std::make_unique<j::OwnerLock>(); }
+};
+
+// F2: a close whose table commit fails after the shard file was replaced (its directory sync
+// throws) fences the Store, which releases the group. The table may hold the group closed, so
+// recover and create refuse the id in this live Host with close_in_doubt. After a later
+// directory sync and a power cut, the restarted host resolves it from the disk: closed, and
+// it recovers every acknowledged record. Without the refusal, a record acknowledged after the
+// failed close is lost.
+void failed_close() {
+	constexpr GroupId g = 71;
+	jt::Disk disk; disk.random.seed(1);
+	std::vector<std::string> acknowledged, attempted;
+	{
+		auto io = std::make_shared<FlakyIO>(disk);
+		Loop loop(disk, false, io);
+		std::exception_ptr error;
+		loop.lone(g);
+		attempted.push_back("a");
+		if (loop.propose(g, "a")) { acknowledged.push_back("a"); }
+		loop.apply(g);
+		auto published = loop.start(checkpoint_of(loop, g, acknowledged));
+		loop.release();
+		check(published->done && !published->error, "the checkpoint publishes: " + what(published->error));
+		io->fail_sync = 1;
+		check(loop.close(g, error) && !error, "close completes when its table commit fails: " + what(error));
+		check(io->failed_syncs == 1, "the table commit's directory sync failed");
+		check(loop.driver->groups() == 0, "the row is erased");
+		check(loop.host->driver(0).parked(g), "the fenced Store released the group: parked");
+		loop.recover(g, error, options({1}));
+		check(is<close_in_doubt>(error), "a live recover of the id refuses with close_in_doubt: " + what(error));
+		if (!error) {  // the reopen the refusal stops: a record acknowledged past the closed base
+			loop.apply(g);
+			attempted.push_back("x");
+			if (loop.propose(g, "x")) { acknowledged.push_back("x"); }
+			loop.apply(g);
+		} else {
+			check(loop.settle(loop.driver->create(g, j::Identity{'F', 'C'}), error) && is<close_in_doubt>(error), "a live create of the id refuses with close_in_doubt: " + what(error));
+			check(loop.close(g, error) && !error && loop.driver->groups() == 0, "the refused row closes: " + what(error));
+		}
+		io->backend.sync_directory();  // any later directory sync: another group's create, a segment
+		loop.release();
+	}
+	disk.power_loss();
+	Loop again(disk);
+	check(again.host->status(g) == j::GroupStatus::closed, "the restarted host holds the group closed, as its file does");
+	std::exception_ptr error;
+	const auto image = again.recover(g, error, options({1}));
+	check(!error, "the restarted host recovers the id: " + what(error));
+	again.apply(g);
+	const auto state = recovered(again, g, image);
+	check(prefix(acknowledged, state) && prefix(state, attempted), "it recovers every acknowledged record and nothing unattempted: acknowledged " + join(acknowledged) + ", recovered " + join(state));
+}
+
 // A5: a checkpoint whose peak exceeds the replacement pool fails at once with
 // checkpoint_exceeds_pool, and the calls behind it go on; one at exactly the peak publishes.
 void pool_bound() {
@@ -863,6 +939,7 @@ const std::map<std::string, void (*)()> cases{
 	{"closed_bytes", &closed_bytes},
 	{"close_crash", &close_crash},
 	{"pool_bound", &pool_bound},
+	{"failed_close", &failed_close},
 };
 
 }  // namespace

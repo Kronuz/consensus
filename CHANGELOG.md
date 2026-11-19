@@ -12,6 +12,7 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 
 - The journal pin moves to journal:be8222c, past journal-reopen-closed (journal:4d364f1), and completion to completion:d8b538c, journal's own. Durable syncs go through `IO::sync_files` and `IO::sync_data_files`.
 - A closing Worker hands its shared group back to the host once drained: closed into the host's table when its last record is a checkpoint covering every batch (`Host::close_group`, `TurnDriver::forget`), otherwise released when its Store ends. The Driver settles the host after erasing a row, so a released group is parked at once. A closed id recovers in the same live host, and 10,000 covered rows closed leave the process heap where it was (`driver_close_test closed_bytes`).
+- A close whose table commit fails fences the row and releases it; `create` and `recover` of that id then complete with `close_in_doubt` until the host restarts, since the table may hold the group closed and a record appended live would be lost at the next restart (`driver_close_test failed_close`).
 
 ### Fixed
 

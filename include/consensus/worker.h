@@ -184,6 +184,8 @@ public:
 	// once drained, the Worker closes its shared Store (close_store).
 	void close() noexcept { closing_ = true; }
 	bool closing() const noexcept { return closing_; }
+	// Its Store's close failed: the host's table may hold the group closed or open (close_store).
+	bool close_failed() const noexcept { return close_failed_; }
 	bool drained() const noexcept {
 		return closing_ && !io_job_ && !maintenance_io_ && !persist_ && output_.empty() &&
 			!checkpoint_ && !source_ && (!core_ || core_->retirement_drained());
@@ -646,14 +648,15 @@ private:
 	// covering every batch, the Store closes into the host's table and the host keeps nothing
 	// of it; otherwise (fenced, or batches after the checkpoint) the group is released when the
 	// Store ends, its records durable in the log (journal's docs/mechanisms/group-lifetime.md).
-	// A close that fails fences the Store, which then releases the group as a fenced one does.
+	// A close that fails fences the Store, which then releases the group as a fenced one does;
+	// the table may still hold it closed, so the Driver refuses to reopen it (close_in_doubt).
 	void close_store() {
 		if (store_closed_ || !store_.shared() || fenced() || !store_.accounting()) { return; }
 		const auto frontier = store_.frontier();
 		if (frontier.sequence != frontier.base_sequence) { return; }
 		try { store_.close(); store_closed_ = true; }
-		catch (const std::exception& error) { failed_ = true; store_.fence_storage(); terminal_ = Fenced{error.what()}; }
-		catch (...) { failed_ = true; store_.fence_storage(); terminal_ = Fenced{"closing the store failed"}; }
+		catch (const std::exception& error) { close_failed_ = failed_ = true; store_.fence_storage(); terminal_ = Fenced{error.what()}; }
+		catch (...) { close_failed_ = failed_ = true; store_.fence_storage(); terminal_ = Fenced{"closing the store failed"}; }
 	}
 	// The least peak journal's checkpoint_plan gives a checkpoint of this cap: two artifacts,
 	// the bundle at its bound and the application at its cap (a shared group's exact peak; an
@@ -1198,7 +1201,7 @@ private:
 	std::unique_ptr<Source> source_;
 	Token next_source_ = 0, next_source_chunk_ = 0;
 	std::size_t source_next_ = 0; unsigned maintenance_next_ = 1;
-	bool failed_ = false, capture_funding_pressure_ = false, cutover_debt_ = false, timer_due_ = true, timer_blocked_ = false, closing_ = false, store_closed_ = false;
+	bool failed_ = false, capture_funding_pressure_ = false, cutover_debt_ = false, timer_due_ = true, timer_blocked_ = false, closing_ = false, store_closed_ = false, close_failed_ = false;
 };
 
 } // namespace kronuz::consensus

@@ -191,6 +191,11 @@ public:
 	// and the newest committed one (Track C, D1).
 	const Membership& membership() const noexcept { return configs_.empty() ? base_membership_ : configs_.rbegin()->second; }
 	const Membership& committed_membership() const noexcept { return membership_at(durable_.commit_index); }
+	// The membership in force at `index`: the newest Configuration entry at or below it.
+	const Membership& membership_at(Index index) const {
+		auto it = configs_.upper_bound(index);
+		return it == configs_.begin() ? base_membership_ : std::prev(it)->second;
+	}
 	// Whether a ChangeMembership would pass D3's preconditions now: a leader, not busy or
 	// transferring and not a witness, that committed an entry of its term, with no
 	// configuration above its commit index.
@@ -311,10 +316,6 @@ private:
 	struct PendingRead { RequestId request; Token probe; Term term; Index index; std::set<NodeId> acknowledgements; };
 	struct Transfer { NodeId target; Token token; std::uint64_t until; bool sent = false; };
 	static constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
-	const Membership& membership_at(Index index) const {
-		auto it = configs_.upper_bound(index);
-		return it == configs_.begin() ? base_membership_ : std::prev(it)->second;
-	}
 	bool is_voter(NodeId incarnation) const { return votes_in(membership(), incarnation); }
 	std::vector<NodeId> voters() const {
 		std::vector<NodeId> out;

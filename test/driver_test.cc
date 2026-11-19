@@ -496,6 +496,44 @@ void sink_throws() {
 	check(loop.settle(loop.driver->propose(g, "after"), placed, error) && is<fenced>(error), "a later call completes with fenced: " + what(error));
 }
 
+// D9: a learner promoted to witness is a data member until the promotion is in force at a
+// range's position. A Committed range below an appended promotion goes to the Sink, so a later
+// term that truncates the promotion leaves the apply index at what the application received.
+void truncated_promotion() {
+	constexpr GroupId g = 71;
+	jt::Disk disk; Loop loop(disk);
+	loop.current = g;
+	loop.driver->open(g, options({}, 4));
+	std::exception_ptr error;
+	check(loop.settle(loop.driver->create(g, j::Identity{'J', 'L'}), error) && !error, "a joiner creates its group");
+	const Membership founding{{{1, 1, MemberRole::Voter}, {2, 2, MemberRole::Voter}, {3, 3, MemberRole::Witness}}, 4, 0};
+	Membership learner = founding; learner.members.push_back({4, 4, MemberRole::Learner}); learner.next_incarnation = 5;
+	Membership promoted = learner; promoted.members.back().role = MemberRole::Witness; promoted.leaving = 3;
+	auto configuration = [](Index index, const Membership& m) { return Entry{index, 1, EntryKind::Configuration, encode_membership(m)}; };
+	// Leader 1, term 1: the learner's own entry, a command, and the promotion; commit below it.
+	loop.driver->receive(g, Receive{1, AppendRequest{1, 101, 0, 0, 3, 0, {Entry{1, 1, EntryKind::NoOp, {}}, configuration(2, learner), Entry{3, 1, EntryKind::Command, "a"}, configuration(4, promoted)}}});
+	loop.release();
+	auto s = loop.driver->state(g);
+	check(s && s->committed == 3, "the learner committed through 3 with the promotion appended at 4");
+	check(s && s->applied <= loop.sink.last_committed(g), "the apply index stays within what the Sink received, below an appended promotion: applied " +
+		std::to_string(s ? s->applied : 0) + ", delivered " + std::to_string(loop.sink.last_committed(g)));
+	loop.apply(g);
+	// Leader 2, term 2, never saw the promotion: its no-op at 4 truncates it.
+	loop.driver->receive(g, Receive{2, AppendRequest{2, 102, 3, 1, 4, 0, {Entry{4, 2, EntryKind::NoOp, {}}}}});
+	loop.release();
+	loop.apply(g);
+	s = loop.driver->state(g);
+	const auto* self = s ? find_member(s->membership, 4) : nullptr;
+	check(self && self->role == MemberRole::Learner, "the truncated promotion leaves node 4 a learner");
+	check(s && s->applied == 4 && loop.sink.last_committed(g) == 4, "the learner's application received every index through its apply index");
+	Index next = 1;
+	for (const auto& [id, c] : loop.sink.committed) {
+		if (id != g) { continue; }
+		check(c.first == next, "each Committed range starts after the last one the application received");
+		next = c.entries.empty() ? next : c.entries.back().index + 1;
+	}
+}
+
 const std::map<std::string, void (*)()> cases{
 	{"lone_voter", &lone_voter},
 	{"rows", &rows},
@@ -504,6 +542,7 @@ const std::map<std::string, void (*)()> cases{
 	{"close", &close_rows},
 	{"fence", &fence_and_shutdown},
 	{"sink_throws", &sink_throws},
+	{"truncated_promotion", &truncated_promotion},
 };
 
 }  // namespace

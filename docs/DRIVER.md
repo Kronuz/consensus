@@ -53,8 +53,9 @@ struct Seams {
 // dispatch; a generic `template <class N> void operator()(GroupId, N&&)` satisfies it.
 //   Send               a message for a peer incarnation (the transport's)
 //   Committed          the next committed range for the application; Core holds it until applied().
-//                      Never for a witness member: it keeps the log, no application state, so the
-//                      Driver acknowledges its ranges itself
+//                      Never for a range whose last index is in a membership that makes this node
+//                      a witness: it keeps the log, no application state, so the Driver
+//                      acknowledges that range itself
 //   RoleChanged        role, term and leader changes
 //   ActivateInstall    an installed image to activate; answer with activated() or activation_failed()
 //   CheckpointPublished, RepairCompleted   only when no caller awaits it (the caller was cancelled)
@@ -176,6 +177,18 @@ after `create` or `recover` succeeds at once.
 **The Sink** runs inside a step and applies nothing inline: it hands a `Committed` range to the
 application, which calls `applied` later. Core holds one range until then, and `close` does not
 wait for it.
+
+**The apply index never passes what the application was delivered.** `applied(through)` must name
+the end of the range the Sink delivered last; Core fences any other (`invalid application
+completion`). Otherwise the apply index moves only to the boundary of a checkpoint the application
+restored (`recover`), an image it activated (`ActivateInstall`) or a `repair` it asked for.
+
+The one exception is a witness's range. The Driver acknowledges a Committed range itself when this
+node is a witness in the membership in force at the range's last index, a committed Configuration
+entry that no later term can truncate. A promotion to witness that is appended but not committed at
+the range's end does not count, so the range goes to the Sink. From its first acknowledged range
+on, a witness's apply index follows its commit index while its application holds no more entries,
+and the incarnation never becomes a data member again ("A witness stays a witness").
 
 ## The blocking entry
 

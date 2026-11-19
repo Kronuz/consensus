@@ -187,6 +187,7 @@ public:
 	bool busy() const noexcept { return core_ && core_->busy(); }
 	Term term() const noexcept { return core_ ? core_->term() : 0; }
 	std::optional<Membership> membership() const { return core_ ? std::optional<Membership>(core_->membership()) : std::nullopt; }
+	std::optional<Membership> membership_at(Index index) const { return core_ ? std::optional<Membership>(core_->membership_at(index)) : std::nullopt; }
 	Index committed() const noexcept { return core_ ? core_->committed() : 0; }
 	Index applied_index() const noexcept { return core_ ? core_->applied() : 0; }
 	std::size_t retained_log_bytes() const noexcept { return core_ ? core_->retained_log_bytes() : 0; }

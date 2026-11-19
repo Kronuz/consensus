@@ -538,9 +538,11 @@ private:
 		return false;
 	}
 
-	bool witness(const Group& g) const {
+	// Whether this node is a witness in the membership in force at `index` (D9). A committed
+	// range's own position decides, so an appended promotion a later term may truncate does not.
+	bool witness(const Group& g, Index index) const {
 		const auto& w = *g.worker;
-		auto membership = w.membership();
+		auto membership = w.membership_at(index);
 		if (!membership) { return false; }
 		auto self = find_member(*membership, w.configuration().local);
 		return self && self->role == MemberRole::Witness;
@@ -826,7 +828,7 @@ private:
 					if (!g.fence_seen) { g.fence_seen = true; sink_(g.id, std::move(value)); }
 				} else if constexpr (std::is_same_v<T, Committed>) {
 					// A witness keeps the log but no application state: it acknowledges its own ranges.
-					if (witness(g)) { g.applied = Applied{value.entries.back().index}; mark_ready(g); } else { sink_(g.id, std::move(value)); }
+					if (witness(g, value.entries.back().index)) { g.applied = Applied{value.entries.back().index}; mark_ready(g); } else { sink_(g.id, std::move(value)); }
 				} else if constexpr (std::is_same_v<T, Send> || std::is_same_v<T, RoleChanged> ||
 					std::is_same_v<T, SnapshotNeeded> || std::is_same_v<T, SnapshotTransmit> || std::is_same_v<T, SnapshotReleased>) {
 					sink_(g.id, std::move(value));

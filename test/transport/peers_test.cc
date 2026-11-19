@@ -9,19 +9,26 @@
 #include "consensus/transport/peers.h"
 #include "consensus/transport/profile.h"
 
+#include <algorithm>
 #include <array>
 #include <condition_variable>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <journal/journal.h>
 #include <journal/memory_io.h>
 #include <openssl/pem.h>
 #include <openssl/x509v3.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
+#if defined(__APPLE__) || defined(__FreeBSD__)
+#include <sys/sysctl.h>
+#endif
 
 using namespace kronuz::consensus;
 using namespace kronuz::consensus::transport;
@@ -237,9 +244,64 @@ asio::ip::address alternate_loopback(asio::io_context &io) {
 	std::fprintf(stderr, "no second loopback address\n");
 	std::abort();
 }
+// The ports bind(0) and connect() hand out, as the system configures them.
+std::pair<unsigned, unsigned> ephemeral_range() {
+#if defined(__linux__)
+	unsigned first = 0, last = 0;
+	std::ifstream range("/proc/sys/net/ipv4/ip_local_port_range");
+	if (range >> first >> last)
+		return {first, last};
+	return {32768, 60999};
+#elif defined(__APPLE__) || defined(__FreeBSD__)
+	int first = 0, last = 0;
+	std::size_t size = sizeof first;
+	if (::sysctlbyname("net.inet.ip.portrange.first", &first, &size, nullptr, 0) == 0 &&
+		::sysctlbyname("net.inet.ip.portrange.last", &last, &size, nullptr, 0) == 0)
+		return {static_cast<unsigned>(first), static_cast<unsigned>(last)};
+	return {49152, 65535};
+#else
+	return {49152, 65535};
+#endif
+}
+bool ephemeral(std::uint16_t port) {
+	static const auto range = ephemeral_range();
+	return port >= range.first && port <= range.second;
+}
+// Claims `port` among this test's processes: a UDP socket bound to it for the rest of the
+// process, without SO_REUSEADDR, so a picker beside this one fails to claim it too.
+bool claim(std::uint16_t port) {
+	const int fd = ::socket(AF_INET6, SOCK_DGRAM, 0);
+	CHECK(fd >= 0);
+	const int dual = 0;
+	::setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &dual, sizeof dual);
+	sockaddr_in6 at{};
+	at.sin6_family = AF_INET6;
+	at.sin6_port = htons(port);
+	at.sin6_addr = in6addr_any;
+	if (::bind(fd, reinterpret_cast<const sockaddr *>(&at), sizeof at) == 0)
+		return true;
+	::close(fd);
+	return false;
+}
+// A port this process alone binds on `address` for its whole run, stops and restarts
+// included: outside the ephemeral range, so no bind(0) or connect() (a self-connect
+// included) is handed it, and claimed, so a peers test beside this one skips it.
 std::uint16_t free_port(asio::io_context &io, asio::ip::address address) {
-	Tcp::acceptor acceptor(io, Tcp::endpoint(address, 0));
-	return acceptor.local_endpoint().port();
+	static const auto [low, high] = [] {
+		const auto [first, last] = ephemeral_range();
+		if (first >= 2048)
+			return std::pair<unsigned, unsigned>{std::max(1024u, first - 16384), first};
+		CHECK(last <= 65535 - 1024);
+		return std::pair<unsigned, unsigned>{last + 1, 65536};
+	}();
+	static unsigned next = static_cast<unsigned>(::getpid()) * 7919u;
+	for (unsigned tried = 0; tried != high - low; ++tried) {
+		const auto port = static_cast<std::uint16_t>(low + next++ % (high - low));
+		if (claim(port) && bindable(io, {address, port}))
+			return port;
+	}
+	std::fprintf(stderr, "no free port in [%u, %u)\n", low, high);
+	std::abort();
 }
 // A port free on both addresses, so a voter can move between them and keep its port.
 std::uint16_t shared_port(asio::io_context &io, asio::ip::address a, asio::ip::address b) {
@@ -1339,6 +1401,35 @@ asio::awaitable<void> late_append(asio::io_context &io, const Certificates &cert
 	CHECK(co_await cluster.stop_all(5s));
 }
 
+// A scenario's ports stay its own from pick to its last restart. A contender listens first on
+// each port the system could hand to its bind(0) or connect(), as a test beside this one did
+// (bind: Address already in use); none can be, so every voter binds, restarts and serves.
+asio::awaitable<void> taken_ports(asio::io_context &io, const Certificates &certificates) {
+	Cluster cluster(io, certificates);
+	const std::array<std::uint16_t, 3> ports{free_port(io, loopback), free_port(io, loopback),
+											 free_port(io, loopback)};
+	std::vector<Tcp::acceptor> contender;
+	for (auto port : ports)
+		if (ephemeral(port)) {
+			contender.emplace_back(io, Tcp::endpoint(loopback, port));
+			contender.back().listen();
+		}
+	cluster.name_peers(ports);
+	auto dns = answering(cluster, loopback);
+	for (unsigned i = 0; i != 3; ++i) {
+		cluster.options[i].listen = {loopback, ports[i]};
+		cluster.start(i);
+	}
+	CHECK(co_await cluster.commit("own ports", {0, 1, 2}, 5s));
+	for (auto port : ports)
+		CHECK(!ephemeral(port) && !claim(port)); // a picker beside this one skips it
+	cluster.restart(2);
+	CHECK(co_await cluster.fully_connected(3s));
+	CHECK(co_await cluster.stop_all(2s));
+	for (auto &resolver : dns)
+		resolver->quiesce();
+}
+
 // A scenario that throws with its voters connected ends its run with the failure (by name only;
 // ctest's consensus_transport_peers_throwing expects the report).
 asio::awaitable<void> throwing(asio::io_context &io, const Certificates &certificates) {
@@ -1377,7 +1468,7 @@ int main(int argc, char **argv) {
 		{"lookup-spacing", lookup_spacing},   {"membership", membership},
 		{"fetch-exact", fetch_exact},         {"fetch-alongside-consensus", fetch_alongside_consensus},
 		{"fetch-failures", fetch_failures},   {"fetch-hung-peer", fetch_hung_peer},
-		{"late-append", late_append},
+		{"late-append", late_append},         {"taken-ports", taken_ports},
 	};
 	if (only == "throwing")
 		return run("throwing", certificates, throwing) ? EXIT_SUCCESS : EXIT_FAILURE;

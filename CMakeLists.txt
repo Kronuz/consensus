@@ -192,6 +192,9 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	add_test(NAME consensus_transport_peers_throwing COMMAND consensus_transport_peers_test throwing)
 	set_tests_properties(consensus_transport_peers_throwing PROPERTIES TIMEOUT 20
 		PASS_REGULAR_EXPRESSION "throwing: threw: thrown with the voters running")
+	# A contender on every port the system could hand out; the voters' own ports stay free.
+	add_test(NAME consensus_transport_peers_taken_ports COMMAND consensus_transport_peers_test taken-ports)
+	set_tests_properties(consensus_transport_peers_taken_ports PROPERTIES TIMEOUT 20)
 	add_test(NAME consensus_transport_tls COMMAND consensus_transport_tls_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture)
 	add_test(NAME consensus_transport_pipe COMMAND consensus_transport_tls_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture --pipes)
 	add_test(NAME consensus_transport_authentication COMMAND consensus_transport_authentication_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture)

@@ -37,8 +37,10 @@
 #include <cassert>
 #include <condition_variable>
 #include <csignal>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <future>
 #include <mutex>
@@ -59,6 +61,8 @@
 #include <dlfcn.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <sys/mbuf.h>
+#include <sys/sysctl.h>
 #endif
 
 using namespace kronuz::consensus::transport;
@@ -728,6 +732,55 @@ class LoopProbe {
 	}
 	std::vector<Probed> loops_;
 };
+// The kernel's network memory and pages each sample, counters as deltas (macOS): mbuf
+// allocations that waited or drained the protocols, the 16 KB clusters active of those created
+// and their failed allocations, free pages, threads waiting for one, page-ins, swap-ins and
+// decompressions. A write that sleeps in the kernel waits for one of these.
+class KernelProbe {
+  public:
+	KernelProbe() { (void)sample(); }
+	std::string sample() {
+		std::string r;
+#ifdef __APPLE__
+		mbstat m{};
+		std::size_t n = sizeof m;
+		if (::sysctlbyname("kern.ipc.mbstat", &m, &n, nullptr, 0) != 0)
+			return r;
+		alignas(mb_stat_t) unsigned char buffer[4096];
+		n = sizeof buffer;
+		const mb_class_stat_t *jumbo = nullptr;
+		if (::sysctlbyname("kern.ipc.mb_stat", buffer, &n, nullptr, 0) == 0) {
+			const auto *s = reinterpret_cast<const mb_stat_t *>(buffer);
+			for (std::uint32_t i = 0; i != s->mbs_cnt && offsetof(mb_stat_t, mbs_class) + (i + 1) * sizeof(mb_class_stat_t) <= n; ++i)
+				if (std::strcmp(s->mbs_class[i].mbcl_cname, "16kcl") == 0)
+					jumbo = &s->mbs_class[i];
+		}
+		unsigned wanted = 0;
+		n = sizeof wanted;
+		(void)::sysctlbyname("vm.page_free_wanted", &wanted, &n, nullptr, 0);
+		vm_statistics64_data_t vm{};
+		mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+		(void)host_statistics64(mach_host_self(), HOST_VM_INFO64, host_info64_t(&vm), &count);
+		const Counters now{m.m_wait, m.m_drain, jumbo ? jumbo->mbcl_fail_cnt : 0, vm.pageins, vm.swapins, vm.decompressions};
+		char line[256];
+		std::snprintf(line, sizeof line,
+					  " {kern wait +%llu drain +%llu 16kcl %u/%u fail +%llu; vm free %llu MiB wanted %u pageins +%llu swapins +%llu decomp +%llu}",
+					  delta(now.wait, last_.wait), delta(now.drain, last_.drain), jumbo ? jumbo->mbcl_active : 0, jumbo ? jumbo->mbcl_total : 0,
+					  delta(now.fail, last_.fail), (unsigned long long)vm.free_count * vm_page_size >> 20, wanted, delta(now.pageins, last_.pageins),
+					  delta(now.swapins, last_.swapins), delta(now.decompressions, last_.decompressions));
+		r = line;
+		last_ = now;
+#endif
+		return r;
+	}
+
+  private:
+	struct Counters {
+		std::uint64_t wait = 0, drain = 0, fail = 0, pageins = 0, swapins = 0, decompressions = 0;
+	};
+	static unsigned long long delta(std::uint64_t now, std::uint64_t then) { return now - std::min(now, then); }
+	Counters last_;
+};
 // A control frame waits behind at most `window` bytes of the reader's data, so its gap is that
 // window over the reader's delivery rate across the run: up to 1.6 times it (the highest of 216
 // probe runs is 1.44, so 11% headroom), never under the 1,000 ms election timeout. On
@@ -791,6 +844,7 @@ bool upload() {
 	const auto start = steady::now();
 	std::vector<std::string> samples;  // every 250 ms: progress, links, host 1's frames, host 2's reads, the sockets, the loops
 	LoopProbe loops{&one, &two};
+	KernelProbe kernel;
 	std::atomic<bool> sampling{true};
 	std::thread sampler([&] {
 		while (sampling) {
@@ -801,7 +855,7 @@ bool upload() {
 						  (unsigned long long)total(one, &HostTransportStats::links), (unsigned long long)total(two, &HostTransportStats::links),
 						  (unsigned long long)total(one, &HostTransportStats::sent), (unsigned long long)total(one, &HostTransportStats::dropped),
 						  (unsigned long long)total(two, &HostTransportStats::reads));
-			samples.push_back(line + sockets({one.port(), two.port()}) + loops.sample());
+			samples.push_back(line + sockets({one.port(), two.port()}) + loops.sample() + kernel.sample());
 		}
 	});
 	for (std::int64_t tick = 0; ms_since(start) < 4000; ++tick) {  // signed: see reader()

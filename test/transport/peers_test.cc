@@ -11,6 +11,7 @@
 #include "../support/ports.h"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <condition_variable>
 #include <csignal>
@@ -316,8 +317,13 @@ struct Cluster {
 		stop(i);
 		start(i);
 	}
+	// The longest between two pumps: how long the executor went without running the scenario.
+	Clock::duration worst_gap{};
+	Clock::time_point last_pump = Clock::now();
 	void pump() {
-		const auto now = static_cast<std::uint64_t>(ms(Clock::now() - origin));
+		const auto at = Clock::now();
+		worst_gap = std::max(worst_gap, at - std::exchange(last_pump, at));
+		const auto now = static_cast<std::uint64_t>(ms(at - origin));
 		if (!frozen) {
 			side.restart();
 			side.poll();
@@ -1037,6 +1043,7 @@ asio::awaitable<void> fetch_exact(asio::io_context &io, const Certificates &cert
 // and the bound of the slowest one's histogram bucket.
 struct RoundTrips {
 	std::uint64_t count = 0, timeouts = 0, slowest_ns = 0;
+	std::array<std::uint64_t, kronuz::metrics::duration_bounds_ns.size() + 1> buckets{};
 };
 using AppendSnapshots = std::array<std::pair<kronuz::metrics::DurationSnapshot, kronuz::metrics::DurationSnapshot>, 3>;
 AppendSnapshots appends(const Cluster &cluster) {
@@ -1053,10 +1060,12 @@ RoundTrips since(const Cluster &cluster, const AppendSnapshots &before) {
 		result.count += now[i].first.count - before[i].first.count;
 		result.timeouts += now[i].second.count - before[i].second.count;
 		for (std::size_t bucket = 0; bucket != now[i].first.buckets.size(); ++bucket)
-			if (now[i].first.buckets[bucket] != before[i].first.buckets[bucket])
+			if (now[i].first.buckets[bucket] != before[i].first.buckets[bucket]) {
+				result.buckets[bucket] += now[i].first.buckets[bucket] - before[i].first.buckets[bucket];
 				result.slowest_ns = std::max(result.slowest_ns, bucket < kronuz::metrics::duration_bounds_ns.size()
 																	? kronuz::metrics::duration_bounds_ns[bucket]
 																	: ~std::uint64_t{0});
+			}
 	}
 	return result;
 }
@@ -1077,6 +1086,32 @@ constexpr std::uint64_t round_trip_bound_ns = 256'000'000;
 #else
 constexpr std::uint64_t round_trip_bound_ns = 64'000'000;
 #endif
+
+// The longest a thread of its own overslept a 1 ms wait since last asked: the host's scheduling
+// stall, which no code of the transport can shorten.
+class HostStall {
+  public:
+	HostStall() : thread_([this] {
+		while (!done_) {
+			const auto begun = Clock::now();
+			std::this_thread::sleep_for(1ms);
+			const auto over = (Clock::now() - begun) - 1ms;
+			auto worst = worst_.load();
+			while (over.count() > worst && !worst_.compare_exchange_weak(worst, over.count())) {
+			}
+		}
+	}) {}
+	~HostStall() {
+		done_ = true;
+		thread_.join();
+	}
+	Clock::duration take() { return Clock::duration(worst_.exchange(0)); }
+
+  private:
+	std::atomic<bool> done_{false};
+	std::atomic<Clock::duration::rep> worst_{0};
+	std::thread thread_;
+};
 
 // F2: rounds of four 8 MiB fetches at once, both ways between voters one and three, through 1 MiB
 // byte budgets every lane shares, under the `loaded` timing (D92). Consensus keeps committing
@@ -1118,13 +1153,18 @@ asio::awaitable<void> fetch_alongside_consensus(asio::io_context &io, const Cert
 		(void)co_await cluster.until([&] { return !busy(); }, end - Clock::now());
 		co_return std::make_pair(count, slowest);
 	};
+	HostStall host;
 	auto before = appends(cluster);
+	cluster.worst_gap = {};
+	(void)host.take();
 	const auto quiet_end = Clock::now() + 500ms;
 	const auto [quiet_commits, quiet_slowest] = co_await commits([&] { return Clock::now() < quiet_end; }, 1s);
 	const auto quiet = since(cluster, before);
+	const auto quiet_gap = ms(cluster.worst_gap), quiet_host = ms(host.take());
 
 	// Rounds of four fetches, each round once the last one's bytes checked out.
 	before = appends(cluster);
+	cluster.worst_gap = {};
 	const auto started = Clock::now();
 	const std::vector<std::pair<unsigned, NodeId>> pairs{{0, 2}, {0, 3}, {2, 1}, {1, 3}};
 	constexpr unsigned rounds = 4;
@@ -1146,6 +1186,7 @@ asio::awaitable<void> fetch_alongside_consensus(asio::io_context &io, const Cert
 	const auto [busy_commits, busy_slowest] = co_await commits(fetching, 20s);
 	const auto elapsed = ms(Clock::now() - started);
 	const auto busy = since(cluster, before);
+	const auto busy_gap = ms(cluster.worst_gap), busy_host = ms(host.take());
 	CHECK(round == rounds && fetches.empty());
 	std::size_t high_water = 0;
 	for (unsigned i = 0; i != 3; ++i) {
@@ -1160,6 +1201,12 @@ asio::awaitable<void> fetch_alongside_consensus(asio::io_context &io, const Cert
 	std::printf("  fetching: %u commits, slowest %lld ms; %llu round trips, slowest bucket <= %llu us, %llu timeouts\n",
 				busy_commits, busy_slowest, (unsigned long long)busy.count, (unsigned long long)(busy.slowest_ns / 1000),
 				(unsigned long long)busy.timeouts);
+	std::printf("  stalls (quiet/fetching): pump gap %lld/%lld ms, host %lld/%lld ms\n", quiet_gap, busy_gap, quiet_host,
+				busy_host);
+	std::printf("  fetching buckets (>=64us):");
+	for (std::size_t i = 3; i != busy.buckets.size(); ++i)
+		std::printf(" %llu", (unsigned long long)busy.buckets[i]);
+	std::printf("\n");
 	CHECK(busy_commits >= 1 && busy.count >= 10 && busy.timeouts == 0 && busy.slowest_ns <= round_trip_bound_ns);
 	CHECK(cluster.leader() == leader && cluster.nodes[*leader]->worker().term() == term);
 	CHECK(co_await cluster.stop_all(2s));

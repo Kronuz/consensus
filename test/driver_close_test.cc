@@ -1,0 +1,498 @@
+/*
+ * Copyright (c) 2026 Germán Méndez Bravo (Kronuz)
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+
+// Driver::close(id) on a row that is open, fenced, half-opened (opened, never created) or
+// unknown: it completes, the Driver erases the row and returns its bytes, and the id opens
+// again. `driver_close_test [case]`; no case runs them all.
+#include "consensus/driver.h"
+#include "journal/memory_io.h"
+
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
+#include <iostream>
+#include <map>
+#include <new>
+#include <span>
+#include <string>
+#include <vector>
+
+using namespace kronuz::consensus;
+namespace j = kronuz::journal;
+namespace jt = kronuz::journal::testing;
+
+// Live heap bytes, counted at the allocation and the sized free, each block carrying its size.
+// Single-threaded: the loop is an inline scheduler. TSan's runtime defines operator new, so
+// there the count is off and the bytes case only reports.
+#if defined(__SANITIZE_THREAD__)
+#define COUNT_BYTES 0
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define COUNT_BYTES 0
+#endif
+#endif
+#ifndef COUNT_BYTES
+#define COUNT_BYTES 1
+#endif
+#if COUNT_BYTES
+namespace {
+std::size_t live_bytes = 0;
+constexpr std::size_t header = alignof(std::max_align_t);
+}
+void* operator new(std::size_t n) {
+	void* raw = std::malloc(n + header);
+	if (!raw) { throw std::bad_alloc(); }
+	*static_cast<std::size_t*>(raw) = n; live_bytes += n;
+	return static_cast<char*>(raw) + header;
+}
+void operator delete(void* p) noexcept {
+	if (!p) { return; }
+	void* raw = static_cast<char*>(p) - header;
+	live_bytes -= *static_cast<std::size_t*>(raw);
+	std::free(raw);
+}
+void operator delete(void* p, std::size_t) noexcept { operator delete(p); }
+#else
+namespace { std::size_t live_bytes = 0; }
+#endif
+
+namespace {
+
+int checks = 0, failures = 0;
+void check(bool value, const std::string& what) {
+	++checks;
+	if (!value) { ++failures; if (failures < 40) { std::cerr << "FAIL: " << what << '\n'; } }
+}
+
+constexpr Timing compact{20, 40, 100, 200, 60000};
+const j::TurnLogOptions turn_options{16 * 1024, 1024, 1, 4, 4096};
+const j::AdmissionLimits admission{{256u << 20, 8192}, {256 * 1024, 3}, {64u << 20, 4}, 32, 3};
+const j::Identity host_identity{'H', 'O', 'S', 'T'};
+
+Limits limits() { Limits l; l.command_bytes = 1024; l.rpc_bytes = 4096; l.log_bytes = 64 * 1024; l.log_entries = 64; l.control_entries = 4; l.rpc_entries = 8; return l; }
+GroupOptions options(std::vector<NodeId> voters, NodeId local = 1) {
+	GroupOptions o;
+	o.configuration.local = local; o.configuration.voters = std::move(voters);
+	o.configuration.cluster[0] = 'C'; o.configuration.configuration[0] = 'G';
+	o.admission = admission; o.limits = limits(); o.timing = compact; o.scheduling = WorkerLimits{16, 128};
+	return o;
+}
+
+struct Sink {
+	std::size_t fenced = 0;
+	std::map<GroupId, Index> committed;  // each group's last committed index
+	std::function<void(GroupId)> on_fenced;  // a Sink may call the Driver's plain calls
+	void operator()(GroupId, Send) {}
+	void operator()(GroupId g, Committed c) { if (!c.entries.empty()) { committed[g] = c.entries.back().index; } }
+	void operator()(GroupId, RoleChanged) {}
+	void operator()(GroupId, ActivateInstall) {}
+	void operator()(GroupId, CheckpointPublished) {}
+	void operator()(GroupId, RepairCompleted) {}
+	void operator()(GroupId g, Fenced) { ++fenced; if (on_fenced) { on_fenced(g); } }
+	void operator()(GroupId, SnapshotNeeded) {}
+	void operator()(GroupId, SnapshotTransmit) {}
+	void operator()(GroupId, SnapshotReleased) {}
+};
+static_assert(sink<Sink>);
+
+// One host and one loop on an inline_scheduler; the Worker's IO and the turns go through
+// InlineCompletion, or through a HeldCompletion the case completes by hand.
+struct Loop {
+	jt::Disk& disk;
+	task::inline_scheduler scheduler;
+	j::InlineCompletion inline_io;
+	j::HeldCompletion held;
+	std::unique_ptr<j::Host> host;
+	Sink sink;
+	std::unique_ptr<Driver<Sink>> driver;
+	task::cancel_source stop;
+	bool turns_done = false, driver_done = false;
+	explicit Loop(jt::Disk& d, bool hold = false) : disk(d) {
+		host = std::make_unique<j::Host>(std::make_shared<jt::MemoryIO>(disk, "host/"), host_identity, j::HostOptions{1, turn_options});
+		auto io = hold ? j::completion_ref::of(held) : j::completion_ref::of(inline_io);
+		driver = std::make_unique<Driver<Sink>>(Seams{task::scheduler_ref::of(scheduler), io, *host, 0, 7}, sink);
+		auto ref = task::scheduler_ref::of(scheduler);
+		auto turns = hold ? j::completion_ref::of(held) : j::completion_ref::of(inline_io);
+		task::spawn(ref, host->driver(0).run(turns, stop.token()), [this](std::exception_ptr) { turns_done = true; });
+		task::spawn(ref, driver->run(stop.token()), [this](std::exception_ptr) { driver_done = true; });
+		run();
+	}
+	~Loop() { finish(); }
+	void run() {
+		std::size_t budget = 10'000'000;
+		scheduler.run_until([&] { return --budget == 0; });
+		if (!budget) { check(false, "the loop spins"); std::exit(1); }
+	}
+	// Runs what is queued within `steps` turns of the scheduler: false if it is still busy.
+	bool run_bounded(std::size_t steps) {
+		std::size_t budget = steps;
+		scheduler.run_until([&] { return --budget == 0; });
+		return budget != 0;
+	}
+	void finish() {
+		if (!driver) { return; }
+		stop.request(task::cancel_reason::shutdown);
+		release();
+		check(turns_done && driver_done, "the turn driver's and the Driver's runs end at shutdown");
+		driver.reset(); host.reset();
+	}
+	void release() {
+		run();
+		for (int n = 0; held.held(); ++n) {
+			if (n == 100000) { check(false, "held IO never runs out"); std::exit(1); }
+			held.complete(held.tickets().front()); run();
+		}
+	}
+	template <class T> struct Started {
+		bool done = false;
+		std::exception_ptr error;
+		std::optional<T> value;
+	};
+	template <class T> std::shared_ptr<Started<T>> start(task::task<T> work) {
+		auto state = std::make_shared<Started<T>>();
+		task::spawn(task::scheduler_ref::of(scheduler), std::move(work), [state](std::exception_ptr e, std::optional<T> v) { state->done = true; state->error = e; state->value = std::move(v); });
+		run();
+		return state;
+	}
+	std::shared_ptr<Started<bool>> start(task::task<void> work) {
+		auto state = std::make_shared<Started<bool>>();
+		auto wrapped = [](task::task<void> inner) -> task::task<bool> { co_await std::move(inner); co_return true; };
+		task::spawn(task::scheduler_ref::of(scheduler), wrapped(std::move(work)), [state](std::exception_ptr e, std::optional<bool> v) { state->done = true; state->error = e; state->value = v; });
+		run();
+		return state;
+	}
+	bool settle(task::task<void> work, std::exception_ptr& error) {
+		auto state = start(std::move(work));
+		release();
+		error = state->error;
+		return state->done;
+	}
+	// A lone voter, created and leading.
+	void lone(GroupId g) {
+		driver->open(g, options({1}));
+		std::exception_ptr error;
+		check(settle(driver->create(g, j::Identity{'L', static_cast<char>(g)}), error) && !error, "create");
+	}
+	// close(g) to completion: whether it completed, and how.
+	bool close(GroupId g, std::exception_ptr& error) { return settle(driver->close(g), error); }
+};
+
+std::string what(std::exception_ptr error) {
+	if (!error) { return "no error"; }
+	try { std::rethrow_exception(error); } catch (const std::exception& e) { return e.what(); } catch (...) {}
+	return "unknown";
+}
+template <class E> bool is(std::exception_ptr error) {
+	if (!error) { return false; }
+	try { std::rethrow_exception(error); } catch (const E&) { return true; } catch (...) {}
+	return false;
+}
+
+// A1: a group fenced by its application, in a live process, closes; the id opens again.
+void fenced_row() {
+	constexpr GroupId g = 11;
+	jt::Disk disk; Loop loop(disk);
+	loop.lone(g);
+	auto read = loop.start(loop.driver->read(g));
+	loop.driver->application_failed(g, 1, "the application failed");
+	loop.run();
+	check(read->done && is<fenced>(read->error), "a waiter on the fenced group completes with fenced");
+	check(loop.sink.fenced == 1, "the Sink heard Fenced");
+	check(loop.driver->groups() == 1, "the fenced row is held");
+	std::exception_ptr error;
+	check(loop.close(g, error) && !error, "close completes on a fenced row: " + what(error));
+	check(loop.driver->groups() == 0 && !loop.driver->state(g), "the fenced row is erased");
+	auto refused = loop.start(loop.driver->read(g));
+	check(refused->done && is<closed>(refused->error), "a call on the erased id completes with closed");
+	loop.driver->open(g, options({1}));
+	check(loop.driver->groups() == 1, "the id opens again");
+	// The host refuses a second recover of an id until it reopens: a journal guard, not Driver state.
+	check(loop.close(g, error) && !error && loop.driver->groups() == 0, "and closes again");
+}
+
+// A1: a group fenced by its application with a proposal's IO in flight: close still ends.
+void fenced_in_flight() {
+	constexpr GroupId g = 12;
+	jt::Disk disk; Loop loop(disk, true);
+	loop.lone(g);
+	auto proposal = loop.start(loop.driver->propose(g, "staged"));
+	check(!proposal->done && loop.held.held() > 0, "the proposal's record waits in a held turn");
+	loop.driver->application_failed(g, 1, "the application failed");
+	loop.run();
+	auto closing = loop.start(loop.driver->close(g));
+	loop.release();
+	check(closing->done && !closing->error, "close completes with a record staged on a fenced row: " + what(closing->error));
+	check(proposal->done && is<fenced>(proposal->error), "the staged proposal's caller completes with fenced: " + what(proposal->error));
+	check(loop.driver->groups() == 0, "the row is erased");
+}
+
+// A2: open succeeded and the caller then failed: no create, no records.
+void half_opened_row() {
+	constexpr GroupId g = 21;
+	jt::Disk disk; Loop loop(disk);
+	loop.driver->open(g, options({1}));
+	check(loop.driver->groups() == 1, "the row is held");
+	std::exception_ptr error;
+	check(loop.close(g, error) && !error, "close completes on a row never created: " + what(error));
+	check(loop.driver->groups() == 0 && !loop.driver->state(g), "the row is erased");
+	loop.driver->open(g, options({1}));
+	check(loop.settle(loop.driver->create(g, j::Identity{'H', 'O'}), error) && !error, "the id opens and creates again: " + what(error));
+	check(loop.driver->state(g) && loop.driver->state(g)->role == Role::Leader, "and leads");
+}
+
+// A2: a create that failed (the group cancelled before it ran) leaves a row that closes.
+void failed_create() {
+	constexpr GroupId g = 22;
+	jt::Disk disk; Loop loop(disk);
+	loop.driver->open(g, options({1}));
+	task::cancel_source cancel; cancel.request();
+	std::exception_ptr error;
+	check(loop.settle(loop.driver->create(g, j::Identity{'F', 'C'}, cancel.token()), error) && is<task::cancelled>(error), "a cancelled create completes with task::cancelled");
+	check(loop.close(g, error) && !error && loop.driver->groups() == 0, "close frees the row: " + what(error));
+}
+
+// An id the Driver never held: close completes at once.
+void unknown_row() {
+	jt::Disk disk; Loop loop(disk);
+	std::exception_ptr error;
+	check(loop.close(31, error) && !error && loop.driver->groups() == 0, "close of an unknown id completes: " + what(error));
+	loop.lone(32);
+	check(loop.close(32, error) && !error, "close of an open row completes: " + what(error));
+	check(loop.close(32, error) && !error, "and again, once erased");
+	loop.driver->open(32, options({1}));
+	check(loop.driver->groups() == 1, "the id opens again");
+	bool threw = false;
+	try { loop.driver->open(32, options({1})); } catch (const std::logic_error&) { threw = true; }
+	check(threw, "an open row refuses a second open");
+}
+
+// A4: a close with a call waiting and IO in flight completes it and then the row, once the IO lands.
+void close_in_flight() {
+	constexpr GroupId g = 41;
+	jt::Disk disk; Loop loop(disk, true);
+	loop.lone(g);
+	auto staged = loop.start(loop.driver->propose(g, "staged"));
+	auto read = loop.start(loop.driver->read(g));
+	check(loop.held.held() > 0 && !staged->done && !read->done, "a record staged, a read waiting");
+	auto closing = loop.start(loop.driver->close(g));
+	check(read->done && is<closed>(read->error), "the read completes with closed");
+	check(!closing->done && loop.driver->groups() == 1, "close waits for the staged record");
+	loop.release();
+	check(staged->done && !staged->error, "the staged proposal completes with its placement");
+	check(closing->done && !closing->error, "close completes once it is durable");
+	check(loop.driver->groups() == 0 && loop.driver->in_flight() == 0, "the row is erased with no IO in flight");
+}
+
+// A group the Sink queues again in its own closing step is erased off the ready list: the Sink's
+// Fenced callback calls applied(), which marks the group ready while it closes in that step.
+void erase_queued() {
+	constexpr GroupId g = 51, h = 52;
+	jt::Disk disk; Loop loop(disk);
+	loop.lone(g); loop.lone(h);
+	std::size_t calls = 0;
+	loop.sink.on_fenced = [&](GroupId id) { ++calls; loop.driver->applied(id, Applied{1}); };
+	// close is queued ahead of the fence, so one step both fences the group and closes it.
+	bool closing_done = false; std::exception_ptr closing_error;
+	task::spawn(task::scheduler_ref::of(loop.scheduler), loop.driver->close(g), [&](std::exception_ptr e) { closing_done = true; closing_error = e; });
+	loop.driver->application_failed(g, 1, "the application failed");
+	loop.run();
+	check(calls == 1, "the Sink queued the group again in its closing step");
+	check(closing_done && !closing_error, "close completes: " + what(closing_error));
+	check(loop.driver->groups() == 1 && !loop.driver->state(g) && loop.driver->state(h), "only the closed row is erased");
+	std::exception_ptr error;
+	check(loop.close(h, error) && !error && loop.driver->groups() == 0, "and the ready list still serves the other row");
+	loop.driver->open(g, options({1}));
+	check(loop.driver->groups() == 1, "the id opens again");
+}
+
+// A checkpoint's capture of the application: `image`, through `through` in `term`.
+struct Capture {
+	std::string image; std::size_t at = 0; Index through; Term term;
+	CaptureMetadata metadata() const { return {0, through, term, 0}; }
+	std::size_t read(std::span<char> out) {
+		auto n = std::min(out.size(), image.size() - at);
+		std::copy_n(image.data() + at, n, out.data()); at += n; return n;
+	}
+};
+
+// A6: after shutdown a group awaiting its turn barrier is not watched again, so the loop does
+// not wake itself while another group's IO keeps it running: it idles until that IO lands,
+// then ends. The turn driver and the Driver stop at once, as in Xapiand's shutdown; the turn
+// driver still writes what is staged.
+void shutdown_idles() {
+	constexpr GroupId g = 61, h = 62;
+	jt::Disk disk; Loop loop(disk, true);
+	loop.lone(h);
+	auto placed = loop.start(loop.driver->propose(h, "k"));
+	loop.release();
+	check(placed->done && placed->value, "placed");
+	if (!placed->value) { return; }
+	for (Index done = 0; loop.sink.committed[h] > done;) { done = loop.sink.committed[h]; loop.driver->applied(h, Applied{done}); loop.release(); }
+	loop.lone(g);
+	auto checkpoint = loop.start(loop.driver->checkpoint(h, 1 << 20, Capture{std::string(1000, 'y'), 0, placed->value->index, placed->value->term}));
+	const auto io = loop.held.held();
+	auto proposal = loop.start(loop.driver->propose(g, "staged"));
+	check(!checkpoint->done && io > 0, "another group's IO is held");
+	check(!proposal->done && loop.held.held() > io && loop.driver->in_flight() > 1, "a record waits for its turn barrier");
+	auto& turns = loop.host->driver(0);
+	const auto durable = turns.sequence(g);
+	check(turns.staged(g), "the proposal's record is staged");
+	loop.stop.request(task::cancel_reason::shutdown);
+	if (!loop.run_bounded(20'000)) { check(false, "the loop idles after shutdown with the barrier pending"); std::cout << checks << " driver close checks, " << failures << " failures\n"; std::exit(1); }
+	check(loop.driver->in_flight() > 0 && !loop.driver_done, "the loop waits for the IO");
+	loop.release();
+	check(loop.driver_done && loop.driver->in_flight() == 0, "the loop ends once the IO lands");
+	check(loop.turns_done && !turns.staged(g) && turns.sequence(g) > durable, "the record staged before shutdown is durable: sequence " + std::to_string(turns.sequence(g)) + " after " + std::to_string(durable));
+	check(proposal->done && is<task::cancelled>(proposal->error), "the proposal completes with task::cancelled: " + what(proposal->error));
+	check(checkpoint->done && is<task::cancelled>(checkpoint->error), "the checkpoint completes with task::cancelled: " + what(checkpoint->error));
+}
+
+// A6: a step after the turn driver returned stages a record (a higher-term VoteRequest to a
+// follower) while another group's IO holds the loop. run() does not wait for that record's
+// barrier, which no turn driver will write: it ends once the IO lands, and the record stays staged.
+void shutdown_ends() {
+	constexpr GroupId g = 71, h = 72;
+	jt::Disk disk; Loop loop(disk, true);
+	loop.lone(h);
+	auto placed = loop.start(loop.driver->propose(h, "k"));
+	loop.release();
+	check(placed->done && placed->value, "placed");
+	if (!placed->value) { return; }
+	for (Index done = 0; loop.sink.committed[h] > done;) { done = loop.sink.committed[h]; loop.driver->applied(h, Applied{done}); loop.release(); }
+	loop.driver->open(g, options({1, 2}));  // a follower: its peer never answers
+	std::exception_ptr error;
+	check(loop.settle(loop.driver->create(g, j::Identity{'T', 'V'}), error) && !error, "the two-voter group is created: " + what(error));
+	auto checkpoint = loop.start(loop.driver->checkpoint(h, 1 << 20, Capture{std::string(1000, 'y'), 0, placed->value->index, placed->value->term}));
+	check(!checkpoint->done && loop.held.held() > 0, "another group's IO is held");
+	loop.stop.request(task::cancel_reason::shutdown);
+	check(loop.run_bounded(20'000) && loop.turns_done && !loop.driver_done, "the turn driver returns; the Driver waits for the IO");
+	auto& turns = loop.host->driver(0);
+	const auto durable = turns.sequence(g);
+	loop.driver->receive(g, Receive{2, VoteRequest{5, 100, 5}});
+	check(loop.run_bounded(20'000), "the loop idles after the step");
+	check(loop.driver->state(g) && loop.driver->state(g)->term == 5 && turns.staged(g), "the step staged the new term after the turn driver returned");
+	loop.release();
+	for (int n = 0; n < 20 && !loop.driver_done; ++n) { loop.scheduler.advance(50'000'000); loop.run_bounded(200'000); }
+	if (!loop.driver_done) { check(false, "the Driver's run ends once the IO lands: in_flight " + std::to_string(loop.driver->in_flight())); std::cout << checks << " driver close checks, " << failures << " failures\n"; std::exit(1); }
+	check(loop.driver->in_flight() == 0, "no IO in flight");
+	check(turns.staged(g) && turns.sequence(g) == durable, "the record stays staged, reported not durable");
+}
+
+// A3: 10,000 rows opened and closed leave the Driver's heap where it was.
+void bytes() {
+	constexpr GroupId rows = 10'000;
+	jt::Disk disk; Loop loop(disk);
+	std::exception_ptr error;
+	// One warm round, so one-time allocations do not count.
+	loop.driver->open(1, options({1}));
+	check(loop.close(1, error) && !error, "warm close");
+	const auto before = live_bytes;
+	for (GroupId g = 1; g <= rows; ++g) { loop.driver->open(g, options({1})); }
+	const auto opened = live_bytes;
+	check(loop.driver->groups() == rows, "10,000 rows held");
+	for (GroupId g = 1; g <= rows; ++g) {
+		auto closing = loop.start(loop.driver->close(g));
+		if (!closing->done || closing->error) { check(false, "close " + std::to_string(g) + " completes: " + what(closing->error)); break; }
+	}
+	check(loop.driver->groups() == 0, "no row held after the closes");
+	// The Host keeps an expired weak entry per group it handed an IO, until its next group_io
+	// call purges them: opening one more row is that call.
+	const auto unpurged = live_bytes;
+	loop.driver->open(rows + 1, options({1}));
+	check(loop.close(rows + 1, error) && !error, "the purging row closes");
+	const auto after = live_bytes;
+	std::printf("per row: %zu bytes held open, %zu left after close before the Host's purge, %zu after\n", (opened - before) / std::size_t(rows),
+		unpurged > before ? (unpurged - before) / std::size_t(rows) : std::size_t(0), after > before ? (after - before) / std::size_t(rows) : std::size_t(0));
+	// What stays is the row table's bucket array, which an unordered_map never shrinks: a pointer a row.
+	check(!COUNT_BYTES || after <= before + rows * sizeof(void*) * 2, "closed rows return their bytes: " + std::to_string(after) + " against " + std::to_string(before));
+}
+
+// Heap the simulated disk itself holds: not the process's (a real host's files are on disk).
+std::size_t disk_bytes(const jt::Disk& disk) {
+	std::size_t bytes = 0;
+	for (const auto& [id, inode] : disk.inodes) {
+		bytes += inode.durable.capacity() + sizeof(inode);
+		for (const auto& [sector, data] : inode.pending) { bytes += data.capacity() + sizeof(data); }
+	}
+	for (const auto& [name, inode] : disk.names) { bytes += name.capacity() + 48; }
+	for (const auto& [name, inode] : disk.durable_names) { bytes += name.capacity() + 48; }
+	return bytes;
+}
+
+// Report only: created rows (the rows Xapiand counts) opened, closed and left, with the share the
+// journal keeps per structure. `proposals` more records are written per row before the close.
+void created_pass(GroupId rows, int proposals) {
+	jt::Disk disk; Loop loop(disk);
+	std::exception_ptr error;
+	loop.lone(1); check(loop.close(1, error) && !error, "warm close");
+	const auto base = live_bytes, base_disk = disk_bytes(disk);
+	for (GroupId g = 2; g < 2 + rows; ++g) {
+		loop.lone(g);
+		for (int n = 0; n < proposals; ++n) { std::exception_ptr e; std::optional<Placement> placed; auto call = loop.start(loop.driver->propose(g, "p")); loop.release(); (void)placed; (void)e; check(call->done && !call->error, "proposal placed"); }
+	}
+	const auto opened = live_bytes, opened_disk = disk_bytes(disk);
+	std::uint64_t records = 0;
+	for (GroupId g = 2; g < 2 + rows; ++g) { records += loop.host->driver_of(g).sequence(g); }
+	for (GroupId g = 2; g < 2 + rows; ++g) { check(loop.close(g, error) && !error, "close"); }
+	loop.driver->open(1, options({1})); check(loop.close(1, error) && !error, "the purging row closes");
+	const auto closed = live_bytes, closed_disk = disk_bytes(disk);
+	for (GroupId g = 2; g < 2 + rows; ++g) { loop.host->driver_of(g).forget(g); }
+	const auto forgotten = live_bytes, forgotten_disk = disk_bytes(disk);
+	// The process's heap: the counted bytes less what the simulated disk holds.
+	auto process = [](std::size_t total, std::size_t disk_part) { return total > disk_part ? total - disk_part : std::size_t(0); };
+	const auto from = process(base, base_disk);
+	auto per = [&](std::size_t now) { return now > from ? (now - from) / std::size_t(rows) : std::size_t(0); };
+	std::printf("created rows=%u proposals=%d records/row=%.1f: process heap per row: open %zu, closed %zu, after the log forgets them %zu; simulated disk per row: %zu\n",
+		unsigned(rows), proposals, double(records) / double(rows), per(process(opened, opened_disk)), per(process(closed, closed_disk)),
+		per(process(forgotten, forgotten_disk)), (closed_disk - base_disk) / std::size_t(rows));
+}
+void created_bytes() { created_pass(2000, 0); created_pass(2000, 10); }
+
+const std::map<std::string, void (*)()> cases{
+	{"created_bytes", &created_bytes},
+	{"erase_queued", &erase_queued},
+	{"shutdown_idles", &shutdown_idles},
+	{"shutdown_ends", &shutdown_ends},
+	{"fenced_row", &fenced_row},
+	{"fenced_in_flight", &fenced_in_flight},
+	{"half_opened_row", &half_opened_row},
+	{"failed_create", &failed_create},
+	{"unknown_row", &unknown_row},
+	{"close_in_flight", &close_in_flight},
+	{"bytes", &bytes},
+};
+
+}  // namespace
+
+int main(int argc, char** argv) {
+	if (argc > 1) {
+		auto found = cases.find(argv[1]);
+		if (found == cases.end()) { std::cerr << "unknown case " << argv[1] << '\n'; return 2; }
+		std::cerr << "case " << argv[1] << '\n';
+		found->second();
+	} else {
+		for (const auto& [name, run] : cases) { if (name == "created_bytes") { continue; } std::cerr << "case " << name << '\n'; run(); }  // a report, run by name
+	}
+	std::cout << checks << " driver close checks, " << failures << " failures\n";
+	return failures ? 1 : 0;
+}

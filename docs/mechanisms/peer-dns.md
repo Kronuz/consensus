@@ -22,24 +22,40 @@ covers a control lane and a bulk lane, so two dials of a peer can run at once.
 `system_resolver`, which calls `getaddrinfo`; tests inject their own. A failure is an empty
 answer, and an exception counts as one.
 
-`Lookup::start` runs the resolver on a new detached thread. `getaddrinfo` cannot be
-cancelled, so the lookup does not use asio's `async_resolve`: that runs every lookup of an
-`io_context` on one internal thread, and one hung lookup would queue every later one behind
-it. Because each lookup has its own thread, a hung lookup holds only that thread.
+`Lookup::start` queues the lookup on the process's `LookupThreads` (`resolve.h`). It runs
+at most 16 lookups at once (`LookupThreads::process_bound`) and starts a thread only when a
+lookup waits and no thread is free; a thread returns once the queue is empty. Later lookups
+queue in order. `getaddrinfo` cannot be cancelled, so the lookup does not use asio's
+`async_resolve`: that runs every lookup of an `io_context` on one internal thread, and one
+hung lookup would queue every later one behind it. Here a hung lookup holds one of the 16
+threads; only 16 hung at once stall the lookups after them.
 
 The thread hands its answer back through a delivery function under the lookup's mutex. The
 delivery posts the answer to the executor with a weak reference to the `Peers`. `stop()`
-and the destructor call `abandon()`, which clears the delivery under the same mutex. After
-that, the thread touches nothing of the transport's, not even the executor. When the
-resolver returns, the thread drops its answer and exits. The thread holds no executor work,
-so a hung lookup never keeps `io_context::run()` from returning.
+and the destructor call `abandon()`. A queued lookup leaves the queue, and its resolver
+never runs. A running one has its delivery cleared under the lookup's mutex, so `abandon()`
+returns only after a delivery in progress returns (`resolve_test.cc`, case `abandon_waits`);
+after that, its thread touches nothing of the transport's, not even the executor, and drops
+the answer when the resolver returns. The thread holds no executor work, so a hung lookup
+never keeps `io_context::run()` from returning.
+
+The process's `LookupThreads` is never destroyed: an atexit handler, registered when it is
+built, closes it. Closing drops the queue, starts no further delivery, waits for each running
+resolver to return, and joins every thread, so no lookup thread outlives it. A lookup started
+during or after exit, by a thread still dialing or by a later atexit handler or static
+destructor, throws `operation_canceled`, which `Links` and `Peers` catch. A stuck
+`getaddrinfo` delays exit by up to the system resolver's timeout. `std::exit` called on a
+lookup thread, from a resolver or a delivery, never returns, since closing waits for that
+thread; resolvers and deliveries must not exit the process. `test/transport/resolve_test.cc`
+measures the wait: destruction with a resolver stuck until 300 ms later took 307 ms, and exit
+with a 200 ms lookup in its resolver waited 206 ms.
 
 A peer has at most one lookup in flight, and a new lookup of a name starts only once the
 last one's deadline has passed. A dial that finds a lookup already running, or one started
 within the deadline, does not start another. Each peer name therefore holds at most one
 thread per `Peers`, and a peer that is down but resolvable costs one lookup per
 `resolve_deadline`, not one per backoff of each lane. `PeerOccupancy::lookups` counts the
-threads.
+lookups in flight.
 
 ## The deadline
 
@@ -104,22 +120,23 @@ address.
 
 ## What a hung `getaddrinfo` costs
 
-A hung lookup costs one parked thread per peer name per `Peers` instance. A restarted
-`Peers` starts its own lookup while the old one's thread is still parked, so parked threads
-grow with restarts until the resolver returns. Each thread has a default stack and blocks in
-the resolver until the resolver returns. The system resolver eventually returns,
-through `resolv.conf`'s timeout and attempts settings.
+A hung lookup costs one parked thread until the resolver returns. A restarted `Peers`
+starts its own lookup while the old one's thread is still parked, but the process never
+holds more than 16 lookup threads: 1,000 restarts over a resolver that never answers peak at
+16 (`resolve_test.cc`, case `rebuilds`), and their abandoned lookups leave no queue. Each
+thread has a default stack. The system resolver eventually returns, through `resolv.conf`'s
+timeout and attempts settings; until 16 are parked, later lookups still get a thread.
 
 It costs nothing else:
 
 1. The executor never waits on a lookup. Dials wait on timers.
-2. Other peers' lookups run on their own threads.
+2. Other peers' lookups run on other threads, while fewer than 16 are parked.
 3. A peer with cached endpoints is dialed at once.
 4. `stop()` cancels the waits and abandons the lookup, so `drained()` does not depend on
    the resolver.
 
 `test/transport/peers_test.cc` runs three Workers over TLS and checks each of these
 properties. `test/transport/dns_mutants.sh` seeds the faults the test must catch: a dial
-that waits for its lookup with no deadline, every lookup queued on one shared thread, a
-refused address that does not move the next dial past it, a cached dial that waits for its
-lookup, and a lookup started on every dial.
+that waits for its lookup with no deadline, every lookup queued on one shared thread (a bound
+of 1), a refused address that does not move the next dial past it, a cached dial that waits
+for its lookup, and a lookup started on every dial.

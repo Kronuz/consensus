@@ -16,7 +16,12 @@
 //   joiner   frame_admission: a joiner (empty membership) catches up as a learner and is promoted
 //   lagging  frame_admission: a follower that missed a voter's addition catches up from it
 //   leftover a read that fails partway hands its frames over under its own connection
+//   reconnect a peer's open holds on its connection only: on the next one, its frames are refused
+//            until it opens the group again
+//   backlog  credit owed while the connection cannot send merges per group and comes back whole
 //   relayout a host restarted with another L serves every group from its new loop
+//   scan     the groups a feed visits per frame stay constant at 100, 1,000 and 10,000 groups
+//   order    control first, round robin across ready groups and per-group credit, as values
 // A timing case the host stalled (a 250 ms oversleep) runs again, at most twice. Each step prints
 // as it starts; a case still running after 100 s prints its step, which loops stopped turning
 // and every thread's stack, then exits 3.
@@ -36,6 +41,10 @@
 #include <future>
 #include <mutex>
 #include <openssl/pem.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
@@ -542,6 +551,50 @@ bool reader() {
 	return ok;
 }
 
+// The sum of a counter over a host's loops.
+std::uint64_t total(Host &h, std::atomic<std::uint64_t> HostTransportStats::*counter) {
+	std::uint64_t sum = 0;
+	for (std::uint32_t k = 0; k != h.transport->loops(); ++k)
+		sum += (h.transport->stats(k).*counter).load();
+	return sum;
+}
+// Each loopback TCP socket of this process on `ports`: local and peer port, bytes unread
+// (FIONREAD), bytes in its send buffer, and on macOS the windows, cwnd, RTO and retransmits.
+std::string sockets(std::initializer_list<std::uint16_t> ports) {
+	std::string r;
+	for (int fd = 3; fd != 1024; ++fd) {
+		sockaddr_in local{}, peer{};
+		socklen_t a = sizeof local, b = sizeof peer;
+		if (::getsockname(fd, reinterpret_cast<sockaddr *>(&local), &a) != 0 || local.sin_family != AF_INET ||
+			::getpeername(fd, reinterpret_cast<sockaddr *>(&peer), &b) != 0)
+			continue;
+		const auto lp = ntohs(local.sin_port), pp = ntohs(peer.sin_port);
+		if (std::find(ports.begin(), ports.end(), lp) == ports.end() && std::find(ports.begin(), ports.end(), pp) == ports.end())
+			continue;
+		int unread = -1, unsent = -1;
+		::ioctl(fd, FIONREAD, &unread);
+#if defined(SO_NWRITE)
+		socklen_t n = sizeof unsent;
+		::getsockopt(fd, SOL_SOCKET, SO_NWRITE, &unsent, &n);
+#elif defined(SIOCOUTQ)
+		::ioctl(fd, SIOCOUTQ, &unsent);
+#endif
+		char line[256];
+		std::snprintf(line, sizeof line, " [%u>%u unread %d sndq %d", lp, pp, unread, unsent);
+		r += line;
+#if defined(TCP_CONNECTION_INFO)
+		tcp_connection_info i{};
+		socklen_t m = sizeof i;
+		if (::getsockopt(fd, IPPROTO_TCP, TCP_CONNECTION_INFO, &i, &m) == 0) {
+			std::snprintf(line, sizeof line, " sndwnd %u rcvwnd %u cwnd %u rto %u srtt %u rexmit %llu", i.tcpi_snd_wnd, i.tcpi_rcv_wnd,
+						  i.tcpi_snd_cwnd, i.tcpi_rto, i.tcpi_srtt, (unsigned long long)i.tcpi_txretransmitpackets);
+			r += line;
+		}
+#endif
+		r += "]";
+	}
+	return r;
+}
 // A2: four groups upload 2 MiB appends of two 1 MiB commands (types.h's command and RPC caps) on
 // the Control connection, faster than the receiver reads them (25 ms a MiB, 40 MB/s, on the
 // connection's own loop). A follower group's heartbeat every 100 ms and a vote every 300 ms on
@@ -584,6 +637,20 @@ bool upload() {
 	step("upload: 4 s of uploads, heartbeats and votes");
 	const auto before = beats.count.load();
 	const auto start = steady::now();
+	std::vector<std::string> samples;  // every 250 ms: progress, links, host 1's frames, host 2's reads, the sockets
+	std::atomic<bool> sampling{true};
+	std::thread sampler([&] {
+		while (sampling) {
+			std::this_thread::sleep_for(250ms);
+			char line[256];
+			std::snprintf(line, sizeof line, "upload: %5llu ms %6.1f MiB %3llu beats; links %llu/%llu sent %llu dropped %llu reads %llu;",
+						  (unsigned long long)ms_since(start), double(uploaded) / (1 << 20), (unsigned long long)(beats.count - before),
+						  (unsigned long long)total(one, &HostTransportStats::links), (unsigned long long)total(two, &HostTransportStats::links),
+						  (unsigned long long)total(one, &HostTransportStats::sent), (unsigned long long)total(one, &HostTransportStats::dropped),
+						  (unsigned long long)total(two, &HostTransportStats::reads));
+			samples.push_back(line + sockets({one.port(), two.port()}));
+		}
+	});
 	for (std::int64_t tick = 0; ms_since(start) < 4000; ++tick) {  // signed: see reader()
 		for (auto g : uploads) {
 			const auto k = one.transport->loop_of_group(g);
@@ -595,6 +662,8 @@ bool upload() {
 		std::this_thread::sleep_until(start + (tick + 1) * 100ms);
 	}
 	const auto elapsed = ms_since(start);
+	sampling = false;
+	sampler.join();
 	two.post(other, [&] { beats.beat(); });  // a silence at the end counts
 	std::this_thread::sleep_for(100ms);
 	step("upload: the hosts stop");
@@ -605,6 +674,9 @@ bool upload() {
 	std::printf("upload: %.1f MiB uploaded in %llu ms on the shared connection; %llu heartbeats and votes, longest gap %llu ms %s\n",
 				double(uploaded) / (1 << 20), (unsigned long long)elapsed, (unsigned long long)controls, (unsigned long long)gap,
 				ok ? "ok" : "FAILS: a follower would start an election");
+	if (!ok)
+		for (auto &s : samples)
+			std::printf("%s\n", s.c_str());
 	return ok;
 }
 
@@ -930,13 +1002,6 @@ bool add_voter_4(Cluster &c, NodeId leader, GroupId g, const std::string &seen, 
 	}
 }
 
-// The sum of a counter over a host's loops.
-std::uint64_t total(Host &h, std::atomic<std::uint64_t> HostTransportStats::*counter) {
-	std::uint64_t sum = 0;
-	for (std::uint32_t k = 0; k != h.transport->loops(); ++k)
-		sum += (h.transport->stats(k).*counter).load();
-	return sum;
-}
 std::uint64_t misplaced(Cluster &c) {
 	std::uint64_t sum = 0;
 	for (auto &n : c.nodes)
@@ -1160,6 +1225,18 @@ void identity() {
 	const bool agreed = until([&] { return send(ok, 1, 2, "agreed"), received(ok, "agreed") > 0; }, 20'000);
 	std::printf("identity: once both store the new epoch, frames arrive: %s\n", agreed ? "yes" : "NO");
 	assert(agreed);
+	step("identity: host 2 stores ok again under a third epoch");
+	two.loops[two.transport->loop_of_group(ok)]->at([&] { two.transport->store(ok, 2, differing([](GroupOpen &o) { o.epoch.fill('Z'); })); });
+	const auto restored = total(two, &HostTransportStats::mismatched);
+	for (int i = 0; i != 20; ++i) {
+		send(ok, 1, 2, "epoch3");
+		std::this_thread::sleep_for(20ms);
+	}
+	const bool closed_again = until([&] { return total(two, &HostTransportStats::mismatched) > restored; }, 20'000);
+	std::this_thread::sleep_for(300ms);
+	std::printf("identity: once host 2 stored another epoch, host 1's open no longer holds: refused %s, delivered %llu of 20\n",
+				closed_again ? "yes" : "NO", (unsigned long long)received(ok, "epoch3"));
+	assert(closed_again && !received(ok, "epoch3"));
 
 	step("identity: host 2 forgets ok");
 	two.loops[two.transport->loop_of_group(ok)]->at([&] { two.transport->forget(ok); });
@@ -1261,6 +1338,90 @@ void refill() {
 	assert(refused >= 8 && after_refusals && after_restart);  // 8 frames: 5 windows
 }
 
+// A node over raw Links, not a HostTransport, on its own loop: it sends the frames a case writes,
+// counts the closed frames it hears and sums the credit per group; while `slow`, it sleeps
+// 150 ms after each frame over 1 MiB it reads.
+struct RawPeer {
+	Loop loop;
+	std::unique_ptr<Links> links;
+	std::atomic<const Link *> link{nullptr};
+	std::atomic<int> ended{0};
+	std::atomic<std::uint64_t> closed{0}, credits{0}, credited{0}, big{0};
+	std::atomic<bool> slow{false};
+	std::map<GroupId, std::uint64_t> credit;  // on the loop
+	RawPeer(NodeId node, NodeId to, std::uint16_t port, LinkOptions options = {}) {
+		auto tls = context(names[node]);
+		std::map<NodeId, Fingerprint> pins;
+		for (NodeId n = 1; n <= 4; ++n)
+			pins[n] = pin_of(names[n]);
+		Identity cluster{};
+		cluster.fill('K');
+		links = std::make_unique<Links>(loop.io.get_executor(), task::scheduler_ref::of(loop.scheduler), tls,
+										NodePins(node, pins, tls->native_handle()), cluster,
+										std::map<NodeId, PeerAddress>{{to, {"127.0.0.1", port}}}, options);
+		links->on_established = [this](const Link &l) { link = &l; };
+		links->on_ended = [this](const Link &l) {
+			if (link == &l)
+				link = nullptr;
+			++ended;
+		};
+		links->on_frame = [this](const Link &, std::string_view f) {
+			closed += f.size() == closed_frame && f[0] == char(FrameKind::closed);
+			if (f.size() == 1 + 8 + 8 && f[0] == char(FrameKind::credit)) {
+				auto rest = f.substr(1);
+				const auto g = j::get64(rest), bytes = j::get64(rest);
+				credit[g] += bytes;
+				credited += bytes;
+				++credits;
+			}
+			if (f.size() > 1 << 20) {
+				++big;
+				if (slow)
+					std::this_thread::sleep_for(150ms);
+			}
+		};
+		loop.start();
+	}
+	// Dials `to` on Control: whether the connection came up within 10 s.
+	bool dial(NodeId to) {
+		loop.at([&] {
+			task::spawn(task::scheduler_ref::of(loop.scheduler), links->dial(to, LinkLane::Control),
+						[](std::exception_ptr, std::optional<bool>) {});
+		});
+		return until([&] { return link.load() != nullptr; }, 10'000);
+	}
+	void send(const std::string &frame) {
+		loop.at([&] { link.load()->connection->send(frame); });
+	}
+	void send(const std::vector<std::string> &frames) {
+		loop.at([&] {
+			for (auto &f : frames)
+				link.load()->connection->send(f);
+		});
+	}
+	// Closes the connection gracefully: whether it ended within 10 s.
+	bool retire(NodeId to) {
+		const int before = ended;
+		loop.at([&] { links->retire(to, LinkLane::Control); });
+		return until([&] { return ended > before; }, 10'000);
+	}
+	// A frame of `g` from incarnation `source` to `destination`, control unless `kind` says.
+	static std::string frame(GroupId g, NodeId source, NodeId destination, const std::string &payload,
+							 FrameKind kind = FrameKind::control) {
+		std::string f(1, char(kind));
+		j::put64(f, g);
+		j::put64(f, source);
+		j::put64(f, destination);
+		return f + payload;
+	}
+	~RawPeer() {
+		loop.at([&] { links->stop(); });
+		const bool stopped = until([&] { return loop.at([&] { return links->drained(); }); }, 10'000);
+		assert(stopped && "the raw peer's links drain");
+		loop.at([&] { links.reset(); });
+	}
+};
+
 // leftover: frames a read handed over before it failed (an oversized length) leave under their
 // own connection, never under the next read's: node 1 never opens g, so g's frame is unopened.
 void leftover() {
@@ -1293,46 +1454,17 @@ void leftover() {
 	warm(honest, [&] { return delivered(3) > 0; });
 
 	step("leftover: node 1 connects over raw Links and never opens g");
-	Loop attacker;
-	auto tls = context(names[1]);
-	std::map<NodeId, Fingerprint> pins;
-	for (NodeId n = 1; n <= 4; ++n)
-		pins[n] = pin_of(names[n]);
-	Identity cluster{};
-	cluster.fill('K');
 	LinkOptions options;
 	options.connection.maximum_frame = 8 << 20;
-	auto links = std::make_unique<Links>(attacker.io.get_executor(), task::scheduler_ref::of(attacker.scheduler), tls,
-										 NodePins(1, pins, tls->native_handle()), cluster,
-										 std::map<NodeId, PeerAddress>{{2, {"127.0.0.1", two.port()}}}, options);
-	std::atomic<const Link *> link{nullptr};
-	std::atomic<bool> ended{false};
-	links->on_established = [&](const Link &l) { link = &l; };
-	links->on_ended = [&](const Link &) { ended = true; };
-	links->on_frame = [](const Link &, std::string_view) {};
-	attacker.start();
-	attacker.at([&] {
-		task::spawn(task::scheduler_ref::of(attacker.scheduler), links->dial(2, LinkLane::Control),
-					[](std::exception_ptr, std::optional<bool>) {});
-	});
-	const bool up = until([&] { return link.load() != nullptr; }, 10'000);
+	auto attacker = std::make_unique<RawPeer>(1, 2, two.port(), options);
+	const bool up = attacker->dial(2);
 	std::printf("leftover: node 1's connection to host 2 is up: %s\n", up ? "yes" : "NO");
 	assert(up);
 
 	step("leftover: node 1 sends a frame for g, then one over host 2's bound");
-	auto frame = [&](std::string payload) {
-		std::string f(1, char(FrameKind::control));
-		j::put64(f, g);
-		j::put64(f, 1);
-		j::put64(f, 2);
-		return f + payload;
-	};
-	const auto evil = frame("evil"), big = frame(std::string(5 << 20, 'B'));
-	attacker.at([&] {
-		link.load()->connection->send(evil);
-		link.load()->connection->send(big);
-	});
-	const bool failed = until([&] { return ended.load(); }, 10'000);
+	attacker->send(RawPeer::frame(g, 1, 2, "evil"));
+	attacker->send(RawPeer::frame(g, 1, 2, std::string(5 << 20, 'B')));
+	const bool failed = until([&] { return attacker->ended > 0; }, 10'000);
 	std::printf("leftover: host 2 ended node 1's connection: %s\n", failed ? "yes" : "NO");
 
 	step("leftover: host 3 sends 20 frames");
@@ -1353,16 +1485,352 @@ void leftover() {
 	std::printf("leftover: host 2 received %llu frames, refused %llu unopened; delivered from incarnation 1 (never opened g): %llu; from 3: %llu\n",
 				(unsigned long long)received, (unsigned long long)unopened, (unsigned long long)bad, (unsigned long long)delivered(3));
 	std::printf("leftover: %s\n", bad ? "node 1's frame was admitted under host 3's open" : "no frame of node 1 admitted");
-	attacker.at([&] { links->stop(); });
-	const bool stopped = until([&] { return attacker.at([&] { return links->drained(); }); }, 10'000);
-	attacker.at([&] { links.reset(); });
-	assert(failed && !bad && unopened >= 1 && delivered(3) > 0 && stopped);
+	attacker.reset();
+	assert(failed && !bad && unopened >= 1 && delivered(3) > 0);
+}
+
+// reconnect: a peer's open holds on the connection it came on only. Node 1, over raw Links,
+// opens g and its frame arrives; on its next connection, g's frame without the open is refused
+// as unopened and closed back, and arrives once node 1 opens g there again.
+void reconnect() {
+	Host two(2, 1);
+	two.open({});
+	const GroupId g = 1001;
+	two.stores({g});
+	std::atomic<std::uint64_t> delivered{0};
+	two.transport->on_deliver(0, [&](const Received &r) {
+		delivered += r.route.source == 1;
+		return true;
+	});
+	two.start();
+	const auto open = encode_open(g, Host::test_open());
+	const auto &stats = two.transport->stats(0);
+	RawPeer one(1, 2, two.port());
+
+	step("reconnect: node 1 opens g and sends a frame");
+	const bool up = one.dial(2);
+	assert(up);
+	one.send(open);
+	one.send(RawPeer::frame(g, 1, 2, "first"));
+	const bool first = until([&] { return delivered == 1; }, 10'000);
+	std::printf("reconnect: on the first connection, g's frame arrives: %s\n", first ? "yes" : "NO");
+
+	step("reconnect: node 1 ends the connection and dials again");
+	const bool retired = one.retire(2), again = one.dial(2);
+	std::printf("reconnect: the first connection ended: %s; the second is up: %s\n", retired ? "yes" : "NO", again ? "yes" : "NO");
+	assert(first && retired && again);
+
+	step("reconnect: node 1 sends g's frame without its open");
+	one.send(RawPeer::frame(g, 1, 2, "second"));
+	const bool refused = until([&] { return stats.unopened >= 1 && one.closed >= 1; }, 5'000);
+	std::this_thread::sleep_for(200ms);
+	std::printf("reconnect: refused unopened %llu, closed back %llu, delivered %llu of 2\n", (unsigned long long)stats.unopened.load(),
+				(unsigned long long)one.closed.load(), (unsigned long long)delivered.load());
+	assert(refused && delivered == 1);
+
+	step("reconnect: node 1 opens g on the second connection");
+	one.send(open);
+	one.send(RawPeer::frame(g, 1, 2, "third"));
+	const bool reopened = until([&] { return delivered == 2; }, 10'000);
+	std::printf("reconnect: once opened again, g's frame arrives: %s; opens %llu, mismatched %llu\n", reopened ? "yes" : "NO",
+				(unsigned long long)stats.opens.load(), (unsigned long long)stats.mismatched.load());
+	assert(reopened && stats.opens == 2 && stats.mismatched == 0 && stats.unopened == 1);
+}
+// backlog: credit owed while the connection cannot send. Node 1, over raw Links, opens 6,000
+// groups on host 2, then reads slowly while host 2 sends it 24 MiB, and meanwhile sends 3 data
+// frames to each group, round by round: host 2 owes 18,000 records with its queue full, past
+// 4,096, so `owe` merges them per group. Each group's credit comes back whole, as values, in
+// fewer credit frames than data frames (a merge ran).
+void backlog() {
+	constexpr std::size_t N = 6000, R = 3, B = 6;
+	Host two(2, 1);
+	two.open({});
+	std::vector<GroupId> groups, bulk;
+	for (std::size_t i = 0; i != N; ++i)
+		groups.push_back(10'001 + i);
+	for (std::size_t i = 0; i != B; ++i)
+		bulk.push_back(90'001 + i);
+	two.stores(groups);
+	two.stores(bulk);
+	std::atomic<std::uint64_t> delivered{0};
+	two.transport->on_deliver(0, [&](const Received &r) {
+		delivered += r.route.source == 1;
+		return true;
+	});
+	two.start();
+	const auto &stats = two.transport->stats(0);
+	RawPeer one(1, 2, two.port());
+
+	step("backlog: node 1 opens 6,000 groups on host 2");
+	const bool up = one.dial(2);
+	assert(up);
+	std::vector<std::string> opens;
+	for (auto g : groups)
+		opens.push_back(encode_open(g, Host::test_open()));
+	one.send(opens);
+	const bool opened = until([&] { return stats.opens >= N; }, 10'000);
+
+	step("backlog: host 2 sends node 1 24 MiB, which node 1 reads slowly");
+	one.slow = true;
+	two.post(0, [&] {
+		for (auto g : bulk)
+			two.transport->send(0, LinkLane::Control, FrameKind::data, {g, 2, 1}, 1, std::string((4 << 20) - 1024, 'B'));
+	});
+	const bool backed = until([&] { return one.big >= 1; }, 10'000);
+
+	step("backlog: node 1 sends 3 data frames to each group while host 2 cannot send");
+	std::vector<std::string> frames;
+	std::map<GroupId, std::uint64_t> expected;
+	std::uint64_t total = 0;
+	for (std::size_t r = 0; r != R; ++r)
+		for (std::size_t i = 0; i != N; ++i) {
+			const std::string payload(1 + (i + 7 * r) % 13, char('a' + r));
+			frames.push_back(RawPeer::frame(groups[i], 1, 2, payload, FrameKind::data));
+			expected[groups[i]] += frame_header + payload.size();
+			total += frame_header + payload.size();
+		}
+	one.send(frames);
+	const bool arrived = until([&] { return delivered == N * R; }, 10'000);
+	const auto read_by_then = one.big.load();
+
+	step("backlog: node 1 reads at full speed; the credit comes back");
+	one.slow = false;
+	const bool credited = until([&] { return one.credited >= total; }, 10'000);
+	std::this_thread::sleep_for(200ms);  // credit over the total would arrive too
+	const auto got = one.loop.at([&] { return one.credit; });
+	std::size_t short_of = 0, over = 0;
+	for (auto &[g, want] : expected) {
+		const auto it = got.find(g);
+		const auto have = it == got.end() ? 0 : it->second;
+		if (have != want && short_of + over < 5)
+			std::printf("backlog: group %llu credited %llu of %llu\n", (unsigned long long)g, (unsigned long long)have,
+						(unsigned long long)want);
+		short_of += have < want;
+		over += have > want;
+	}
+	std::printf("backlog: up %s, %llu opens; node 1 read %llu of %llu bulk frames by the time host 2 delivered %llu of %zu data frames\n",
+				up ? "yes" : "NO", (unsigned long long)stats.opens.load(), (unsigned long long)read_by_then, (unsigned long long)B,
+				(unsigned long long)delivered.load(), N * R);
+	std::printf("backlog: credit %llu of %llu bytes in %llu credit frames for %zu frames (fewer: merged); groups credited %zu of %zu, "
+				"short %zu, over %zu, other groups %zu; closed %llu\n",
+				(unsigned long long)one.credited.load(), (unsigned long long)total, (unsigned long long)one.credits.load(), N * R,
+				got.size(), N, short_of, over, got.size() > N ? got.size() - N : 0, (unsigned long long)one.closed.load());
+	assert(opened && backed && arrived && credited);
+	assert(short_of == 0 && over == 0 && got.size() == N && "every group's credit, whole");
+	assert(one.credits < N * R && one.closed == 0 && "the owed records merged");
+}
+
+// scan: the feed's work per frame. Host 1 stores N groups and sends a control and a data frame
+// per group to host 2, for N = 100, 1,000 and 10,000, every group on one loop: the groups both
+// hosts' feeds visit per frame they send stay under 2 at each N (a scan per frame grows with N).
+void scan() {
+	Host one(1, 1), two(2, 1);
+	one.open(addresses({&two}));
+	two.open(addresses({&one}));
+	std::atomic<std::uint64_t> delivered{0};
+	two.transport->on_deliver(0, [&](const Received &) {
+		++delivered;
+		return true;
+	});
+	one.stores({1});
+	two.stores({1});
+	one.start();
+	two.start();
+	step("scan: the connection comes up");
+	warm([&] { one.post(0, [&] { one.transport->send(0, LinkLane::Control, FrameKind::control, {1, 1, 2}, 2, "w"); }); },
+		 [&] { return delivered > 0; });
+	auto totals = [&] {
+		std::pair<std::uint64_t, std::uint64_t> r;  // visited, sent
+		for (Host *h : {&one, &two}) {
+			r.first += h->transport->stats(0).visited;
+			r.second += h->transport->stats(0).sent;
+		}
+		return r;
+	};
+	GroupId next = 1'000'000;
+	std::vector<double> ratios;
+	for (std::size_t n : {100, 1'000, 10'000}) {
+		std::vector<GroupId> groups;
+		for (std::size_t i = 0; i != n; ++i)
+			groups.push_back(next++);
+		for (Host *h : {&one, &two})
+			h->loops[0]->at([&] { h->stores(groups); });
+		std::this_thread::sleep_for(100ms);
+		const auto before = totals();
+		const auto d0 = delivered.load();
+		step("scan: " + std::to_string(n) + " groups send");
+		one.post(0, [&one, groups] {
+			for (auto g : groups)
+				for (auto kind : {FrameKind::control, FrameKind::data})
+					one.transport->send(0, LinkLane::Control, kind, {g, 1, 2}, 2, std::string(39, 'p'));
+		});
+		const auto start = steady::now();
+		while (delivered != d0 + 2 * n) {
+			assert(ms_since(start) < 60'000 && "every frame arrives");
+			std::this_thread::sleep_for(1ms);
+		}
+		for (auto last = totals();;) {  // credit returns, then nothing moves for 100 ms
+			std::this_thread::sleep_for(100ms);
+			const auto now = totals();
+			if (now == last)
+				break;
+			last = now;
+		}
+		for (const auto credit_start = steady::now(); one.transport->stats(0).uncredited || two.transport->stats(0).uncredited;) {
+			assert(ms_since(credit_start) < 10'000 && "every group's credit returns");
+			std::this_thread::sleep_for(1ms);
+		}
+		const auto after = totals();
+		const double visited = double(after.first - before.first), sent = double(after.second - before.second);
+		ratios.push_back(visited / sent);
+		std::printf("scan: %zu groups: %.0f frames sent, %.0f groups visited, %.3f a frame (%.1f ms)\n", n, sent, visited, ratios.back(),
+					double(ms_since(start)));
+	}
+	one.stop();
+	two.stop();
+	for (auto r : ratios)
+		assert(r < 2 && "groups visited per frame sent stays constant");
+}
+
+// order: what a feed hands a connection, as values.
+//   Host 1 queues, in one turn of its one loop: data a0 a1, control a0 a1 a2, b0 b1 b2, c0, data
+//   b0. Host 2 (one loop: delivery in wire order) gets control first, round robin across the
+//   groups ready (a0 b0 c0 a1 b1 a2 b2), then data round robin (a0 b0 a1).
+//   Per-group credit: host 2 of 2 loops stalls group a's loop; a's data frames are over its
+//   window (64-byte frames, a 100-byte window: one at a time), b's are not stalled. All of b's
+//   arrive, exactly one of a's crosses the connection until the stall ends, then a's arrive in
+//   order.
+void order() {
+	using Seen = std::vector<std::string>;
+	auto tag = [](GroupId g, bool data, int i) { return std::string(1, char('a' + (g - 1001))) + (data ? "d" : "c") + std::to_string(i); };
+	{
+		Host one(1, 1), two(2, 1);
+		one.open(addresses({&two}));
+		two.open(addresses({&one}));
+		Seen seen;  // written on host 2's loop
+		one.stores({1, 1001, 1002, 1003});
+		two.stores({1, 1001, 1002, 1003});
+		std::atomic<bool> up{false};
+		two.transport->on_deliver(0, [&](const Received &r) {
+			if (r.route.group == 1)
+				up = true;
+			else
+				seen.push_back(r.payload);
+			return true;
+		});
+		one.start();
+		two.start();
+		step("order: the connection comes up");
+		warm([&] { one.post(0, [&] { one.transport->send(0, LinkLane::Control, FrameKind::control, {1, 1, 2}, 2, "w"); }); },
+			 [&] { return up.load(); });
+		std::this_thread::sleep_for(100ms);
+		step("order: one turn queues every frame");
+		one.post(0, [&] {
+			auto send = [&](GroupId g, bool data, int i) {
+				one.transport->send(0, LinkLane::Control, data ? FrameKind::data : FrameKind::control, {g, 1, 2}, 2, tag(g, data, i));
+			};
+			send(1001, true, 0);
+			send(1001, true, 1);
+			for (int i = 0; i != 3; ++i)
+				send(1001, false, i);
+			for (int i = 0; i != 3; ++i)
+				send(1002, false, i);
+			send(1003, false, 0);
+			send(1002, true, 0);
+		});
+		const Seen expected = {"ac0", "bc0", "cc0", "ac1", "bc1", "ac2", "bc2", "ad0", "bd0", "ad1"};
+		Seen got;
+		for (int i = 0; got.size() < expected.size(); ++i) {
+			assert(i < 5000 && "every frame arrives");
+			std::this_thread::sleep_for(1ms);
+			got = two.loops[0]->at([&] { return seen; });
+		}
+		std::string line;
+		for (auto &s : got)
+			line += " " + s;
+		std::printf("order: delivered%s\n", line.c_str());
+		one.stop();
+		two.stop();
+		assert(got == expected && "control first, round robin across ready groups");
+	}
+	{
+		HostTransportOptions options;
+		options.window = 100;
+		Host one(1, 1), two(2, 2);
+		one.open(addresses({&two}), options);
+		two.open(addresses({&one}), options);
+		const auto R = two.transport->loop_of_node(1);
+		const GroupId a = groups_on(2, 1 - R, 1)[0], b = groups_on(2, R, 1)[0];
+		std::mutex seen_mutex;
+		std::map<GroupId, Seen> seen;
+		std::atomic<bool> up{false};
+		for (std::uint32_t k = 0; k != 2; ++k)
+			two.transport->on_deliver(k, [&](const Received &r) {
+				if (r.route.group == b && r.payload == "w") {
+					up = true;
+					return true;
+				}
+				std::lock_guard hold(seen_mutex);
+				seen[r.route.group].push_back(r.payload);
+				return true;
+			});
+		one.stores({a, b});
+		two.stores({a, b});
+		one.start();
+		two.start();
+		auto count = [&](GroupId g) {
+			std::lock_guard hold(seen_mutex);
+			return seen[g].size();
+		};
+		step("order: credit: the connection comes up");
+		warm([&] { one.post(0, [&] { one.transport->send(0, LinkLane::Control, FrameKind::control, {b, 1, 2}, 2, "w"); }); },
+			 [&] { return up.load(); });
+		std::promise<void> release;
+		auto stalled = release.get_future().share();
+		two.post(1 - R, [stalled] { stalled.wait(); });
+		std::this_thread::sleep_for(50ms);
+		const std::uint64_t received = two.transport->stats(R).received;
+		step("order: credit: a's loop stalls; a and b each queue 3 data frames over the window");
+		one.post(0, [&] {
+			for (int i = 0; i != 3; ++i)
+				for (auto g : {a, b}) {
+					std::string payload(39, 'p');
+					payload[0] = char('0' + i);
+					one.transport->send(0, LinkLane::Control, FrameKind::data, {g, 1, 2}, 2, payload);
+				}
+		});
+		for (int i = 0; count(b) < 3; ++i) {
+			assert(i < 5000 && "b's frames arrive while a's loop stalls");
+			std::this_thread::sleep_for(1ms);
+		}
+		std::this_thread::sleep_for(300ms);
+		const std::uint64_t crossed = two.transport->stats(R).received - received;
+		const auto a_during = count(a);
+		release.set_value();
+		for (int i = 0; count(a) < 3; ++i) {
+			assert(i < 5000 && "a's frames arrive once its loop runs");
+			std::this_thread::sleep_for(1ms);
+		}
+		std::string a_order;
+		{
+			std::lock_guard hold(seen_mutex);
+			for (auto &p : seen[a])
+				a_order += p[0];
+			for (auto &p : seen[b])
+				a_order += p[0];
+		}
+		std::printf("order: credit: while a's loop stalled, b delivered 3, a %zu, frames crossing %llu (3 of b's, 1 of a's); then a and b in order: %s\n",
+					a_during, (unsigned long long)crossed, a_order.c_str());
+		one.stop();
+		two.stop();
+		assert(a_during == 0 && crossed == 4 && a_order == "012012" && "credit is per group");
+	}
 }
 } // namespace
 
 int main(int argc, char **argv) {
 	if (argc != 3) {
-		std::fprintf(stderr, "usage: %s <fixture dir> threads|credit|reader|upload|driver|refill|identity|joiner|lagging|leftover|relayout\n", argv[0]);
+		std::fprintf(stderr, "usage: %s <fixture dir> threads|credit|reader|upload|driver|refill|identity|joiner|lagging|leftover|reconnect|backlog|relayout|scan|order\n", argv[0]);
 		return 2;
 	}
 #ifndef SO_NOSIGPIPE
@@ -1393,12 +1861,20 @@ int main(int argc, char **argv) {
 		identity();
 	else if (which == "leftover")
 		leftover();
+	else if (which == "reconnect")
+		reconnect();
+	else if (which == "backlog")
+		backlog();
 	else if (which == "joiner")
 		joiner();
 	else if (which == "lagging")
 		lagging();
 	else if (which == "relayout")
 		relayout();
+	else if (which == "scan")
+		scan();
+	else if (which == "order")
+		order();
 	else
 		return 2;
 	std::printf("%s: ok\n", which.c_str());

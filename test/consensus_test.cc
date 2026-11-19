@@ -1096,7 +1096,7 @@ void repair_at_or_below_commit() {
 	}
 	check(repaired == applied - follower.core->base_index() + 1, "every repair replays to the undamaged applied sequence");
 	auto reason = [](const Actions& actions) { auto r = find<Reject>(actions); return r ? std::optional<RejectReason>(r->reason) : std::nullopt; };
-	check(reason(follower.core->step(Repair{200, {applied + 1, term_at(applied)}})) == RejectReason::InvalidRepair, "a boundary above applied is refused");
+	check(reason(follower.core->step(Repair{200, {applied + 1, term_at(applied)}})) == RejectReason::InvalidRepair, "a boundary above commit is refused");
 	check(reason(follower.core->step(Repair{201, {applied, term_at(applied) + 1}})) == RejectReason::InvalidRepair, "a boundary whose term differs is refused");
 	check(reason(cluster.host(1).core->step(Repair{202, {applied, term_at(applied)}})) == RejectReason::LeaderMustTransfer, "a leader transfers before it repairs");
 	// A capture from before the repair's epoch is rejected; one under the current epoch is not.
@@ -1109,12 +1109,15 @@ void repair_at_or_below_commit() {
 	if (checkpoint) { cluster.consume(2, follower.core->step(Persisted{checkpoint->token})); }
 	check(follower.core->base_index() == through, "the checkpoint raised the base");
 	check(reason(follower.core->step(Repair{205, {through - 1, term_at(through - 1)}})) == RejectReason::InvalidRepair, "a boundary below base_index is refused");
+	check(reason(follower.core->step(Repair{207, {through, term_at(through) + 1}})) == RejectReason::InvalidRepair, "a boundary at base_index with another term is refused");
 	// A delivery outstanding refuses a repair.
 	follower.auto_apply = false;
 	cluster.consume(1, cluster.host(1).core->step(Propose{7, "c7"})); cluster.pump();
 	for (unsigned round = 0; round < 4; ++round) { cluster.tick(cluster.now + 10); cluster.pump(); }
 	check(follower.applying.has_value(), "repair setup: a delivery outstanding");
 	check(reason(follower.core->step(Repair{206, {through, term_at(through)}})) == RejectReason::Busy, "a repair waits for the outstanding delivery");
+	check(follower.core->applied() < follower.core->committed() && reason(follower.core->step(Repair{208, {follower.core->applied(), term_at(follower.core->applied())}})) == RejectReason::Busy,
+		"a repair while applied is below commit answers Busy");
 	cluster.complete_apply(2); follower.auto_apply = true;
 	// The voter keeps voting and following: a new leader commits, and the repaired voter applies it.
 	cluster.isolated.insert(1);
@@ -1126,6 +1129,20 @@ void repair_at_or_below_commit() {
 		cluster.consume(leader, cluster.host(leader).core->step(Propose{8, "c8"})); cluster.pump();
 		for (unsigned round = 0; round < 4; ++round) { cluster.tick(cluster.now + 10); cluster.pump(); }
 		check(follower.applied_commands.back() == "c8" && cluster.host(3).applied_commands == follower.applied_commands, "after repair the voter applies what the group commits");
+	}
+	// The commit bound: a follower holding an appended entry it has not seen committed
+	// refuses a repair at that boundary even when the term matches.
+	{
+		Network c(3); c.start(); c.elect(1);
+		for (RequestId r = 500; r < 503; ++r) { c.consume(1, c.host(1).core->step(Propose{r, "k" + std::to_string(r)})); c.pump(); }
+		auto& h = c.host(2);
+		const Index commit = h.core->committed();
+		check(commit > 0 && h.core->last_index() > commit && h.core->applied() == commit, "commit bound setup: an appended entry above commit");
+		const Index last = h.core->last_index();
+		const Term last_term = h.core->term();
+		for (Index b = commit + 1; b <= last; ++b) {
+			check(reason(h.core->step(Repair{510 + b, {b, last_term}})) == RejectReason::InvalidRepair, "a boundary above commit is refused");
+		}
 	}
 	// The core refuses a repair while busy (a storage batch pending).
 	{

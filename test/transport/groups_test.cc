@@ -53,6 +53,12 @@
 #ifdef __linux__
 #include <sys/prctl.h>
 #endif
+#ifdef __APPLE__
+#include <cxxabi.h>
+#include <dlfcn.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
 
 using namespace kronuz::consensus::transport;
 using namespace kronuz::consensus;
@@ -597,6 +603,129 @@ std::string sockets(std::initializer_list<std::uint16_t> ports) {
 	}
 	return r;
 }
+// Each loop of the hosts, every sample: how long the stamp posted to it last has waited (0 once
+// it ran), its thread's CPU ms since the last sample, its run state on macOS (R runnable, W
+// waiting, U uninterruptible, S stopped) and, once a stamp waits 250 ms, the thread's stack.
+// A stuck loop that waits is blocked in a call; one with CPU and a moving stack runs a long
+// handler; one runnable with a stack that does not move is a thread the host does not run.
+class LoopProbe {
+  public:
+	explicit LoopProbe(std::initializer_list<Host *> hosts) {
+		for (auto *h : hosts)
+			for (std::uint32_t k = 0; k != h->loops.size(); ++k)
+				loops_.push_back({h->node, k, h->loops[k].get()});
+	}
+	std::string sample() {
+		std::string r;
+		for (auto &l : loops_) {
+			const auto now = steady::now();
+			const std::uint64_t age = *l.ran ? 0 : std::uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(now - l.posted).count());
+			if (*l.ran) {
+				*l.ran = false;
+				l.posted = now;
+				asio::post(l.loop->io, [ran = l.ran] { *ran = true; });
+			}
+			char state = '?';
+			const auto cpu = cpu_us(*l.loop, state);
+			char line[96];
+			std::snprintf(line, sizeof line, " {%llu.%u age %llu cpu %llu %c", (unsigned long long)l.node, l.k, (unsigned long long)age,
+						  (unsigned long long)((cpu - std::min(cpu, l.cpu)) / 1000), state);
+			l.cpu = cpu;
+			r += line;
+			if (age >= 250)
+				r += stack(*l.loop);
+			r += "}";
+		}
+		return r;
+	}
+
+  private:
+	struct Probed {
+		NodeId node;
+		std::uint32_t k;
+		Loop *loop;
+		std::shared_ptr<std::atomic<bool>> ran = std::make_shared<std::atomic<bool>>(true);
+		steady::time_point posted{};
+		std::uint64_t cpu = 0;
+	};
+	// The thread's user and system time in microseconds, and its run state.
+	static std::uint64_t cpu_us(Loop &loop, char &state) {
+#ifdef __APPLE__
+		thread_basic_info_data_t info{};
+		mach_msg_type_number_t n = THREAD_BASIC_INFO_COUNT;
+		if (thread_info(pthread_mach_thread_np(loop.thread.native_handle()), THREAD_BASIC_INFO, thread_info_t(&info), &n) !=
+			KERN_SUCCESS)
+			return 0;
+		state = "?RSWUH"[info.run_state >= 1 && info.run_state <= 5 ? info.run_state : 0];
+		return std::uint64_t(info.user_time.seconds + info.system_time.seconds) * 1000000 +
+			   std::uint64_t(info.user_time.microseconds + info.system_time.microseconds);
+#else
+		clockid_t clock;
+		timespec t{};
+		if (pthread_getcpuclockid(loop.thread.native_handle(), &clock) != 0 || clock_gettime(clock, &t) != 0)
+			return 0;
+		return std::uint64_t(t.tv_sec) * 1000000 + std::uint64_t(t.tv_nsec) / 1000;
+#endif
+	}
+	// The thread's program counter and up to 7 return addresses by its frame pointers, read while
+	// it is suspended and named once it resumes (dladdr may take a lock the thread holds).
+	static std::string stack(Loop &loop) {
+		std::string r;
+#ifdef __APPLE__
+		const auto thread = pthread_mach_thread_np(loop.thread.native_handle());
+		std::uintptr_t pcs[8] = {}, pc = 0, fp = 0;
+		std::size_t n = 0;
+		if (thread_suspend(thread) != KERN_SUCCESS)
+			return r;
+#if defined(__x86_64__)
+		x86_thread_state64_t s{};
+		mach_msg_type_number_t count = x86_THREAD_STATE64_COUNT;
+		if (thread_get_state(thread, x86_THREAD_STATE64, thread_state_t(&s), &count) == KERN_SUCCESS)
+			pc = s.__rip, fp = s.__rbp;
+#elif defined(__arm64__)
+		arm_thread_state64_t s{};
+		mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+		if (thread_get_state(thread, ARM_THREAD_STATE64, thread_state_t(&s), &count) == KERN_SUCCESS)
+			pc = arm_thread_state64_get_pc(s), fp = arm_thread_state64_get_fp(s);
+#endif
+		pcs[n++] = pc;
+		while (fp && n != 8) {
+			std::uintptr_t frame[2] = {};
+			mach_vm_size_t got = 0;
+			if (mach_vm_read_overwrite(mach_task_self(), fp, sizeof frame, mach_vm_address_t(frame), &got) != KERN_SUCCESS ||
+				got != sizeof frame || frame[0] <= fp)
+				break;
+			pcs[n++] = frame[1];
+			fp = frame[0];
+		}
+		thread_resume(thread);
+		for (std::size_t i = 0; i != n && pcs[i]; ++i) {
+			Dl_info info{};
+			std::string name = "?";
+			std::uintptr_t base = 0;
+			if (dladdr(reinterpret_cast<void *>(pcs[i]), &info) && info.dli_sname) {
+				int status = 0;
+				char *plain = abi::__cxa_demangle(info.dli_sname, nullptr, nullptr, &status);
+				name = plain ? plain : info.dli_sname;
+				std::free(plain);
+				base = reinterpret_cast<std::uintptr_t>(info.dli_saddr);
+			} else if (info.dli_fname) {
+				name = std::filesystem::path(info.dli_fname).filename().string();
+				base = reinterpret_cast<std::uintptr_t>(info.dli_fbase);
+			}
+			if (name.size() > 72)
+				name.resize(72);
+			char at[24];
+			std::snprintf(at, sizeof at, "+0x%llx", (unsigned long long)(pcs[i] - base));
+			r += (i ? " < " : " pc ") + name + at;
+		}
+#else
+		(void)loop;
+#endif
+		return r;
+	}
+	std::vector<Probed> loops_;
+};
 // A control frame waits behind at most `window` bytes of the reader's data, so its gap is that
 // window over the reader's delivery rate across the run: up to 1.6 times it (the highest of 216
 // probe runs is 1.44, so 11% headroom), never under the 1,000 ms election timeout. On
@@ -658,7 +787,8 @@ bool upload() {
 	step("upload: 4 s of uploads, heartbeats and votes");
 	const auto before = beats.count.load();
 	const auto start = steady::now();
-	std::vector<std::string> samples;  // every 250 ms: progress, links, host 1's frames, host 2's reads, the sockets
+	std::vector<std::string> samples;  // every 250 ms: progress, links, host 1's frames, host 2's reads, the sockets, the loops
+	LoopProbe loops{&one, &two};
 	std::atomic<bool> sampling{true};
 	std::thread sampler([&] {
 		while (sampling) {
@@ -669,7 +799,7 @@ bool upload() {
 						  (unsigned long long)total(one, &HostTransportStats::links), (unsigned long long)total(two, &HostTransportStats::links),
 						  (unsigned long long)total(one, &HostTransportStats::sent), (unsigned long long)total(one, &HostTransportStats::dropped),
 						  (unsigned long long)total(two, &HostTransportStats::reads));
-			samples.push_back(line + sockets({one.port(), two.port()}));
+			samples.push_back(line + sockets({one.port(), two.port()}) + loops.sample());
 		}
 	});
 	for (std::int64_t tick = 0; ms_since(start) < 4000; ++tick) {  // signed: see reader()

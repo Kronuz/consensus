@@ -27,6 +27,18 @@
 #include <sys/user.h>
 #endif
 
+// Whether a sanitizer that may start threads of its own is built in.
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define SANITIZER_THREADS 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define SANITIZER_THREADS 1
+#endif
+#endif
+#ifndef SANITIZER_THREADS
+#define SANITIZER_THREADS 0
+#endif
+
 using namespace kronuz::consensus::transport;
 using namespace std::chrono_literals;
 using Clock = std::chrono::steady_clock;
@@ -108,9 +120,9 @@ template <class Done> bool until(Done done, Clock::duration limit = 5s) {
 std::size_t before_warmup = 0;  // the process's threads before the warm-up thread
 std::size_t baseline = 0;       // the process's threads before any lookup
 
-// Waits up to `limit` for the process to have `expected` threads. When it does not, prints how
-// the count moved, and each thread's name and run state.
-bool settles(std::size_t expected, Clock::duration limit = 5s) {
+// Waits up to `limit` for the process to have `expected` threads, storing the wait in `took`.
+// When it does not, prints how the count moved, and each thread's name and run state.
+bool settles(std::size_t expected, Clock::duration limit = 5s, Clock::duration *took = nullptr) {
 	const auto start = Clock::now();
 	std::string trace;
 	std::size_t last = SIZE_MAX;
@@ -120,6 +132,8 @@ bool settles(std::size_t expected, Clock::duration limit = 5s) {
 			trace += " " + std::to_string(ms(Clock::now() - start)) + "ms:" + std::to_string(last = count);
 		return count == expected;
 	}, limit);
+	if (took)
+		*took = Clock::now() - start;
 	if (!done) {
 		std::fprintf(stderr, "threads: expected %zu (baseline %zu, %zu before the warm-up thread); count over time:%s\n",
 					 expected, baseline, before_warmup, trace.c_str());
@@ -304,8 +318,10 @@ void shutdown() {
 	for (auto &lookup : lookups)
 		lookup->abandon();
 	// A joined thread may linger in the system's count for a moment after the join returns.
-	CHECK(settles(baseline, 1s));
-	std::printf("shutdown: a resolver stuck until 300 ms after destruction began held it %lld ms\n", ms(took));
+	Clock::duration listed{};
+	CHECK(settles(baseline, 1s, &listed));
+	std::printf("shutdown: a resolver stuck until 300 ms after destruction began held it %lld ms; "
+				"its threads left the system's list %lld ms after\n", ms(took), ms(listed));
 	CHECK(took >= 290ms && gate->entered == 4 && gate->returned == 4 && answers->size() == 0);
 }
 
@@ -352,9 +368,10 @@ void rebuilds() {
 // built); every thread it ran has been joined, and a lookup started now throws.
 void exited() {
 	const auto took = Clock::now() - returned_at;
-	const bool joined = settles(baseline, 1s);
-	std::printf("exit: waited %lld ms for the lookup in flight; %s\n", ms(took),
-				joined ? "every lookup thread joined" : "a lookup thread is left");
+	Clock::duration listed{};
+	const bool joined = settles(baseline, 1s, &listed);
+	std::printf("exit: waited %lld ms for the lookup in flight; %s, gone from the system's list in %lld ms\n",
+				ms(took), joined ? "every lookup thread joined" : "a lookup thread is left", ms(listed));
 	bool canceled = false;
 	try {
 		Lookup::start([](const std::string &) { return std::vector<asio::ip::address>{}; }, "after exit",
@@ -371,9 +388,22 @@ void exited() {
 } // namespace
 
 int main(int argc, char **argv) {
+	// A sanitizer's own threads start with the first thread. The baseline is the count while the
+	// warm-up thread runs, less that thread: once joined it may stay listed for a moment.
 	before_warmup = os_threads();
-	std::thread([] { name_thread("warm-up"); }).join();  // a sanitizer's own threads start with the first one
-	baseline = os_threads();
+	std::size_t during = 0;
+	std::thread([&] {
+		name_thread("warm-up");
+		during = os_threads();
+	}).join();
+	baseline = during - 1;
+	Clock::duration listed{};
+	CHECK(settles(baseline, 5s, &listed));
+#if !SANITIZER_THREADS
+	CHECK(baseline == before_warmup);
+#endif
+	std::printf("main: baseline %zu threads (%zu before the warm-up thread); the joined warm-up thread left the "
+				"system's list %lld ms after\n", baseline, before_warmup, ms(listed));
 	std::atexit(exited);
 	const std::pair<const char *, void (*)()> cases[] = {
 		{"delivers", delivers}, {"abandoned", abandoned}, {"abandon_waits", abandon_waits},

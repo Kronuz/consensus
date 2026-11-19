@@ -10,7 +10,6 @@
 #include <asio/io_context.hpp>
 #include <arpa/inet.h>
 #include <asio/post.hpp>
-#include <asio/steady_timer.hpp>
 #include <atomic>
 #include <cassert>
 #include <csignal>
@@ -19,7 +18,6 @@
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
-#include <functional>
 #include <netinet/in.h>
 #include <openssl/pem.h>
 #include <mutex>
@@ -633,7 +631,6 @@ struct reader_run {
 	long wedge_queue;
 	int wedge_events, wedge_error;
 	std::string refills;  // drain_watch::refills
-	long long l1_late, l1_late_at;  // the writer's loop's worst late timer, ms, and when from the start
 	int rcvbuf, rcvbuf_end, sndbuf_end;  // the reader's SO_RCVBUF once accepted and at the end; the writer's SO_SNDBUF
 };
 
@@ -641,7 +638,6 @@ struct reader_run {
 //   READ_SLOWLY_BUILD_MS   the dialer's loop is held this long while the frames are queued, as a
 //                          slow allocator (TSan, a loaded host) holds it
 //   COARSE_WRITER_SNDBUF   the coarse writer's SO_SNDBUF and low-water mark, bytes
-//   COARSE_WRITER_PULSE_MS wakes the writer's loop this often and reports its worst late timer
 //   COARSE_WRITER_TRACE    prints the coarse writer's buffers and write bursts on every run
 long long knob(const char *name, long long fallback = 0) {
 	const char *v = std::getenv(name);
@@ -750,29 +746,7 @@ reader_run read_slowly_once(reader_load load) {
 		assert(!e);
 		dialer_end = v;
 	});
-	// With COARSE_WRITER_PULSE_MS: the writer's loop's lateness, a timer's worst late fire and when
-	// (ms from the start). The pulse wakes the loop, so it can mask a late wheel fire; off by default.
-	const auto pulse_ms = std::chrono::milliseconds(knob("COARSE_WRITER_PULSE_MS"));
-	asio::steady_timer pulse(l1.io);
-	long long l1_late = 0, l1_late_at = 0;
-	std::function<void()> arm = [&] {
-		pulse.expires_after(pulse_ms);
-		pulse.async_wait([&](asio::error_code ec) {
-			if (ec)
-				return;
-			const auto now = std::chrono::steady_clock::now();
-			if (const auto late = std::chrono::duration_cast<std::chrono::milliseconds>(now - pulse.expiry()).count();
-				late > l1_late) {
-				l1_late = late;
-				l1_late_at = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
-			}
-			arm();
-		});
-	};
-	if (pulse_ms.count() > 0)
-		arm();
 	assert(l1.until([&] { return dialer_end && acceptor_done; }, 60s));
-	pulse.cancel();
 	l1.until([] { return false; }, 5ms);
 	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 	const auto held_ms = held->worst_ms();
@@ -789,14 +763,15 @@ reader_run read_slowly_once(reader_load load) {
 	t2.join();
 	return {got, ms, watch.worst_ms(), held_ms, *dialer_end, *acceptor_end, acceptor.keepalives_sent(),
 			dialer.drained_expiries(), coarse_wakes, queue_left, sndbuf, lowat, load,
-			wedged_ms, wedge_queue, wedge_events, wedge_error, refills, l1_late, l1_late_at, rcvbuf, rcvbuf_end, sndbuf_end};
+			wedged_ms, wedge_queue, wedge_events, wedge_error, refills, rcvbuf, rcvbuf_end, sndbuf_end};
 }
 // Both ends share this process, so a host stop silences the reader's keepalives too, which no
 // two hosts do, and the host's network stack may withhold the bytes (macOS throttles a
 // background process's sockets): a failed run the host stalled for a third of dead_after, or a
 // coarse writer's run that ended stuck after its queue went half of dead_after without draining
-// (it writes only after a wait, so the sampled queue shows every drain), runs again, at most
-// twice. Only a whole run passes, and any other failure fails at once.
+// (it writes only after a wait, so the sampled queue shows every drain), or that finished whole
+// without one expired wait (the kernel drained it early), runs again, at most twice. Only a whole
+// run with its expiry passes, and any other failure fails at once.
 void read_slowly(const reader_load &load) {
 	for (int attempt = 1;; ++attempt) {
 		const auto r = read_slowly_once(load);
@@ -813,17 +788,19 @@ void read_slowly(const reader_load &load) {
 								: "");
 		const bool whole = r.got == used.frames && r.dialer == ConnectionEnd::closed && r.acceptor == ConnectionEnd::closed;
 		if (used.coarse && (knob("COARSE_WRITER_TRACE") || !whole || (r.coarse_wakes && !r.drained_expiries)))
-			std::printf("%s: reader SO_RCVBUF %d, %d at the end; writer SO_SNDBUF %d at the end; the writer's loop ran a "
-						"timer %lld ms late at most, at %lld ms; write bursts (ms: queue before->after):%s\n",
-						used.name, r.rcvbuf, r.rcvbuf_end, r.sndbuf_end, r.l1_late, r.l1_late_at, r.refills.c_str());
+			std::printf("%s: reader SO_RCVBUF %d, %d at the end; writer SO_SNDBUF %d at the end; "
+						"write bursts (ms: queue before->after):%s\n",
+						used.name, r.rcvbuf, r.rcvbuf_end, r.sndbuf_end, r.refills.c_str());
 		if (used.coarse && (!whole || (r.coarse_wakes && !r.drained_expiries)))  // what a coarse failure leaves to name its cause
 			std::printf("%s: socket buffer %d, low-water mark %d, queue %ld at the last sample; the queue was empty with "
 						"the socket not writable for %lld ms at most (then queue %ld, poll events 0x%x, SO_ERROR %d)\n",
 						used.name, r.sndbuf, r.lowat, r.queue_left, r.wedged_ms, r.wedge_queue, r.wedge_events, r.wedge_error);
 		if (whole) {
 			assert(r.ms >= used.frames * used.per_frame.count());
-			assert(!r.coarse_wakes || r.drained_expiries > 0);  // the case reached the rule it tests
-			return;
+			if (!r.coarse_wakes || r.drained_expiries > 0)
+				return;
+			assert(attempt < 3);  // a whole run that never waited out dead_after did not reach the rule
+			continue;
 		}
 		const bool stalled = r.stalled_ms >= load.dead_after.count() / 3;
 		const bool held = load.coarse && r.dialer == ConnectionEnd::failed && r.held_ms >= load.dead_after.count() / 2;

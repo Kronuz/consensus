@@ -6,6 +6,17 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#consensus) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-19
+
+### Changed
+
+- The journal pin moves to journal:be8222c, past journal-reopen-closed (journal:4d364f1), and completion to completion:d8b538c, journal's own. Durable syncs go through `IO::sync_files` and `IO::sync_data_files`.
+- A closing Worker hands its shared group back to the host once drained: closed into the host's table when its last record is a checkpoint covering every batch (`Host::close_group`, `TurnDriver::forget`), otherwise released when its Store ends. The Driver settles the host after erasing a row, so a released group is parked at once. A closed id recovers in the same live host, and 10,000 covered rows closed leave the process heap where it was (`driver_close_test closed_bytes`).
+
+### Fixed
+
+- A checkpoint whose peak (its bundle bound plus its application cap) exceeds the replacement pool fails at once with `checkpoint_exceeds_pool` instead of waiting forever and blocking the calls behind it.
+
 ## 2026-11-18
 
 ### Fixed

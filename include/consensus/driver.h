@@ -619,11 +619,12 @@ private:
 			if (!ready_head_) { ready_tail_ = nullptr; }
 			g.queued = false; g.ready_next = nullptr;
 			step(g);
-			if (g.closed) { erase(g); }
+			if (g.closed) { erase(g); host_.settle(loop_); }
 		}
 	}
 	// A closed group's node goes once nothing refers to it: close_step disarmed it, and it has
-	// no waiter or IO; only the ready list can still link it.
+	// no waiter or IO; only the ready list can still link it. Its Worker is gone, so its hold
+	// on the group ended: settle() releases what the host still keeps of it.
 	void erase(Group& g) {
 		if (g.queued) {
 			Group* before = nullptr;

@@ -739,13 +739,19 @@ reader_run read_slowly_once(reader_load load) {
 			// The writer wakes once the queue holds at most sndbuf - lowat. The reader's buffer takes
 			// `capacity` of it unread and the reader pulls at most size / per_frame after that, so the
 			// pace is set for the rest (lowat - capacity) to outlast two dead_after.
-			const long long rest = lowat - capacity;
-			if (rest <= 0)
-				std::printf("%s: precondition broken: the writer's low-water mark %d is within the reader's capacity %d\n",
-							load.name, lowat, capacity);
-			assert(rest > 0 && "the reader holds the writer's whole mark");
-			const long long pace = (2 * load.dead_after.count() * (long long)load.size + rest - 1) / rest;
+			const long long rest = (long long)lowat - capacity, room = rest - (sndbuf - lowat);
+			const long long pace = (2 * load.dead_after.count() * (long long)load.size + std::max(rest, 1LL) - 1) /
+								   std::max(rest, 1LL);
 			load.per_frame = std::max(load.per_frame, std::chrono::milliseconds(pace));
+			// The most the reader can pull in a dead_after at that pace (as read_slowly counts it: the
+			// frames taken, one half-read, a record) must leave the queue above the wake level.
+			const long long window = (load.dead_after.count() + load.per_frame.count() - 1) / load.per_frame.count();
+			const long long pulled = (window + 1) * (long long)load.size + 16 * 1024;
+			if (pulled >= room)
+				std::printf("%s: precondition broken: a mark of %d over the reader's capacity %d leaves %lld B above the "
+							"wake level, and the reader pulls up to %lld B in a dead_after\n",
+							load.name, lowat, capacity, room, pulled);
+			assert(pulled < room && "the writer's mark is too small to outlast the reader");
 			load.frames = std::max(load.frames, int((sndbuf + capacity) / load.size) + 16);
 		}
 	}

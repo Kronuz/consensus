@@ -602,8 +602,11 @@ std::string sockets(std::initializer_list<std::uint16_t> ports) {
 // probe runs is 1.44, so 11% headroom), never under the 1,000 ms election timeout. On
 // macos-15-intel the rate runs 6-26 MiB/s against the nominal 38. A run delivering under two
 // windows is a dead connection, not a slow reader.
+constexpr std::uint64_t upload_bound_ms(std::uint64_t window, std::uint64_t uploaded, std::uint64_t elapsed_ms) {
+	return std::max<std::uint64_t>(1000, uploaded ? window * elapsed_ms * 8 / 5 / uploaded : ~std::uint64_t{0});
+}
 constexpr bool upload_gap_ok(std::uint64_t gap_ms, std::uint64_t window, std::uint64_t uploaded, std::uint64_t elapsed_ms) {
-	return uploaded >= 2 * window && gap_ms < std::max<std::uint64_t>(1000, window * elapsed_ms * 8 / 5 / uploaded);
+	return uploaded >= 2 * window && gap_ms < upload_bound_ms(window, uploaded, elapsed_ms);
 }
 // Recorded runs: probe 44441165298 (a loaded runner: 1.09 s at 8 MiB/s), CI failures 44216299768 and 44264616865.
 void upload_bound() {
@@ -692,9 +695,14 @@ bool upload() {
 	std::printf("upload: %.1f MiB uploaded in %llu ms on the shared connection; %llu heartbeats and votes, longest gap %llu ms %s\n",
 				double(uploaded) / (1 << 20), (unsigned long long)elapsed, (unsigned long long)controls, (unsigned long long)gap,
 				ok ? "ok" : "FAILS: a follower would start an election");
-	if (!ok)
+	if (!ok) {  // what a failure needs: the window, the reader's rate, the bound, then the samples
+		std::printf("upload: window %.1f MiB, reader %.1f MiB/s, window/rate %llu ms, bound %llu ms, gap %llu ms, %llu controls\n",
+					double(options.window) / (1 << 20), double(uploaded) / (1 << 20) * 1000 / double(elapsed),
+					(unsigned long long)(uploaded ? options.window * elapsed / uploaded : 0),
+					(unsigned long long)upload_bound_ms(options.window, uploaded, elapsed), (unsigned long long)gap, (unsigned long long)controls);
 		for (auto &s : samples)
 			std::printf("%s\n", s.c_str());
+	}
 	return ok;
 }
 

@@ -177,6 +177,13 @@ after `create` or `recover` succeeds at once.
 application, which calls `applied` later. Core holds one range until then, and `close` does not
 wait for it.
 
+**The apply index never passes what the application was delivered.** `applied(through)` must name
+the end of the range the Sink delivered last; Core fences any other (`invalid application
+completion`). Otherwise the apply index moves only to the boundary of a checkpoint the application
+restored (`recover`), an image it activated (`ActivateInstall`) or a `repair` it asked for. A
+witness member is delivered nothing: the Driver acknowledges each of its ranges itself, so its
+apply index follows its commit index while its application holds no entries.
+
 ## The blocking entry
 
 `consensus::run(driver, scheduler, work)` holds the loop's turn driver (journal's `Hold`, so a

@@ -1,16 +1,96 @@
+# Probe for peers-tsan-timeout (never lands): consensus_transport_peers under linux-tsan beside a
+# looping connection_test, whole runs (full shards) or hung-resolver and slow-resolver alone in turn
+# (cases shards); probe 7 runs 8 full shards of 40, line-buffered through a pty; a run that overstays gets CPU time, timerfd state,
+# an strace window and gdb stacks of every thread.
 name: CI
 on:
-  push:
-    branches: [main, master, 'quest/**']
-  pull_request:
   workflow_dispatch:
     inputs:
       nightly: { type: boolean, default: false }
-concurrency:
-  group: ci-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: true
 jobs:
-  ci:
-    uses: Kronuz/cpp-libraries/.github/workflows/cmake.yml@main
-    with:
-      nightly: ${{ inputs.nightly || false }}
+  probe:
+    name: probe-${{ matrix.load }}-${{ matrix.shard }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        load: [beside]
+        shard: [full-1, full-2, full-3, full-4, full-5, full-6, full-7, full-8]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Packages
+        run: sudo apt-get update -q && sudo apt-get install -y -q gdb strace
+      - name: Configure
+        env: { CC: clang, CXX: clang++ }
+        run: >-
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCONSENSUS_TRANSPORT=ON
+          "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=-O1 -g -fsanitize=thread -fno-omit-frame-pointer"
+          "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread"
+      - name: Build
+        run: cmake --build build --parallel 4 --target consensus_transport_peers_test consensus_transport_connection_test
+      - name: Probe
+        env: { TSAN_OPTIONS: "halt_on_error=1 second_deadlock_stack=1" }
+        run: |
+          set +e
+          ctest --test-dir build -R '^consensus_tls_certificates$' --output-on-failure
+          (cd build && while true; do ./consensus_transport_connection_test tls-fixture > /dev/null 2>&1; done) &
+          bg=$!
+          cd build
+          bin="$PWD/consensus_transport_peers_test"
+          diag() {
+            pid=$1
+            cpu() { sudo awk '{print $14 + $15}' /proc/$pid/stat; }
+            a=$(cpu); sleep 5; b=$(cpu)
+            echo "-- cpu ticks in 5 s: $((b - a)) (100 per s); threads $(ls /proc/$pid/task | wc -l); monotonic $(cut -d' ' -f1 /proc/uptime)"
+            for fd in $(sudo ls /proc/$pid/fd); do
+              if sudo readlink /proc/$pid/fd/$fd | grep -q timerfd; then echo "-- timerfd $fd"; sudo cat /proc/$pid/fdinfo/$fd; fi
+            done
+            echo "-- per-thread state"
+            for t in $(ls /proc/$pid/task); do echo "$t $(sudo awk '{print $3, $14 + $15}' /proc/$pid/task/$t/stat) $(sudo cat /proc/$pid/task/$t/wchan)"; done
+            echo "-- strace 3 s"
+            sudo timeout 3 strace -f -tt -p $pid -o strace.txt > /dev/null 2>&1
+            awk '{print $3}' strace.txt | sed 's/(.*//' | sort | uniq -c | sort -rn | head
+            head -40 strace.txt
+            echo "-- stacks"
+            sudo gdb -p $pid -batch -ex 'set pagination off' -ex 'thread apply all bt 16' 2>&1 | grep -v '^\[New LWP' | cut -c1-240
+          }
+          fails=0
+          runs=0
+          if [ "${{ startsWith(matrix.shard, 'full') }}" = true ]; then plan=$(seq 1 40 | sed 's/.*/all/'); limit=60; else plan=$(for i in $(seq 1 90); do echo hung-resolver; echo slow-resolver; done); limit=30; fi
+          for what in $plan; do
+            runs=$((runs+1))
+            arg=$what; [ $what = all ] && arg=
+            start=$(date +%s.%N)
+            script -q -f -e -c "$bin $arg" run.log > /dev/null 2>&1 &
+            wrapper=$!
+            hung=0
+            while kill -0 $wrapper 2>/dev/null; do
+              if [ "$(echo "$(date +%s.%N) - $start > $limit" | bc)" = 1 ]; then
+                hung=1
+                pid=$(pgrep -n -f "^$bin")
+                echo "== run $runs ($what): past $limit s, pid $pid"
+                tr -d '\r' < run.log | tail -4
+                diag $pid
+                kill -9 $pid $wrapper 2>/dev/null
+                break
+              fi
+              sleep 0.5
+            done
+            wait $wrapper
+            rc=$?
+            elapsed=$(echo "$(date +%s.%N) - $start" | bc)
+            cases=$(tr -d '\r' < run.log | grep -E ': ok \(' | sed -E 's/^([a-z-]+): ok \(([0-9]+) ms\).*/\1=\2/' | tr '\n' ' ')
+            echo "== run $runs ($what): rc $rc hung $hung ${elapsed}s $cases"
+            tr -d '\r' < run.log >> all.log
+            if [ $hung = 1 ] || [ $rc != 0 ]; then
+              fails=$((fails+1))
+              echo "-- run $runs output"
+              tr -d '\r' < run.log
+            fi
+          done
+          kill $bg
+          echo "probe: $fails of $runs failed"
+          grep -E ': ok \(' all.log | sed -E 's/^([a-z-]+): ok \(([0-9]+) ms\).*/\1 \2/' |
+            awk '{ if ($2 > m[$1]) m[$1] = $2; s[$1] += $2; n[$1]++ } END { for (k in m) printf "  %s: max %d, mean %d over %d\n", k, m[k], s[k] / n[k], n[k] }'
+          [ $fails = 0 ]

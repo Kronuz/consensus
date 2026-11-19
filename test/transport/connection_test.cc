@@ -641,6 +641,7 @@ struct reader_run {
 //   READ_SLOWLY_BUILD_MS   the dialer's loop is held this long while the frames are queued, as a
 //                          slow allocator (TSan, a loaded host) holds it
 //   COARSE_WRITER_SNDBUF   the coarse writer's SO_SNDBUF and low-water mark, bytes
+//   COARSE_WRITER_PULSE_MS wakes the writer's loop this often and reports its worst late timer
 //   COARSE_WRITER_TRACE    prints the coarse writer's buffers and write bursts on every run
 long long knob(const char *name, long long fallback = 0) {
 	const char *v = std::getenv(name);
@@ -749,11 +750,13 @@ reader_run read_slowly_once(reader_load load) {
 		assert(!e);
 		dialer_end = v;
 	});
-	// The writer's loop's lateness: a 10 ms timer's worst late fire, and when (ms from the start).
+	// With COARSE_WRITER_PULSE_MS: the writer's loop's lateness, a timer's worst late fire and when
+	// (ms from the start). The pulse wakes the loop, so it can mask a late wheel fire; off by default.
+	const auto pulse_ms = std::chrono::milliseconds(knob("COARSE_WRITER_PULSE_MS"));
 	asio::steady_timer pulse(l1.io);
 	long long l1_late = 0, l1_late_at = 0;
 	std::function<void()> arm = [&] {
-		pulse.expires_after(10ms);
+		pulse.expires_after(pulse_ms);
 		pulse.async_wait([&](asio::error_code ec) {
 			if (ec)
 				return;
@@ -766,7 +769,8 @@ reader_run read_slowly_once(reader_load load) {
 			arm();
 		});
 	};
-	arm();
+	if (pulse_ms.count() > 0)
+		arm();
 	assert(l1.until([&] { return dialer_end && acceptor_done; }, 60s));
 	pulse.cancel();
 	l1.until([] { return false; }, 5ms);

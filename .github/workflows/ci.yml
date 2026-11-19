@@ -1,16 +1,53 @@
+# Probe for groups-upload-loop-stall (never lands): the whole suite as CI runs it on
+# macos-15-intel (ctest --parallel 2), 10 times a shard. When upload's connection loop is stuck
+# 250 ms the test starts spindump on itself (GROUPS_PROBE_SPINDUMP): the stuck thread's kernel
+# stack names what write(2) waits on.
 name: CI
 on:
-  push:
-    branches: [main, master, 'quest/**']
-  pull_request:
   workflow_dispatch:
     inputs:
       nightly: { type: boolean, default: false }
-concurrency:
-  group: ci-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: true
 jobs:
-  ci:
-    uses: Kronuz/cpp-libraries/.github/workflows/cmake.yml@main
-    with:
-      nightly: ${{ inputs.nightly || false }}
+  probe:
+    name: probe-${{ matrix.shard }}
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Configure
+        env: { CC: clang, CXX: clang++ }
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo "-DCMAKE_C_FLAGS_RELWITHDEBINFO=-O2 -g" "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=-O2 -g -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE"
+      - name: Build
+        run: cmake --build build --parallel 4
+      - name: Probe
+        run: |
+          set +e
+          sysctl kern.ipc.mb_uses_mcache kern.ipc.nmbclusters kern.ipc.njcl hw.memsize hw.ncpu
+          sudo -n true && echo "sudo: yes"
+          fails=0
+          for i in $(seq 1 10); do
+            export GROUPS_PROBE_SPINDUMP="$PWD/spindump-$i.txt"
+            ctest --test-dir build --output-on-failure --no-tests=ignore --parallel 2 > suite-$i.txt 2>&1
+            rc=$?
+            echo "== suite $i rc $rc $(date -u +%H:%M:%S): $(grep -E 'tests passed|\(Failed\)|\(Timeout\)' suite-$i.txt | tr '\n' ' ')"
+            if grep -q 'groups_upload (Failed)' suite-$i.txt; then
+              fails=$((fails+1))
+              awk '/Start +[0-9]+: consensus_transport_groups_upload$/{f=1} f&&/upload: FAILED/{print; exit} f' suite-$i.txt
+            fi
+            if [ -s spindump-$i.txt ]; then
+              sleep 4
+              echo "-- spindump $i: the threads in Connection::flush"
+              awk '/^  Thread 0x/{if (b ~ /flush|write/) print b; b=""} {b=b $0 "\n"} END{if (b ~ /flush|write/) print b}' spindump-$i.txt | head -200
+            fi
+          done
+          echo "probe: groups_upload failed in $fails of 10 suites"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: spindump-${{ matrix.shard }}
+          path: spindump-*.txt
+          if-no-files-found: ignore

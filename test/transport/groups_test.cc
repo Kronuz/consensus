@@ -609,6 +609,17 @@ std::string sockets(std::initializer_list<std::uint16_t> ports) {
 	}
 	return r;
 }
+// The probe workflow's kernel stacks: with GROUPS_PROBE_SPINDUMP set, the first stuck sample
+// starts spindump on this process for 3 s in the background (sudo, as on a CI runner).
+void spindump_once() {
+	static bool started = false;
+	const char *path = std::getenv("GROUPS_PROBE_SPINDUMP");
+	if (started || !path || !*path)
+		return;
+	started = true;
+	const std::string command = "sudo -n spindump " + std::to_string(::getpid()) + " 3 10 -o '" + path + "' >/dev/null 2>&1 &";
+	(void)std::system(command.c_str());
+}
 // Each loop of the hosts, every sample: how long the stamp posted to it last has waited (0 once
 // it ran), its thread's CPU ms since the last sample, its run state on macOS (R runnable, W
 // waiting, U uninterruptible, S stopped) and, once a stamp waits 250 ms, the thread's stack.
@@ -638,8 +649,10 @@ class LoopProbe {
 						  (unsigned long long)((cpu - std::min(cpu, l.cpu)) / 1000), state);
 			l.cpu = cpu;
 			r += line;
-			if (age >= 250)
+			if (age >= 250) {
+				spindump_once();
 				r += stack(*l.loop);
+			}
 			r += "}";
 		}
 		return r;

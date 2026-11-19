@@ -8,6 +8,7 @@
 // mid-fetch (docs/mechanisms/peer-fetch.md). Peers is also instantiated over a minimal host.
 #include "consensus/transport/peers.h"
 #include "consensus/transport/profile.h"
+#include "../support/ports.h"
 
 #include <algorithm>
 #include <array>
@@ -16,22 +17,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
-#include <fstream>
 #include <functional>
 #include <journal/journal.h>
 #include <journal/memory_io.h>
 #include <openssl/pem.h>
 #include <openssl/x509v3.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
-#if defined(__APPLE__) || defined(__FreeBSD__)
-#include <sys/sysctl.h>
-#endif
 
 using namespace kronuz::consensus;
 using namespace kronuz::consensus::transport;
+using namespace kronuz::consensus::testing;
 using namespace std::chrono_literals;
 using Clock = std::chrono::steady_clock;
 using Tcp = asio::ip::tcp;
@@ -228,79 +224,12 @@ struct Node {
 const asio::ip::address loopback = asio::ip::make_address("127.0.0.1");
 const std::array<std::string, 3> names{"one", "two", "three"};
 
-bool bindable(asio::io_context &io, Tcp::endpoint endpoint) {
-	asio::error_code error;
-	Tcp::acceptor probe(io);
-	probe.open(endpoint.protocol(), error);
-	if (!error)
-		probe.bind(endpoint, error);
-	return !error;
-}
 // The second loopback address: 127.0.0.2 where the system routes all of 127/8, else ::1.
 asio::ip::address alternate_loopback(asio::io_context &io) {
 	for (const char *candidate : {"127.0.0.2", "::1"})
 		if (bindable(io, {asio::ip::make_address(candidate), 0}))
 			return asio::ip::make_address(candidate);
 	std::fprintf(stderr, "no second loopback address\n");
-	std::abort();
-}
-// The ports bind(0) and connect() hand out, as the system configures them.
-std::pair<unsigned, unsigned> ephemeral_range() {
-#if defined(__linux__)
-	unsigned first = 0, last = 0;
-	std::ifstream range("/proc/sys/net/ipv4/ip_local_port_range");
-	if (range >> first >> last)
-		return {first, last};
-	return {32768, 60999};
-#elif defined(__APPLE__) || defined(__FreeBSD__)
-	int first = 0, last = 0;
-	std::size_t size = sizeof first;
-	if (::sysctlbyname("net.inet.ip.portrange.first", &first, &size, nullptr, 0) == 0 &&
-		::sysctlbyname("net.inet.ip.portrange.last", &last, &size, nullptr, 0) == 0)
-		return {static_cast<unsigned>(first), static_cast<unsigned>(last)};
-	return {49152, 65535};
-#else
-	return {49152, 65535};
-#endif
-}
-bool ephemeral(std::uint16_t port) {
-	static const auto range = ephemeral_range();
-	return port >= range.first && port <= range.second;
-}
-// Claims `port` among this test's processes: a UDP socket bound to it for the rest of the
-// process, without SO_REUSEADDR, so a picker beside this one fails to claim it too.
-bool claim(std::uint16_t port) {
-	const int fd = ::socket(AF_INET6, SOCK_DGRAM, 0);
-	CHECK(fd >= 0);
-	const int dual = 0;
-	::setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &dual, sizeof dual);
-	sockaddr_in6 at{};
-	at.sin6_family = AF_INET6;
-	at.sin6_port = htons(port);
-	at.sin6_addr = in6addr_any;
-	if (::bind(fd, reinterpret_cast<const sockaddr *>(&at), sizeof at) == 0)
-		return true;
-	::close(fd);
-	return false;
-}
-// A port this process alone binds on `address` for its whole run, stops and restarts
-// included: outside the ephemeral range, so no bind(0) or connect() (a self-connect
-// included) is handed it, and claimed, so a peers test beside this one skips it.
-std::uint16_t free_port(asio::io_context &io, asio::ip::address address) {
-	static const auto [low, high] = [] {
-		const auto [first, last] = ephemeral_range();
-		if (first >= 2048)
-			return std::pair<unsigned, unsigned>{std::max(1024u, first - 16384), first};
-		CHECK(last <= 65535 - 1024);
-		return std::pair<unsigned, unsigned>{last + 1, 65536};
-	}();
-	static unsigned next = static_cast<unsigned>(::getpid()) * 7919u;
-	for (unsigned tried = 0; tried != high - low; ++tried) {
-		const auto port = static_cast<std::uint16_t>(low + next++ % (high - low));
-		if (claim(port) && bindable(io, {address, port}))
-			return port;
-	}
-	std::fprintf(stderr, "no free port in [%u, %u)\n", low, high);
 	std::abort();
 }
 // A port free on both addresses, so a voter can move between them and keep its port.

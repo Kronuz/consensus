@@ -159,7 +159,7 @@ until it throws, every unsent byte charged (`refusals-unbounded`), and `queue-ca
 mutants (`test/transport/rpc_mutants.py`) fails the case of its name, and so does `late-deadline`
 (T7: a 2.1 s stop past a 10 s deadline gives 2.1 s once, a 30 s one gives 10 s). `fuzz/rpc_fuzz.cc` drives
 the decoder and a call table whose pools are below two windows and whose queue is below two frames,
-so calls wait for `calling`, `outgoing` and room (N4); its corpus `fuzz/corpus/rpc` replays as
+so calls wait for `calling`, `outgoing` and room (N4); its corpus `fuzz/corpus/rpc` (with `seed-past-credit`, a served request's Body past its 4 KiB window, rule 7.6) replays as
 `consensus_fuzz_rpc_replay`, and `fuzz/rpc_fuzz.sh` fuzzes it at `-max_len=65600`.
 
 `test/transport/rpc_host_test.cc`, two hosts over loopback TLS, one ctest entry per case:

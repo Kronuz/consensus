@@ -16,6 +16,7 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 
 ### Fixed
 
+- A throw that ends the Driver's loop (one a step does not catch) completes every waiting call with `task::cancelled`, as a stop does, instead of leaving it suspended (`driver_close_test close_crash`).
 - A checkpoint whose peak (its bundle bound plus its application cap) exceeds the replacement pool fails at once with `checkpoint_exceeds_pool` instead of waiting forever and blocking the calls behind it.
 
 ## 2026-11-18

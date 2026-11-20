@@ -764,6 +764,8 @@ bool close_crash_run(std::uint64_t seed, std::uint64_t cut) {
 	std::mt19937_64 random(seed);
 	bool reached = false;
 	const auto at = "seed " + std::to_string(seed) + " cut " + std::to_string(cut);
+	std::vector<std::function<bool()>> calls;  // whether each call the run started completed
+	auto track = [&](auto call) { calls.push_back([call] { return call->done; }); return call; };
 	{
 		Loop loop(disk);
 		loop.lone(g);
@@ -774,7 +776,7 @@ bool close_crash_run(std::uint64_t seed, std::uint64_t cut) {
 		for (unsigned round = 0; round < 6 && alive; ++round) {
 			const auto c = "r" + std::to_string(round);
 			attempted.push_back(c);
-			auto placed = loop.start(loop.driver->propose(g, c)); loop.release();
+			auto placed = track(loop.start(loop.driver->propose(g, c))); loop.release();
 			if (!placed->done || placed->error) { alive = false; break; }
 			acknowledged = attempted;
 			const auto action = random() % 4;
@@ -782,10 +784,10 @@ bool close_crash_run(std::uint64_t seed, std::uint64_t cut) {
 			if (action == 0) { loop.driver->application_failed(g, loop.sink.committed[g], "fenced by the sweep"); loop.release(); }
 			if (action == 2) {
 				loop.apply(g);
-				auto published = loop.start(checkpoint_of(loop, g, acknowledged)); loop.release();
+				auto published = track(loop.start(checkpoint_of(loop, g, acknowledged))); loop.release();
 				if (!published->done || published->error) { alive = false; break; }
 			}
-			if (!ok(loop.start(loop.driver->close(g)))) { alive = false; break; }
+			if (!ok(track(loop.start(loop.driver->close(g))))) { alive = false; break; }
 			++(loop.host->status(g) == j::GroupStatus::closed ? crash_tables : crash_releases);
 			const auto image = loop.recover(g, error, options({1}));
 			loop.apply(g);
@@ -797,6 +799,8 @@ bool close_crash_run(std::uint64_t seed, std::uint64_t cut) {
 		reached = alive && !disk.dead();
 		if (!reached && !disk.dead()) { check(false, "the run failed before its power cut: " + at); }
 	}
+	// The cut may end the Driver's loop by a throw: its callers still complete, none suspended.
+	check(std::all_of(calls.begin(), calls.end(), [](const auto& done) { return done(); }), "every call completes once the loop ends: " + at);
 	disk.power_loss();
 	Loop again(disk);
 	if (again.host->status(g) != j::GroupStatus::none) {

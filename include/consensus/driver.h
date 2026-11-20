@@ -499,20 +499,24 @@ private:
 		void await_resume() const noexcept {}
 	};
 
+	// A throw that ends the loop (one step() does not catch, as a power cut's) ends it for its
+	// callers as a stop does: each completes with task::cancelled, none is left suspended.
 	task::task<void> loop(task::cancel_token stop) {
-		for (;;) {
-			if (stop.requested()) {
-				shutdown();
-				if (!in_flight_) { co_return; }
+		try {
+			for (;;) {
+				if (stop.requested()) {
+					shutdown();
+					if (!in_flight_) { co_return; }
+				}
+				if (ready_head_) {
+					pump();
+					co_await task::yield();
+					continue;
+				}
+				// Shutting down, only landing IO wakes the loop.
+				co_await Idle(*this, stopping_ ? task::cancel_token{} : stop);
 			}
-			if (ready_head_) {
-				pump();
-				co_await task::yield();
-				continue;
-			}
-			// Shutting down, only landing IO wakes the loop.
-			co_await Idle(*this, stopping_ ? task::cancel_token{} : stop);
-		}
+		} catch (...) { shutdown(); throw; }
 	}
 
 	void on_loop() const {

@@ -137,7 +137,7 @@ T run(Driver<Sink>& driver, task::blocking_scheduler& scheduler, task::task<T> w
 | `close` | the group's state is freed and its row erased: `groups()` no longer counts it, and the id opens again on this Driver; a late plain call is dropped and counted with the ids not open. Close completes on an open, fenced or never-created row, and on an id the Driver never held. The drained Worker hands its group back to the host: a row whose last record is a checkpoint covering every batch closes into the host's table, which then keeps nothing of it; any other row (fenced, or with records after its checkpoint) is released, its records durable in the log and its in-memory state parked. Either way the id recovers again in the same live host. A close whose table commit fails fences the row, which is then released; the table may still hold the group closed, so `create` and `recover` of that id complete with `close_in_doubt` until the host restarts, and the restarted host recovers it from its disk | no token | - |
 
 Every call completes with `fenced` once its group fences, and with `task::cancelled`
-(`cancel_reason::shutdown`) once the loop shuts down; a staged record is still written. A call on
+(`cancel_reason::shutdown`) once the loop shuts down, or once a throw ends `run()`; a staged record is still written. A call on
 an id that is not open, or is closing or closed, completes with `closed` and submits nothing.
 
 **Shutdown order.** A host closes its groups while `run()` steps the loop, then requests `stop`.

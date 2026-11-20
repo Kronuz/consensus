@@ -19,6 +19,7 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 
 - A throw that ends the Driver's loop (one a step does not catch) completes every waiting call with `task::cancelled`, as a stop does, instead of leaving it suspended (`driver_close_test close_crash`); under `consensus::run` the throw reaches the caller and the Driver stays stopped (`entry_throw`).
 - A checkpoint whose peak (its bundle bound plus its application cap) exceeds the replacement pool fails at once with `checkpoint_exceeds_pool` instead of waiting forever and blocking the calls behind it.
+- The leader starts an install only after a peer refuses an append at or below its base. A next index there for any other reason, a flight timeout or the leader's own checkpoint, first appends at the base, so a peer that already holds the entries catches up within rpc_timeout of a heal instead of waiting out snapshot_timeout (60 s) (`consensus_test heal_after_checkpoint_past_stale_match`).
 - A `LookupThreads::start` that throws while making a thread's list entry no longer leaves its lookup queued: the entry is made inside the try, so no resolver runs for a caller that saw the exception (`test/transport/resolve_test.cc`, case `start_fails`, fails `start()` at each of its allocations).
 
 ## 2026-11-18

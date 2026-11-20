@@ -1078,6 +1078,7 @@ struct Node {
 				o.configuration.configuration[0] = 'G';
 				o.admission = admission;
 				o.scheduling = WorkerLimits{16, 128};
+				o.limits.command_bytes = o.limits.rpc_bytes = 4096;  // a full batch fits the 16 KiB segments' turn room
 				driver->open(g, std::move(o));
 				auto opening = journal->status(g) == j::GroupStatus::stored ? driver->recover(g, [](j::ArtifactReader &) {})
 																			: driver->create(g, j::Identity{'G', char('0' + host.node)});

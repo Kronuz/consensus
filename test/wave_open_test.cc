@@ -62,7 +62,7 @@ GroupOptions options() {
 	o.configuration.local = 1; o.configuration.voters = {1};
 	o.configuration.cluster[0] = 'C'; o.configuration.configuration[0] = 'G';
 	o.admission = admission; o.timing = Timing{20, 40, 100, 200, 60000}; o.scheduling = WorkerLimits{16, 128};
-	o.limits.command_bytes = 4096; o.limits.rpc_bytes = 16384; o.limits.log_bytes = 64 * 1024;
+	o.limits.command_bytes = 4096; o.limits.rpc_bytes = 8192; o.limits.log_bytes = 64 * 1024;
 	o.limits.log_entries = 64; o.limits.control_entries = 4; o.limits.rpc_entries = 8;
 	return o;
 }

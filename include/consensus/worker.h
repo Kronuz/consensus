@@ -121,6 +121,7 @@ public:
 		snapshot_limits_(snapshots), store_(host, group, admission, batch_limit(configuration_, limits, scheduling), artifact_limit(snapshots)) {
 		scheduling_.async_appends = scheduling_.async_storage = true;
 		validate_configuration(admission);
+		validate_turn_room(host.driver_of(group).log().options());
 	}
 	Worker(const Worker&) = delete;
 	Worker& operator=(const Worker&) = delete;
@@ -672,6 +673,16 @@ private:
 		if (configuration_.voters.empty()) { state.membership = Membership{}; }
 		else if (founding_ && encode_initialization(configuration_, founding_) != encode_initialization(configuration_)) { state.membership = founding_; }
 		return state;
+	}
+	// The group's largest record, an operating-limit batch or the founding record, must fit one
+	// empty segment of the host's turn log; a larger one fences its group at the first append.
+	void validate_turn_room(const kronuz::journal::TurnLogOptions& turns) const {
+		const auto batch = storage_batch_size(true, true, std::max(limits_.rpc_entries, scheduling_.follower_batch_entries),
+			std::max(limits_.rpc_bytes, scheduling_.follower_batch_bytes));
+		const auto cost = kronuz::journal::turn_log_detail::record_cost(std::max(storage_detail::maximum_initialization_size, batch));
+		if (cost > kronuz::journal::turn_log_detail::turn_room(turns.segment_bytes, turns.block_bytes)) {
+			throw std::invalid_argument("worker batch exceeds the host's turn room");
+		}
 	}
 	void validate_configuration(const kronuz::journal::AdmissionLimits& admission) {
 		replacement_pool_ = admission.replacement_pool;

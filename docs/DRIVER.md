@@ -42,6 +42,10 @@ struct GroupOptions {
 // The loop's seams. The host's journal (journal/host.h) holds every group's Store and the
 // loop's turn driver, host.driver(loop), which the host runs (TurnDriver::run) on the same
 // scheduler, or consensus::run commits inline. `seed` seeds the election jitter; 0 draws one.
+// A group's Worker refuses, with std::invalid_argument, a configuration whose largest record
+// does not fit one empty segment of the host's turn log: a batch of Limits::rpc_entries and
+// rpc_bytes (WorkerLimits::follower_batch_* too, when larger), or the founding record. Size
+// the host's TurnLogOptions::segment_bytes above the batch.
 struct Seams {
 	task::scheduler_ref scheduler;
 	kronuz::journal::completion_ref io;

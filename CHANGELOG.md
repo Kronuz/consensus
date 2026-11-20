@@ -6,6 +6,12 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#consensus) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-20
+
+### Changed
+
+- A Worker on a journal host refuses at construction (`std::invalid_argument`, "worker batch exceeds the host's turn room") a configuration whose largest record exceeds one empty segment of the host's turn log (D132): a batch of `Limits::rpc_entries` and `rpc_bytes` (or `WorkerLimits::follower_batch_*` when larger), or the founding record. Before, it reached the journal and fenced its group at the first append. A caller sets segments big enough for the batch, or lower `rpc_bytes` (and `command_bytes`, which it must not exceed); the default 2 MiB rpc batch needs 64 MiB segments or lower limits. A merged `Receive` a caller submits beyond the operating limits can still fence its group (`worker_test --turn-room`).
+
 ## 2026-11-19
 
 ### Changed

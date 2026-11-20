@@ -205,6 +205,17 @@ became a vector of records (consensus:01e2c06, job 261117-205819-0701eb) the dat
 1,575-1,608 ns against main's 644-647 ns: each batch built a credit table and a sender's record
 per credited group, then freed both.
 
+D115 rests on the exclusive job 261118-003330-778798, the same streams alone on the machine: data,
+same 607 and 625 ns on main against 465 and 470 on the branch; control, 277 and 290 ns against
+336 and 333.
+
+The receiver's credit costs frames in the reverse direction. A batch owes one record per run of a
+group's frames, and the sender's round robin makes each run one frame long, so the receiver sends
+about one credit frame per data frame: 0.55-0.90 credit frames per data frame in the hop data
+stream, against 0.43-0.49 on main's per-group map (job 261118-013433-b93ec8), about twice the
+credit bytes (17 B a frame). Both ends' CPU still falls, so the records stay; merging runs per
+batch again would need a per-batch table, the cost the records removed.
+
 Beside it, the bare Asio hop with no TLS and no transport (Detent `run.sh hop_cost`, job
 261117-092732-0475d9, exclusive, Detent:d15d063): 793-851 ns per frame posted alone, 21-22 ns in
 batches of 64, and 7.2 us of CPU per batch that wakes an idle loop (2.7 us at 16 frames). D10's

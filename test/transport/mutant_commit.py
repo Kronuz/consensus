@@ -108,6 +108,9 @@ MUTANTS = {
     "no-current": (T + "host_transport.h", "const bool current = batch.peer.generation == connection.generation;", "const bool current = true;"),
     # transport-feed-scan review G1: owe's merge keeps only the first record's bytes per group
     "coalesce-drops-credit": (T + "host_transport.h", "\t\t\t\tv[m - 1].bytes += v[i].bytes;\n", "\t\t\t\t(void)0;\n"),
+    # transport-receive-bound: what a connection's frames hold before their group loop takes them
+    "data-unbounded": (T + "host_transport.h", "} else if (held.data && held.data + frame.size() > options_.window) {", "} else if (false) {"),
+    "control-unbounded": (T + "host_transport.h", "if (held.frames >= options_.arriving) {", "if (false) {"),
     # transport-group-bytes: what a connection owes (Owing) and the feed's order
     "owing-keeps-prefix": (T + "host_transport.h", "\t\tif (repaid_ * 2 >= records_.size())\n\t\t\tdrop_repaid();\n", ""),
     "closes-unbounded": (T + "host_transport.h", "if (r.close && closes_ < closes) {", "if (r.close) {"),

@@ -51,8 +51,18 @@ counted (Raft resends), exactly what D10's `reader_test` prototype assumes. The 
 waits on a group, so a group whose admission is full never holds another group's heartbeat.
 
 After delivering a batch, the group's loop sends the batch's data credit back to the
-connection's loop in one post. Credit is per connection: frames that came on a connection
-that has since ended return nothing, and a new connection starts every group at zero.
+connection's loop in one post, with the count of control and open frames it took. Credit is per
+connection: frames that came on a connection that has since ended return nothing, and a new
+connection starts every group at zero.
+
+**The receive bound.** Until its group loop takes them, a connection's frames for one group hold
+at most what the sender may send: data within `window`, or one frame when none is held, as the
+sender's credit allows; and `arriving` (256) control and open frames, a fixed byte bound since a
+control frame is bounded by the node limits. The connection's loop keeps the count per group in
+`Lane::arriving`, an entry only while frames are held, and the post back releases it. A data
+frame past the window is a sender ignoring its credit: the connection ends (`overrun`). A control
+frame past the count is refused (`flooded`), as a full group's are; the connection stays. A
+frame on a connection its lane has replaced is refused, since its batch would be stale.
 
 ## Identity: the per-frame rule and the group-open exchange
 
@@ -217,6 +227,7 @@ keep every byte and the closed (`coalesce-drops-credit`). `consensus_transport_g
 | `reconnect` | node 1 over raw Links opens g on host 2 and its frame arrives; after that connection ends, g's frame on the next one without the open is refused (1 `unopened`) and closed back, and arrives once node 1 opens g there | `no-generation-clear`; `no-current` survives (a stale batch never reaches a group loop: see Identity) |
 | `backlog` | node 1 over raw Links, through a gate that leaves host 2's bytes unread, opens 6,000 groups on host 2; with the gate held, host 2 sends it 24 MiB and node 1 sends 3 data frames to each group: host 2 owes 18,000 records with its queue full, so they merge per group; once all have arrived the gate opens and each group's credit comes back whole as values, in fewer credit frames than data frames | `coalesce-drops-credit` |
 | `owe-order` | as `backlog`, host 2 owes 2,000 groups' credit behind its gated queue, then queues 10 control frames for node 1; once the gate opens node 1 reads every control frame before any credit frame | `owed-before-control` |
+| `receive-bound` | host 2 of 2 loops holds g's loop; node 1 sends g 8 data frames of 16,000 B against a 64 KiB window: the connection ends at the fifth (1 `overrun`) and 4 are delivered; on a new connection 1,000 control frames: 256 delivered, 744 `flooded`, and the next frame arrives on the same connection | `data-unbounded`, `control-unbounded` |
 | `relayout` | three nodes of 2 loops with on-disk journals commit four groups; node 1 restarts with 3 loops, its journal re-partitions, two groups move loop, and all four commit on all three with node 1's frames on each group's new loop | |
 
 A timing case that the host stalled 250 ms or more runs again, at most twice. Each step prints

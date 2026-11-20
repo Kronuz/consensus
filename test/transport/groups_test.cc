@@ -2119,6 +2119,80 @@ void owe_order() {
 	assert(one.credits_at_control == 0 && "control frames go before credit");
 }
 
+// receive-bound: what a connection's frames for one group may hold on the receiver before its
+// group loop takes them (transport-groups review N2). Host 2 has 2 loops; g sits on the loop
+// that does not read node 1's connection, and that loop is held. Node 1 sends g 8 data frames
+// of 16,000 B against a 64 KiB window: the receiver ends the connection at the fifth (`overrun`)
+// and delivers at most 4 once the loop goes on. On a new connection node 1 sends g 1,000 control
+// frames: at most 256 are held and delivered, the rest refused (`flooded`), and the connection
+// stays up and delivers g's next frame.
+void receive_bound() {
+	constexpr std::uint32_t L = 2;
+	HostTransportOptions options;
+	options.window = 64 << 10;
+	Host two(2, L);
+	two.open({}, options);
+	const auto reader = two.transport->loop_of_node(1), held = 1 - reader;
+	const GroupId g = groups_on(L, held, 1)[0];
+	two.stores({g});
+	std::atomic<std::uint64_t> data{0}, control{0};
+	for (std::uint32_t k = 0; k != L; ++k)
+		two.transport->on_deliver(k, [&](const Received &r) {
+			(r.data ? data : control) += r.route.group == g;
+			return true;
+		});
+	two.start();
+	std::atomic<bool> hold{false};
+	auto stall = [&] {
+		hold = true;
+		two.post(held, [&] {
+			while (hold)
+				std::this_thread::sleep_for(1ms);
+		});
+	};
+	const auto open = encode_open(g, Host::test_open());
+	RawPeer one(1, 2, two.port());
+
+	step("receive-bound: node 1 sends 8 frames of 16,000 B past g's 64 KiB window while g's loop is held");
+	const bool up = one.dial(2);
+	assert(up);
+	one.send(open);
+	const bool opened = until([&] { return total(two, &HostTransportStats::opens) >= 1; }, 10'000);
+	stall();
+	std::vector<std::string> frames;
+	for (int i = 0; i != 8; ++i)
+		frames.push_back(RawPeer::frame(g, 1, 2, std::string(16'000, 'd'), FrameKind::data));
+	one.send(frames);
+	const bool ended = until([&] { return one.ended >= 1; }, 10'000);
+	hold = false;
+	std::this_thread::sleep_for(300ms);
+	std::printf("receive-bound: opened %s; the connection ended: %s (overrun %llu); delivered %llu of 8 data frames\n", opened ? "yes" : "NO",
+				ended ? "yes" : "NO", (unsigned long long)total(two, &HostTransportStats::overrun), (unsigned long long)data.load());
+	assert(opened && ended && total(two, &HostTransportStats::overrun) == 1 && data <= 4);
+
+	step("receive-bound: on a new connection node 1 sends g 1,000 control frames while g's loop is held");
+	const bool again = one.dial(2);
+	assert(again);
+	one.send(open);
+	const bool reopened = until([&] { return total(two, &HostTransportStats::opens) >= 2; }, 10'000);
+	stall();
+	frames.clear();
+	for (int i = 0; i != 1000; ++i)
+		frames.push_back(RawPeer::frame(g, 1, 2, "c"));
+	one.send(frames);
+	const bool refused = until([&] { return total(two, &HostTransportStats::flooded) >= 1000 - options.arriving; }, 10'000);
+	hold = false;
+	const bool taken = until([&] { return control >= options.arriving; }, 10'000);
+	std::this_thread::sleep_for(100ms);
+	const auto delivered = control.load();
+	one.send(RawPeer::frame(g, 1, 2, "next"));
+	const bool next = until([&] { return control == options.arriving + 1; }, 10'000);
+	std::printf("receive-bound: reopened %s; flooded %llu, delivered %llu of 1,000, then the next frame: %s; the connection ended %d time(s)\n",
+				reopened ? "yes" : "NO", (unsigned long long)total(two, &HostTransportStats::flooded), (unsigned long long)delivered,
+				next ? "yes" : "NO", one.ended.load());
+	assert(reopened && refused && taken && delivered == options.arriving && next && one.ended == 1);
+}
+
 // scan: the feed's work per frame. Host 1 stores N groups and sends a control and a data frame
 // per group to host 2, for N = 100, 1,000 and 10,000, every group on one loop: the groups both
 // hosts' feeds visit per frame they send stay under 2 at each N (a scan per frame grows with N).
@@ -2329,7 +2403,7 @@ void order() {
 
 int main(int argc, char **argv) {
 	if (argc != 3) {
-		std::fprintf(stderr, "usage: %s <fixture dir> threads|credit|reader|upload|driver|refill|identity|joiner|lagging|leftover|reconnect|backlog|owe-order|relayout|scan|order\n", argv[0]);
+		std::fprintf(stderr, "usage: %s <fixture dir> threads|credit|reader|upload|driver|refill|identity|joiner|lagging|leftover|reconnect|backlog|owe-order|receive-bound|relayout|scan|order\n", argv[0]);
 		return 2;
 	}
 #ifndef SO_NOSIGPIPE
@@ -2366,6 +2440,8 @@ int main(int argc, char **argv) {
 		backlog();
 	else if (which == "owe-order")
 		owe_order();
+	else if (which == "receive-bound")
+		receive_bound();
 	else if (which == "joiner")
 		joiner();
 	else if (which == "lagging")

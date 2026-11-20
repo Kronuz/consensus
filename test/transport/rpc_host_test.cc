@@ -215,8 +215,18 @@ bool calls() {
 	std::printf("calls: high water serving %zu calling %zu outgoing %zu; lane frames out %llu\n",
 				two.transport->serving_pool().high_water(), one.transport->calling_pool().high_water(),
 				one.transport->outgoing_pool().high_water(), (unsigned long long)one.lane(&LaneStats::frames_out));
-	check(one.ended(rpc::Outcome::ok) == 1 && one.ended(rpc::Outcome::cancel) == 2 && two.lane(&LaneStats::served) == 3,
-		  "the lane counts each call by outcome");
+	// b ends cancel when the caller's timer fires first, error when a late fire's extension (T7)
+	// lets the server's Error arrive first: the lane counts what each call's done saw.
+	std::uint64_t seen[rpc::outcomes] = {};
+	for (const auto *call : {a.get(), b.get(), c.get()})
+		++seen[std::size_t(call->status.outcome)];
+	bool counted = two.lane(&LaneStats::served) == 3;
+	for (std::size_t o = 0; o != rpc::outcomes; ++o)
+		counted &= one.ended(rpc::Outcome(o)) == seen[o];
+	std::printf("calls: ended ok %llu error %llu cancel %llu; served %llu\n", (unsigned long long)one.ended(rpc::Outcome::ok),
+				(unsigned long long)one.ended(rpc::Outcome::error), (unsigned long long)one.ended(rpc::Outcome::cancel),
+				(unsigned long long)two.lane(&LaneStats::served));
+	check(counted, "the lane counts each call by outcome");
 	one.stop();
 	two.stop();
 	return ok;
@@ -254,22 +264,23 @@ bool group_full() {
 	// The window less one frame: the next 64 KiB frame no longer fits.
 	const bool full = until([&] { return one.transport->stats(sender).uncredited > (4u << 20) - (64u << 10) - frame_header; }, 2s);
 	const auto uncredited = one.transport->stats(sender).uncredited.load();
+	// 15 calls 50 ms apart, all within the 4 s stall: none of the group's frames is delivered yet.
 	std::uint64_t worst = 0, done = 0;
-	const auto start = steady::now();
-	while (ms_since(start) < 1500) {
+	for (int i = 0; i != 15; ++i) {
 		auto c = start_call(one, 2, echo, 64, 10s);
 		if (until([&] { return c->done.load(); }, 5s) && c->status.outcome == rpc::Outcome::ok)
 			++done;
 		worst = std::max<std::uint64_t>(worst, std::chrono::duration_cast<std::chrono::milliseconds>(c->finished - c->started).count());
 		std::this_thread::sleep_for(50ms);
 	}
+	const auto stalled = delivered.load();
 	until([&] { return delivered == 100; }, 10s);
 	one.stop();
 	two.stop();
-	const bool ok = full && done >= 15 && worst < 250 && delivered == 100;
-	std::printf("group-full: group 1's credit full (%s, %llu bytes uncredited as the calls began); %llu calls, largest latency %llu ms; group 1 delivered %llu of 100 %s\n",
+	const bool ok = full && done == 15 && stalled == 0 && worst < 250 && delivered == 100;
+	std::printf("group-full: group 1's credit full (%s, %llu bytes uncredited as the calls began); %llu of 15 calls, largest latency %llu ms; group 1 delivered %llu as the calls ended, %llu of 100 after %s\n",
 				full ? "yes" : "no", (unsigned long long)uncredited, (unsigned long long)done, (unsigned long long)worst,
-				(unsigned long long)delivered.load(), ok ? "ok" : "FAILED");
+				(unsigned long long)stalled, (unsigned long long)delivered.load(), ok ? "ok" : "FAILED");
 	return ok;
 }
 

@@ -25,7 +25,7 @@ XAPIAND=${XAPIAND:-$HOME/code/Kronuz/Xapiand}
 CLUSTER="$XAPIAND/tools/vm/cluster.sh"
 CACHE=${NETLAB_CACHE:-$HOME/.scratch/netlab-consensus}
 CPUS=${NETLAB_CPUS:-8}
-MB=${NETLAB_MB:-6144}
+MB=${NETLAB_MB:-8192}
 key=$(git rev-parse HEAD:bench/netlab/node.cc HEAD:bench/netlab/node.cmake HEAD:include HEAD:CMakeLists.txt | shasum | cut -c1-16)
 bin=$CACHE/bin/$key/consensus_netlab_node
 rev=$(cut -c1-40 bench/netlab/FAULTLAB_REV)
@@ -73,9 +73,9 @@ case $what in
 		tar -C "$faultlab" -cf - python/faultlab | guest 'mkdir -p ~/nlc/faultlab && tar -xf - -C ~/nlc/faultlab'
 		guest 'nproc; uname -sr; python3 --version; file ~/nlc/consensus_netlab_node | cut -d, -f1-2'
 		status=0
-		guest "sudo python3 -I ~/nlc/bench.py run --faultlab ~/nlc/faultlab --node ~/nlc/consensus_netlab_node --nodes $nodes ${args[*]-} --out ~/nlc/out" || status=$?
+		guest "sudo python3 -I ~/nlc/bench.py run --faultlab ~/nlc/faultlab --node ~/nlc/consensus_netlab_node --nodes $nodes ${args[*]-} --data /dev/shm/netlab-consensus --out ~/nlc/out" || status=$?
 		guest 'sudo tar -C ~/nlc/out -cf - .' | tar -xf - -C "$out" || true
-		guest 'sudo tar -C /var/tmp/netlab-consensus -cf - stderr' | tar -xf - -C "$out" || true
+		guest 'sudo tar -C /dev/shm/netlab-consensus -cf - stderr' | tar -xf - -C "$out" || true
 		echo "vm.sh: $nodes nodes, exit $status, results in $out, $(($(date +%s) - started)) s"
 		exit $status
 		;;

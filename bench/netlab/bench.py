@@ -520,7 +520,8 @@ class Bench:
 
     def load(self, leader: int, size: int, inflight: int) -> dict[str, Any]:
         seconds = self.plan.load_seconds
-        cap = 4096 if size == LARGE else 1_000_000
+        # 128 MiB of 64 KiB entries per node, which the guest holds twice
+        cap = 2048 if size == LARGE else 1_000_000
         reply = self.call(
             leader, f"load {seconds} {size} {inflight} {cap}", seconds + 30
         )
@@ -1010,7 +1011,7 @@ def main(argv: list[str]) -> int:
     p.add_argument("--nodes", type=int, default=3, choices=(3, 5))
     p.add_argument("--shapes", default=",".join(s.name for s in SHAPES))
     p.add_argument("--quick", action="store_true", help="the dry run's short plan")
-    p.add_argument("--data", type=Path, default=Path("/var/tmp/netlab-consensus"))
+    p.add_argument("--data", type=Path, default=Path("/dev/shm/netlab-consensus"))
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--seed", type=int, default=1)
     p = sub.add_parser("table", help="the markdown table and hunt rows of result files")

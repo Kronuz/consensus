@@ -211,6 +211,13 @@ class ByteBudget {
 		return true;
 	}
 	void release(std::size_t n) { renew(n, 0); }
+	// Takes `n` now, past the limit if it must: for frames that answer the peer and cannot wait.
+	// Their own bound is elsewhere (LaneOptions::queue_bytes); until they go, nobody else takes.
+	void charge(std::size_t n) {
+		std::lock_guard lock(mutex_);
+		used_ += n;
+		high_ = std::max(high_, used_);
+	}
 	// Gives back a holder's `returned` bytes and takes up to `wanted` back in one step, its own
 	// first: the result, the new holding, is at least min(wanted, returned). It grows past
 	// `returned` only while nobody waits.
@@ -220,7 +227,10 @@ class ByteBudget {
 		{
 			std::lock_guard lock(mutex_);
 			used_ -= returned;
-			held = waiters_.empty() ? take(0, wanted) : take(0, std::min(wanted, returned));
+			held = std::min(wanted, returned);  // its own bytes, whatever another holder took past the limit
+			used_ += held;
+			if (waiters_.empty())
+				held += take(0, wanted - held);
 			serve(wakes);
 		}
 		run(wakes);
@@ -235,7 +245,7 @@ class ByteBudget {
 		std::uint64_t ticket;
 	};
 	std::size_t take(std::size_t least, std::size_t most) {
-		const std::size_t n = std::min(most, limit_ - used_);
+		const std::size_t n = used_ < limit_ ? std::min(most, limit_ - used_) : 0;
 		if (n < least || !n)
 			return 0;
 		used_ += n;
@@ -315,6 +325,9 @@ using Clock = std::chrono::steady_clock;
 struct LaneOptions {
 	std::size_t window = 4 << 20; // a served request's credit window
 	std::size_t serving = 256;    // served calls live at once
+	// Bytes of frames the table queues unsent (A3, R2): Call and Body frames wait for room past it,
+	// so a peer that stops reading holds at most this much of rpc_outgoing_bytes. One frame always fits.
+	std::size_t queue_bytes = 4 * (header_bytes + 24 + chunk_bytes);
 	std::chrono::milliseconds max_call_deadline = std::chrono::hours(1);
 	unsigned version = 1;
 	// The time a call whose deadline passed `late` ago gets again, once (T7: the transport's
@@ -335,7 +348,9 @@ struct Outgoing {
 // One connection's call table. Not thread-safe: it lives on the connection's loop; `post` runs
 // work there, for pool wakes from other loops. `ready` runs when next() has a frame. A throw from
 // receive() is a protocol violation: the connection closes, then close(). A throw from this end's
-// own code (accept, a call's events) fails that call alone, counted in failed().
+// own code (accept, a call's events) fails that call alone, counted in failed(). A callback may
+// call into the table, close() included, which then runs once the outermost call returns; none
+// may destroy it.
 class Lane {
   public:
 	using Accept = std::function<std::optional<Events>(const Incoming &)>; // none: unknown_method
@@ -350,6 +365,7 @@ class Lane {
 	// Starts a call: it waits for `calling` credit and `outgoing` bytes, then queues its Call.
 	// On a closed or draining lane `done` runs at once, within call().
 	Handle call(MethodId method, CallOptions options, std::string request, Events events) {
+		Busy busy(*this);
 		const std::uint64_t total = options.total.value_or(request.size());
 		if (!method || request.size() > chunk_bytes || !options.window || request.size() > total)
 			throw std::invalid_argument("rpc call");
@@ -385,12 +401,13 @@ class Lane {
 	}
 	// Queues the next chunk of this end's stream, within sendable(); `end` ends it.
 	void send(Handle h, std::string bytes, bool end) {
+		Busy busy(*this);
 		auto it = calls_.find(h);
 		if (it == calls_.end())
 			return;
 		auto &o = it->second.out;
 		if (o.ended() || bytes.size() > sendable(h) || (!bytes.size() && !end) ||
-			(o.total != unknown_total && end != (o.sent + bytes.size() == o.total)))
+			(o.total != unknown_total && (bytes.size() > o.total - o.sent || end != (o.sent + bytes.size() == o.total))))
 			throw std::logic_error("rpc send");
 		o.sent += bytes.size();
 		o.pending.push_back({std::move(bytes), end});
@@ -399,6 +416,7 @@ class Lane {
 	}
 	// The consumer took `n` bytes of the peer's stream: renews credit, or finishes the stream.
 	void consume(Handle h, std::size_t n) {
+		Busy busy(*this);
 		auto it = calls_.find(h);
 		if (it == calls_.end())
 			return;
@@ -424,6 +442,7 @@ class Lane {
 	}
 	// Ends a call early: Cancel from its caller, Error from its server.
 	void stop(Handle h, Code code, std::string_view text = {}) {
+		Busy busy(*this);
 		auto it = calls_.find(h);
 		if (it == calls_.end())
 			return;
@@ -441,6 +460,7 @@ class Lane {
 	}
 	// Sends Drain: no new calls either way; the connection may close once drained().
 	void drain() {
+		Busy busy(*this);
 		if (drain_sent_ || closed_)
 			return;
 		drain_sent_ = true;
@@ -450,11 +470,17 @@ class Lane {
 	bool drained() const noexcept { return drain_sent_ && calls_.empty(); }
 	// The connection failed: every call ends, every byte returns.
 	void close() {
+		if (depth_) {
+			close_wanted_ = true;
+			return;
+		}
 		if (closed_)
 			return;
 		closed_ = true;
 		small_.clear();
 		chunks_.clear();
+		roomless_.clear();
+		queued_ = refusals_ = 0;
 		std::vector<Handle> live;
 		for (auto &[h, c] : calls_)
 			live.push_back(h);
@@ -465,6 +491,7 @@ class Lane {
 	// Ends the calls whose deadline has passed, each first given the late rule's time once;
 	// next_deadline() says when to call it again.
 	void expire() {
+		Busy busy(*this);
 		const auto now = now_();
 		std::vector<Handle> due;
 		for (auto &[h, c] : calls_) {
@@ -489,9 +516,11 @@ class Lane {
 	}
 	// The next frame to write: small frames first, in order, then chunks round-robin by call.
 	std::optional<Outgoing> next() {
+		Busy busy(*this);
 		std::optional<Outgoing> out;
 		if (!small_.empty()) {
-			out = std::move(small_.front());
+			refusals_ -= small_.front().refusal;
+			out = std::move(small_.front().out);
 			small_.pop_front();
 		} else if (!chunks_.empty()) {
 			auto it = chunks_.upper_bound(cursor_);
@@ -503,9 +532,14 @@ class Lane {
 			if (it->second.empty())
 				chunks_.erase(it);
 		}
+		if (out) {
+			queued_ -= out->bytes.size();
+			room();
+		}
 		return out;
 	}
 	void receive(std::string_view bytes) {
+		Busy busy(*this);
 		if (closed_)
 			return;
 		const Frame f = decode(bytes, options_.version);
@@ -515,8 +549,12 @@ class Lane {
 		// Rule 6: a caller sends Call, request Body, Cancel and response Credit; a server the rest.
 		if (ours ? f.kind == Kind::call || f.kind == Kind::cancel : f.kind == Kind::error)
 			throw ProtocolError("rpc: rule 6: direction");
-		if (f.kind == Kind::call)
-			return called(f);
+		if (f.kind == Kind::call) {
+			called(f);
+			if (refusals_ > options_.serving)
+				throw ProtocolError("rpc: queue: the peer does not read its refusals");
+			return;
+		}
 		if (ours ? f.call > last_id_ : f.call > high_peer_)
 			throw ProtocolError("rpc: rule 6: id not allocated");
 		auto at = index_.find(f.call);
@@ -565,6 +603,8 @@ class Lane {
 	// What next() would return: a small frame, or else a chunk.
 	bool small_ready() const noexcept { return !small_.empty(); }
 	bool chunk_ready() const noexcept { return !chunks_.empty(); }
+	// Bytes of frames queued and not yet taken by next().
+	std::size_t queued() const noexcept { return queued_; }
 
   private:
 	struct Pending {
@@ -595,6 +635,22 @@ class Lane {
 		Outbound out;
 		std::uint64_t ticket = 0; // a wait in ticket_pool
 		ByteBudget *ticket_pool = nullptr;
+		std::size_t reserved = 0; // the connection's room its outgoing wait holds
+		bool roomless = false;    // waits for room on the connection
+	};
+	// A queued frame; a refusal answers a Call the table never took.
+	struct Queued {
+		Outgoing out;
+		bool refusal = false;
+	};
+	// Holds the table for a callback's duration: a close() inside runs when the outermost returns.
+	struct Busy {
+		Lane &lane;
+		explicit Busy(Lane &l) : lane(l) { ++lane.depth_; }
+		~Busy() {
+			if (!--lane.depth_ && std::exchange(lane.close_wanted_, false))
+				lane.close();
+		}
 	};
 
 	ByteBudget::Wake wake(Handle h, ByteBudget &pool) {
@@ -607,6 +663,7 @@ class Lane {
 		};
 	}
 	void granted(Handle h, ByteBudget &pool, std::size_t n) {
+		Busy busy(*this);
 		auto it = calls_.find(h);
 		if (it == calls_.end() || it->second.ticket_pool != &pool || !it->second.ticket)
 			return pool.release(n);
@@ -615,6 +672,7 @@ class Lane {
 		if (&pool == &pools_.calling) {
 			started(h, n);
 		} else {
+			reserved_ -= std::exchange(it->second.reserved, 0);
 			chunk(h, Charge(pool, n));
 			pump(h);
 		}
@@ -626,22 +684,48 @@ class Lane {
 		c.in.limit = n;
 		pump(h);
 	}
-	// Moves pending chunks into the queue as `outgoing` admits them.
+	// Moves pending chunks into the queue as the connection's room, then `outgoing`, admits
+	// them; each frame is charged whole (A3). A call without room waits, in order, for next().
 	void pump(Handle h) {
 		auto it = calls_.find(h);
-		while (it != calls_.end() && !it->second.ticket && !it->second.out.pending.empty()) {
+		while (it != calls_.end() && !it->second.ticket && !it->second.roomless && !it->second.out.pending.empty()) {
 			auto &c = it->second;
-			const std::size_t n = c.out.pending.front().bytes.size();
-			Charge charge;
-			if (n) {
-				if (!pools_.outgoing.acquire(n, n, wake(h, pools_.outgoing), c.ticket)) {
-					c.ticket_pool = &pools_.outgoing;
-					return;
-				}
-				charge = Charge(pools_.outgoing, n);
+			const std::size_t size = head_size(c);
+			if (!fits(size)) {
+				c.roomless = true;
+				roomless_.push_back(h);
+				return;
 			}
-			chunk(h, std::move(charge));
+			if (!pools_.outgoing.acquire(size, size, wake(h, pools_.outgoing), c.ticket)) {
+				c.ticket_pool = &pools_.outgoing;
+				reserved_ += c.reserved = size;
+				return;
+			}
+			chunk(h, Charge(pools_.outgoing, size));
 			it = calls_.find(h);
+		}
+	}
+	// The encoded size of a call's next frame: its Call, or a Body.
+	static std::size_t head_size(const Call &c) {
+		return c.out.pending.front().bytes.size() + header_bytes + (c.called ? 16 : 24);
+	}
+	bool fits(std::size_t size) const noexcept {
+		return !(queued_ + reserved_) || queued_ + reserved_ + size <= options_.queue_bytes;
+	}
+	// Frames left the queue: the calls waiting for room pump again, first come first, while the
+	// first one's frame fits.
+	void room() {
+		while (!roomless_.empty()) {
+			const auto h = roomless_.front();
+			auto it = calls_.find(h);
+			const bool waiting = it != calls_.end() && it->second.roomless;
+			if (waiting && !fits(head_size(it->second)))
+				return;
+			roomless_.pop_front();
+			if (waiting) {
+				it->second.roomless = false;
+				pump(h);
+			}
 		}
 	}
 	// D4: an id is allocated when its Call is queued, after every wait, so ids reach the peer in order.
@@ -664,10 +748,12 @@ class Lane {
 			allocate(c, h);
 			const Frame f{.kind = Kind::call, .end = p.end, .word = c.method, .call = c.id, .timeout_ms = std::uint64_t(left),
 						  .window = c.in.limit, .total = c.out.total, .bytes = p.bytes};
-			small_.push_back({encode(f, options_.version), std::move(charge)});
+			small_.push_back({{encode(f, options_.version), std::move(charge)}});
+			queued_ += small_.back().out.bytes.size();
 		} else {
 			const Frame f{.kind = Kind::body, .end = p.end, .call = c.id, .offset = c.out.queued, .total = c.out.total, .bytes = p.bytes};
 			auto frame = encode(f, options_.version);  // before the queue: a throw leaves no empty one
+			queued_ += frame.size();
 			chunks_[c.id].push_back({std::move(frame), std::move(charge)});
 		}
 		c.out.end = p.end;
@@ -700,7 +786,7 @@ class Lane {
 		const std::size_t want = std::min<std::uint64_t>(options_.window, need);
 		std::size_t held = 0;
 		if (serving_ >= options_.serving || (want && !(held = pools_.serving.try_acquire(std::min(want, chunk_bytes), want))))
-			return small({.kind = Kind::error, .word = std::uint32_t(Code::overloaded), .call = f.call});
+			return small({.kind = Kind::error, .word = std::uint32_t(Code::overloaded), .call = f.call}, true);
 		const Handle h = ++handles_;
 		std::optional<Events> events;
 		try {
@@ -708,11 +794,11 @@ class Lane {
 		} catch (...) {
 			++failed_;
 			pools_.serving.release(held);
-			return small({.kind = Kind::error, .word = std::uint32_t(Code::handler_failed), .call = f.call});
+			return small({.kind = Kind::error, .word = std::uint32_t(Code::handler_failed), .call = f.call}, true);
 		}
 		if (!events) {
 			pools_.serving.release(held);
-			return small({.kind = Kind::error, .word = std::uint32_t(Code::unknown_method), .call = f.call});
+			return small({.kind = Kind::error, .word = std::uint32_t(Code::unknown_method), .call = f.call}, true);
 		}
 		auto &c = calls_[h];
 		c.id = f.call;
@@ -768,23 +854,37 @@ class Lane {
 			if (calls_.count(h))
 				finish(h, {Outcome::not_processed});
 	}
-	void small(const Frame &f) {
-		small_.push_back({encode(f, options_.version), {}});
+	// A small frame answers or tells the peer, so it never waits: it takes rpc_outgoing_bytes at
+	// once, and a peer that never reads past `serving` refusals is closed (receive).
+	void small(const Frame &f, bool refusal = false) {
+		auto bytes = encode(f, options_.version);
+		pools_.outgoing.charge(bytes.size());
+		const auto n = bytes.size();
+		small_.push_back({{std::move(bytes), Charge(pools_.outgoing, n)}, refusal});
+		queued_ += n;
+		refusals_ += refusal;
 		ready_();
 	}
 	// A call ends here exactly once: its bytes return, its id retires, `done` runs last.
 	void finish(Handle h, Status status) {
 		auto it = calls_.find(h);
+		if (it == calls_.end())
+			return;
 		Call c = std::move(it->second);
 		calls_.erase(it);
 		if (c.id)
 			index_.erase(c.id);
 		if (c.ticket)
 			c.ticket_pool->cancel(c.ticket); // a grant already on its way is released by granted()
+		reserved_ -= c.reserved;
 		if (c.in.held)
 			c.in.pool->release(c.in.held);
-		if (!(c.serving && status.outcome == Outcome::ok))
-			chunks_.erase(c.id);
+		if (auto q = chunks_.find(c.id); q != chunks_.end() && !(c.serving && status.outcome == Outcome::ok)) {
+			for (auto &o : q->second)
+				queued_ -= o.bytes.size();
+			chunks_.erase(q);
+			room();
+		}
 		if (c.serving)
 			--serving_;
 		if (c.events->done) {
@@ -809,8 +909,12 @@ class Lane {
 	bool closed_ = false, drain_sent_ = false, peer_drained_ = false;
 	std::map<Handle, Call> calls_;
 	std::unordered_map<std::uint64_t, Handle> index_;
-	std::deque<Outgoing> small_;
+	std::deque<Queued> small_;
 	std::map<std::uint64_t, std::deque<Outgoing>> chunks_;
+	std::deque<Handle> roomless_;                     // calls waiting for room, in order
+	std::size_t queued_ = 0, reserved_ = 0, refusals_ = 0; // unsent bytes; room outgoing waits hold; refusals unsent
+	int depth_ = 0;                                    // callbacks running (Busy)
+	bool close_wanted_ = false;                        // a close() asked for inside one
 	std::shared_ptr<int> alive_ = std::make_shared<int>();
 };
 } // namespace kronuz::consensus::transport::rpc

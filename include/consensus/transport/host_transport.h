@@ -205,7 +205,7 @@ template <class V> class GroupTable {
 struct RpcOptions {
 	std::size_t serving_bytes = std::size_t{256} << 20;  // served requests' bodies
 	std::size_t calling_bytes = std::size_t{256} << 20;  // this host's calls' responses
-	std::size_t outgoing_bytes = std::size_t{64} << 20;  // body bytes queued to send
+	std::size_t outgoing_bytes = std::size_t{64} << 20;  // lane frames queued to send; at least rpc::frame_bytes
 	rpc::LaneOptions lane;
 };
 // A call on the lane, on its connection's loop (loop_of_node(node)): one this host made or serves.
@@ -282,6 +282,8 @@ class HostTransport {
 			throw std::invalid_argument("host transport: maximum_frame below a frame of this node's rpc_bytes");
 		if (options_.links.rpc_max && options_.links.connection.maximum_frame < rpc::frame_bytes)
 			throw std::invalid_argument("host transport: maximum_frame below the RPC lane's largest frame");
+		if (options_.rpc.outgoing_bytes < rpc::frame_bytes)
+			throw std::invalid_argument("host transport: rpc_outgoing_bytes below the RPC lane's largest frame");
 		for (std::uint32_t k = 0; k != loops_.size(); ++k) {
 			auto &loop = loops_[k];
 			loop.at = loops[k];

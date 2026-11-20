@@ -36,7 +36,10 @@ receiver's parity or 0 or was never allocated (rule 10). A frame for a retired i
 `late()` and dropped (rule 9). On a throw the connection closes and calls `close()`. A throw from
 this end's own code (the accept callback, a call's `body`, `credit` or `done`) is not the peer's:
 it is counted in `failed()` and fails that call alone, `Error handler_failed` from a server and
-`Cancel cancelled` from a caller, with the exception's text.
+`Cancel cancelled` from a caller, with the exception's text. A callback may call into the table:
+a `close()` from one (a `ready` whose write failed at once, say) runs when the table's outermost
+call returns, never while it holds a call (N3). No callback may destroy the table. `send` refuses
+bytes past a call's known total at once, before anything changes (N2).
 
 A call ends once at each end, and its `done` runs once: `ok` when the response is consumed to its
 end (the caller) or queued to its end (the server); `error` or `cancel` with the frame's code;
@@ -63,8 +66,19 @@ posts it to the waiting lane's loop.
   holding and takes up to a window back in one step, its own bytes first. The holding never
   drops below what the peer may still send, so no other call can strand the stream; it grows
   beyond its own bytes only while nobody waits.
-- A chunk, and a `Call`'s inline bytes, charge `rpc_outgoing_bytes` before they queue; the charge
-  returns when the frame's write completes. Headers and the small frames are not charged.
+- Every queued frame is charged to `rpc_outgoing_bytes`, header included, until `next()` hands
+  it over and its write completes. A `Call` or `Body` waits for the charge, first in first out;
+  the small frames (`Credit`, `Cancel`, `Error`, `Drain`) answer the peer and take it at once,
+  past the limit if they must (`ByteBudget::charge`), so nobody else takes until they go.
+- **A per-connection queue** (A3; Xapiand:a3b4b4903 R2): a table queues at most
+  `LaneOptions::queue_bytes` unsent (4 frames, 262,336 bytes), small frames included. A `Call` or
+  `Body` that does not fit waits for room, in order, before it asks `rpc_outgoing_bytes`; one
+  frame always fits an empty queue. A peer that stops reading therefore holds at most its
+  connection's queue, plus the frame being handed over, of the host's pool, and calls to every
+  other peer go on.
+- **A peer that never reads** (N1): a served response waits for room like any stream, so its
+  call keeps its slot and `serving` bounds them; a `Call` refused past that is answered `Error`,
+  and more than `serving` refusals unsent close the connection (`ProtocolError`).
 - `next()` returns small frames first, in order, then chunks round-robin by call.
 
 ## Drain
@@ -114,10 +128,16 @@ keeps connections up until `stop()`, which aborts them), and `hold(node)`.
 ## Evidence
 
 `test/transport/rpc_test.cc` has a case per rule with values, a call's life, the pools under
-threads, and two lanes over pipes on two loops (run under TSan). Each of the model's eight
+threads, and two lanes over pipes on two loops (run under TSan). `reenter` closes the table from
+`ready` inside `called()`, `stop()` and a served end (ASan; control `close-reenters`), `overrun`
+sends past a known total (`send-past-total`), `unread-queue` feeds a table that is never read
+until it throws, every unsent byte charged (`refusals-unbounded`), and `queue-cap` streams three
+1 MiB requests into a two-frame queue (`rpc-no-queue-cap`). Each of the model's eight
 mutants (`test/transport/rpc_mutants.py`) fails the case of its name, and so does `late-deadline`
 (T7: a 2.1 s stop past a 10 s deadline gives 2.1 s once, a 30 s one gives 10 s). `fuzz/rpc_fuzz.cc` drives
-the decoder and a call table; its corpus `fuzz/corpus/rpc` replays as `consensus_fuzz_rpc_replay`.
+the decoder and a call table whose pools are below two windows and whose queue is below two frames,
+so calls wait for `calling`, `outgoing` and room (N4); its corpus `fuzz/corpus/rpc` replays as
+`consensus_fuzz_rpc_replay`, and `fuzz/rpc_fuzz.sh` fuzzes it at `-max_len=65600`.
 
 `test/transport/rpc_host_test.cc`, two hosts over loopback TLS, one ctest entry per case:
 
@@ -128,6 +148,7 @@ the decoder and a call table; its corpus `fuzz/corpus/rpc` replays as `consensus
 | `call-full` | a call whose server never reads holds its 4 MiB credit and pool; heartbeats on Control keep every gap under 1,000 ms | |
 | `lane-only` | no shared group: the call dials Bulk alone, its bytes exact, one link per end, every group counter 0 | |
 | `stream` | a 32 MiB request under the lane's credit, heartbeats' gaps under 1,000 ms, the serving pool's and the sender's queued bytes' (`rpc_outgoing_bytes`) high water within one window | `rpc-past-credit` (chunks that ignore the peer's credit) |
+| `stalled-peer` | four calls hold 16 MiB of host 2's credit when host 2 stops reading for 4 s; host 1's 2 MiB `rpc_outgoing_bytes` holds at most that connection's queue, so a 1 MiB echo to host 3 completes before host 2 resumes | `rpc-no-queue-cap` |
 | `local-throw` | a handler acting outside its events and a body consumer that throw each end their call `handler_failed`; the link count, `malformed` 0, a group's frames on Bulk and the next 1 MiB echo show the connection went on | `local-throw-closes` (a local throw closes the connection) |
 
 `hello_test version` refuses a 32 KiB `maximum_frame` below the lane's 65,584-byte frame

@@ -14,6 +14,8 @@
 //   local-throw a handler and a body consumer that throw fail their own call handler_failed; the
 //               Bulk connection, a group's frames on it and the next call go on (control:
 //               local-throw-closes)
+//   stalled-peer a peer that stops reading holds at most its connection's queue of the host's
+//               rpc_outgoing_bytes, so a call to another peer goes on (A3; control: rpc-no-queue-cap)
 //   consensus_transport_rpc_host_test <fixture dir> case
 #include "rpc_hosts.h"
 
@@ -462,11 +464,78 @@ bool local_throw() {
 	two.stop();
 	return ok;
 }
+// A3 (R2, Xapiand:a3b4b4903): four calls to host 2 hold 16 MiB of its credit when host 2 stops
+// reading for 4 s; host 1's 2 MiB rpc_outgoing_bytes holds at most host 2's connection queue, so a
+// 1 MiB echo to host 3 completes while host 2 is still stopped.
+bool stalled_peer() {
+	constexpr std::uint32_t L = 2;
+	Host one(1, L), two(2, L), three(3, L);
+	Server s2, s3;
+	HostTransportOptions options;
+	options.rpc.outgoing_bytes = 2 << 20;
+	one.open(addresses({&two, &three}), options);
+	two.open(addresses({&one}));
+	three.open(addresses({&one}));
+	s2.install(*two.transport);
+	s3.install(*three.transport);
+	one.start();
+	two.start();
+	three.start();
+	auto w2 = start_call(one, 2, echo, 64, 10s), w3 = start_call(one, 3, echo, 64, 10s);
+	if (!until([&] { return w2->done && w3->done; }, 10s))
+		return false;
+	std::vector<std::shared_ptr<Seen>> held;
+	for (int i = 0; i != 4; ++i)
+		held.push_back(start_call(one, 2, sink, 4 << 20, 30s, 1024));  // the writer waits after the Call
+	const bool credited = until([&] {
+		return one.at(2, [&] {
+			for (auto &c : held)
+				if (one.transport->sendable(c->out.call) == 0)
+					return false;
+			return true;
+		});
+	}, 10s);
+	const auto stalled = steady::now();
+	two.post(two.transport->loop_of_node(1), [] { std::this_thread::sleep_for(4000ms); });
+	std::this_thread::sleep_for(100ms);
+	one.at(2, [&] {
+		for (auto &c : held) {
+			c->out.limit = ~std::uint64_t{0};
+			c->out.pump();
+		}
+		return 0;
+	});
+	std::this_thread::sleep_for(500ms);  // host 2's socket and host 1's queue to it fill
+	const auto outgoing = one.transport->outgoing_pool().used();
+	auto live = start_call(one, 3, echo, 1 << 20, 30s);
+	const bool done = until([&] { return live->done.load(); }, 10s);
+	const auto took = live->done ? std::uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(live->finished - live->started).count()) : 0;
+	const bool before = live->done && live->finished < stalled + 4000ms;
+	const bool all = until([&] {
+		for (auto &c : held)
+			if (!c->done)
+				return false;
+		return true;
+	}, 20s);
+	bool ok_all = all;
+	for (auto &c : held)
+		ok_all &= c->status.outcome == rpc::Outcome::ok && !c->out.failed;
+	const bool freed = until([&] { return pools_empty(one) && pools_empty(two) && pools_empty(three); }, 5s);
+	const bool ok = credited && done && before && live->status.outcome == rpc::Outcome::ok && live->received == 1 << 20 &&
+					!live->mismatched && ok_all && freed;
+	std::printf("stalled-peer: host 2 stopped with 16 MiB credited; host 1's rpc_outgoing_bytes held %zu of %zu; the echo to host 3 took %llu ms, %s host 2 resumed; the stopped calls %s; pools freed: %s %s\n",
+				outgoing, std::size_t(2) << 20, (unsigned long long)took, before ? "before" : "after", ok_all ? "all ok" : "NOT ok",
+				freed ? "yes" : "no", ok ? "ok" : "FAILED");
+	one.stop();
+	two.stop();
+	three.stop();
+	return ok;
+}
 } // namespace
 
 int main(int argc, char **argv) {
 	if (argc != 3) {
-		std::fprintf(stderr, "usage: %s <fixture dir> calls|group-full|call-full|lane-only|stream|local-throw\n", argv[0]);
+		std::fprintf(stderr, "usage: %s <fixture dir> calls|group-full|call-full|lane-only|stream|local-throw|stalled-peer\n", argv[0]);
 		return 2;
 	}
 	fixture = argv[1];
@@ -485,6 +554,8 @@ int main(int argc, char **argv) {
 		ok = stream();
 	else if (which == "local-throw")
 		ok = local_throw();
+	else if (which == "stalled-peer")
+		ok = stalled_peer();
 	else
 		return 2;
 	std::fflush(stdout);

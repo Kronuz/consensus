@@ -210,3 +210,13 @@ as it starts, and a case still running after 100 s prints its step, whether each
 turns, the loops' counters and every thread's stack (`sample` on macOS, `gdb` elsewhere), then
 exits 3. Mutants are
 written by `test/transport/mutant_commit.py`; the plain case run at one must fail.
+
+A failed `upload` run on a macOS CI runner also prints each loop's run state and the kernel's
+network and page counters. When a connection loop is stuck 250 ms in state U (an uninterruptible
+kernel wait), the test runs `sudo -n spindump` on itself for 3 s and prints the threads in `write`,
+a socket call or the sampler. Kernel frames print raw as `kernel + 0xN`, N from the loaded kernel's
+base, beside the OS build, the kernel's UUID, its base and the KASLR slide: a runner's kernel
+exports 18,427 symbols, so any name taken from them is the nearest export, wrong. To name the
+frames, download the Kernel Debug Kit for that build (Apple developer login; CI does not download
+it), take its release kernel whose UUID matches (`dwarfdump -u`), and run
+`atos -o <kernel> -arch x86_64 -l <base> <base + N>`, or look up the unslid `__TEXT` address plus N.

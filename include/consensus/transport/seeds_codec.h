@@ -1,4 +1,5 @@
 #pragma once
+#include <compare>
 #include <consensus/types.h>
 #include <cstdint>
 #include <cstring>
@@ -14,7 +15,7 @@ namespace kronuz::consensus::transport {
 struct SeedService {
 	std::string name;
 	std::uint16_t port = 0;
-	bool operator==(const SeedService &) const = default;
+	auto operator<=>(const SeedService &) const = default;
 };
 // What one datagram says: the cluster, the announcing process, and its services.
 struct Announcement {

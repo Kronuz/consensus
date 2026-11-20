@@ -246,11 +246,12 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	endforeach()
 	set_tests_properties(consensus_transport_rpc PROPERTIES TIMEOUT 120)
 	# Multicast seeds (docs/mechanisms/seeds.md), one ctest entry per case. A host whose loopback
-	# cannot carry multicast skips the cases that need it (exit 77) and says why.
+	# cannot carry multicast skips the cases that need it (exit 77) and says why; where CI or
+	# CONSENSUS_SEEDS_REQUIRE is set, that fails instead.
 	add_executable(consensus_transport_seeds_test test/transport/seeds_test.cc)
 	target_link_libraries(consensus_transport_seeds_test PRIVATE consensus::transport)
 	target_compile_options(consensus_transport_seeds_test PRIVATE -UNDEBUG)
-	foreach(c codec drops processes unavailable forged rate)
+	foreach(c codec drops processes unavailable forged forged_rotating rate recovers receive_errors throws require)
 		add_test(NAME consensus_transport_seeds_${c} COMMAND consensus_transport_seeds_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture ${c})
 		set_tests_properties(consensus_transport_seeds_${c} PROPERTIES FIXTURES_REQUIRED consensus_tls TIMEOUT 60 SKIP_RETURN_CODE 77)
 	endforeach()

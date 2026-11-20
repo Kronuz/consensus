@@ -38,8 +38,10 @@ struct SeedOptions {
 	std::chrono::milliseconds interval{2000}, jitter{1000}, burst_spacing{100};
 	std::size_t burst = 3;  // 1 is no burst: the first announcement, then the interval
 	std::chrono::milliseconds expire{10000};  // a seed not heard this long leaves the set
-	std::size_t seeds = 256;  // the set's bound: a flood of senders costs this many entries, no more
-	// A seed whose dial failed waits backoff, doubling per failure up to backoff_max.
+	std::size_t seeds = 256;  // the set's bound: a flood of announcements costs this many entries, no more
+	std::size_t per_address = 16;  // the entries one source address holds: a host's few processes
+	// A seed whose dial failed waits backoff, doubling per failure up to backoff_max; so do a
+	// failed start() before its retry and a failed receive before the next.
 	std::chrono::milliseconds backoff{1000}, backoff_max{60000};
 };
 inline void validate_seed_options(const SeedOptions &o) {
@@ -59,11 +61,14 @@ inline void validate_seed_options(const SeedOptions &o) {
 		throw std::invalid_argument("seeds: expire below one interval and its jitter");
 	if (!o.seeds || o.seeds > 65536)
 		throw std::invalid_argument("seeds: set bound outside 1..65536");
+	if (!o.per_address || o.per_address > o.seeds)
+		throw std::invalid_argument("seeds: per-address bound outside 1..seeds");
 	if (o.backoff < std::chrono::milliseconds(1) || o.backoff_max < o.backoff)
 		throw std::invalid_argument("seeds: backoff below 1 ms or above backoff_max");
 }
 
-// A node another process announced: where it was heard from and the asked-for services there.
+// A dial target another process announced: the address it was heard from and the asked-for
+// services there, by name. The two name the seed; `sender` is the latest announcer's.
 struct Seed {
 	std::uint64_t id = 0;  // names the seed to failed() and joined()
 	kronuz::consensus::Identity sender{};
@@ -77,15 +82,16 @@ struct Seed {
 	}
 };
 struct SeedStats {
-	std::uint64_t announced = 0, send_failures = 0, received = 0;
+	std::uint64_t announced = 0, send_failures = 0, received = 0, receive_failures = 0, setup_failures = 0;
 	std::uint64_t oversized = 0, malformed = 0, version = 0, cluster = 0;  // dropped, never a seed
-	std::uint64_t own = 0, unwanted = 0, full = 0;  // well formed, no seed: this process, no asked-for service, set full
+	// Well formed, no new seed: this process, no asked-for service, the set or the address full.
+	std::uint64_t own = 0, unwanted = 0, full = 0, address_full = 0;
 	std::uint64_t dials = 0, failures = 0, expired = 0;
 };
 
 // The multicast seed source on one loop's executor: it announces `services` and seeds the
 // services in `wanted`. Unavailable multicast (no route, a sandbox) is reported once through
-// on_unavailable; the source then stays idle and the node goes on with its explicit seeds.
+// on_unavailable; the source retries with backoff and the node goes on with its explicit seeds.
 class Seeds {
   public:
 	using Clock = std::chrono::steady_clock;
@@ -93,7 +99,7 @@ class Seeds {
 	Seeds(asio::any_io_executor executor, kronuz::consensus::Identity cluster, std::vector<SeedService> services,
 		  std::set<std::string> wanted, SeedOptions options = {})
 		: options_(std::move(options)), receiver_(executor), sender_(executor), timer_(executor),
-		  wanted_(std::move(wanted)), random_(std::random_device{}()) {
+		  receive_timer_(executor), wanted_(std::move(wanted)), random_(std::random_device{}()) {
 		validate_seed_options(options_);
 		self_.cluster = cluster;
 		for (auto &c : self_.sender)
@@ -113,23 +119,100 @@ class Seeds {
 	Seeds &operator=(const Seeds &) = delete;
 	~Seeds() { assert(drained() && "Seeds destroyed with operations pending: stop() and run the loop until drained()"); }
 
-	// Called once, when multicast cannot be used here; the reason names the failing step.
+	// Called once per outage, when multicast cannot be used here; the reason names the failing step.
 	std::function<void(const std::string &reason)> on_unavailable;
 	// A seed to dial: a new one, or one whose backoff passed and which is still announced. The
-	// caller answers each with failed(id) or joined(id); none comes for a seed until then.
+	// caller answers each with failed(id) or joined(id); none comes for a seed until then. A throw
+	// counts as failed(id) and leaves the loop's run().
 	std::function<void(const Seed &)> on_dial;
 
 	const SeedStats &stats() const noexcept { return stats_; }
+	// Why multicast is unusable now; empty once a retried start() succeeds.
 	const std::string &unavailable() const noexcept { return unavailable_; }
 	const kronuz::consensus::Identity &sender() const noexcept { return self_.sender; }
 	int sending_handle() noexcept { return sender_.is_open() ? int(sender_.native_handle()) : -1; }
+	int receiving_handle() noexcept { return receiver_.is_open() ? int(receiver_.native_handle()) : -1; }
 	bool drained() const noexcept { return !pending_; }
 
-	// Opens the sockets, joins the group, and starts announcing and listening.
+	// Opens the sockets, joins the group, and starts announcing and listening; a failed step is
+	// reported and retried after backoff, doubling per failure.
 	void start() {
 		if (started_)
 			return;
 		started_ = true;
+		open();
+	}
+	// Closes the sockets and cancels the timers; run the loop until drained() before destroying.
+	void stop() noexcept {
+		stopping_ = true;
+		asio::error_code ignored;
+		timer_.cancel();
+		receive_timer_.cancel();
+		receiver_.close(ignored);
+		sender_.close(ignored);
+	}
+
+	// The seeds heard within `expire`, ordered by address and services.
+	std::vector<Seed> seeds() const {
+		std::vector<Seed> r;
+		const auto now = Clock::now();
+		for (const auto &[key, e] : entries_)
+			if (now - e.heard < options_.expire)
+				r.push_back(e.seed);
+		return r;
+	}
+	// The caller's dial of a seed failed (no connection, a failed TLS hello, an unpinned node), or
+	// the node it joined was lost: its next dial waits backoff, doubled per failure since its last join.
+	void failed(std::uint64_t id) {
+		auto *e = find(id);
+		if (!e || e->state == State::idle)
+			return;
+		++stats_.failures;
+		e->state = State::idle;
+		e->next = Clock::now() + backoff_after(e->failures++);
+	}
+	// The caller's dial of a seed authenticated a node: no further dials unless failed() says it was lost.
+	void joined(std::uint64_t id) {
+		if (auto *e = find(id); e && e->state == State::dialing) {
+			e->state = State::joined;
+			e->failures = 0;
+		}
+	}
+
+  private:
+	enum class State : std::uint8_t { idle, dialing, joined };
+	struct Entry {
+		Seed seed;
+		Clock::time_point heard, next;
+		std::uint32_t failures = 0;
+		State state = State::idle;
+	};
+	// The dial target: never the sender, which the announcer chooses freely.
+	using Key = std::pair<asio::ip::address, std::vector<SeedService>>;
+
+	struct Pending {
+		Seeds &self;
+		explicit Pending(Seeds &s) : self(s) { ++self.pending_; }
+		Pending(const Pending &o) noexcept : self(o.self) { ++self.pending_; }
+		~Pending() { --self.pending_; }
+	};
+
+	// The wait after `failures` earlier failures: backoff, doubled each, up to backoff_max.
+	Clock::duration backoff_after(std::uint32_t failures) const {
+		auto wait = options_.backoff;
+		for (std::uint32_t i = 0; i < failures && wait < options_.backoff_max; ++i)
+			wait *= 2;
+		return std::min(wait, options_.backoff_max);
+	}
+	void report(std::string reason) {
+		if (!unavailable_.empty())
+			return;
+		unavailable_ = std::move(reason);
+		if (on_unavailable)
+			on_unavailable(unavailable_);
+	}
+
+	void open() {
 		asio::error_code error;
 		const auto group = asio::ip::make_address(options_.group);
 		const asio::ip::udp::endpoint to(group, options_.port);
@@ -159,7 +242,9 @@ class Seeds {
 		if (!error)
 			sender_.set_option(asio::ip::multicast::enable_loopback(true), error), step = "loopback";
 		if (error)
-			return fail(std::string(step) + ": " + error.message());
+			return setup_failed(std::string(step) + ": " + error.message());
+		setup_failures_ = 0;
+		unavailable_.clear();
 		group_ = to;
 		if (listens)
 			receive();
@@ -169,75 +254,19 @@ class Seeds {
 			announce();
 		}
 	}
-	// Closes the sockets and cancels the timer; run the loop until drained() before destroying.
-	void stop() noexcept {
-		stopping_ = true;
-		asio::error_code ignored;
-		timer_.cancel();
-		receiver_.close(ignored);
-		sender_.close(ignored);
-	}
-
-	// The seeds heard within `expire`, ordered by address and sender.
-	std::vector<Seed> seeds() const {
-		std::vector<Seed> r;
-		const auto now = Clock::now();
-		for (const auto &[key, e] : entries_)
-			if (now - e.heard < options_.expire)
-				r.push_back(e.seed);
-		return r;
-	}
-	// The caller's dial of a seed failed (no connection, a failed TLS hello, an unpinned node), or
-	// the node it joined was lost: its next dial waits backoff, doubled per failure since its last join.
-	void failed(std::uint64_t id) {
-		auto *e = find(id);
-		if (!e || e->state == State::idle)
-			return;
-		++stats_.failures;
-		e->state = State::idle;
-		auto wait = options_.backoff;
-		for (std::uint32_t i = 0; i < e->failures && wait < options_.backoff_max; ++i)
-			wait *= 2;
-		++e->failures;
-		e->next = Clock::now() + std::min(wait, options_.backoff_max);
-	}
-	// The caller's dial of a seed authenticated a node: no further dials unless failed() says it was lost.
-	void joined(std::uint64_t id) {
-		if (auto *e = find(id); e && e->state == State::dialing) {
-			e->state = State::joined;
-			e->failures = 0;
-		}
-	}
-
-  private:
-	enum class State : std::uint8_t { idle, dialing, joined };
-	struct Entry {
-		Seed seed;
-		Clock::time_point heard, next;
-		std::uint32_t failures = 0;
-		State state = State::idle;
-	};
-	using Key = std::pair<asio::ip::address, kronuz::consensus::Identity>;
-
-	struct Pending {
-		Seeds &self;
-		explicit Pending(Seeds &s) : self(s) { ++self.pending_; }
-		Pending(const Pending &o) noexcept : self(o.self) { ++self.pending_; }
-		~Pending() { --self.pending_; }
-	};
-
-	void fail(std::string reason) {
+	void setup_failed(std::string reason) {
 		asio::error_code ignored;
 		receiver_.close(ignored);
 		sender_.close(ignored);
-		report(std::move(reason));
-	}
-	void report(std::string reason) {
-		if (!unavailable_.empty())
+		++stats_.setup_failures;
+		report(std::move(reason));  // on_unavailable may stop()
+		if (stopping_)
 			return;
-		unavailable_ = std::move(reason);
-		if (on_unavailable)
-			on_unavailable(unavailable_);
+		timer_.expires_after(backoff_after(setup_failures_++));
+		timer_.async_wait([this, pending = Pending(*this)](asio::error_code e) {
+			if (!e && !stopping_)
+				open();
+		});
 	}
 	void join(const asio::ip::address &group, asio::error_code &error) {
 		if (group.is_v4()) {
@@ -305,13 +334,30 @@ class Seeds {
 			return;
 		Pending pending(*this);
 		receiver_.async_receive_from(asio::buffer(buffer_), from_, [this, pending](asio::error_code error, std::size_t n) {
-			if (stopping_)
+			if (stopping_ || error == asio::error::operation_aborted || !receiver_.is_open())
 				return;
-			if (!error)
+			if (error)
+				return receive_failed(error);
+			receive_failures_ = 0;
+			try {
 				received(std::string_view(buffer_.data(), n));
-			else if (error == asio::error::operation_aborted || !receiver_.is_open())
-				return;
+			} catch (...) {
+				receive();
+				throw;
+			}
 			receive();
+		});
+	}
+	// A receive error is counted, reported once, and waits backoff before the next receive.
+	void receive_failed(const asio::error_code &error) {
+		++stats_.receive_failures;
+		report("receive: " + error.message());
+		if (stopping_)
+			return;
+		receive_timer_.expires_after(backoff_after(receive_failures_++));
+		receive_timer_.async_wait([this, pending = Pending(*this)](asio::error_code e) {
+			if (!e)
+				receive();
 		});
 	}
 
@@ -334,24 +380,40 @@ class Seeds {
 				services.push_back(std::move(s));
 		if (services.empty())
 			return void(++stats_.unwanted);
+		std::sort(services.begin(), services.end());
 		const auto now = Clock::now();
 		sweep();
-		const Key key{from_.address(), a.sender};
+		const Key key{from_.address(), services};
 		auto it = entries_.find(key);
 		if (it == entries_.end()) {
 			if (entries_.size() >= options_.seeds)
 				return void(++stats_.full);
-			it = entries_.emplace(key, Entry{Seed{++ids_, a.sender, from_.address(), {}}, now, now}).first;
+			if (held(key.first) >= options_.per_address)
+				return void(++stats_.address_full);
+			it = entries_.emplace(key, Entry{Seed{++ids_, {}, key.first, std::move(services)}, now, now}).first;
 			index_[it->second.seed.id] = key;
 		}
 		auto &e = it->second;
 		e.heard = now;
-		e.seed.services = std::move(services);
+		e.seed.sender = a.sender;
 		if (e.state == State::idle && now >= e.next && on_dial) {
 			e.state = State::dialing;
 			++stats_.dials;
-			on_dial(e.seed);  // may call failed() or joined() at once
+			const auto id = e.seed.id;
+			try {
+				on_dial(e.seed);  // may call failed() or joined() at once
+			} catch (...) {
+				failed(id);
+				throw;
+			}
 		}
+	}
+	// The entries `address` holds: they sort together, so this reads at most per_address of them.
+	std::size_t held(const asio::ip::address &address) const {
+		std::size_t n = 0;
+		for (auto it = entries_.lower_bound(Key{address, {}}); it != entries_.end() && it->first.first == address; ++it)
+			++n;
+		return n;
 	}
 
 	// Drops seeds not heard within `expire`, except one being dialed or still backing off, so an
@@ -376,7 +438,7 @@ class Seeds {
 
 	SeedOptions options_;
 	asio::ip::udp::socket receiver_, sender_;
-	asio::steady_timer timer_;
+	asio::steady_timer timer_, receive_timer_;
 	asio::ip::udp::endpoint group_, from_;
 	Announcement self_;
 	std::set<std::string> wanted_;
@@ -387,6 +449,7 @@ class Seeds {
 	std::map<std::uint64_t, Key> index_;
 	std::uint64_t ids_ = 0;
 	std::size_t burst_left_ = 0, pending_ = 0;
+	std::uint32_t setup_failures_ = 0, receive_failures_ = 0;  // consecutive, for the backoff
 	bool started_ = false, stopping_ = false;
 	SeedStats stats_;
 };

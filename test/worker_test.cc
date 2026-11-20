@@ -27,6 +27,7 @@
 #include <fstream>
 #include <sys/resource.h>
 #include "completion/posix.h"
+#include "journal/memory_io.h"
 #include <iostream>
 #include <map>
 #include <ctime>
@@ -2357,8 +2358,34 @@ void worker_rejoin_by_install() {
 	check(reopened.ready() && m && find_member(*m, 4) && find_member(*m, 4)->role == MemberRole::Voter, "the returned node's store reopens with the membership in force");
 }
 
+// A group on a journal host refuses a configuration whose largest record does not fit one
+// empty segment of the host's turn log (the operating limits, follower batching included).
+void batch_turn_room() {
+	namespace j = kronuz::journal;
+	namespace jt = kronuz::journal::testing;
+	const j::TurnLogOptions turns{16 * 1024, 1024, 1, 4, 4096};
+	const j::AdmissionLimits quota{{4u << 20, 4096}, {64 * 1024, 3}, {256 * 1024, 4}, 16, 3};
+	const auto room = j::turn_log_detail::turn_room(turns.segment_bytes, turns.block_bytes);
+	// The largest rpc_bytes whose batch of 8 entries still fits the room.
+	const std::size_t fits = room - j::turn_log_detail::record_cost(0) - storage_batch_size(true, true, 8);
+	auto attempt = [&](std::size_t rpc_bytes, WorkerLimits scheduling = {16, 128}) -> std::string {
+		jt::Disk disk; j::Host host(std::make_shared<jt::MemoryIO>(disk, "host/"), {'T', 'R', 'M'}, j::HostOptions{1, turns});
+		Limits l; l.command_bytes = 1024; l.rpc_bytes = rpc_bytes; l.log_bytes = 1u << 20; l.log_entries = 64; l.control_entries = 4; l.rpc_entries = 8;
+		try { Worker worker(host, 1, configuration(), quota, l, compact, scheduling); return {}; }
+		catch (const std::invalid_argument& error) { return error.what(); }
+	};
+	const std::string refusal = "worker batch exceeds the host's turn room";
+	check(attempt(fits).empty(), "a batch that fills the host's turn room is accepted");
+	check(attempt(fits + 1) == refusal, "a batch one byte past the host's turn room is refused");
+	check(attempt(16384) == refusal, "a 16 KiB rpc batch is refused on 16 KiB segments");
+	check(attempt(4096).empty(), "a 4 KiB rpc batch fits 16 KiB segments");
+	WorkerLimits merging{16, 128}; merging.follower_batch_entries = 8; merging.follower_batch_bytes = fits + 1;
+	check(attempt(4096, merging) == refusal, "follower batching past the turn room is refused");
+}
+
 int main(int argc, char** argv) {
 	try {
+		if (argc == 2 && std::string_view(argv[1]) == "--turn-room") { batch_turn_room(); std::cout << checks << " turn room checks, " << failures << " failures\n"; return failures ? 1 : 0; }
 		if (argc == 2 && std::string_view(argv[1]) == "--retained-regressions") { founding_and_join_records(); retained_checkpoint_funding(); std::cout << checks << " retained Worker checks, " << failures << " failures\n"; return failures ? 1 : 0; }
 		if (argc == 2 && std::string_view(argv[1]) == "--terminal-regressions") { terminal_original_settlement(); terminal_checkpoint_originals(); terminal_output_and_dispatch_failure(); terminal_snapshot_readback(); terminal_published_activation(); terminal_reclamation_original(); std::cout << checks << " terminal checks, " << failures << " failures\n"; return failures ? 1 : 0; }
 		terminal_original_settlement(); terminal_checkpoint_originals(); terminal_output_and_dispatch_failure(); terminal_snapshot_readback(); terminal_published_activation(); terminal_reclamation_original(); founding_and_join_records(); retained_checkpoint_funding(); snapshot_senders(); worker_rejoin_by_install();
@@ -2367,7 +2394,7 @@ int main(int argc, char** argv) {
 		if (argc == 2 && std::string_view(argv[1]) == "--completion-regressions") { completion_appends(); completion_storage(); completion_channel_cancellation(); completion_snapshot_readback(); retired_completion_worker(); for (unsigned mode : {0u, 1u, 3u}) { binary_transfer_integration(65553, mode, false, true); } std::cout << checks << " completion checks, " << failures << " failures\n"; return failures ? 1 : 0; }
 		if (argc == 2 && std::string_view(argv[1]) == "--review-regressions") { channel_dispatch_and_unstarted_result(); binary_transfer_integration(65553); binary_transfer_integration(65553, 5); owned_snapshot_sources(); std::cout << checks << " review checks, " << failures << " failures\n"; return failures ? 1 : 0; }
 		if (argc == 2 && std::string_view(argv[1]) == "--transfer-benchmark") { std::ofstream(std::filesystem::current_path() / ".scratch" / "snapshot-transfer-benchmark.csv") << "image_bytes,wall_s,cpu_s,wire_bytes,retained_frame_bytes,payload_buffer_capacity,process_maxrss_native,sender_payload_reads,receiver_payload_reads\n"; binary_transfer_integration(1048576, 0, true); binary_transfer_integration(67108864, 0, true); std::cout << checks << " benchmark checks, " << failures << " failures\n"; return failures ? 1 : 0; }
-		follower_batching();
+		batch_turn_room(); follower_batching();
 		completion_appends(); completion_storage(); completion_channel_cancellation(); completion_snapshot_readback(); retired_completion_worker(); for (unsigned mode : {0u, 1u, 3u}) { binary_transfer_integration(65553, mode, false, true); } checkpoint_format_recovery(); legacy_source_export_rejection(); binary_channel_validation(); hostile_transfer_frames(); receiving_protocol(); worker_api_guards(); channel_dispatch_and_unstarted_result(); binary_transfer_codec(); for (std::size_t length : {std::size_t{0}, std::size_t{9}, std::size_t{65553}, std::size_t{1048576}}) { binary_transfer_integration(length); }
 		for (unsigned mode : {1u, 2u, 3u, 5u}) { binary_transfer_integration(65553, mode); }
 		windowed_snapshot_transfer();

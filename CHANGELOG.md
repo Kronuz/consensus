@@ -8,6 +8,10 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 
 ## 2026-11-20
 
+### Added
+
+- A closed group reopens without an election when its leader is unchanged ([docs/mechanisms/quiescence.md](docs/mechanisms/quiescence.md)). `Core::closed_state()` gives a replica's closed state once it rests at a checkpoint covering applied (hard state, last log index and term, membership and its index, the leader it knew); `encode_closed_state` and `decode_closed_state` carry it as `RFTCLOS1` (192 bytes for a lone voter, 240 for a three-voter member, CRC32C, bound to the journal group, its incarnation and the member incarnation). `Core::reopen(closed)` before `Start` resumes the closed term (leading it, or following its leader) when the record matches the recovered state, and the first batch after it carries the hard state with the first write: a reopened lone voter's first write costs two barriers, as on an open group, instead of five (`simulation_test`, `closing` cases).
+
 ### Changed
 
 - A Worker on a journal host refuses at construction (`std::invalid_argument`, "worker batch exceeds the host's turn room") a configuration whose largest record exceeds one empty segment of the host's turn log (D132): a batch of `Limits::rpc_entries` and `rpc_bytes` (or `WorkerLimits::follower_batch_*` when larger), or the founding record. Before, it reached the journal and fenced its group at the first append. A caller sets segments big enough for the batch, or lower `rpc_bytes` (and `command_bytes`, which it must not exceed); the default 2 MiB rpc batch needs 64 MiB segments or lower limits. A merged `Receive` a caller submits beyond the operating limits can still fence its group (`worker_test --turn-room`).

@@ -113,6 +113,7 @@ struct Node {
 	std::optional<Committed> applying;
 	std::vector<std::string> applied;  // commands applied since the last restart
 	std::vector<Entry> applied_entries;  // every entry applied since the last restart
+	std::optional<ClosedState> closed;  // the last record it closed with, kept even once stale
 	bool up = true;
 };
 
@@ -173,6 +174,8 @@ public:
 				checkpoint(n);
 			} else if (pick < 760) {
 				serve_snapshot();
+			} else if (pick < 775) {
+				close(n);
 			} else {
 				for (auto& [i, m] : nodes_) { tick(m); }
 				if (!n.up && random_() % 8 == 0) { restart(n); }  // a crashed node comes back
@@ -264,6 +267,7 @@ public:
 	std::uint64_t reads = 0, checkpoints = 0, installs = 0, limit_changes = 0, replaced_configurations = 0, forced_removals = 0;
 	std::uint64_t forced_replacements = 0, removals_with_snapshot = 0, removals_with_read = 0, delayed_timeout_nows = 0;
 	std::uint64_t held_back = 0;  // empty appends to peers below their next entry (M8)
+	std::uint64_t closes = 0, resumed = 0, stale = 0;  // closed at rest; reopens that resumed their term; records refused as stale
 	std::uint64_t held_back_total() const { auto total = held_back; for (const auto& [_, n] : nodes_) { if (n.core) { total += n.core->held_back(); } } return total; }
 	std::map<int, std::uint64_t> reject_reasons;
 	Term max_term() const {
@@ -310,8 +314,11 @@ private:
 		if (n.durable.base) { state.membership = n.durable.membership; }
 		else if (n.joiner) { state.membership = Membership{}; }  // the join record: no membership yet
 		else if (witness_) { state.membership = founding_; }
+		bool resuming = false;
 		try {
 			n.core = std::make_unique<Core>(node_config(n), state, n.limits, timing_);
+			// Half the restarts hand the core the last closed record, matching or stale.
+			if (n.closed && random_() % 2) { resuming = n.core->reopen(*n.closed); resumed += resuming; stale += !resuming; }
 		} catch (const std::exception& error) {
 			std::string detail = "node " + std::to_string(n.id) + " cannot reopen: " + error.what() + "; hard term " + std::to_string(state.hard.term) + " base " +
 				std::to_string(state.base_index) + " command limit " + std::to_string(n.limits.command_bytes) + "; entries";
@@ -330,7 +337,9 @@ private:
 		}
 		n.up = true;
 		act(n, n.core->step(Tick{local_time(n), election_delay()}));
+		const Term term = n.core->term();
 		act(n, n.core->step(Start{}));
+		if (resuming && n.core->term() != term) { fail("node " + std::to_string(n.id) + " reopened into another term"); }
 		// The hello tells each side the other's node limits; the host keeps the last ones it
 		// heard, so a restarted core learns a down peer's too.
 		for (auto& [id, m] : nodes_) {
@@ -563,6 +572,21 @@ private:
 		++reads;
 		if (ready.index < it->second) { fail("a read at index " + std::to_string(ready.index) + " misses commit " + std::to_string(it->second)); }
 		read_floors_.erase(it);
+	}
+	// Closes a node at rest with its record and reopens it at once or later; a node with an
+	// application gap checkpoints first.
+	void close(Node& n) {
+		if (!n.up || n.pending || n.checkpointing || n.installing || n.applying) { return; }
+		auto closed = n.core->closed_state();
+		if (!closed) { checkpoint(n); return; }
+		const auto c = node_config(n);
+		const ClosedIdentity id{c.cluster, c.configuration, 1, 1, n.id};
+		n.closed = decode_closed_state(encode_closed_state(*closed, id), id);
+		if (*n.closed != *closed) { fail("a closed record does not round-trip"); }
+		++closes;
+		held_back += n.core->held_back();
+		n.core.reset(); n.up = false;
+		if (random_() % 2) { restart(n); }
 	}
 	// A local checkpoint through what the node applied.
 	void checkpoint(Node& n) {
@@ -935,6 +959,246 @@ private:
 	std::uint64_t trace_after_ = std::getenv("SIM_TRACE_AFTER") ? std::strtoull(std::getenv("SIM_TRACE_AFTER"), nullptr, 10) : 0;
 };
 
+// Quiescence's closed state (docs/mechanisms/quiescence.md): a group closed at rest reopens in
+// its closed term with no election, and a reopened lone voter's first write costs the same
+// barriers as a write to an open group. Storage completes at once; each batch is one barrier.
+namespace closing {
+
+void expect(bool value, const std::string& what) { if (!value) { fail("closing: " + what); } }
+
+struct Replica {
+	std::unique_ptr<Core> core;
+	Durable durable;
+	std::size_t barriers = 0;  // storage batches written
+	std::vector<StorageBatch> batches;
+	std::vector<RoleChanged> roles;
+	std::size_t vote_traffic = 0;  // pre-vote and vote requests sent
+	std::size_t granted = 0;  // votes granted
+	Index applied = 0;
+};
+
+class Group {
+public:
+	explicit Group(std::size_t voters) : voters_(voters) {
+		for (NodeId id = 1; id <= voters; ++id) { open(id, std::nullopt); }
+	}
+	std::map<NodeId, Replica> replicas;
+	std::map<Term, NodeId> leaders;  // every leader seen, per term
+	static ClosedIdentity identity(NodeId local) { auto c = config(local, 1); return {c.cluster, c.configuration, 7, 3, local}; }
+
+	// Recovers `id` from its durable state; with a record, hands it to Core::reopen first.
+	bool open(NodeId id, const std::optional<std::string>& record) {
+		auto& r = replicas[id];
+		RecoveredState state{config(id, voters_), r.durable.hard, r.durable.base, r.durable.base_term, r.durable.log, r.durable.base, r.durable.membership};
+		if (!r.durable.base) { state.membership.reset(); }
+		r.core = std::make_unique<Core>(config(id, voters_), state, Limits{}, timing_);
+		r.applied = r.durable.base;
+		bool resumed = record && r.core->reopen(decode_closed_state(*record, identity(id)));
+		act(id, r.core->step(Tick{now_, delay(id)}));
+		act(id, r.core->step(Start{}));
+		return resumed;
+	}
+	// Checkpoints at applied and returns the record, closing the replica.
+	std::string close(NodeId id) {
+		auto& r = replicas.at(id);
+		const auto c = config(id, voters_);
+		if (r.applied > r.durable.base) {
+			act(id, r.core->step(LocalCheckpoint{++request_, 1, r.applied, *r.core->term_at(r.applied), c.cluster, c.configuration, r.core->epoch()}));
+		}
+		auto closed = r.core->closed_state();
+		expect(closed.has_value(), "replica " + std::to_string(id) + " can close at rest");
+		r.core.reset();
+		return closed ? encode_closed_state(*closed, identity(id)) : std::string{};
+	}
+	void tick(std::uint64_t dt) {
+		now_ += dt;
+		for (auto& [id, r] : replicas) { if (r.core) { act(id, r.core->step(Tick{now_, delay(id)})); } }
+		settle();
+	}
+	void settle() {
+		for (int n = 0; !network_.empty() && n < 100000; ++n) {
+			auto e = std::move(network_.front()); network_.pop_front();
+			auto& r = replicas.at(e.to);
+			if (r.core) { act(e.to, r.core->step(Receive{e.from, std::move(e.message)})); }
+		}
+	}
+	// Proposes on `id` and settles; true once `id` applied it.
+	bool write(NodeId id, const std::string& command) {
+		auto& r = replicas.at(id);
+		act(id, r.core->step(Propose{++request_, command}));
+		settle();
+		return r.applied == r.core->last_index() && r.durable.entry(r.applied) && r.durable.entry(r.applied)->payload == command;
+	}
+	NodeId leader() const {
+		for (const auto& [id, r] : replicas) { if (r.core && r.core->role() == Role::Leader) { return id; } }
+		return 0;
+	}
+	void act(NodeId id, Actions actions) {
+		auto& r = replicas.at(id);
+		for (auto& a : actions) {
+			if (auto p = std::get_if<Persist>(&a)) {
+				++r.barriers; r.batches.push_back(p->batch); r.durable.apply(p->batch);
+				act(id, r.core->step(Persisted{p->token}));
+			} else if (auto c = std::get_if<PersistCheckpoint>(&a)) {
+				r.durable.install(c->state, {}); act(id, r.core->step(Persisted{c->token}));
+			} else if (auto c = std::get_if<Committed>(&a)) {
+				r.applied = c->entries.back().index; act(id, r.core->step(Applied{r.applied}));
+			} else if (auto s = std::get_if<Send>(&a)) {
+				r.vote_traffic += std::holds_alternative<VoteRequest>(s->message) || std::holds_alternative<PreVoteRequest>(s->message);
+				if (auto v = std::get_if<VoteResponse>(&s->message); v && v->granted) { ++r.granted; }
+				network_.push_back({id, s->peer, s->message, 0});
+			} else if (auto role = std::get_if<RoleChanged>(&a)) {
+				r.roles.push_back(*role);
+				if (role->role == Role::Leader) {
+					auto [it, fresh] = leaders.emplace(role->term, id);
+					expect(fresh || it->second == id, "two leaders in term " + std::to_string(role->term));
+				}
+			} else if (auto f = std::get_if<Fenced>(&a)) {
+				expect(false, "replica " + std::to_string(id) + " fenced: " + f->reason);
+			}
+		}
+	}
+private:
+	// Distinct election delays, so three voters never split their votes forever.
+	std::uint64_t delay(NodeId id) const { return timing_.election_min + 150 * id; }
+	std::size_t voters_;
+	Timing timing_{60, 300, 600, 1200, 3000};
+	std::deque<Envelope> network_;
+	std::uint64_t now_ = 1;
+	RequestId request_ = 0;
+};
+
+// A1, X5/F15: a closed lone voter reopens leading its closed term, and its first write costs
+// two barriers (the entry with the term record, then the commit), as on an open group; without
+// the record it elects again and the same write costs five.
+void lone_voter() {
+	Group g(1);
+	g.tick(1);
+	expect(g.leader() == 1 && g.write(1, "a"), "a lone voter leads and commits");
+	auto& r = g.replicas.at(1);
+	auto before = r.barriers;
+	expect(g.write(1, "b") && r.barriers - before == 2, "a write to an open lone voter costs two barriers");
+	const Term term = r.core->term();
+	const auto record = g.close(1);
+	expect(record.size() == 192, "a lone voter's record is 192 bytes, not " + std::to_string(record.size()));
+	const auto durable = r.durable;
+
+	// Reopened with its record: leading at Start, same term, no campaign.
+	r.roles.clear(); before = r.barriers; const auto batch = r.batches.size();
+	expect(g.open(1, record), "the record matches the recovered state");
+	expect(r.core->role() == Role::Leader && r.core->term() == term, "the reopen leads its closed term");
+	expect(r.roles.size() == 1 && r.roles[0].role == Role::Leader && r.roles[0].term == term, "the only role change is Leader in the closed term");
+	expect(r.barriers == before, "the reopen itself writes nothing");
+	expect(g.write(1, "c"), "the reopened lone voter commits");
+	expect(r.barriers - before == 2, "the first write after a reopen costs two barriers, not " + std::to_string(r.barriers - before));
+	expect(r.batches[batch].hard && r.batches[batch].hard->term == term && r.batches[batch].log && r.batches[batch].log->entries.size() == 1,
+		"the term record shares the first write's batch");
+	expect(!r.batches[batch + 1].log && r.batches[batch + 1].hard, "the second batch is the commit index");
+	before = r.barriers;
+	expect(g.write(1, "d") && r.barriers - before == 2 && !r.batches[batch + 2].hard, "the second write carries no term record");
+
+	// The stale record: the replica wrote after it, so the reopen elects as after any restart.
+	r.core.reset(); r.roles.clear(); before = r.barriers;
+	expect(!g.open(1, record), "a record the log moved past is stale");
+	g.tick(1);
+	expect(r.core->term() == term + 1 && !r.roles.empty() && r.roles[0].role == Role::Candidate, "a stale record's reopen elects");
+
+	// The control: the same closed state reopened without its record elects, and its first
+	// write costs five barriers (ballot, no-op, commit, entry, commit).
+	r.core.reset(); r.durable = durable; before = r.barriers;
+	expect(!g.open(1, std::nullopt), "no record");
+	g.tick(1);
+	expect(g.write(1, "c") && r.barriers - before == 5, "without the record the first write costs five barriers, not " + std::to_string(r.barriers - before));
+	expect(r.core->term() == term + 1, "without the record the reopen raises the term");
+}
+
+// A1: a three-voter group closed at rest reopens with no election and no term change, on a
+// request to its leader and on a frame to its followers; a reopened follower keeps its ballot.
+void three_voters() {
+	Group g(3);
+	for (int n = 0; n < 200 && !g.leader(); ++n) { g.tick(97); }
+	const NodeId leader = g.leader();
+	expect(leader != 0 && g.write(leader, "a"), "three voters elect and commit");
+	g.tick(70);  // a heartbeat carries the commit index to the followers
+	const Term term = g.replicas.at(leader).core->term();
+	std::map<NodeId, std::string> records;
+	for (NodeId id = 1; id <= 3; ++id) {
+		records[id] = g.close(id);
+		expect(records[id].size() == 240, "a three-voter member's record is 240 bytes");
+		expect(decode_closed_state(records[id], Group::identity(id)).leader == leader, "replica " + std::to_string(id) + " closes knowing the leader");
+	}
+	// The leader reopens first, on a request; each follower on the frame it sends.
+	for (auto& [id, r] : g.replicas) { r.roles.clear(); r.vote_traffic = 0; }
+	expect(g.open(leader, records[leader]), "the leader's record matches");
+	for (NodeId id = 1; id <= 3; ++id) { if (id != leader) { expect(g.open(id, records[id]), "a follower's record matches"); } }
+	expect(g.write(leader, "b"), "the reopened group commits a request");
+	for (auto& [id, r] : g.replicas) {
+		expect(r.core->term() == term, "replica " + std::to_string(id) + " stays in the closed term");
+		expect(r.vote_traffic == 0, "replica " + std::to_string(id) + " sends no vote request");
+		for (const auto& role : r.roles) { expect(role.role != Role::Candidate && role.term == term, "no campaign"); }
+		expect(r.core->leader() == leader, "every replica follows the closed leader");
+	}
+	// A reopened follower never votes twice in its term: its ballot is the recovered one.
+	NodeId follower = 0;
+	for (auto& [id, r] : g.replicas) { if (id != leader && r.durable.hard.voted_for == leader) { follower = id; } }
+	expect(follower != 0, "a follower voted for the leader");
+	if (!follower) { return; }
+	const NodeId other = 6 - leader - follower;
+	auto& f = g.replicas.at(follower);
+	const auto granted = f.granted;
+	g.act(follower, f.core->step(Receive{other, VoteRequest{term, 100, term, true}}));
+	expect(f.granted == granted, "a reopened follower refuses a second candidate in its term");
+}
+
+// The record's bytes: a round trip, and every refusal decoding names.
+void record_bytes() {
+	Group g(3);
+	for (int n = 0; n < 200 && !g.leader(); ++n) { g.tick(97); }
+	const NodeId leader = g.leader();
+	g.write(leader, "a");
+	const auto id = Group::identity(leader);
+	const auto bytes = g.close(leader);
+	const auto closed = decode_closed_state(bytes, id);
+	expect(encode_closed_state(closed, id) == bytes, "the record round-trips");
+	auto refused = [&](std::string b, const ClosedIdentity& expected, const std::string& what) {
+		try { decode_closed_state(b, expected); } catch (const kronuz::journal::Corruption&) { return; }
+		expect(false, "decoding refuses " + what);
+	};
+	for (std::size_t i = 0; i < bytes.size(); ++i) { auto b = bytes; b[i] ^= 0x10; refused(b, id, "a flipped byte at " + std::to_string(i)); }
+	refused(bytes.substr(0, bytes.size() - 1), id, "a truncated record");
+	refused(bytes + "x", id, "a trailing byte");
+	for (auto change : {&ClosedIdentity::group, &ClosedIdentity::incarnation, &ClosedIdentity::local}) {
+		auto other = id; ++(other.*change); refused(bytes, other, "another replica's record");
+	}
+	auto other = id; other.cluster[1] = 'x'; refused(bytes, other, "another cluster's record");
+	// Fields the rules refuse, under a valid checksum.
+	auto patched = [&](std::size_t offset, std::uint64_t value, unsigned width = 8) {
+		auto b = bytes.substr(0, bytes.size() - 4);
+		for (unsigned i = 0; i < width; ++i) { b[offset + i] = static_cast<char>(value >> (8 * i)); }
+		kronuz::journal::put32(b, kronuz::journal::crc32c(b));
+		return b;
+	};
+	refused(patched(84, closed.last.index + 1), id, "a commit index past the last index");
+	refused(patched(100, closed.hard.term + 1), id, "a last term past the term");
+	refused(patched(76, 0), id, "a leader without its ballot");
+	refused(patched(116, closed.last.index + 1), id, "a membership index past the last index");
+	refused(patched(8, bytes.size() + 8, 4), id, "a length that is not the record's");
+	expect(decode_closed_state(patched(108, closed.leader), id) == closed, "the patch itself keeps a valid record");
+	bool thrown = false;
+	try { auto bad = closed; bad.hard.commit_index = bad.last.index + 1; encode_closed_state(bad, id); } catch (const std::invalid_argument&) { thrown = true; }
+	expect(thrown, "encoding refuses a state the rules refuse");
+}
+
+bool run() {
+	lone_voter();
+	three_voters();
+	record_bytes();
+	std::printf("closing: lone voter, three voters and record bytes: %s\n", failures ? "FAILED" : "ok");
+	return !failures;
+}
+
+}  // namespace closing
+
 }  // namespace
 
 namespace kronuz::consensus::driver_simulation { bool run(std::uint64_t seeds, std::uint64_t steps, std::uint64_t first); }
@@ -945,6 +1209,8 @@ int main(int argc, char** argv) {
 	const std::uint64_t first = argc > 3 ? std::strtoull(argv[3], nullptr, 10) : 1;
 	std::uint64_t restarts = 0, kept = 0, lost = 0, elections = 0, repairs = 0, transfers = 0, changes = 0, committed_changes = 0;
 	std::uint64_t reads = 0, checkpoints = 0, installs = 0, limit_changes = 0, replaced = 0, removals = 0, replacements = 0, with_snapshot = 0, with_read = 0, duplicated = 0, held = 0;
+	std::uint64_t closes = 0, resumed = 0, stale = 0;
+	if (!closing::run()) { return EXIT_FAILURE; }
 	for (std::uint64_t seed = first; seed < first + seeds && !failures; ++seed) {
 		current_seed = seed;
 		Simulation sim(seed, 3 + 2 * (seed % 3 == 0), seed % 2 == 0, seed % 5 == 1);  // even seeds change membership
@@ -971,6 +1237,7 @@ int main(int argc, char** argv) {
 		with_read += sim.removals_with_read;
 		duplicated += sim.delayed_timeout_nows;
 		held += sim.held_back_total();
+		closes += sim.closes; resumed += sim.resumed; stale += sim.stale;
 	}
 	std::printf("simulation: %llu seeds x %llu steps, %llu elections, %llu restarts (%llu kept a pending batch, %llu lost one), %llu repairs, %llu transfers, %llu membership changes proposed, %llu committed memberships applied: %s\n",
 		(unsigned long long)seeds, (unsigned long long)steps, (unsigned long long)elections, (unsigned long long)restarts, (unsigned long long)kept,
@@ -979,6 +1246,7 @@ int main(int argc, char** argv) {
 		(unsigned long long)checkpoints, (unsigned long long)installs, (unsigned long long)limit_changes, (unsigned long long)replaced, (unsigned long long)removals);
 	std::printf("  forced: %llu crashes between promotion and removal; removals committed with a snapshot in flight %llu, with a read in flight %llu; %llu delayed duplicate TimeoutNows; %llu appends held back from peers below their next entry\n",
 		(unsigned long long)replacements, (unsigned long long)with_snapshot, (unsigned long long)with_read, (unsigned long long)duplicated, (unsigned long long)held);
+	std::printf("  %llu closes at rest; %llu reopens resumed their closed term, %llu records refused as stale\n", (unsigned long long)closes, (unsigned long long)resumed, (unsigned long long)stale);
 	if (failures) { return EXIT_FAILURE; }
 	const auto* driver_seeds = std::getenv("SIM_DRIVER_SEEDS");  // the Driver's seeds alone, when set
 	const bool driver = driver_simulation::run(driver_seeds ? std::strtoull(driver_seeds, nullptr, 10) : (seeds + 9) / 10, std::min<std::uint64_t>(steps, 3000), first);

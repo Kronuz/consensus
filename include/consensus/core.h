@@ -37,6 +37,84 @@
 
 namespace kronuz::consensus {
 
+// A replica's consensus position at close (docs/mechanisms/quiescence.md): its hard state,
+// the end of its log, the membership in force and the index it is in force from, and the
+// leader it knew in its term. A matching one reopens the group with no election.
+struct ClosedState {
+	HardState hard;
+	LogBoundary last{0, 0};
+	Membership membership;
+	Index membership_index = 0;
+	NodeId leader = 0;
+	bool operator==(const ClosedState&) const = default;
+};
+// What binds a closed state to one replica of one group: a replaced replica (a new group
+// incarnation in the journal's table, a new member incarnation) never takes another's.
+struct ClosedIdentity {
+	Identity cluster{}, configuration{};
+	std::uint64_t group = 0, incarnation = 0;
+	NodeId local = 0;
+	bool operator==(const ClosedIdentity&) const = default;
+};
+
+namespace closed_detail {
+inline constexpr std::string_view magic{"RFTCLOS1", 8};
+inline constexpr std::size_t fixed_bytes = 132;  // every field but the membership's bytes
+// The record's rules; names the first one broken, null when none is.
+inline const char* invalid(const ClosedState& s, NodeId local) {
+	const auto& h = s.hard;
+	if ((h.term == 0 && h.voted_for) || (h.voted_for && *h.voted_for == 0)) { return "closed state ballot"; }
+	if (h.commit_index > s.last.index || s.last.term > h.term || (s.last.index == 0) != (s.last.term == 0)) { return "closed state log"; }
+	if (s.membership_index > s.last.index) { return "closed state membership index"; }
+	if (s.leader && s.leader == local && h.voted_for != local) { return "closed state leader without its ballot"; }
+	return nullptr;
+}
+} // namespace closed_detail
+
+// RFTCLOS1: the closed state's bytes, CRC32C at the end. Throws std::invalid_argument for a
+// state the record's rules refuse.
+inline std::string encode_closed_state(const ClosedState& state, const ClosedIdentity& id) {
+	using kronuz::journal::put32;
+	using kronuz::journal::put64;
+	if (auto why = closed_detail::invalid(state, id.local)) { throw std::invalid_argument(why); }
+	validate_membership(state.membership, ceilings);
+	auto membership = encode_membership(state.membership);
+	std::string bytes(closed_detail::magic);
+	put32(bytes, static_cast<std::uint32_t>(closed_detail::fixed_bytes + membership.size()));
+	bytes.append(id.cluster.data(), id.cluster.size()); bytes.append(id.configuration.data(), id.configuration.size());
+	for (auto v : {id.group, id.incarnation, id.local, state.hard.term, state.hard.voted_for.value_or(0), state.hard.commit_index,
+			 state.last.index, state.last.term, state.leader, state.membership_index}) { put64(bytes, v); }
+	put32(bytes, static_cast<std::uint32_t>(membership.size())); bytes += membership;
+	put32(bytes, kronuz::journal::crc32c(bytes));
+	return bytes;
+}
+// Throws kronuz::journal::Corruption for damaged bytes, another replica's record, or a state
+// the record's rules refuse.
+inline ClosedState decode_closed_state(std::string_view bytes, const ClosedIdentity& expected) {
+	using kronuz::journal::Corruption;
+	using kronuz::journal::get32;
+	using kronuz::journal::get64;
+	if (bytes.size() < closed_detail::fixed_bytes || bytes.substr(0, 8) != closed_detail::magic) { throw Corruption("closed state magic"); }
+	auto body = bytes.substr(0, bytes.size() - 4), tail = bytes.substr(bytes.size() - 4);
+	if (get32(tail) != kronuz::journal::crc32c(body)) { throw Corruption("closed state checksum"); }
+	body.remove_prefix(8);
+	if (get32(body) != bytes.size()) { throw Corruption("closed state length"); }
+	ClosedIdentity id;
+	std::copy_n(body.begin(), 16, id.cluster.begin()); std::copy_n(body.begin() + 16, 16, id.configuration.begin()); body.remove_prefix(32);
+	id.group = get64(body); id.incarnation = get64(body); id.local = get64(body);
+	if (id != expected) { throw Corruption("closed state of another replica"); }
+	ClosedState s;
+	s.hard.term = get64(body);
+	if (auto vote = get64(body)) { s.hard.voted_for = vote; }
+	s.hard.commit_index = get64(body);
+	s.last.index = get64(body); s.last.term = get64(body);
+	s.leader = get64(body); s.membership_index = get64(body);
+	if (get32(body) != body.size()) { throw Corruption("closed state membership length"); }
+	s.membership = decode_membership(body);
+	if (auto why = closed_detail::invalid(s, id.local)) { throw Corruption(why); }
+	return s;
+}
+
 // One owning executor. No I/O, clock reads, entropy, or application callbacks.
 // Persist changes are staged internally; all dependent actions are deferred.
 class Core {
@@ -213,6 +291,25 @@ public:
 
 	// The leader this node knows of in its term; 0 for none.
 	NodeId leader() const noexcept { return leader_; }
+	// The closed state, when this replica can close now: started, not fenced or retiring,
+	// nothing persisting or out for application, applied at the commit index and a checkpoint
+	// there (docs/mechanisms/quiescence.md).
+	std::optional<ClosedState> closed_state() const {
+		if (!started_ || retiring_ || role_ == Role::Fenced || busy() || delivered_through_ || applied_ != durable_.commit_index ||
+			base_index_ != applied_ || membership().members.empty()) { return std::nullopt; }
+		return ClosedState{durable_, {last_index(), log_term(last_index())}, membership(), membership_index(), leader_};
+	}
+	// Before Start: resumes the closed term when `closed` matches the recovered state exactly
+	// (hard state, last index and term, membership and its index); false, changing nothing,
+	// for a stale one. The first storage batch then carries the hard state (the term record).
+	bool reopen(const ClosedState& closed) {
+		if (started_) { throw std::logic_error("reopen after start"); }
+		if (auto why = closed_detail::invalid(closed, configuration_.local)) { throw std::invalid_argument(why); }
+		if (closed.hard != durable_ || closed.last != LogBoundary{last_index(), log_term(last_index())} ||
+			closed.membership != membership() || closed.membership_index != membership_index()) { return false; }
+		resume_ = closed.leader; term_record_ = true;
+		return true;
+	}
 	// The term of the entry at `index`, while the retained log or its base holds it.
 	std::optional<Term> term_at(Index index) const {
 		if (index < base_index_ || index > last_index() || (index == 0 && base_index_ == 0)) { return std::nullopt; }
@@ -458,6 +555,7 @@ private:
 	}
 	void persist(StorageBatch batch, Actions deferred, Actions& output, bool elected = false) {
 		if (busy()) { throw std::logic_error("overlapping persistence"); }
+		if (std::exchange(term_record_, false) && !batch.hard) { batch.hard = hard_; }
 		auto id = token();
 		pending_.emplace(Pending{id, hard_, std::move(deferred), elected, std::nullopt});
 		output.emplace_back(Persist{id, std::move(batch)});
@@ -465,9 +563,12 @@ private:
 	void handle(Start, Actions& output) {
 		if (started_) { return; }
 		started_ = true; reset_election();
+		// A reopen resumes its closed term: as its leader, or following the leader it knew.
+		if (resume_ == configuration_.local) { lead(); output.emplace_back(RoleChanged{role_, hard_.term, leader_}); }
+		else if (resume_) { follower(resume_, output); leader_contact_ = now_; }
 		// X5: the only voter, with no witness, needs nobody's vote: its election is due at once,
 		// so the next Tick campaigns at the same clock and its admission funds the ballot.
-		if (lone_voter()) { election_deadline_ = now_; }
+		else if (lone_voter()) { election_deadline_ = now_; }
 		deliver(output);
 	}
 	bool lone_voter() const {
@@ -1141,17 +1242,25 @@ private:
 		if (last_index() >= maximum - 1 || entries_.charged_entries() >= std::min(limits_in_force().log_entries, retained_.log_entries)) {
 			follower(0, output); return; // Control reserve exhausted: fail closed.
 		}
+		lead();
+		Entry noop{last_index() + 1, hard_.term, EntryKind::NoOp, {}}; entries_.push_back(noop);
+		Actions deferred; deferred.emplace_back(RoleChanged{role_, hard_.term, leader_});
+		persist(StorageBatch{std::nullopt, LogMutation{noop.index, {noop}}}, std::move(deferred), output);
+	}
+	// Leads this term from now: every replica from the next index, CheckQuorum's window afresh,
+	// a heartbeat due at once.
+	void lead() {
 		role_ = Role::Leader; leader_ = configuration_.local; peers_.clear(); grants_.clear(); answered_.clear(); transfer_.reset();
 		leadership_start_ = now_; handed_off_ = false;
 		for (NodeId replica : replicas()) {
 			peers_.emplace(replica, Peer{last_index() + 1, 0, {}});
 			if (is_voter(replica)) { answered_[replica] = now_; }
 		}
-		Entry noop{last_index() + 1, hard_.term, EntryKind::NoOp, {}}; entries_.push_back(noop);
-		Actions deferred; deferred.emplace_back(RoleChanged{role_, hard_.term, leader_});
-		persist(StorageBatch{std::nullopt, LogMutation{noop.index, {noop}}}, std::move(deferred), output);
 		heartbeat_deadline_ = now_;
 	}
+	// The index the membership in force is known from: its Configuration entry while the
+	// retained log holds it, else the base index.
+	Index membership_index() const noexcept { return configs_.empty() ? base_index_ : configs_.rbegin()->first; }
 	void snapshot_keepalive(NodeId id, Peer& peer, Actions& output) {
 		if (peer.keepalive && now_ - peer.keepalive->sent < timing_.heartbeat) { return; }
 		auto rpc = token(); peer.keepalive = Flight{rpc, 0, 0, 0, now_, true};
@@ -1286,6 +1395,8 @@ private:
 	mutable std::pair<std::uint64_t, Index> wire_key_{};
 	bool handed_off_ = false;  // a self-removing leader tried its transfer
 	Index witness_bound_ = 0;  // a witness truncates only through this (D9)
+	NodeId resume_ = 0;  // a reopen's leader at close, resumed at Start
+	bool term_record_ = false;  // a reopen's first batch carries the hard state
 };
 
 } // namespace kronuz::consensus

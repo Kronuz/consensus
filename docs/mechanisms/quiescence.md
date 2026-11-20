@@ -54,8 +54,10 @@ membership is in force; 0 for a founding membership with no checkpoint. A lone v
   takes an old replica's record;
 - term 0 with a vote, a vote for incarnation 0, a commit index past the last index, a last term
   past the term, a last index and last term not both zero or both nonzero;
-- a membership that does not decode (`decode_membership`), a leader that does not vote in it, or
-  a leader that is this replica without its ballot (a leader voted for itself in its term).
+- a membership that does not decode (`decode_membership`), a membership index past the last
+  index, or a leader that is this replica without its ballot (a leader voted for itself in its
+  term). The leader need not be a member of the membership in force: a leader leads until its own
+  removal commits, and its followers follow it until then.
 
 ### Closing
 
@@ -91,13 +93,18 @@ the replica resumed under.
 
 ### Why reopening without an election is safe
 
-A term has at most one leader, so a replica that led term `T` and still holds term `T` with the
-log it led with can lead `T` again: no other replica can lead `T`, its log holds every entry it
-sent in `T` (a leader sends an entry only once it is durable), and commitment still needs a
-quorum's acknowledgement in `T`, which a replica that moved to a later term refuses. The exact
-match is what proves "still holds": any durable change after the record (a new term, a vote, an
-entry, a commit) makes it stale. The ballot survives too: the record's vote is the recovered
-vote, so a reopen never votes twice in a term.
+A term has at most one leader, so a replica that led term `T` and still holds term `T` can lead
+`T` again: no other replica can lead `T`, its log holds every entry it sent in `T` (a leader
+sends an entry only once it is durable, and nothing else writes its log in `T`), and commitment
+still needs a quorum's acknowledgement in `T`, which a replica that moved to a later term
+refuses. A follower that resumes following its leader of `T` follows the only one `T` has. The
+ballot survives too: the record's vote is the recovered vote, so a reopen never votes twice in a
+term.
+
+Safety needs only the term; the exact match keeps the rule conservative and the record
+truthful. A reopened replica starts exactly at the position its record states, so a host can
+read that position from the record instead of scanning the log, and a record the replica moved
+past (a vote, an entry, a commit, a membership) costs an election instead of a resumed term.
 
 The leader must be recorded, not inferred. A lone voter that voted for itself in `T` did not
 necessarily lead `T`: a three-voter group's leader `X` of `T` can remove the third voter and then

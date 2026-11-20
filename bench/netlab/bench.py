@@ -812,6 +812,11 @@ class Bench:
                 "isolated_leader": isolated_term,
             },
             "elected_after_heal": after,
+            "roles": [  # every role change from the cut on: ms after the cut, node, role, term, leader
+                (round((when - self.started_cut) * 1000, 1), n, role, t, named)
+                for when, n, role, t, named in self.roles
+                if when >= self.started_cut
+            ],
             "operations": len(log.ops),
             "acknowledged_writes": len(writes),
             "violations": len(violations),

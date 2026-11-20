@@ -236,6 +236,9 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 		add_test(NAME consensus_transport_rpc_host_${c} COMMAND consensus_transport_rpc_host_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture ${c})
 		set_tests_properties(consensus_transport_rpc_host_${c} PROPERTIES FIXTURES_REQUIRED consensus_tls TIMEOUT 150)
 	endforeach()
+	# Latency bounds a runner that stops the process can break (D100): `ctest -LE timing` skips them; CI runs them.
+	set_tests_properties(consensus_transport_rpc_host_group-full consensus_transport_rpc_host_call-full
+		consensus_transport_rpc_host_stream consensus_transport_rpc_host_reader PROPERTIES LABELS timing)
 	# The node hello's limits and wire versions (docs/mechanisms/hello.md).
 	add_executable(consensus_transport_hello_test test/transport/hello_test.cc)
 	target_link_libraries(consensus_transport_hello_test PRIVATE consensus::transport)

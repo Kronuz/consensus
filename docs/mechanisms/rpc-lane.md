@@ -177,7 +177,10 @@ so calls wait for `calling`, `outgoing` and room (N4); its corpus `fuzz/corpus/r
 | `shutdown` | `drain()` with a 4 MiB echo streaming: it completes whole, a later call ends `not_processed`, the lanes close, no call ends `connection_aborted` | |
 | `fetch` | host 2 uploads 4 groups' 1 MiB data frames to host 1 on Bulk while host 1 fetches 16 MiB on the same connection: it arrives exact in about 1.1 s beside 131 MiB of uploads, heartbeats on Control keep a 210 ms longest gap; a missing name gives nullopt, a throwing reader `io_error`, 48 MiB against a 32 MiB `fetch_bytes` `message_size`, and past 4 awaiting `resource_unavailable_try_again` | |
 | `reader` | host 2's loop that does not read node 1's connection is held; 10 echoes on that connection complete, the slowest in under 200 ms (T5) | `lane-via-other-loop` |
+| `stop-drain` | host 2 runs in a child process that raises SIGSTOP in its reader; host 1's fetch ends `timed_out`, and after SIGCONT the late reply arrives, is dropped (rule 9) on the same connection, and the next fetch is exact on it (F18) | `forget-is-violation` (never drain), `fetch-deadline-io-error` |
 | `local-throw` | a handler acting outside its events and a body consumer that throw each end their call `handler_failed`; the link count, `malformed` 0, a group's frames on Bulk and the next 1 MiB echo show the connection went on | `local-throw-closes` (a local throw closes the connection) |
+
+`group-full`, `call-full`, `stream` and `reader` assert latency bounds a runner that stops the process can break (D100): they carry the ctest label `timing`, which `ctest -LE timing` skips; CI runs them.
 
 `hello_test version` refuses a 32 KiB `maximum_frame` below the lane's 65,584-byte frame
 (control `lane-frame-unchecked`).

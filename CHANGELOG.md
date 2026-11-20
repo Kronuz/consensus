@@ -8,6 +8,10 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 
 ## 2026-11-20
 
+### Added
+
+- Multicast seeds ([docs/mechanisms/seeds.md](docs/mechanisms/seeds.md)): `transport::Seeds` announces a node's services (each a name and its port, up to 8 per host) by UDP multicast on the Xapian-era group and port (239.192.168.1:58880), and offers the services a listener asks for as seeds to dial over TLS, each failed dial backing off from 1 s to 60 s per dial target (source address and services, never the announcer-chosen sender), at most 16 targets per source address. The datagram, `DTSD0001` (`seeds_codec.h`), is bounded at 512 bytes and versioned; malformed, oversized, wrong-version and other-cluster datagrams are counted and dropped. Unavailable multicast is reported once through `on_unavailable` and nothing throws; a failed setup is retried with backoff, and a failing receive backs off instead of spinning. The tests fail instead of skipping where `CI` is set. Its decoder has a libFuzzer target (`consensus_fuzz_seeds`) whose corpus replays in ctest.
+
 ### Changed
 
 - A Worker on a journal host refuses at construction (`std::invalid_argument`, "worker batch exceeds the host's turn room") a configuration whose largest record exceeds one empty segment of the host's turn log (D132): a batch of `Limits::rpc_entries` and `rpc_bytes` (or `WorkerLimits::follower_batch_*` when larger), or the founding record. Before, it reached the journal and fenced its group at the first append. A caller sets segments big enough for the batch, or lower `rpc_bytes` (and `command_bytes`, which it must not exceed); the default 2 MiB rpc batch needs 64 MiB segments or lower limits. A merged `Receive` a caller submits beyond the operating limits can still fence its group (`worker_test --turn-room`).

@@ -650,6 +650,10 @@ bool shutdown() {
 
 // D8, A4: fetch beside a maximal upload on one Bulk connection, against heartbeats.
 bool fetch() {
+#ifndef SO_NOSIGPIPE
+	// A write() to a peer that closed raises SIGPIPE here: the host ignores it (main).
+	std::raise(SIGPIPE);
+#endif
 	constexpr std::uint32_t L = 2;
 	Host one(1, L), two(2, L);
 	HostTransportOptions client, server;

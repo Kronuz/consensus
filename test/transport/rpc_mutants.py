@@ -66,6 +66,8 @@ MUTANTS = {
     # hello_test leader: the transport reports default limits, not the ones the peer's hello carried
     "hello-limits-ignored": [(HOST, "here.report(route.group, {route.source, limits});",
                               "here.report(route.group, {route.source, kronuz::consensus::Limits{}});")],
+    # rpc_host_test fetch (Linux, where SO_NOSIGPIPE is missing): the host does not ignore SIGPIPE
+    "sigpipe-default": [("test/transport/rpc_host_test.cc", "\tstd::signal(SIGPIPE, SIG_IGN);", "\t(void)0;")],
 }
 
 

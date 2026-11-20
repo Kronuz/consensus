@@ -163,6 +163,7 @@ std::unique_ptr<HostTransport> transport_of(NodeId node, std::vector<std::unique
 			return std::nullopt;
 		return Member{incarnation, incarnation, MemberRole::Voter};
 	};
+	options.open_of = [](GroupId) { return bench_open(); };
 	std::vector<HostLoop> at;
 	for (auto &l : loops)
 		at.push_back({l->io.get_executor(), task::scheduler_ref::of(l->scheduler)});
@@ -389,7 +390,7 @@ struct Node {
 	void start(const std::map<NodeId, PeerAddress> &addresses) {
 		transport = transport_of(id, loops, addresses);
 		for (auto &[g, group] : groups)
-			transport->store(g, id, bench_open());
+			transport->store(g, id);
 		transport->on_deliver(0, [this](const Received &r) { return deliver(r); });
 		transport->serve(acceptor);
 		loops[0]->start();
@@ -724,8 +725,8 @@ void gap(const std::string &lane, std::size_t frame, unsigned seconds) {
 	const auto beat = groups_on(L, other, 1)[0];
 	for (auto *t : {one.get(), two.get()}) {
 		for (auto g : bulk)
-			t->store(g, t == one.get() ? 1 : 2, bench_open());
-		t->store(beat, t == one.get() ? 1 : 2, bench_open());
+			t->store(g, t == one.get() ? 1 : 2);
+		t->store(beat, t == one.get() ? 1 : 2);
 	}
 	std::atomic<std::uint64_t> delivered{0}, sent{0};
 	std::uint64_t last = 0, worst_gap = 0, beats = 0;

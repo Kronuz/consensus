@@ -137,6 +137,8 @@ struct Host {
 	tcp::acceptor acceptor;
 	std::unique_ptr<HostTransport> transport;
 	bool running = false, quiet = false;
+	std::mutex opens_mutex;
+	std::map<GroupId, GroupOpen> opens;  // the host's opens, which open_of reads
 	Host(NodeId n, std::uint32_t L, std::uint16_t port = 0) : node(n), loops(make(L)), acceptor(loops[0]->io, {asio::ip::address_v4::loopback(), port}) {
 		std::lock_guard hold(hosts_mutex);
 		hosts.push_back(this);
@@ -160,6 +162,10 @@ struct Host {
 					return std::nullopt;
 				return Member{incarnation, incarnation, MemberRole::Voter};
 			};
+		options.open_of = [this](GroupId g) {
+			std::lock_guard hold(opens_mutex);
+			return opens.at(g);
+		};
 		std::vector<HostLoop> at;
 		for (auto &l : loops)
 			at.push_back({l->io.get_executor(), task::scheduler_ref::of(l->scheduler)});
@@ -167,10 +173,18 @@ struct Host {
 		cluster.fill('K');
 		transport = std::make_unique<HostTransport>(at, tls, NodePins(node, pins, tls->native_handle()), cluster, addresses, options);
 	}
+	// On the group's loop: the host's open of `g` becomes `open`, and it stores g as `incarnation`.
+	void store(GroupId g, NodeId incarnation, const GroupOpen &open) {
+		{
+			std::lock_guard hold(opens_mutex);
+			opens[g] = open;
+		}
+		transport->store(g, incarnation);
+	}
 	// Before start(): stores each group as incarnation `node`, with `open`.
 	void stores(const std::vector<GroupId> &groups, const GroupOpen &open = test_open()) {
 		for (auto g : groups)
-			transport->store(g, node, open);
+			store(g, node, open);
 	}
 	static GroupOpen test_open() {
 		GroupOpen o;
@@ -1085,7 +1099,7 @@ struct Node {
 				// stored once member_of answers for it (host-transport.md, Identity)
 				task::spawn(task::scheduler_ref::of(host.loops[k]->scheduler), std::move(opening), [this, g, &opened](std::exception_ptr e) {
 					assert(!e && "create or recover");
-					host.transport->store(g, host.node, Host::test_open());
+					host.store(g, host.node, Host::test_open());
 					opened.set_value();
 				});
 			});
@@ -1514,14 +1528,14 @@ void identity() {
 	assert(total(two, &HostTransportStats::mismatched) >= 4 && total(two, &HostTransportStats::unstored) >= 20);
 
 	step("identity: host 2 stores the late group; host 1 opens it again");
-	two.loops[two.transport->loop_of_group(late)]->at([&] { two.transport->store(late, 2, Host::test_open()); });
+	two.loops[two.transport->loop_of_group(late)]->at([&] { two.store(late, 2, Host::test_open()); });
 	const bool late_opened = until([&] { return send(late, 1, 2, "late"), received(late, "late") > 0; }, 20'000);
 	std::printf("identity: once host 2 stored it, the late group's frames arrive: %s\n", late_opened ? "yes" : "NO");
 	assert(late_opened);
 
 	step("identity: host 1 stores ok again under another epoch");
 	const auto epoch2 = differing([](GroupOpen &o) { o.epoch.fill('Y'); });
-	one.loops[one.transport->loop_of_group(ok)]->at([&] { one.transport->store(ok, 1, epoch2); });
+	one.loops[one.transport->loop_of_group(ok)]->at([&] { one.store(ok, 1, epoch2); });
 	const auto mismatched = total(two, &HostTransportStats::mismatched);
 	for (int i = 0; i != 20; ++i) {
 		send(ok, 1, 2, "epoch2");
@@ -1533,12 +1547,12 @@ void identity() {
 				(unsigned long long)received(ok, "epoch2"));
 	assert(reopened && !received(ok, "epoch2"));
 	step("identity: host 2 stores ok under the same epoch");
-	two.loops[two.transport->loop_of_group(ok)]->at([&] { two.transport->store(ok, 2, epoch2); });
+	two.loops[two.transport->loop_of_group(ok)]->at([&] { two.store(ok, 2, epoch2); });
 	const bool agreed = until([&] { return send(ok, 1, 2, "agreed"), received(ok, "agreed") > 0; }, 20'000);
 	std::printf("identity: once both store the new epoch, frames arrive: %s\n", agreed ? "yes" : "NO");
 	assert(agreed);
 	step("identity: host 2 stores ok again under a third epoch");
-	two.loops[two.transport->loop_of_group(ok)]->at([&] { two.transport->store(ok, 2, differing([](GroupOpen &o) { o.epoch.fill('Z'); })); });
+	two.loops[two.transport->loop_of_group(ok)]->at([&] { two.store(ok, 2, differing([](GroupOpen &o) { o.epoch.fill('Z'); })); });
 	const auto restored = total(two, &HostTransportStats::mismatched);
 	for (int i = 0; i != 20; ++i) {
 		send(ok, 1, 2, "epoch3");
@@ -1658,7 +1672,8 @@ struct RawPeer {
 	std::unique_ptr<Links> links;
 	std::atomic<const Link *> link{nullptr};
 	std::atomic<int> ended{0};
-	std::atomic<std::uint64_t> closed{0}, credits{0}, credited{0}, big{0};
+	std::atomic<std::uint64_t> closed{0}, credits{0}, credited{0}, big{0}, controls{0};
+	std::atomic<std::uint64_t> credits_at_control{~0ull};  // credit frames read before the first control frame
 	std::map<GroupId, std::uint64_t> credit;  // on the loop
 	RawPeer(NodeId node, NodeId to, std::uint16_t port, LinkOptions options = {}) {
 		auto tls = context(names[node]);
@@ -1686,6 +1701,8 @@ struct RawPeer {
 				++credits;
 			}
 			big += f.size() > 1 << 20;
+			if (!f.empty() && f[0] == char(FrameKind::control) && !controls++)
+				credits_at_control = credits.load();
 		};
 		loop.start();
 	}
@@ -2037,6 +2054,71 @@ void backlog() {
 	assert(one.credits < N * R && one.closed == 0 && "the owed records merged");
 }
 
+// owe-order: control frames leave before what a connection owes (feed-scan review N2). As in
+// backlog, the gate holds host 2's sends behind 24 MiB while node 1's data frames make host 2 owe
+// 2,000 groups' credit; then host 2 queues 10 control frames for node 1. Once the gate opens,
+// node 1 reads every control frame before any credit.
+void owe_order() {
+	constexpr std::size_t N = 2000, B = 6;
+	HostTransportOptions options;
+	options.links.connection.dead_after = 60s;
+	Host two(2, 1);
+	two.open({}, options);
+	std::vector<GroupId> groups, bulk;
+	for (std::size_t i = 0; i != N; ++i)
+		groups.push_back(10'001 + i);
+	for (std::size_t i = 0; i != B; ++i)
+		bulk.push_back(90'001 + i);
+	const GroupId beat = 80'001;
+	two.stores(groups);
+	two.stores(bulk);
+	two.stores({beat});
+	std::atomic<std::uint64_t> delivered{0};
+	two.transport->on_deliver(0, [&](const Received &r) {
+		delivered += r.route.source == 1;
+		return true;
+	});
+	two.start();
+	const auto &stats = two.transport->stats(0);
+	Gate gate(two.port());
+	RawPeer one(1, 2, gate.port(), options.links);
+	step("owe-order: node 1 opens 2,000 groups on host 2");
+	const bool up = one.dial(2);
+	assert(up);
+	std::vector<std::string> opens;
+	for (auto g : groups)
+		opens.push_back(encode_open(g, Host::test_open()));
+	one.send(opens);
+	const bool opened = until([&] { return stats.opens >= N; }, 10'000);
+	step("owe-order: the gate holds host 2's sends behind 24 MiB; node 1 sends a data frame to each group");
+	gate.hold(true);
+	const auto sent_before = stats.sent.load();
+	two.post(0, [&] {
+		for (auto g : bulk)
+			two.transport->send(0, LinkLane::Control, FrameKind::data, {g, 2, 1}, 1, std::string((4 << 20) - 1024, 'B'));
+	});
+	const bool backed = until([&] { return stats.sent > sent_before; }, 10'000);
+	std::vector<std::string> frames;
+	for (auto g : groups)
+		frames.push_back(RawPeer::frame(g, 1, 2, "d", FrameKind::data));
+	one.send(frames);
+	const bool arrived = until([&] { return delivered == N && stats.owed >= N; }, 10'000);
+	step("owe-order: host 2 queues 10 control frames for node 1; the gate opens");
+	two.post(0, [&] {
+		for (int i = 0; i != 10; ++i)
+			two.transport->send(0, LinkLane::Control, FrameKind::control, {beat, 2, 1}, 1, "beat");
+	});
+	std::this_thread::sleep_for(100ms);
+	gate.hold(false);
+	const bool read = until([&] { return one.controls >= 10 && one.credited >= N * (frame_header + 1); }, 20'000);
+	std::printf("owe-order: up %s, opened %s, backed %s, host 2 owed %llu records; node 1 read %llu control frames and %llu credit frames, "
+				"%llu of them before the first control frame\n",
+				up ? "yes" : "NO", opened ? "yes" : "NO", backed ? "yes" : "NO", (unsigned long long)N, (unsigned long long)one.controls.load(),
+				(unsigned long long)one.credits.load(), (unsigned long long)one.credits_at_control.load());
+	assert(opened && backed && arrived && read);
+	assert(one.credits_at_control == 0 && "control frames go before credit");
+}
+
 // scan: the feed's work per frame. Host 1 stores N groups and sends a control and a data frame
 // per group to host 2, for N = 100, 1,000 and 10,000, every group on one loop: the groups both
 // hosts' feeds visit per frame they send stay under 2 at each N (a scan per frame grows with N).
@@ -2247,7 +2329,7 @@ void order() {
 
 int main(int argc, char **argv) {
 	if (argc != 3) {
-		std::fprintf(stderr, "usage: %s <fixture dir> threads|credit|reader|upload|driver|refill|identity|joiner|lagging|leftover|reconnect|backlog|relayout|scan|order\n", argv[0]);
+		std::fprintf(stderr, "usage: %s <fixture dir> threads|credit|reader|upload|driver|refill|identity|joiner|lagging|leftover|reconnect|backlog|owe-order|relayout|scan|order\n", argv[0]);
 		return 2;
 	}
 #ifndef SO_NOSIGPIPE
@@ -2282,6 +2364,8 @@ int main(int argc, char **argv) {
 		reconnect();
 	else if (which == "backlog")
 		backlog();
+	else if (which == "owe-order")
+		owe_order();
 	else if (which == "joiner")
 		joiner();
 	else if (which == "lagging")

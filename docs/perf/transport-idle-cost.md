@@ -112,6 +112,13 @@ from:
 The measured fit sits between them: about `137 + 37P` at L = 1 and `131 + 41P` at L = 4. Stored
 is 27-33 B under 164, and each peer 11-15 B under 52.
 
+Since transport-group-bytes the open is the host's (`open_of(group)`, host-transport.md,
+Identity), and the last source a connection reported sits beside its id in the group loop's set
+(16 B, not 8). Stored is the id, incarnation and serial, 24 B; per peer, 16 and 16, 32 B. So the
+minimum is `24 + 32P` and the bound `44 + 64P` (24 x 1.5 + 8; 2 x (16 x 1.5 + 8)), and the bench
+also fails a group stored over D108's 64 B. The rows at the new commit are in transport-group-bytes'
+section below.
+
 The per-end and per-host rows below are job 261118-075717-797949 (light, consensus:33f8540, Release
 and no build type, 3 runs each; byte counts do not depend on load).
 

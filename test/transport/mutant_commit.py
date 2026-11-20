@@ -100,20 +100,27 @@ MUTANTS = {
                       "\t\tif (r.size++)\n\t\t\tlane.active.find(r.tail)->next[ring] = id;\n\t\telse\n\t\t\tr.head = id;\n\t\tr.tail = id;",
                       "\t\ta.next[ring] = r.head;\n\t\tr.head = id;\n\t\tif (!r.size++)\n\t\t\tr.tail = id;"),
     "uncredited-kept": (T + "host_transport.h", "\t\t\t\there.stats.uncredited -= credited;\n", ""),
-    "store-keeps-opens": (T + "host_transport.h", "\t\there.stored[group] = {incarnation, {open, ++here.serial}};\n\t\tunopen(here, group);",
-                          "\t\there.stored[group] = {incarnation, {open, ++here.serial}};"),
+    "store-keeps-opens": (T + "host_transport.h", "\t\there.stored[group] = {incarnation, ++here.serial};\n\t\tunopen(here, group);",
+                          "\t\there.stored[group] = {incarnation, ++here.serial};"),
     # transport-feed-scan review F3: the per-connection generation rule on the group loop
     "no-generation-clear": (T + "host_transport.h", "\t\t\tconnection.generation = batch.peer.generation;\n\t\t\tconnection.groups.clear();",
                             "\t\t\tconnection.generation = batch.peer.generation;"),
     "no-current": (T + "host_transport.h", "const bool current = batch.peer.generation == connection.generation;", "const bool current = true;"),
     # transport-feed-scan review G1: owe's merge keeps only the first record's bytes per group
-    "coalesce-drops-credit": (T + "host_transport.h", "\t\t\t\tv[n - 1].bytes += v[i].bytes;\n", "\t\t\t\t(void)0;\n"),
+    "coalesce-drops-credit": (T + "host_transport.h", "\t\t\t\tv[m - 1].bytes += v[i].bytes;\n", "\t\t\t\t(void)0;\n"),
+    # transport-group-bytes: what a connection owes (Owing) and the feed's order
+    "owing-keeps-prefix": (T + "host_transport.h", "\t\tif (repaid_ * 2 >= records_.size())\n\t\t\tdrop_repaid();\n", ""),
+    "closes-unbounded": (T + "host_transport.h", "if (r.close && closes_ < closes) {", "if (r.close) {"),
+    "owed-before-control": [
+        (T + "host_transport.h", "\t\t\tif (lane.rings[control_ring].size) {\n\t\t\t\tauto [id, a] = pop(lane, control_ring, stats);",
+         "\t\t\tif (!lane.owed.empty()) {\n\t\t\t\tfed += repay(k, lane, stats);\n\t\t\t\tcontinue;\n\t\t\t}\n\t\t\tif (lane.rings[control_ring].size) {\n\t\t\t\tauto [id, a] = pop(lane, control_ring, stats);"),
+    ],
     # security review S1: a read that fails after handing frames over leaves them for the next read
     "read-fails-unflushed": (T + "connection.h",
                              "\t\t\t\tif (on_read)\n\t\t\t\t\ton_read();  // the frames this read handed over, even when it then failed\n\t\t\t\tif (failed)\n\t\t\t\t\tstd::rethrow_exception(failed);",
                              "\t\t\t\tif (failed)\n\t\t\t\t\tstd::rethrow_exception(failed);\n\t\t\t\tif (on_read)\n\t\t\t\t\ton_read();"),
     # security review N2: a zero identity stored
-    "store-zero": (T + "host_transport.h", "if (open.cluster == Identity{} || open.group == Identity{} || open.epoch == Identity{})", "if (false)"),
+    "store-zero": (T + "host_transport.h", "open.cluster == Identity{} || open.group == Identity{} || open.epoch == Identity{})", "false)"),
     # the control: Detent:73e96d6's rule, only a sender that votes in the receiver's membership
     "voters-only": (T + "host_transport.h", "source && source->node != node)",
                     "!source || source->role == kronuz::consensus::MemberRole::Learner || source->node != node)"),

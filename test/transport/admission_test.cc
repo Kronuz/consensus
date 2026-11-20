@@ -1,5 +1,7 @@
 // The per-frame rule (R7) and the group open's checks, as values: each refusal, and what each
-// admits (docs/mechanisms/host-transport.md, Identity).
+// admits (docs/mechanisms/host-transport.md, Identity). Then what a connection owes (Owing): a
+// backlog that never empties frees its repaid prefix (feed-scan review N3), and a flood of
+// refusals for distinct groups owes at most `closes` closed answers (identity review N1).
 #include "consensus/transport/host_transport.h"
 #include <cassert>
 #include <cstdio>
@@ -54,6 +56,71 @@ GroupOpen base() {
 	o.profile.fill(0xAB);
 	return o;
 }
+// A backlog that never empties, under the merge bound: 500 records owed, then rounds of a
+// 1,000-record batch and 1,000 repaid. Without freeing its repaid prefix the vector would hold
+// every record ever owed; it holds at most a few batches.
+void owing_prefix() {
+	Owing owing;
+	auto batch = [](GroupId from, std::size_t n) {
+		std::vector<Owing::Record> b;
+		for (GroupId g = from; g != from + n; ++g)
+			b.push_back({g, 64, false});
+		return b;
+	};
+	owing.add(batch(1, 500), 4096);
+	std::size_t most = 0;
+	for (int round = 0; round != 200; ++round) {
+		owing.add(batch(1000 + GroupId(round) * 1000, 1000), 4096);
+		for (int i = 0; i != 1000; ++i)
+			(void)owing.next();
+		most = std::max(most, owing.held());
+	}
+	std::printf("owing prefix: 200 rounds, %zu owed, at most %zu records held\n", owing.owed(), most);
+	assert(owing.owed() == 500 && most <= 4000);
+}
+// 100,000 refusals of distinct groups while nothing is repaid: at most 4,096 closed answers owed.
+void owing_closes() {
+	Owing owing;
+	std::size_t dropped = 0;
+	for (GroupId base = 0; base != 100'000; base += 1000) {
+		std::vector<Owing::Record> batch;
+		for (GroupId g = base; g != base + 1000; ++g)
+			batch.push_back({g + 1, 0, true});
+		dropped += owing.add(std::move(batch), 4096);
+	}
+	std::printf("owing closes: %zu owed, %zu closed answers, %zu dropped\n", owing.owed(), owing.closes(), dropped);
+	assert(owing.owed() <= 4096 && owing.closes() <= 4096 && dropped == 100'000 - owing.closes());
+	// A credit keeps its record, its closed dropped; once repaid, a closed is owed again.
+	owing.add({{200'000, 64, true}}, 4096);
+	assert(owing.owed() == 4097 && owing.closes() == 4096);
+	while (!owing.empty())
+		(void)owing.next();
+	assert(!owing.closes() && !owing.held());
+	owing.add({{7, 0, true}}, 4096);
+	assert(owing.closes() == 1 && owing.next().close);
+}
+// Records merge per group past the bound; the bytes and the closed are kept whole.
+void owing_merge() {
+	Owing owing;
+	std::uint64_t bytes = 0;
+	for (int round = 0; round != 3; ++round) {
+		std::vector<Owing::Record> batch;
+		for (GroupId g = 1; g <= 3000; ++g)
+			batch.push_back({g, 10, g == 5});
+		bytes += 3000 * 10;
+		owing.add(std::move(batch), 4096);
+	}
+	assert(owing.owed() == 3000 && owing.closes() == 1);
+	std::uint64_t seen = 0;
+	bool closed = false;
+	while (!owing.empty()) {
+		const auto r = owing.next();
+		seen += r.bytes;
+		closed |= r.group == 5 && r.close;
+	}
+	assert(seen == bytes && closed);
+	std::printf("owing merge: 9,000 records of 3,000 groups owed as 3,000, every byte and the closed kept\n");
+}
 } // namespace
 
 int main() {
@@ -102,5 +169,8 @@ int main() {
 	other[0] = char(FrameKind::control);
 	assert(!decode_open(other));
 	std::printf("admission: ok\n");
+	owing_prefix();
+	owing_closes();
+	owing_merge();
 	return 0;
 }

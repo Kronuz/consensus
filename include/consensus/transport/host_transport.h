@@ -97,6 +97,9 @@ Admission admit(const Route &route, kronuz::consensus::NodeId node, kronuz::cons
 // The member the group's membership names for an incarnation, or nullopt where it names none.
 // Called on the group's loop, so loops call it at once for different groups.
 using MemberOf = std::function<std::optional<kronuz::consensus::Member>(GroupId, kronuz::consensus::NodeId)>;
+// The open of a group the host stores, as its latest store() made it: the host keeps it, so an idle
+// group costs the transport no copy. Called on the group's loop, as MemberOf is.
+using OpenOf = std::function<GroupOpen(GroupId)>;
 
 // A message frame as the group's loop receives it; `node` is the connection's authenticated node.
 struct Received {
@@ -201,6 +204,90 @@ template <class V> class GroupTable {
 	std::vector<std::uint32_t> index_;  // an entry's slot + 1; 0 is empty
 };
 
+// What a host owes a peer on one connection for the groups it receives from it: credit, and a
+// closed where the peer's frames were refused here, as records in the order the batches came.
+// While the connection cannot send, the records merge per group each time they double (at 4,096
+// at least), so they stay O(groups); a repaid prefix past half of them is freed; and at most
+// `closes` closed answers are owed at once: past that a refusal goes unanswered, and the peer's
+// next frame for the group is refused, and answered, again.
+class Owing {
+  public:
+	struct Record {
+		GroupId group = 0;
+		std::uint64_t bytes = 0;
+		bool close = false;
+	};
+	static constexpr std::size_t floor = 4096;
+	// A batch's records join, at most `closes` of them owing a closed; returns the closed answers dropped.
+	std::size_t add(std::vector<Record> batch, std::size_t closes) {
+		std::size_t n = 0, dropped = 0;
+		for (auto &r : batch) {
+			if (r.close && closes_ < closes) {
+				++closes_;
+			} else if (r.close) {
+				r.close = false;
+				++dropped;
+			}
+			if (r.bytes || r.close)
+				batch[n++] = r;
+		}
+		batch.resize(n);
+		if (empty()) {
+			records_ = std::move(batch);
+			repaid_ = 0;
+			return dropped;
+		}
+		if (repaid_ * 2 >= records_.size())
+			drop_repaid();
+		records_.insert(records_.end(), batch.begin(), batch.end());
+		if (owed() >= merge_at_)
+			merge();
+		return dropped;
+	}
+	bool empty() const noexcept { return repaid_ == records_.size(); }
+	std::size_t owed() const noexcept { return records_.size() - repaid_; }
+	std::size_t held() const noexcept { return records_.size(); }  // repaid ones included
+	std::size_t closes() const noexcept { return closes_; }
+	// The next record owed; the records go once all are repaid.
+	Record next() {
+		const auto r = records_[repaid_++];
+		closes_ -= r.close;
+		if (empty())
+			clear();
+		return r;
+	}
+	void clear() {
+		std::vector<Record>().swap(records_);
+		repaid_ = closes_ = 0;
+		merge_at_ = floor;
+	}
+
+  private:
+	void drop_repaid() {
+		records_.erase(records_.begin(), records_.begin() + std::ptrdiff_t(repaid_));
+		repaid_ = 0;
+	}
+	void merge() {
+		drop_repaid();
+		auto &v = records_;
+		std::stable_sort(v.begin(), v.end(), [](const Record &a, const Record &b) { return a.group < b.group; });
+		std::size_t m = 0;
+		for (std::size_t i = 0; i != v.size(); ++i) {
+			if (m && v[m - 1].group == v[i].group) {
+				closes_ -= v[m - 1].close && v[i].close;
+				v[m - 1].bytes += v[i].bytes;
+				v[m - 1].close |= v[i].close;
+			} else {
+				v[m++] = v[i];
+			}
+		}
+		v.resize(m);
+		merge_at_ = std::max(floor, 2 * m);
+	}
+	std::vector<Record> records_;
+	std::size_t repaid_ = 0, merge_at_ = floor, closes_ = 0;
+};
+
 // The RPC lane's host-wide pools (D5) and each connection's call table.
 struct RpcOptions {
 	std::size_t serving_bytes = std::size_t{256} << 20;  // served requests' bodies
@@ -229,6 +316,10 @@ struct HostTransportOptions {
 	std::size_t feed = 64 * 1024;       // bytes handed to a connection once its queue is out
 	std::chrono::milliseconds redial{200};
 	MemberOf member_of;  // required: the per-frame rule's source check
+	OpenOf open_of;      // required: a stored group's open, sent and checked by the group-open exchange
+	// Closed answers a connection owes at once; past it a refusal goes unanswered, and the peer's
+	// next frame for that group is refused, and answered, again (transport-identity N1).
+	std::size_t closes = 4096;
 };
 
 // Counters of one loop, readable from any thread.
@@ -242,6 +333,9 @@ struct HostTransportStats {
 	// A level, not a count: data bytes this loop's connections sent that their peers have not
 	// credited yet. Zero once every group's credit is back.
 	std::atomic<std::uint64_t> uncredited{0};
+	// A level: records this loop's connections hold of what they owe their peers (credit, closed),
+	// repaid ones included until they are freed; and closed answers dropped past `closes`.
+	std::atomic<std::uint64_t> owed{0}, unanswered{0};
 };
 
 // A loop of the host: where its tasks run and its sockets wait.
@@ -275,8 +369,8 @@ class HostTransport {
 			nodes_.push_back(node);
 		if (loops_.empty() || loops_.size() > 4096)
 			throw std::invalid_argument("host transport: 1 to 4,096 loops");
-		if (!options_.member_of)
-			throw std::invalid_argument("host transport: member_of is required");
+		if (!options_.member_of || !options_.open_of)
+			throw std::invalid_argument("host transport: member_of and open_of are required");
 		kronuz::consensus::validate_limits(options_.links.limits);
 		if (options_.links.connection.maximum_frame < frame_header + control_frame_bound(options_.links.limits))
 			throw std::invalid_argument("host transport: maximum_frame below a frame of this node's rpc_bytes");
@@ -317,18 +411,19 @@ class HostTransport {
 	void on_peer_limits(std::uint32_t loop, ReportLimits report) { loops_.at(loop).report = std::move(report); }
 	// On `loop`: its connections' counters, hellos refused by version among them.
 	const LinkStats &link_stats(std::uint32_t loop) const { return loops_.at(loop).links->stats(); }
-	// On the group's loop: the host stores `group` as its incarnation `incarnation`. A peer's
-	// frames for it are admitted on a connection once that peer's open matches `open`; storing
-	// again replaces both and opens the group again on every connection. A zero cluster, group
-	// or epoch is refused, as a hello refused it.
-	void store(GroupId group, kronuz::consensus::NodeId incarnation, const GroupOpen &open) {
+	// On the group's loop: the host stores `group` as its incarnation `incarnation`, with the open
+	// `open_of(group)` gives now. A peer's frames for it are admitted on a connection once that
+	// peer's open matches it; storing again (after the open changes, say) replaces both and opens
+	// the group again on every connection. A zero cluster, group or epoch is refused, as a hello
+	// refused it.
+	void store(GroupId group, kronuz::consensus::NodeId incarnation) {
 		if (!incarnation)
 			throw std::invalid_argument("host transport: incarnation 0");
 		using kronuz::consensus::Identity;
-		if (open.cluster == Identity{} || open.group == Identity{} || open.epoch == Identity{})
+		if (const auto open = options_.open_of(group); open.cluster == Identity{} || open.group == Identity{} || open.epoch == Identity{})
 			throw std::invalid_argument("host transport: a zero identity in a group's open");
 		auto &here = loops_[loop_of_group(group)];
-		here.stored[group] = {incarnation, {open, ++here.serial}};
+		here.stored[group] = {incarnation, ++here.serial};
 		unopen(here, group);
 	}
 	// On the group's loop: the host no longer stores `group`; its frames are refused, and it
@@ -362,7 +457,7 @@ class HostTransport {
 			return;
 		}
 		const auto to = loop_of_node(node);
-		here.out[to].push_back({node, lane, kind, route.group, std::move(frame), stored->open});
+		here.out[to].push_back({node, lane, kind, route.group, std::move(frame), {options_.open_of(route.group), stored->serial}});
 		if (!here.flushing) {
 			here.flushing = true;
 			asio::post(here.at.executor, [this, loop] { flush(loop); });
@@ -476,10 +571,11 @@ class HostTransport {
 		LinkLane lane = LinkLane::Control;
 		std::uint64_t generation = 0;
 	};
-	// A group this host stores, on its loop: its incarnation here and its open.
+	// A group this host stores, on its loop: its incarnation here and the serial of its open
+	// (open_of gives the open itself).
 	struct Stored {
 		kronuz::consensus::NodeId incarnation = 0;
-		Opening open;
+		std::uint64_t serial = 0;
 	};
 	// On a group loop, one connection: the stored groups whose peer open matched on it, each with
 	// the source whose limits were reported last (0: none yet). A batch of a newer generation
@@ -497,22 +593,35 @@ class HostTransport {
 	};
 	// The ready rings of a lane's sending groups: control, data.
 	enum : int { control_ring = 0, data_ring = 1 };
+	// A FIFO of frames in a vector: its storage goes once it empties, so a group waiting only for
+	// credit holds none.
+	struct Frames {
+		std::vector<std::string> v;
+		std::size_t head = 0;
+		bool empty() const noexcept { return head == v.size(); }
+		std::size_t size() const noexcept { return v.size() - head; }
+		std::string &front() noexcept { return v[head]; }
+		const std::string &front() const noexcept { return v[head]; }
+		void push_back(std::string f) { v.push_back(std::move(f)); }
+		void pop_front() {
+			if (++head == v.size()) {
+				std::vector<std::string>().swap(v);
+				head = 0;
+			} else if (head >= 16 && head * 2 >= v.size()) {
+				v.erase(v.begin(), v.begin() + std::ptrdiff_t(head));
+				head = 0;
+			}
+		}
+	};
 	// A group with something to send on a lane, or data sent and not yet credited; an idle group has none.
 	struct Active {
-		std::deque<std::string> control, data;
+		Frames control, data;
 		std::uint64_t queued = 0, outstanding = 0;  // data bytes queued; sent and not yet credited
 		Opening open;                               // the open of the latest frame queued
 		GroupId next[2] = {};                       // the next group in each ring
 		std::uint8_t in = 0;                        // the rings it is in, a bit each
 	};
-	// What this host owes the peer for a group it receives: credit, and a closed when the peer's
-	// frames were refused here.
-	struct Owed {
-		GroupId group = 0;
-		std::uint64_t bytes = 0;
-		bool close = false;
-	};
-	static constexpr std::size_t coalesce_floor = 4096;
+	using Owed = Owing::Record;
 	// A FIFO of groups, linked through their Active records.
 	struct Ring {
 		GroupId head = 0, tail = 0;
@@ -522,8 +631,7 @@ class HostTransport {
 	struct Lane {
 		GroupTable<std::uint64_t> opened;  // the groups whose open the connection carries, by serial
 		GroupTable<Active> active;
-		std::vector<Owed> owed;  // in the order the batches came; owed[repaid..] is still owed
-		std::size_t repaid = 0, coalesce_at = coalesce_floor;
+		Owing owed;  // what the host owes the peer on this connection
 		Ring rings[2];
 		const Link *link = nullptr;
 		std::uint64_t generation = 0, dial_after = 0;
@@ -616,55 +724,35 @@ class HostTransport {
 			r.head = id;
 		r.tail = id;
 	}
-	static GroupId pop(Lane &lane, int ring, HostTransportStats &stats) {
+	// The ring's head: its group and record, the one lookup a frame's feed makes.
+	static std::pair<GroupId, Active *> pop(Lane &lane, int ring, HostTransportStats &stats) {
 		auto &r = lane.rings[ring];
 		const auto id = r.head;
-		auto &a = *lane.active.find(id);
+		auto *a = lane.active.find(id);
 		++stats.visited;
-		a.in &= std::uint8_t(~(1u << ring));
+		a->in &= std::uint8_t(~(1u << ring));
 		if (--r.size)
-			r.head = a.next[ring];
-		return id;
+			r.head = a->next[ring];
+		return {id, a};
 	}
 	// An Active with nothing left and in no ring goes.
-	static void settle(Lane &lane, GroupId id) {
-		if (const auto *a = lane.active.find(id); a && !a->in && a->control.empty() && a->data.empty() && !a->outstanding)
+	static void settle(Lane &lane, GroupId id, const Active &a) {
+		if (!a.in && a.control.empty() && a.data.empty() && !a.outstanding)
 			lane.active.erase(id);
 	}
-	// A batch's records join what the lane owes; while its connection cannot send, they merge
-	// per group each time they double, so the lane owes O(groups) records.
-	static void owe(Lane &lane, std::vector<Owed> owed) {
-		if (lane.repaid == lane.owed.size()) {
-			lane.owed = std::move(owed);
-			lane.repaid = 0;
-			return;
-		}
-		lane.owed.insert(lane.owed.end(), owed.begin(), owed.end());
-		if (lane.owed.size() - lane.repaid < lane.coalesce_at)
-			return;
-		auto &v = lane.owed;
-		v.erase(v.begin(), v.begin() + std::ptrdiff_t(lane.repaid));
-		lane.repaid = 0;
-		std::stable_sort(v.begin(), v.end(), [](const Owed &a, const Owed &b) { return a.group < b.group; });
-		std::size_t n = 0;
-		for (std::size_t i = 0; i != v.size(); ++i) {
-			if (n && v[n - 1].group == v[i].group) {
-				v[n - 1].bytes += v[i].bytes;
-				v[n - 1].close |= v[i].close;
-			} else {
-				v[n++] = v[i];
-			}
-		}
-		v.resize(n);
-		lane.coalesce_at = std::max(coalesce_floor, 2 * n);
+	// A batch's records join what the lane owes (Owing).
+	void owe(Lane &lane, std::vector<Owed> owed, HostTransportStats &stats) {
+		const auto held = lane.owed.held();
+		stats.unanswered += lane.owed.add(std::move(owed), options_.closes);
+		stats.owed += lane.owed.held();
+		stats.owed -= held;
 	}
 	// A connection begins or ends: it carries no open, nothing is outstanding or owed, and the
 	// rings are rebuilt from what is queued.
 	void reset(Lane &lane, HostTransportStats &stats) {
 		lane.opened.clear();
-		std::vector<Owed>().swap(lane.owed);
-		lane.repaid = 0;
-		lane.coalesce_at = coalesce_floor;
+		stats.owed -= lane.owed.held();
+		lane.owed.clear();
 		for (auto &r : lane.rings)
 			r = {};
 		for (auto &[id, a] : lane.active) {
@@ -678,11 +766,11 @@ class HostTransport {
 				push(lane, control_ring, id, a);
 			if (data_ready(a))
 				push(lane, data_ring, id, a);
-			if (!a.in)
+			if (!a.in && a.control.empty() && a.data.empty())
 				idle.push_back(id);
 		}
 		for (auto id : idle)
-			settle(lane, id);
+			lane.active.erase(id);
 	}
 
 	void enqueue(std::uint32_t k, std::vector<Outgoing> frames) {
@@ -701,7 +789,7 @@ class HostTransport {
 				if (!data || data_ready(a))
 					push(lane, data ? data_ring : control_ring, f.group, a);
 			}
-			settle(lane, f.group);
+			settle(lane, f.group, a);
 			if (touched.empty() || touched.back() != std::pair{f.node, f.lane})
 				touched.emplace_back(f.node, f.lane);
 		}
@@ -739,9 +827,10 @@ class HostTransport {
 		++loops_[k].stats.sent;
 		return frame.size();
 	}
-	// Once the connection's queue is out, hands it up to `feed` bytes: credit and closed first,
-	// then control frames, then data frames, so a control frame waits behind at most one data
-	// frame. Each frame takes the head of one ring: no group is looked at but the one it sends.
+	// Once the connection's queue is out, hands it up to `feed` bytes: control frames first, then
+	// credit and closed, then data frames, so a control frame waits behind at most one data frame
+	// and never behind what the lane owes. Each frame takes the head of one ring: no group is
+	// looked at but the one it sends.
 	void feed(std::uint32_t k, Lane &lane) {
 		auto &connection = *lane.link->connection;
 		if (connection.queued() || connection.draining())
@@ -750,54 +839,54 @@ class HostTransport {
 		// D1: on Bulk the lane's small frames go first, and its chunks alternate with groups' data.
 		rpc::Lane *calls = lane.link->lane == LinkLane::Bulk ? rpc_lane(k, *lane.link) : nullptr;
 		for (std::size_t fed = 0; fed < options_.feed;) {
-			if (lane.repaid != lane.owed.size()) {
+			if (calls && calls->small_ready()) {
+				fed += put_rpc(k, lane, *calls->next());
+				continue;
+			}
+			if (lane.rings[control_ring].size) {
+				auto [id, a] = pop(lane, control_ring, stats);
+				fed += open_first(k, lane, id, *a);
+				const auto frame = std::move(a->control.front());
+				a->control.pop_front();
+				fed += put(k, lane, frame);
+				if (!a->control.empty())
+					push(lane, control_ring, id, *a);
+				settle(lane, id, *a);
+				continue;
+			}
+			if (!lane.owed.empty()) {
 				fed += repay(k, lane, stats);
 				continue;
 			}
-			if (calls && (calls->small_ready() || (calls->chunk_ready() && (lane.lane_turn || !lane.rings[data_ring].size)))) {
-				const bool chunk = !calls->small_ready();
+			if (calls && calls->chunk_ready() && (lane.lane_turn || !lane.rings[data_ring].size)) {
 				fed += put_rpc(k, lane, *calls->next());
-				lane.lane_turn = lane.lane_turn && !chunk;
+				lane.lane_turn = false;
 				continue;
 			}
-			GroupId id;
-			if (lane.rings[control_ring].size) {
-				id = pop(lane, control_ring, stats);
-				auto &a = *lane.active.find(id);
-				fed += open_first(k, lane, id, a);
-				const auto frame = std::move(a.control.front());
-				a.control.pop_front();
-				fed += put(k, lane, frame);
-				if (!a.control.empty())
-					push(lane, control_ring, id, a);
-			} else if (lane.rings[data_ring].size) {
-				id = pop(lane, data_ring, stats);
-				auto &a = *lane.active.find(id);
-				fed += open_first(k, lane, id, a);
-				const auto frame = std::move(a.data.front());
-				a.data.pop_front();
-				a.queued -= frame.size();
-				a.outstanding += frame.size();
-				stats.uncredited += frame.size();
-				fed += put(k, lane, frame);
-				lane.lane_turn = true;
-				if (data_ready(a))
-					push(lane, data_ring, id, a);
-			} else {
+			if (!lane.rings[data_ring].size)
 				break;
-			}
-			settle(lane, id);
+			auto [id, a] = pop(lane, data_ring, stats);
+			fed += open_first(k, lane, id, *a);
+			const auto frame = std::move(a->data.front());
+			a->data.pop_front();
+			a->queued -= frame.size();
+			a->outstanding += frame.size();
+			stats.uncredited += frame.size();
+			fed += put(k, lane, frame);
+			lane.lane_turn = true;
+			if (data_ready(*a))
+				push(lane, data_ring, id, *a);
+			settle(lane, id, *a);
 		}
 	}
 	// The next record owed: its credit, then its closed. The records go once all are repaid.
 	std::size_t repay(std::uint32_t k, Lane &lane, HostTransportStats &stats) {
-		const auto o = lane.owed[lane.repaid++];
+		const auto held = lane.owed.held();
+		const auto o = lane.owed.next();
 		const auto id = o.group;
 		++stats.visited;
-		if (lane.repaid == lane.owed.size()) {
-			std::vector<Owed>().swap(lane.owed);
-			lane.repaid = 0;
-		}
+		stats.owed += lane.owed.held();
+		stats.owed -= held;
 		std::size_t fed = 0;
 		std::string frame;
 		if (o.bytes) {
@@ -884,7 +973,7 @@ class HostTransport {
 				here.stats.uncredited -= credited;
 				if (data_ready(*a))
 					push(lane, data_ring, group, *a);
-				settle(lane, group);
+				settle(lane, group, *a);
 			}
 			return;
 		}
@@ -956,10 +1045,10 @@ class HostTransport {
 			}
 			bool taken = false;
 			try {
-				const bool opened = stored && current && connection.groups.contains(r.route.group);
-				switch (admit(r.route, r.node, stored ? stored->incarnation : 0, opened, options_.member_of)) {
+				auto *opened = stored && current ? connection.groups.find(r.route.group) : nullptr;
+				switch (admit(r.route, r.node, stored ? stored->incarnation : 0, opened != nullptr, options_.member_of)) {
 				case Admission::admitted:
-					report(here, connection, r.route, batch.limits);
+					report(here, *opened, r.route, batch.limits);
 					taken = here.deliver && here.deliver(r);
 					here.stats.refused += !taken;
 					break;
@@ -991,7 +1080,7 @@ class HostTransport {
 			auto &lane = loops_[from].lanes[{peer.node, peer.lane}];
 			if (lane.generation != peer.generation || !lane.link)
 				return;  // the connection the frames came on ended; its credit went with it
-			owe(lane, std::move(owed));
+			owe(lane, std::move(owed), loops_[from].stats);
 			feed(from, lane);
 		};
 		if (batch.from == k)
@@ -1001,16 +1090,15 @@ class HostTransport {
 	}
 
 	// A source's node limits, once per connection, before its first admitted frame there.
-	static void report(Loop &here, Opened &connection, const Route &route, const kronuz::consensus::Limits &limits) {
-		auto *last = connection.groups.find(route.group);  // admitted: open on this connection
-		if (!last || *last == route.source || !here.report)
+	static void report(Loop &here, kronuz::consensus::NodeId &last, const Route &route, const kronuz::consensus::Limits &limits) {
+		if (last == route.source || !here.report)
 			return;
-		*last = route.source;
+		last = route.source;
 		here.report(route.group, {route.source, limits});
 	}
 	// A peer's open on its connection: it opens the group there when the group is stored here and
 	// every field matches; otherwise it closes it there (false: tell the peer).
-	static bool opening(Loop &here, const Stored *stored, bool current, Opened &connection, GroupId group, std::string_view frame) {
+	bool opening(Loop &here, const Stored *stored, bool current, Opened &connection, GroupId group, std::string_view frame) {
 		const auto open = decode_open(frame);
 		if (!stored) {
 			++here.stats.unstored;
@@ -1020,7 +1108,7 @@ class HostTransport {
 			++here.stats.mismatched;
 			return false;  // a stale connection's open changes nothing on the current one
 		}
-		if (!open || open_fault(stored->open.open, open->second)) {
+		if (!open || open_fault(options_.open_of(group), open->second)) {
 			connection.groups.erase(group);
 			++here.stats.mismatched;
 			return false;

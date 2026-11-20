@@ -41,9 +41,9 @@
 // Bytes are counted exactly: OpenSSL's allocations (CRYPTO_set_mem_functions) and the C++ heap
 // (operator new), by usable size, on macOS and glibc without a sanitizer; zone statistics are
 // printed beside them only. cost exits nonzero when an idle group holds a descriptor, an armed
-// timer or a frame, or more than 164 + 52P bytes (the minimum per group at the tables' worst
-// slack, docs/perf/transport-idle-cost.md); when an idle connection end holds more
-// than 48 KB (the fit's slope); or, without --quick, when a host is more than 10% over
+// timer or a frame, more than 64 bytes stored (D108) or 44 + 64P in all (the minimum at the
+// tables' worst slack, docs/perf/transport-idle-cost.md); when an idle connection end holds
+// more than 48 KB (the fit's slope); or, without --quick, when a host is more than 10% over
 // 52 KB + 2P x 44 KB.
 #include "consensus/transport/host_transport.h"
 #include <asio/executor_work_guard.hpp>
@@ -308,6 +308,8 @@ struct Host {
 					return std::nullopt;
 				return kronuz::consensus::Member{incarnation, incarnation, kronuz::consensus::MemberRole::Voter};
 			};
+		if (!options.open_of)
+			options.open_of = [](GroupId g) { return open_of(g); };
 		auto tls = context(node);
 		std::map<NodeId, Fingerprint> pins;
 		for (NodeId n = 1; n <= max_node; ++n)
@@ -327,18 +329,21 @@ struct Host {
 			});
 		loops[0]->at([this] { transport->serve(*acceptor); });
 	}
-	// On loop k, the groups': stores each as incarnation `node`, every group with its own open.
+	// Every group's own open, as a host computes it: the transport keeps none.
+	static GroupOpen open_of(GroupId g) {
+		GroupOpen o;
+		o.cluster.fill('T');
+		o.group.fill('G');
+		std::memcpy(o.group.data(), &g, sizeof g);
+		o.epoch.fill('E');
+		o.profile.fill(0x5A);
+		return o;
+	}
+	// On loop k, the groups': stores each as incarnation `node`.
 	void stores(std::uint32_t k, const std::vector<GroupId> &groups) {
 		loops[k]->at([&] {
-			for (auto g : groups) {
-				GroupOpen o;
-				o.cluster.fill('T');
-				o.group.fill('G');
-				std::memcpy(o.group.data(), &g, sizeof g);
-				o.epoch.fill('E');
-				o.profile.fill(0x5A);
-				transport->store(g, node, o);
-			}
+			for (auto g : groups)
+				transport->store(g, node);
 		});
 	}
 	std::uint64_t total() const {
@@ -661,8 +666,11 @@ Cost cost(int H, std::uint32_t L, std::size_t G, double idle_seconds, bool print
 		expect(group_timers == 0, "no armed timer per idle group" + at);
 		expect(end_timers == 2, "two armed timers per idle connection end, keepalive and dead peer" + at);
 		expect(host_fds == 1 + 2 * P, "1 + 2P descriptors per host" + at);
-		if (heap_measured)
-			expect(std::abs(group) <= 164 + 52 * P, "an idle group within 164 + 52P bytes" + at);
+		if (heap_measured) {
+			const double stored = (counted(after_stores) - counted(before_groups)) / double(G * H);
+			expect(stored <= 64, "an idle group stored within 64 bytes (D108)" + at);
+			expect(std::abs(group) <= 44 + 64 * P, "an idle group within 44 + 64P bytes" + at);
+		}
 	}
 	watched = nullptr;
 	return {P, L, host, false};

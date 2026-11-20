@@ -200,9 +200,15 @@ class FakeCluster:
                 and any(self.leading(n) for n in self.component(node))
             ):
                 del self.leader_of[node]
+                current = next(n for n in self.component(node) if self.leading(n))
                 self.emit(
                     node,
-                    {"ev": "role", "role": "follower", "term": self.term, "leader": 0},
+                    {
+                        "ev": "role",
+                        "role": "follower",
+                        "term": self.term,
+                        "leader": current,
+                    },
                 )
                 for kind, request in self.held.pop(node, []):
                     self.emit(

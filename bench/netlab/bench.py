@@ -91,7 +91,9 @@ class Plan:
     """How long each measurement runs; --quick shrinks it for the dry run."""
 
     load_seconds: float = 2.0
-    inflight: int = 32
+    inflight: int = (
+        256  # small entries; 64 KiB ones run an eighth as many, 2 MiB in flight
+    )
     rpc_seconds: float = 1.5
     rpc_max: int = 400
     elections: int = 4
@@ -103,7 +105,7 @@ class Plan:
     def quick() -> Plan:
         return Plan(
             load_seconds=0.6,
-            inflight=8,
+            inflight=64,
             rpc_seconds=0.5,
             rpc_max=50,
             elections=1,
@@ -323,6 +325,10 @@ class Bench:
         self.minority_acks: list[str] = []
         self.values = 0
         self.started_cut = 0.0
+        self.unshaped_ms = 0.0
+        self.roles: list[
+            tuple[float, int, str, int, int]
+        ] = []  # t, node, role, term, leader
         self.skew = (
             0.0  # the largest gap between a node's clock and ours at its ready event
         )
@@ -362,6 +368,15 @@ class Bench:
                 str(event["role"]),
                 int(event["term"]),
                 float(event["t"]) / 1e6,
+            )
+            self.roles.append(
+                (
+                    float(event["t"]) / 1e6,
+                    node,
+                    str(event["role"]),
+                    int(event["term"]),
+                    int(event.get("leader", 0)),
+                )
             )
         elif kind == "error":
             print(f"  node {node}: {event.get('why')}", flush=True)
@@ -427,11 +442,19 @@ class Bench:
         self.lab.reorder(shape.reorder)
 
     def measure_floor(self) -> None:
-        """The unshaped round trip between namespaces: the tolerance's floor."""
+        """The round trip of a packet netem holds for 1 us each way: the path's own cost and the
+        guest's timer latency on each hold, which every delayed shape pays beside its delay."""
         self.shape(SHAPES[0])
         samples = self.ping_all()
+        self.unshaped_ms = statistics.median(samples) if samples else 0.0
+        self.shape(Shape("held", ms=0.001))
+        samples = self.ping_all()
         self.floor_ms = statistics.median(samples) if samples else 0.0
-        print(f"  unshaped round trip {self.floor_ms:.3f} ms", flush=True)
+        self.shape(SHAPES[0])
+        print(
+            f"  round trip unshaped {self.unshaped_ms:.3f} ms, held 1 us each way {self.floor_ms:.3f} ms",
+            flush=True,
+        )
 
     def ping_all(self) -> list[float]:
         medians = []
@@ -538,7 +561,10 @@ class Bench:
         }
 
     def rpc(self, leader: int) -> dict[str, Any]:
+        """One call opens the lane's Bulk link (its dial, TLS and hellos): its latency is the cold
+        call's; then calls one at a time on the open link."""
         peer = next(n for n in range(1, self.nodes + 1) if n != leader)
+        cold = self.call(leader, f"rpc {peer} {SMALL} 30 1", 40)
         reply = self.call(
             leader,
             f"rpc {peer} {SMALL} {self.plan.rpc_seconds} {self.plan.rpc_max}",
@@ -547,6 +573,7 @@ class Bench:
         if not reply:
             return {"error": "no answer"}
         return {
+            "cold_ms": cold["p50"] / 1000 if cold and cold.get("n") else None,
             "calls": reply["n"],
             "failed": reply["failed"],
             "p50_ms": reply["p50"] / 1000,
@@ -747,19 +774,28 @@ class Bench:
         healed = self.cluster.now()
         self.lab.heal()
         self.minority = set()
-        stepped = self.pump(
-            5,
-            lambda: (
-                self.role.get(leader, ("", 0, 0))[0] != "leader"
-                or self.role[leader][1] > term
-            ),
+        isolated_term = max(
+            (t for when, n, _, t, _ in self.roles if n == leader and when < healed),
+            default=term,
         )
+
+        def rejoined() -> list[tuple[float, int, str, int, int]]:
+            return [
+                r
+                for r in self.roles
+                if r[1] == leader and r[0] >= healed - 1e-3 and r[4] not in (0, leader)
+            ]
+
+        self.pump(5, lambda: bool(rejoined()))
         rejoin_ms = (
-            (self.role[leader][2] - healed) * 1000
-            if stepped and self.role[leader][2] >= healed
-            else 0.0
+            max(0.0, rejoined()[0][0] - healed) * 1000 if rejoined() else float("inf")
         )
         self.pump(self.plan.healed_seconds)
+        after = [
+            (n, t)
+            for when, n, role, t, _ in self.roles
+            if when >= healed and role == "leader"
+        ]
         current = self.leader()
         final = self.final_reads(current) if current else []
         self.end_history()
@@ -770,6 +806,12 @@ class Bench:
             "election_ms": round(election_ms, 1),
             "bound_ms": self.bound_ms(shape),
             "rejoin_ms": round(rejoin_ms, 1),
+            "terms": {
+                "before": term,
+                "new_leader": self.role[new][1] if new else None,
+                "isolated_leader": isolated_term,
+            },
+            "elected_after_heal": after,
             "operations": len(log.ops),
             "acknowledged_writes": len(writes),
             "violations": len(violations),
@@ -781,6 +823,11 @@ class Bench:
             f"{shape.name}: elects after the cut",
             elected and election_ms <= self.bound_ms(shape),
             f"{election_ms:.0f} ms, bound {self.bound_ms(shape):.0f} ms",
+        )
+        self.check(
+            f"{shape.name}: the cut leader rejoins after heal",
+            rejoin_ms <= 5000,
+            f"{rejoin_ms:.0f} ms",
         )
         self.check(
             f"{shape.name}: no acknowledgement from the cut leader",
@@ -815,7 +862,7 @@ class Bench:
             row["small_throughput"] = self.load(leader, SMALL, self.plan.inflight)
             row["large_latency"] = self.load(leader, LARGE, 1)
             row["large_throughput"] = self.load(
-                leader, LARGE, max(1, self.plan.inflight // 4)
+                leader, LARGE, max(1, self.plan.inflight // 8)
             )
             row["rpc"] = self.rpc(leader)
             times = self.elections(shape)
@@ -886,6 +933,7 @@ def measure(bench: Bench, shapes: Sequence[Shape]) -> dict[str, Any]:
     return {
         "nodes": bench.nodes,
         "floor_rtt_ms": bench.floor_ms,
+        "unshaped_rtt_ms": bench.unshaped_ms,
         "plan": bench.plan.__dict__,
         "rows": rows,
         "checks": [c.__dict__ for c in bench.checks],
@@ -903,7 +951,7 @@ def _ms(value: Any) -> str:
 def table(results: Sequence[dict[str, Any]], jobs: dict[int, str]) -> str:
     head = (
         "| Nodes | Shape | RTT set / ping ms | Commit p50 / p99 ms (64 B) | (64 KiB) | Commits/s (64 B) | MB/s (64 KiB) "
-        "| RPC p50 / p99 ms | Election ms (median, max) | vs loopback | Job |\n"
+        "| RPC p50 / p99 ms (cold) | Election ms (median, max) | vs loopback | Job |\n"
         "|---|---|---|---|---|---|---|---|---|---|---|\n"
     )
     lines = []
@@ -938,15 +986,17 @@ def table(results: Sequence[dict[str, Any]], jobs: dict[int, str]) -> str:
             lines.append(
                 f"| {row['nodes']} | {row['shape']} | {row['set_rtt_ms']:g} / {_ms(row.get('rtt_ms'))} "
                 f"| {_ms(sl.get('p50_ms'))} / {_ms(sl.get('p99_ms'))} | {_ms(ll.get('p50_ms'))} / {_ms(ll.get('p99_ms'))} "
-                f"| {st.get('per_s', 0):,.0f} | {lt.get('mb_s', 0):.1f} | {_ms(rpc.get('p50_ms'))} / {_ms(rpc.get('p99_ms'))} "
+                f"| {st.get('per_s', 0):,.0f} | {lt.get('mb_s', 0):.1f} | {_ms(rpc.get('p50_ms'))} / {_ms(rpc.get('p99_ms'))} (cold {_ms(rpc.get('cold_ms'))}) "
                 f"| {f'{statistics.median(el):.0f}, {max(el):.0f}' if el else '-'} | {versus} | {jobs.get(row['nodes'], '-')} |"
             )
     return head + "\n".join(lines) + "\n"
 
 
 def hunts(results: Sequence[dict[str, Any]]) -> list[str]:
-    """What degrades past what the delay explains: commit p99 over 2 round trips plus loopback's
-    p99, RPC p99 over a round trip plus loopback's, an election past 3 timeouts."""
+    """What degrades past what the delay explains, by the round trip ping measured: a commit at one
+    in flight is one round trip, so p50 over a round trip plus loopback's p99, or p99 over two; an
+    RPC p99 over a round trip plus loopback's; an election past 3 timeouts. Each round trip carries
+    A1's 10% margin."""
     found = []
     for result in results:
         base = next(
@@ -960,12 +1010,20 @@ def hunts(results: Sequence[dict[str, Any]]) -> list[str]:
         for row in result["rows"]:
             if "small_latency" not in row or base is None:
                 continue
-            rtt = row["set_rtt_ms"]
+            rtt = (1 + RTT_TOLERANCE) * (
+                row.get("rtt_ms") or row["set_rtt_ms"]
+            )  # A1's own margin
+            where = f"{result['nodes']} nodes, {row['shape']}"
             for name in ("small_latency", "large_latency"):
+                limit = rtt + base[name]["p99_ms"]
+                if row[name]["p50_ms"] > limit:
+                    found.append(
+                        f"{where}: {name} p50 {row[name]['p50_ms']:.2f} ms > RTT + loopback p99 = {limit:.2f} ms"
+                    )
                 limit = 2 * rtt + base[name]["p99_ms"]
                 if row[name]["p99_ms"] > limit:
                     found.append(
-                        f"{result['nodes']} nodes, {row['shape']}: {name} p99 {row[name]['p99_ms']:.2f} ms > 2 RTT + loopback p99 = {limit:.2f} ms"
+                        f"{where}: {name} p99 {row[name]['p99_ms']:.2f} ms > 2 RTT + loopback p99 = {limit:.2f} ms"
                     )
             limit = rtt + base["rpc"]["p99_ms"]
             if row["rpc"].get("p99_ms", 0) > limit:

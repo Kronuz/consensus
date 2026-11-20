@@ -45,7 +45,9 @@ struct GroupOptions {
 // A group's Worker refuses, with std::invalid_argument, a configuration whose largest record
 // does not fit one empty segment of the host's turn log: a batch of Limits::rpc_entries and
 // rpc_bytes (WorkerLimits::follower_batch_* too, when larger), or the founding record. Size
-// the host's TurnLogOptions::segment_bytes above the batch.
+// the host's TurnLogOptions::segment_bytes above the batch. A merged Receive a caller submits
+// beyond those limits (up to the retained policy's batch bounds) can still exceed the room,
+// and then fences its group.
 struct Seams {
 	task::scheduler_ref scheduler;
 	kronuz::journal::completion_ref io;

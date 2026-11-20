@@ -107,7 +107,7 @@ struct NodeSink {
 	void operator()(GroupId, ActivateInstall notice);
 	void operator()(GroupId, CheckpointPublished notice);
 	void operator()(GroupId, RepairCompleted notice);
-	void operator()(GroupId, SnapshotNeeded) {}
+	void operator()(GroupId, SnapshotNeeded notice);
 	void operator()(GroupId, SnapshotTransmit) {}
 	void operator()(GroupId, SnapshotReleased) {}
 	void operator()(GroupId, Fenced notice);
@@ -264,7 +264,11 @@ struct Simulation {
 		for (auto& [id, n] : nodes_) { if (!n.up) { boot(n); } }
 		std::map<GroupId, std::shared_ptr<Call>> last;
 		auto healed = [&](GroupId g) { auto& c = last[g]; return c && c->placed && healed_everywhere(g, *c->placed); };
-		for (int round = 0; round < 4000 && !failures; ++round) {
+		// A leader that compacted past a peer's known match asks for an install the simulation
+		// never sends, and probes again at its base after snapshot_timeout: healing outlasts that
+		// twice on the slowest node's clock (a quiet round is 5 ms, 4 ms at a 0.8 rate).
+		const int rounds = 4000 + int(2 * timing.snapshot_timeout / 4);
+		for (int round = 0; round < rounds && !failures; ++round) {
 			trace_step = 1'000'000 + std::uint64_t(round);
 			quiet_round();
 			bool all = true;
@@ -287,7 +291,7 @@ struct Simulation {
 		}
 		for (auto g : groups_) {
 			if (healed(g)) { continue; }
-			fail("group " + std::to_string(g) + " did not commit a new entry on every member (applied on every data voter) after healing");
+			fail("group " + std::to_string(g) + " did not commit a new entry on every member (applied on every data voter) after healing; " + std::to_string(snapshots_needed[g]) + " SnapshotNeeded");
 			if (auto& c = last[g]) {
 				std::string why = "none";
 				if (c->error) { try { std::rethrow_exception(c->error); } catch (const std::exception& e) { why = e.what(); } catch (...) { why = "?"; } }
@@ -325,6 +329,7 @@ struct Simulation {
 	std::uint64_t checkpoints = 0, restored = 0, repairs = 0, repairs_below_base = 0, repaired = 0, refused = 0, repairs_cancelled = 0, repairs_pending = 0;
 	std::uint64_t repair_wait_total = 0, repair_wait_max = 0;  // simulated ms from issue to a completed repair
 	std::uint64_t boots_by_loops[5] = {};
+	std::map<GroupId, std::uint64_t> snapshots_needed;  // the simulation sends no installs
 
 	void on_send(Node& n, GroupId g, Send notice) {
 		network_.push_back({n.id, notice.peer, g, std::move(notice.message), now_ + random_() % 6});
@@ -763,6 +768,10 @@ void NodeSink::operator()(GroupId g, RoleChanged notice) { sim->on_role(*node, g
 void NodeSink::operator()(GroupId g, CheckpointPublished notice) { sim->on_published(*node, g, notice); }
 void NodeSink::operator()(GroupId g, RepairCompleted notice) { sim->on_repaired(*node, g, notice, true); }
 void NodeSink::operator()(GroupId g, Fenced notice) { sim->on_fenced(*node, g, notice); }
+void NodeSink::operator()(GroupId g, SnapshotNeeded notice) {
+	++sim->snapshots_needed[g];
+	trace("node %llu group %llu SnapshotNeeded for peer %llu", (unsigned long long)node->id, (unsigned long long)g, (unsigned long long)notice.peer);
+}
 void NodeSink::operator()(GroupId g, ActivateInstall) {
 	if (sim->witness(node->id, g)) { fail("a witness member was asked to activate an image"); }
 }

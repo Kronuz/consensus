@@ -733,8 +733,7 @@ class LoopProbe {
 			l.cpu = cpu;
 			r += line;
 			if (age >= 250) {
-				if (state == 'U')
-					spindump_.start();
+				spindump_.start();  // probe: any stuck loop
 				r += stack(*l.loop);
 			}
 			r += "}";
@@ -957,7 +956,11 @@ bool upload() {
 			samples.push_back(line + sockets({one.port(), two.port()}) + loops.sample() + kernel.sample());
 		}
 	});
+	const char *hold = std::getenv("GROUPS_UPLOAD_HOLD_MS");  // probe: holds host 1's connection loop at 300 ms
+	const auto hold_ms = std::chrono::milliseconds(hold ? std::atoll(hold) : 0);
 	for (std::int64_t tick = 0; ms_since(start) < 4000; ++tick) {  // signed: see reader()
+		if (tick == 3 && hold_ms.count() > 0)
+			one.post(one.transport->loop_of_node(2), [hold_ms] { std::this_thread::sleep_for(hold_ms); });
 		for (auto g : uploads) {
 			const auto k = one.transport->loop_of_group(g);
 			one.post(k, [&, g, k] { send_message(*one.transport, k, g, 1, 2, Send{2, chunk}); });

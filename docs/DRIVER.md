@@ -53,8 +53,9 @@ struct Seams {
 // dispatch; a generic `template <class N> void operator()(GroupId, N&&)` satisfies it.
 //   Send               a message for a peer incarnation (the transport's)
 //   Committed          the next committed range for the application; Core holds it until applied().
-//                      Never for a witness member: it keeps the log, no application state, so the
-//                      Driver acknowledges its ranges itself
+//                      Never for a witness's range (from its promotion's range on, its removal's
+//                      included): it keeps the log, no application state, so the Driver
+//                      acknowledges that range itself
 //   RoleChanged        role, term and leader changes
 //   ActivateInstall    an installed image to activate; answer with activated() or activation_failed()
 //   CheckpointPublished, RepairCompleted   only when no caller awaits it (the caller was cancelled)
@@ -80,7 +81,7 @@ public:
 
 	// Plain calls, on the loop's thread (Debug-asserted with runs_here()); from another thread,
 	// post_call them. Each only queues and marks the group ready: none steps inline, so a Sink
-	// may call them. On a closed group they are dropped and counted (dropped()).
+	// may call them. On an id that is not open, closed ones included, they are dropped and counted (dropped()).
 	void open(GroupId, GroupOptions);           // state only; throws if the id is open on this Driver
 	void receive(GroupId, Receive);
 	void applied(GroupId, Applied);
@@ -88,7 +89,7 @@ public:
 	void activated(GroupId, Token token);       // ActivateInstall::token
 	void activation_failed(GroupId, Token token, std::string reason);
 	void peer_limits(GroupId, PeerLimits);
-	std::uint64_t dropped(GroupId) const;       // plain calls dropped on a closed group, and inbox overflow
+	std::uint64_t dropped(GroupId) const;       // an open group's inbox overflow; for an id not open (closed, never opened), the Driver-wide count of plain calls dropped on ids not open
 
 	// Task calls, from any scheduler: a call made off the loop hops there (one post) and resumes
 	// the caller on its own scheduler. Each completes per its D8 row (below).
@@ -132,7 +133,7 @@ T run(Driver<Sink>& driver, task::blocking_scheduler& scheduler, task::task<T> w
 | `transfer_leadership` | the target leads (`RoleChanged`); `transfer_failed` when Core's transfer deadline passes or another node leads | `task::cancelled`; Core carries on | `closed` |
 | `repair` | `RepairCompleted` | `task::cancelled`; Core carries on, the Sink gets `RepairCompleted` | `closed` |
 | `checkpoint` | `CheckpointPublished` | before publication starts it is cancelled and its reservation reclaimed; after, publication finishes and the Sink gets `CheckpointPublished`; the caller gets `task::cancelled` either way | started publication: completes when published; else `closed` |
-| `close` | the group's state is freed; its table entry stays, so late plain calls are dropped and counted | no token | - |
+| `close` | the group's state is freed and its row erased: `groups()` no longer counts it, and the id opens again on this Driver; a late plain call is dropped and counted with the ids not open. Close completes on an open, fenced or never-created row, and on an id the Driver never held. The journal host still refuses `create` or `recover` of an id it created or recovered until the host reopens | no token | - |
 
 Every call completes with `fenced` once its group fences, and with `task::cancelled`
 (`cancel_reason::shutdown`) once the loop shuts down; a staged record is still written. A call on
@@ -140,7 +141,9 @@ an id that is not open, or is closing or closed, completes with `closed` and sub
 
 **Shutdown order.** A host closes its groups while `run()` steps the loop, then requests `stop`.
 After `stop`, `close` completes with `task::cancelled` like every other call and frees nothing;
-`~Driver` frees what the groups still hold.
+`~Driver` frees what the groups still hold. `run()` does not wait for a turn barrier after `stop`:
+the turn driver writes what is staged while it runs, and a record a step stages after it returns
+stays staged (`TurnDriver::staged`) until a turn driver runs again.
 
 **The Sink must not throw.** A throw out of a Sink call fences the group: the rest of that step's
 actions are lost, so its waiters complete with `fenced` and the Sink hears `Fenced`.
@@ -174,6 +177,28 @@ after `create` or `recover` succeeds at once.
 **The Sink** runs inside a step and applies nothing inline: it hands a `Committed` range to the
 application, which calls `applied` later. Core holds one range until then, and `close` does not
 wait for it.
+
+**The apply index never passes what the application was delivered.** `applied(through)` must name
+the end of the range the Sink delivered last; Core fences any other (`invalid application
+completion`). Otherwise the apply index moves only to the boundary of a checkpoint the application
+restored (`recover`), an image it activated (`ActivateInstall`) or a `repair` it asked for.
+
+The one exception is a witness's range, which the Driver acknowledges itself instead of handing it
+to the Sink. The witness transitions, both ways:
+
+1. Learner to witness. A range is the witness's from the first one whose last index is in a
+   membership that makes this node a witness, a committed Configuration entry that no later term
+   can truncate. A range ending below the promotion goes to the Sink, and so does one ending while
+   the promotion is appended but not committed, which a later term may truncate.
+2. Witness to no member. The incarnation never becomes a data member again ("A witness stays a
+   witness"), so every range after its first is its own too: its removal's and any past it. A
+   range whose last index is past the removal is also the witness's when this node was a witness
+   at the index before it (the apply index), as after a restart from the witness's checkpoint.
+
+From its first acknowledged range on, a witness's apply index follows its commit index, and its
+application receives no further range. A restart from a checkpoint taken after the removal finds
+this node a witness at neither index, so its later ranges go to the Sink, which restored that
+checkpoint and continues from its boundary.
 
 ## The blocking entry
 

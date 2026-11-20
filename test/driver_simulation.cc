@@ -39,18 +39,22 @@
 //     a value; every call completes by shutdown;
 //   - a witness member votes but never applies: its Sink never receives a Committed range;
 //   - a repair completes only at or above the node's latest checkpoint, and the application
-//     replays from its boundary; no group fences but by a power cut.
+//     replays from its boundary; once the network heals every repair completes (none pending);
+//   - no group fences but by a power cut, and no loop spins, stopping or not.
 // After the run the network heals and a new entry commits in every group on every data voter.
 #include "consensus/driver.h"
 #include "journal/memory_io.h"
 
+#include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
 #include <random>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace kronuz::consensus::driver_simulation {
@@ -63,6 +67,15 @@ namespace {
 std::uint64_t failures = 0, current_seed = 0;
 void fail(const std::string& what) {
 	if (failures++ < 20) { std::fprintf(stderr, "driver seed %llu: %s\n", (unsigned long long)current_seed, what.c_str()); }
+}
+// SIM_DRIVER_TRACE=1 logs each step's apply, delivery and fault events to stderr.
+const bool tracing = std::getenv("SIM_DRIVER_TRACE") != nullptr;
+std::uint64_t trace_step = 0;
+void trace(const char* format, ...) {
+	if (!tracing) { return; }
+	std::fprintf(stderr, "[%llu] ", (unsigned long long)trace_step);
+	va_list args; va_start(args, format); std::vfprintf(stderr, format, args); va_end(args);
+	std::fputc('\n', stderr);
 }
 
 constexpr std::uint64_t ms = 1'000'000;
@@ -111,6 +124,7 @@ struct Call {
 	Placement target;          // committed()
 	LogBoundary boundary{};    // repair()
 	Index floor = 0;           // read: the highest index of the group applied anywhere when it was issued
+	std::uint64_t issued = 0;  // the simulated time (ms) it was issued
 	task::cancel_source cancel;
 	bool cancel_requested = false;
 	int completions = 0;
@@ -155,10 +169,6 @@ struct Capture {
 	}
 };
 
-// Rounds in which a stopping loop stayed busy: Detent msg-71, a Driver after stop re-watches a
-// group awaiting its turn barrier with the cancelled shutdown token, so the loop never idles
-// until the sim lands the barrier. Counted and reported, not failed, until that is fixed.
-std::uint64_t busy_at_stop = 0;
 // One reactor loop of a host: its scheduler, its IO, its Driver, and its turn driver's task.
 struct Loop {
 	std::uint32_t index = 0;
@@ -168,12 +178,10 @@ struct Loop {
 	std::unique_ptr<task::cancel_source> stop;
 	bool turns_done = true, driver_done = true;
 	task::scheduler_ref ref() const { return task::scheduler_ref::of(*scheduler); }
-	// Runs what is queued, failing (not hanging) if the loop never settles; a stopping loop
-	// gets a smaller budget and a count instead (busy_at_stop).
-	void run(NodeId node, bool stopping = false) {
-		std::size_t budget = stopping ? 10'000 : 1'000'000;
+	// Runs what is queued, failing (not hanging) if the loop never settles.
+	void run(NodeId node) {
+		std::size_t budget = 1'000'000;
 		scheduler->run_until([&] { return --budget == 0; });
-		if (!budget && stopping) { ++busy_at_stop; return; }
 		if (!budget) {
 			std::fprintf(stderr, "driver seed %llu: node %llu loop %u spins\n", (unsigned long long)current_seed, (unsigned long long)node, index);
 			std::exit(1);
@@ -227,6 +235,7 @@ struct Simulation {
 
 	void run(std::size_t steps) {
 		for (std::size_t step = 0; step < steps && !failures; ++step) {
+			trace_step = step;
 			advance(1 + random_() % 4);
 			auto& n = std::next(nodes_.begin(), std::ptrdiff_t(random_() % nodes_.size()))->second;
 			const auto g = groups_[random_() % groups_.size()];
@@ -256,6 +265,7 @@ struct Simulation {
 		std::map<GroupId, std::shared_ptr<Call>> last;
 		auto healed = [&](GroupId g) { auto& c = last[g]; return c && c->placed && healed_everywhere(g, *c->placed); };
 		for (int round = 0; round < 4000 && !failures; ++round) {
+			trace_step = 1'000'000 + std::uint64_t(round);
 			quiet_round();
 			bool all = true;
 			for (auto g : groups_) {
@@ -296,6 +306,11 @@ struct Simulation {
 			if (n.replicas[g].committed_notices) { fail("a witness member's Sink received a Committed range"); }
 			if (!s || s->applied != s->committed || s->committed == 0) { fail("a witness member acknowledges its committed ranges itself"); }
 		}
+		// Repair liveness (F4): on the healed network every repair completes before shutdown.
+		auto pending = [&] { std::size_t k = 0; for (const auto& c : calls_) { k += c->kind == Call::repair && !c->completions; } return k; };
+		for (int round = 0; round < 1000 && pending() && !failures; ++round) { quiet_round(); }
+		repairs_pending = pending();
+		if (repairs_pending) { fail(std::to_string(repairs_pending) + " repairs still pending after healing"); }
 		// Shutdown: every call completes.
 		for (auto& [id, n] : nodes_) { shut(n, false); }
 		for (const auto& call : calls_) {
@@ -305,7 +320,8 @@ struct Simulation {
 	}
 
 	std::uint64_t proposals = 0, placed = 0, commits = 0, superseded_count = 0, reads = 0, cancelled = 0, crashes = 0, transfers = 0, elections = 0, repartitions = 0;
-	std::uint64_t checkpoints = 0, restored = 0, repairs = 0, repairs_below_base = 0, repaired = 0, refused = 0;
+	std::uint64_t checkpoints = 0, restored = 0, repairs = 0, repairs_below_base = 0, repaired = 0, refused = 0, repairs_cancelled = 0, repairs_pending = 0;
+	std::uint64_t repair_wait_total = 0, repair_wait_max = 0;  // simulated ms from issue to a completed repair
 	std::uint64_t boots_by_loops[5] = {};
 
 	void on_send(Node& n, GroupId g, Send notice) {
@@ -315,6 +331,8 @@ struct Simulation {
 	void on_committed(Node& n, GroupId g, Committed notice) {
 		auto& r = n.replicas[g];
 		++r.committed_notices;
+		trace("node %llu group %llu Committed %llu..%llu (application had %zu)", (unsigned long long)n.id, (unsigned long long)g, (unsigned long long)notice.first,
+			(unsigned long long)(notice.entries.empty() ? 0 : notice.entries.back().index), r.applied.size());
 		if (n.id == witness_node && witnessed_.count(g)) { fail("a witness member's Sink received a Committed range"); }
 		// The range after a repair replays from its boundary.
 		if (r.repairing && notice.first == *r.repairing + 1) { r.applied.resize(std::min<std::size_t>(r.applied.size(), *r.repairing)); r.replayed = true; }
@@ -332,6 +350,7 @@ struct Simulation {
 		r.applying = r.applied.empty() ? 0 : r.applied.back().index;
 	}
 	void on_role(Node& n, GroupId g, RoleChanged notice) {
+		trace("node %llu group %llu role %d term %llu", (unsigned long long)n.id, (unsigned long long)g, int(notice.role), (unsigned long long)notice.term);
 		if (notice.role != Role::Leader) { return; }
 		++elections;
 		auto [it, fresh] = leaders_[g].emplace(notice.term, n.id);
@@ -408,6 +427,7 @@ private:
 		}
 		n.replicas.clear();
 		n.up = true;
+		trace("node %llu boots with %u loops", (unsigned long long)n.id, n.host->loops());
 		for (std::size_t k = 0; k < groups_.size(); ++k) {
 			const auto g = groups_[k];
 			GroupOptions o;
@@ -431,10 +451,10 @@ private:
 		auto stopped = [&] { for (auto& l : n.loops) { if (!l->turns_done || !l->driver_done) { return false; } } return true; };
 		for (int round = 0; round < 10000 && !(stopped() && !n.held()); ++round) {
 			for (auto& l : n.loops) {
-				l->run(n.id, true);
+				l->run(n.id);
 				for (auto ticket : l->held.tickets()) {
 					if (power_cut) { l->held.fail(ticket, std::make_exception_ptr(jt::PowerLoss{})); } else { l->held.complete(ticket); }
-					l->run(n.id, true);
+					l->run(n.id);
 				}
 			}
 		}
@@ -444,7 +464,7 @@ private:
 		if (power_cut) { n.disk.power_loss(); }
 		n.up = n.cutting = false;
 	}
-	void crash(Node& n) { ++crashes; shut(n, true); }
+	void crash(Node& n) { ++crashes; trace("node %llu crashes", (unsigned long long)n.id); shut(n, true); }
 
 	std::optional<SimDriver::GroupState> state(Node& n, GroupId g) { return n.up ? n.driver(g).state(g) : std::nullopt; }
 	void advance(std::uint64_t dt) {
@@ -503,6 +523,7 @@ private:
 		auto& r = n.replicas[g];
 		if (!r.applying) { return; }
 		auto& l = n.loop_of(g);
+		trace("node %llu group %llu applied(%llu)", (unsigned long long)n.id, (unsigned long long)g, (unsigned long long)*r.applying);
 		l.driver->applied(g, Applied{*r.applying});
 		r.applying.reset();
 		l.run(n.id);
@@ -521,9 +542,16 @@ private:
 	template <class T> void start(Node& n, std::shared_ptr<Call> call, task::task<T> work) {
 		task::spawn(n.loop_of(call->group).ref(), std::move(work), [this, call](std::exception_ptr error, std::optional<T> value) {
 			++call->completions; call->error = error;
+			if constexpr (std::is_same_v<T, Placement>) {
+				trace("node %llu propose %s: %s %llu:%llu", (unsigned long long)call->node, call->command.c_str(), error ? "error" : "placed",
+					value ? (unsigned long long)value->term : 0ull, value ? (unsigned long long)value->index : 0ull);
+			}
 			if constexpr (std::is_same_v<T, Placement>) { call->placed = value; }
 			if constexpr (std::is_same_v<T, ReadReady>) { call->ready = value; }
-			if constexpr (std::is_same_v<T, RepairCompleted>) { call->repaired = value; if (value) { on_repaired(nodes_.at(call->node), call->group, *value); } }
+			if constexpr (std::is_same_v<T, RepairCompleted>) {
+				call->repaired = value;
+				if (value) { const auto wait = now_ - call->issued; repair_wait_total += wait; repair_wait_max = std::max(repair_wait_max, wait); on_repaired(nodes_.at(call->node), call->group, *value); }
+			}
 			if constexpr (std::is_same_v<T, CheckpointPublished>) { call->published = value; if (value) { on_published(nodes_.at(call->node), call->group, *value); } }
 			// A refused repair rewinds nothing; a cancelled one may still complete (D8's row).
 			if (error && call->kind == Call::repair && !call->cancel_requested) { auto& r = nodes_.at(call->node).replicas[call->group]; r.repairing.reset(); r.replayed = false; }
@@ -615,7 +643,7 @@ private:
 		++repairs; repairs_below_base += b < r.base;
 		r.repairing = b;
 		auto call = track(n, g, Call::repair);
-		call->boundary = {b, term};
+		call->boundary = {b, term}; call->issued = now_;
 		start(n, call, n.driver(g).repair(g, call->boundary, call->cancel.token()));
 		n.loop_of(g).run(n.id);
 	}
@@ -627,6 +655,7 @@ private:
 			if (target == id) { target = target == 1 ? 2 : 1; }
 			if (!witnessed_.count(g)) { target = 1 + random_() % 3; if (target == id) { target = 1 + target % 3; } }
 			++transfers;
+			trace("node %llu group %llu transfers to %llu", (unsigned long long)id, (unsigned long long)g, (unsigned long long)target);
 			auto call = track(n, g, Call::transfer);
 			start(n, call, n.driver(g).transfer_leadership(g, target, call->cancel.token()));
 			n.loop_of(g).run(n.id);
@@ -639,6 +668,7 @@ private:
 		if (live.empty()) { return; }
 		auto call = live[random_() % live.size()];
 		call->cancel_requested = true; ++cancelled;
+		trace("cancel a call of kind %d on node %llu", int(call->kind), (unsigned long long)call->node);
 		call->cancel.request();
 		auto& n = nodes_.at(call->node);
 		if (n.up) { n.loop_of(call->group).run(n.id); }
@@ -674,7 +704,7 @@ private:
 					auto e = sequence.find(c->target.index);
 					if (e == sequence.end() || e->second.term == c->target.term) { fail("committed() superseded though its entry committed with its term"); }
 				}
-				catch (const task::cancelled&) {}
+				catch (const task::cancelled&) { repairs_cancelled += c->kind == Call::repair; }
 				catch (const std::exception&) { refused += c->kind == Call::repair; }
 				continue;
 			}
@@ -720,26 +750,37 @@ void NodeSink::operator()(GroupId g, ActivateInstall) {
 
 }  // namespace
 
-// Runs `seeds` seeds of `steps` steps from `first`.
+// Seeds that once failed, each at its failing step count, run beside every range of seeds.
+constexpr std::pair<std::uint64_t, std::uint64_t> regressions[] = {{399, 3000}};
+
+// Runs `seeds` seeds of `steps` steps from `first`, then the regression seeds outside that range.
 bool run(std::uint64_t seeds, std::uint64_t steps, std::uint64_t first) {
 	std::uint64_t proposals = 0, placed = 0, commits = 0, superseded_count = 0, reads = 0, cancelled = 0, crashes = 0, transfers = 0, elections = 0, repartitions = 0;
-	std::uint64_t checkpoints = 0, restored = 0, repairs = 0, below = 0, repaired = 0, refused = 0, boots[5] = {};
-	for (std::uint64_t seed = first; seed < first + seeds && !failures; ++seed) {
+	std::uint64_t checkpoints = 0, restored = 0, repairs = 0, below = 0, repaired = 0, refused = 0, repairs_cancelled = 0, pending = 0, wait_total = 0, wait_max = 0, boots[5] = {};
+	auto one = [&](std::uint64_t seed, std::uint64_t length) {
 		current_seed = seed;
 		Simulation sim(seed);
-		sim.run(steps);
+		sim.run(length);
 		if (!failures) { sim.heal(); }
 		proposals += sim.proposals; placed += sim.placed; commits += sim.commits; superseded_count += sim.superseded_count;
 		reads += sim.reads; cancelled += sim.cancelled; crashes += sim.crashes; transfers += sim.transfers; elections += sim.elections; repartitions += sim.repartitions;
 		checkpoints += sim.checkpoints; restored += sim.restored; repairs += sim.repairs; below += sim.repairs_below_base; repaired += sim.repaired; refused += sim.refused;
+		repairs_cancelled += sim.repairs_cancelled; pending += sim.repairs_pending; wait_total += sim.repair_wait_total; wait_max = std::max(wait_max, sim.repair_wait_max);
 		for (int l = 0; l < 5; ++l) { boots[l] += sim.boots_by_loops[l]; }
+	};
+	for (std::uint64_t seed = first; seed < first + seeds && !failures; ++seed) { one(seed, steps); }
+	std::uint64_t replayed = 0;
+	for (auto [seed, length] : regressions) {
+		if (failures || (seed >= first && seed < first + seeds && steps == length)) { continue; }
+		one(seed, length); ++replayed;
 	}
-	std::printf("driver simulation: %llu seeds x %llu steps, hosts booted with 2/3/4 loops %llu/%llu/%llu times (%llu re-partitions), %llu elections, %llu crashes, %llu proposals (%llu placed), %llu commits awaited (%llu superseded), %llu reads, %llu transfers, %llu cancels: %s\n",
-		(unsigned long long)seeds, (unsigned long long)steps, (unsigned long long)boots[2], (unsigned long long)boots[3], (unsigned long long)boots[4], (unsigned long long)repartitions,
+	std::printf("driver simulation: %llu seeds x %llu steps (+%llu regression seeds), hosts booted with 2/3/4 loops %llu/%llu/%llu times (%llu re-partitions), %llu elections, %llu crashes, %llu proposals (%llu placed), %llu commits awaited (%llu superseded), %llu reads, %llu transfers, %llu cancels: %s\n",
+		(unsigned long long)seeds, (unsigned long long)steps, (unsigned long long)replayed, (unsigned long long)boots[2], (unsigned long long)boots[3], (unsigned long long)boots[4], (unsigned long long)repartitions,
 		(unsigned long long)elections, (unsigned long long)crashes, (unsigned long long)proposals, (unsigned long long)placed,
 		(unsigned long long)commits, (unsigned long long)superseded_count, (unsigned long long)reads, (unsigned long long)transfers, (unsigned long long)cancelled, failures ? "FAILED" : "ok");
-	std::printf("  %llu checkpoints (%llu images restored), %llu repairs (%llu below the checkpoint): %llu completed, %llu refused; %llu rounds a stopping loop stayed busy (Detent msg-71)\n", (unsigned long long)checkpoints, (unsigned long long)restored,
-		(unsigned long long)repairs, (unsigned long long)below, (unsigned long long)repaired, (unsigned long long)refused, (unsigned long long)busy_at_stop);
+	std::printf("  %llu checkpoints (%llu images restored), %llu repairs requested (%llu below the checkpoint): %llu completed, %llu refused, %llu cancelled, %llu pending at a seed's end; completed after %.1f ms on average, %llu ms at the longest\n",
+		(unsigned long long)checkpoints, (unsigned long long)restored, (unsigned long long)repairs, (unsigned long long)below, (unsigned long long)repaired, (unsigned long long)refused,
+		(unsigned long long)repairs_cancelled, (unsigned long long)pending, repaired ? double(wait_total) / double(repaired) : 0.0, (unsigned long long)wait_max);
 	return failures == 0;
 }
 

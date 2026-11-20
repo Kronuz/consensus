@@ -179,10 +179,7 @@ public:
 	// Plain calls, on the loop.
 	void open(GroupId id, GroupOptions options) {
 		on_loop();
-		if (auto found = groups_.find(id); found != groups_.end()) {
-			if (!found->second->closed) { throw std::logic_error("the group is open on this Driver"); }
-			disarm(*found->second); groups_.erase(found);
-		}
+		if (groups_.contains(id)) { throw std::logic_error("the group is open on this Driver"); }
 		if (host_.loop(id) != loop_) { throw std::invalid_argument("the group is placed on another loop"); }
 		auto group = std::make_unique<Group>();
 		group->driver = this; group->id = id; group->fire = &Driver::fired;
@@ -228,13 +225,15 @@ public:
 		if (!g || g->closing) { count_drop(id); return; }
 		g->limits.push_back(limits); mark_ready(*g);
 	}
+	// An open group's own count; an id not open (closed, never opened) reads the count of plain
+	// calls dropped on every id not open.
 	std::uint64_t dropped(GroupId id) const {
 		auto found = groups_.find(id);
 		return found == groups_.end() ? dropped_unknown_ : found->second->dropped;
 	}
 	std::optional<GroupState> state(GroupId id) const {
 		auto found = groups_.find(id);
-		if (found == groups_.end() || !found->second->worker) { return std::nullopt; }
+		if (found == groups_.end()) { return std::nullopt; }
 		const auto& w = *found->second->worker;
 		return GroupState{w.role(), w.term(), w.leader(), w.committed(), w.applied_index(), w.membership().value_or(Membership{})};
 	}
@@ -252,6 +251,8 @@ public:
 		std::sort(ids.begin(), ids.end());
 		return ids;
 	}
+	// The rows the Driver holds: each open, created or closing group, and none once closed.
+	std::size_t groups() const noexcept { return groups_.size(); }
 	// IO tasks and turn watches in flight: the only frames a group holds besides its callers'.
 	std::size_t in_flight() const noexcept { return in_flight_; }
 	task::scheduler_ref scheduler() const noexcept { return scheduler_; }
@@ -340,7 +341,7 @@ public:
 		// After shutdown nothing steps the loop: close completes as every other call does.
 		if (stopping_) { call.fail(std::make_exception_ptr(task::cancelled{})); co_await call; co_return; }
 		auto found = groups_.find(id);
-		if (found == groups_.end() || found->second->closed) { co_await call.leave(); co_return; }
+		if (found == groups_.end()) { co_await call.leave(); co_return; }
 		auto& g = *found->second;
 		call.waiter.admitted = true;
 		call.link(g);
@@ -373,6 +374,7 @@ private:
 		std::uint64_t dropped = 0;
 		unsigned io = 0;  // IO tasks and turn watches in flight
 		bool queued = false, opened = false, started = false, closing = false, retiring = false, closed = false, watching = false, fence_seen = false;
+		bool witnessed = false;  // acknowledged a range as a witness's own: acknowledges every later one
 	};
 
 	// A call's frame state: its waiter, its token's callback, and the hops between the caller's
@@ -515,7 +517,7 @@ private:
 	}
 	Group* live(GroupId id) {
 		auto found = groups_.find(id);
-		return found == groups_.end() || found->second->closed ? nullptr : found->second.get();
+		return found == groups_.end() ? nullptr : found->second.get();
 	}
 	void count_drop(GroupId id) {
 		auto found = groups_.find(id);
@@ -537,12 +539,22 @@ private:
 		return false;
 	}
 
-	bool witness(const Group& g) const {
+	// This node's role in the membership in force at `index`; none when it is not a member.
+	std::optional<MemberRole> role_at(const Group& g, Index index) const {
 		const auto& w = *g.worker;
-		auto membership = w.membership();
-		if (!membership) { return false; }
-		auto self = find_member(*membership, w.configuration().local);
-		return self && self->role == MemberRole::Witness;
+		auto membership = w.membership_at(index);
+		const auto* self = membership ? find_member(*membership, w.configuration().local) : nullptr;
+		return self ? std::optional<MemberRole>(self->role) : std::nullopt;
+	}
+	// Whether a Committed range is a witness's own (D9): this node is a witness at the range's last
+	// index (committed, so no term truncates it), or was one at the apply index and has left since.
+	// A witness incarnation never applies again, so every range after its first is its own too.
+	bool witness_range(Group& g, const Committed& range) {
+		if (g.witnessed) { return true; }
+		auto role = role_at(g, range.entries.back().index);
+		if (!role) { role = role_at(g, range.first - 1); }
+		g.witnessed = role == MemberRole::Witness;
+		return g.witnessed;
 	}
 
 	void link(Group& g, Waiter& w) noexcept {
@@ -607,7 +619,19 @@ private:
 			if (!ready_head_) { ready_tail_ = nullptr; }
 			g.queued = false; g.ready_next = nullptr;
 			step(g);
+			if (g.closed) { erase(g); }
 		}
+	}
+	// A closed group's node goes once nothing refers to it: close_step disarmed it, and it has
+	// no waiter or IO; only the ready list can still link it.
+	void erase(Group& g) {
+		if (g.queued) {
+			Group* before = nullptr;
+			for (auto* x = ready_head_; x != &g; x = x->ready_next) { before = x; }
+			(before ? before->ready_next : ready_head_) = g.ready_next;
+			if (ready_tail_ == &g) { ready_tail_ = before; }
+		}
+		groups_.erase(g.id);
 	}
 
 	// One group's step: delivers its inputs and admits its calls, runs the Worker until it
@@ -644,7 +668,7 @@ private:
 			fail_all(g, std::make_exception_ptr(fenced(fence_reason(g))));
 		}
 		if (g.closed) { return; }
-		if (w.awaiting_turn() && !g.watching) { watch(g); }
+		if (w.awaiting_turn() && !g.watching && !stopping_) { watch(g); }  // after shutdown, never again: D8
 		if (exhausted) { mark_ready(g); return; }
 		arm(g);
 	}
@@ -813,7 +837,7 @@ private:
 					if (!g.fence_seen) { g.fence_seen = true; sink_(g.id, std::move(value)); }
 				} else if constexpr (std::is_same_v<T, Committed>) {
 					// A witness keeps the log but no application state: it acknowledges its own ranges.
-					if (witness(g)) { g.applied = Applied{value.entries.back().index}; mark_ready(g); } else { sink_(g.id, std::move(value)); }
+					if (witness_range(g, value)) { g.applied = Applied{value.entries.back().index}; mark_ready(g); } else { sink_(g.id, std::move(value)); }
 				} else if constexpr (std::is_same_v<T, Send> || std::is_same_v<T, RoleChanged> ||
 					std::is_same_v<T, SnapshotNeeded> || std::is_same_v<T, SnapshotTransmit> || std::is_same_v<T, SnapshotReleased>) {
 					sink_(g.id, std::move(value));
@@ -828,6 +852,7 @@ private:
 		if (w.fenced()) {
 			if (!g.fence_seen) { g.fence_seen = true; sink_(g.id, Fenced{fence_reason(g)}); }
 			fail_all(g, std::make_exception_ptr(fenced(fence_reason(g))));
+			if (g.closed) { return; }
 		}
 		if (auto activation = w.snapshot_activation(); activation && (!g.activating || g.activating->token != activation->token)) {
 			g.activating = std::make_unique<SnapshotActivation>(*activation);
@@ -922,7 +947,8 @@ private:
 		});
 	}
 	// A shared append or publication completes at its turn's barrier: wait for the group's
-	// next record to be durable there.
+	// next record to be durable there. Shutdown cancels the watch and step never starts
+	// another, so the loop neither spins on it nor waits for a turn no one may write (D8).
 	void watch(Group& g) {
 		g.watching = true; ++g.io; ++in_flight_;
 		task::spawn(scheduler_, turns_.durable(g.id, turns_.sequence(g.id) + 1, shutdown_.token()), [this, &g](std::exception_ptr) {

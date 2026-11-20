@@ -306,10 +306,12 @@ private:
 	struct SnapshotFlight { SnapshotKey key; SnapshotPhase phase; std::uint64_t started; };
 	// Up to `pipeline` Append RPCs and `window_bytes` in flight (D15), oldest first, `next`
 	// past the last; one flight at verified progress until a first success, and after a
-	// failure or timeout. A snapshot's keepalive flies outside the window.
+	// failure or timeout. A snapshot's keepalive flies outside the window. `lacks_base`: the
+	// peer's last refusal, unanswered by any append or image since, put `next` at or below the
+	// base; only then does an install start, and a `next` there for any other reason probes the base.
 	struct Peer {
 		Index next = 1, matched = 0; std::deque<Flight> flights; std::uint64_t retry_after = 0; std::optional<SnapshotFlight> snapshot{}; std::optional<std::uint64_t> snapshot_retry_clock{}; bool blocked = false;
-		std::optional<Flight> keepalive{}; bool verified = false; std::uint64_t window = 0;
+		std::optional<Flight> keepalive{}; bool verified = false, lacks_base = false; std::uint64_t window = 0;
 		// Back to one flight, resuming at `from` (the oldest flight's start: nothing before it is in doubt).
 		void reset_flights(Index from) { flights.clear(); window = 0; verified = false; next = std::max(matched + 1, from); }
 	};
@@ -581,7 +583,7 @@ private:
 		auto key = peer.snapshot->key; output.emplace_back(SnapshotReleased{id, key, reason}); peer.snapshot.reset();
 		peer.keepalive.reset();
 		peer.retry_after = deadline(timing_.rpc_timeout); peer.snapshot_retry_clock = now_;
-		if (probe) { peer.next = std::max(peer.matched + 1, key.boundary.index + 1); }
+		if (probe) { peer.next = std::max(peer.matched + 1, key.boundary.index + 1); peer.lacks_base = false; }
 	}
 	void handle(SnapshotSourceReady ready, Actions& output) {
 		if (busy() || role_ != Role::Leader || !valid_snapshot_key(ready.key)) { return; }
@@ -1013,6 +1015,7 @@ private:
 			} else {
 				peer.next = std::max(peer.matched + 1, std::min(response.next_hint, peer.next > 1 ? peer.next - 1 : 1));
 			}
+			peer.lacks_base = peer.next <= base_index_;
 			// Capacity rejection or an unusable hint must not form an immediate
 			// request/response loop. Retry on a later monotonic tick.
 			peer.retry_after = peer.next < previous_next ? 0 : deadline(timing_.rpc_timeout);
@@ -1048,7 +1051,7 @@ private:
 			auto boundary = peer.snapshot->key.boundary;
 			output.emplace_back(SnapshotReleased{source, response.key, SnapshotReleaseReason::Installed}); peer.snapshot.reset();
 			peer.keepalive.reset(); peer.flights.clear(); peer.window = 0;
-			peer.matched = std::max(peer.matched, boundary.index); peer.next = peer.matched + 1; peer.retry_after = 0; peer.snapshot_retry_clock.reset();
+			peer.matched = std::max(peer.matched, boundary.index); peer.next = peer.matched + 1; peer.retry_after = 0; peer.snapshot_retry_clock.reset(); peer.lacks_base = false;
 			replicate(source, peer, output, needed_probe(source));
 		} else { release_snapshot(source, peer, response.result == SnapshotReply::CaughtUp ? SnapshotReleaseReason::CaughtUp : SnapshotReleaseReason::Rejected, output, response.result == SnapshotReply::CaughtUp); }
 	}
@@ -1164,9 +1167,13 @@ private:
 		if (peer.flights.size() >= depth || (!peer.flights.empty() && (peer.next > last_index() || peer.window >= flow_.window_bytes))) { return; }
 		if (peer.next <= base_index_) {
 			if (!peer.flights.empty()) { return; }  // an install starts once nothing is in flight
-			SnapshotKey key{durable_.term, token(), {base_index_, base_term_}};
-			peer.snapshot.emplace(SnapshotFlight{key, SnapshotPhase::AwaitSource, now_}); peer.snapshot_retry_clock.reset();
-			output.emplace_back(SnapshotNeeded{id, key}); snapshot_keepalive(id, peer, output); return;
+			if (!peer.lacks_base) {
+				peer.next = base_index_ + 1;  // a timeout or the leader's own compaction, not the peer, put it here
+			} else {
+				SnapshotKey key{durable_.term, token(), {base_index_, base_term_}};
+				peer.snapshot.emplace(SnapshotFlight{key, SnapshotPhase::AwaitSource, now_}); peer.snapshot_retry_clock.reset();
+				output.emplace_back(SnapshotNeeded{id, key}); snapshot_keepalive(id, peer, output); return;
+			}
 		}
 		Index previous = peer.next - 1;
 		std::vector<Entry> batch; std::size_t bytes = 0;
@@ -1183,7 +1190,7 @@ private:
 		// An entry above this peer's limits goes by install: until then it hears heartbeats.
 		peer.blocked = batch.empty() && peer.next <= last_index();
 		if (peer.blocked) { peer.retry_after = deadline(timing_.heartbeat); ++held_back_; }
-		auto rpc = token();
+		auto rpc = token(); peer.lacks_base = false;  // this append may change what the peer holds
 		peer.flights.push_back(Flight{rpc, previous, previous + batch.size(), probe, now_, false, bytes});
 		peer.window += bytes;
 		peer.next = previous + batch.size() + 1;  // optimistic (Raft §10.2.1)

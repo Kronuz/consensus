@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# Copies include/ to OUT/include with one seeded fault, which waiter_test, driver_test or
-# membership_test must catch (under ASan for the resume-before-unlink pair). Each names its
-# header, the text it replaces and the replacement:
+# Copies include/ to OUT/include with one seeded fault, which waiter_test, driver_test,
+# membership_test or the Driver simulation must catch (under ASan for the resume-before-unlink
+# pair). Each names its header, the text it replaces and the replacement:
 #   driver_mutants.py NAME OUT      (NAME "list" prints the names)
 import pathlib, shutil, sys
 
@@ -40,6 +40,18 @@ MUTANTS = {
     "checkpoint-drops-suffix": ("core.h",
         "\t\tif (capture_mode_) { captured_ = FrozenCheckpoint(*this, id, state, entries_.size() - first); }\n",
         "\t\tif (capture_mode_) { captured_ = FrozenCheckpoint(*this, id, state, 0); }\n",
+    ),
+    # A shared append acknowledges its record (Persisted) once staged, before its loop's turn
+    # barrier makes it durable; the Driver simulation's power cuts catch it.
+    "ack-before-turn-barrier": ("worker.h",
+        "\t\t\t\tif (!io_job_->done()) {\n\t\t\t\t\tif (io_persist_token_ && core_->busy()) { ingest(core_->step(current_time)); }\n",
+        "\t\t\t\tif (!io_job_->done() && io_persist_token_ && store_.shared()) {\n\t\t\t\t\tauto token = *io_persist_token_; io_persist_token_.reset();\n\t\t\t\t\tingest(core_->step(current_time)); ingest(core_->step(Persisted{token})); ++foreground_; return TurnResult::Completed;\n\t\t\t\t}\n\t\t\t\tif (!io_job_->done()) {\n\t\t\t\t\tif (io_persist_token_ && core_->busy()) { ingest(core_->step(current_time)); }\n",
+    ),
+    # A repair below base_index passes the Core's check (tools/mutants.sh's), which the Driver
+    # simulation's repairs below a checkpoint reach.
+    "repair-below-base": ("core.h",
+        "if (b.index < base_index_ || b.index > durable_.commit_index ||",
+        "if (b.index > durable_.commit_index ||",
     ),
     # A witness incarnation may become a learner or voter (R16).
     "witness-becomes-data": ("core.h",

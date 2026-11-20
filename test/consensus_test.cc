@@ -119,6 +119,7 @@ struct Network {
 	std::map<NodeId, std::unique_ptr<Host>> hosts;
 	std::deque<Envelope> network;
 	std::set<NodeId> isolated;
+	std::set<std::pair<NodeId, NodeId>> cut;  // one-way: (from, to) messages are lost
 	std::vector<SnapshotNeeded> snapshots;  // requested by leaders; the test drives each transfer
 	std::uint64_t now = 0;
 	explicit Network(std::size_t count = 3, Limits limits = {}) {
@@ -179,7 +180,7 @@ struct Network {
 	void pump(std::size_t bound = 10000) {
 		while (!network.empty() && bound--) {
 			auto envelope = std::move(network.front()); network.pop_front();
-			if (isolated.contains(envelope.from) || isolated.contains(envelope.to) || !hosts.contains(envelope.to)) { continue; }
+			if (isolated.contains(envelope.from) || isolated.contains(envelope.to) || cut.contains({envelope.from, envelope.to}) || !hosts.contains(envelope.to)) { continue; }
 			consume(envelope.to, host(envelope.to).core->step(Tick{now, 100 + 20 * (envelope.to - 1)}));
 			consume(envelope.to, host(envelope.to).core->step(Receive{envelope.from, std::move(envelope.message)}));
 		}
@@ -911,6 +912,41 @@ void late_append_during_snapshot() {
 	check(find<SnapshotNeeded>(needed) && core.awaiting_snapshot(2), "a compacted-history failure starts the install");
 	auto late = core.step(Receive{2, AppendResponse{2, superseded, true, 3, 4, 0}});
 	check(late.empty() && core.progress(2) == Index{0} && core.awaiting_snapshot(2), "a late success during the install changes nothing");
+}
+
+// A peer whose replies are lost holds the entries while the leader's record of its match stays
+// stale, and the leader checkpoints past that match: after the heal the peer catches up by an
+// append at the base within two heartbeats, with no install. A peer that lacks the entries still
+// gets one once it refuses that append.
+void heal_after_checkpoint_past_stale_match() {
+	for (bool holds : {true, false}) {
+		Network cluster(3); cluster.start(); cluster.elect(1);
+		auto& leader = *cluster.host(1).core;
+		auto round = [&](unsigned count) { for (unsigned i = 0; i < count; ++i) { cluster.tick(cluster.now + 10); cluster.pump(); } };
+		for (RequestId r = 1; r <= 2; ++r) { cluster.consume(1, leader.step(Propose{r, "c" + std::to_string(r)})); cluster.pump(); }
+		round(4);
+		const Index stale = leader.progress(2).value_or(0);
+		if (holds) { cluster.cut.insert({2, 1}); } else { cluster.isolated.insert(2); }
+		for (RequestId r = 3; r <= 8; ++r) { cluster.consume(1, leader.step(Propose{r, "c" + std::to_string(r)})); cluster.pump(); round(2); }
+		round(10);  // flights to 2 time out, back to its stale match
+		const Index through = leader.applied();
+		check(stale > 0 && leader.progress(2) == stale && through > stale && (cluster.host(2).core->last_index() == leader.last_index()) == holds,
+			"heal setup: the leader's match for 2 is stale and 2 holds the entries only if its replies alone were lost");
+		auto published = leader.step(LocalCheckpoint{300, 1, through, cluster.host(1).applied_entries.at(through - 1).term, config(1).cluster, config(1).configuration, leader.epoch()});
+		auto checkpoint = find<PersistCheckpoint>(published);
+		if (!checkpoint) { check(false, "heal setup: the leader checkpoints past the stale match"); continue; }
+		cluster.consume(1, leader.step(Persisted{checkpoint->token}));
+		round(10);  // flights time out again, now below the base
+		cluster.cut.clear(); cluster.isolated.clear();
+		const auto healed = cluster.now, bound = healed + 2 * compact.heartbeat;
+		auto needed = [&] { return std::any_of(cluster.snapshots.begin(), cluster.snapshots.end(), [](const SnapshotNeeded& n) { return n.peer == 2; }); };
+		while (cluster.now < bound && leader.progress(2) != leader.last_index() && !needed()) { round(1); }
+		if (holds) {
+			check(leader.progress(2) == leader.last_index() && !needed(), "a peer holding the entries catches up within two heartbeats of the heal, with no install");
+		} else {
+			check(needed() && leader.awaiting_snapshot(2) && leader.awaiting_snapshot(2)->boundary.index == through, "a peer lacking the entries gets an install at the base within two heartbeats of the heal");
+		}
+	}
 }
 
 void checkpoint_semantic_recovery() {
@@ -2076,7 +2112,7 @@ void recovered_delivery_byte_bound() {
 }
 
 int main() {
-	try { recovered_delivery_byte_bound(); terminal_retirement(); snapshot_sender_maximum_fanout(); snapshot_sender_lost_ack_and_terms(); snapshot_sender_receiver_contact(); snapshot_sender_restart_clock_and_admission(); snapshot_sender_correlation(); snapshot_sender_keepalive_pacing(); snapshot_sender_retries_and_retention(); snapshot_timeout_retries(); portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); late_append_responses(); late_append_read_probe(); stale_append_responses(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); late_append_during_snapshot(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); repair_at_or_below_commit(); prevote_guard_checkquorum(); membership_scripts(); membership_formats(); leadership_transfer(); witnesses(); checkpoint_with_configuration_suffix(); founding_records(); limits_by_position(); learner_install_and_promotion(); }
+	try { recovered_delivery_byte_bound(); terminal_retirement(); snapshot_sender_maximum_fanout(); snapshot_sender_lost_ack_and_terms(); snapshot_sender_receiver_contact(); snapshot_sender_restart_clock_and_admission(); snapshot_sender_correlation(); snapshot_sender_keepalive_pacing(); snapshot_sender_retries_and_retention(); snapshot_timeout_retries(); portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); late_append_responses(); late_append_read_probe(); stale_append_responses(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); late_append_during_snapshot(); heal_after_checkpoint_past_stale_match(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); repair_at_or_below_commit(); prevote_guard_checkquorum(); membership_scripts(); membership_formats(); leadership_transfer(); witnesses(); checkpoint_with_configuration_suffix(); founding_records(); limits_by_position(); learner_install_and_promotion(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " consensus checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

@@ -5,7 +5,7 @@ and pin are added and removed after construction, so `--join` and multicast seed
 cluster. Which certificate makes a joining node trusted is a trust policy; the default is the
 cluster CA, with the pin recorded at first join (D149). The code is
 `include/consensus/transport/admission.h` (faults and policies), `node_pins.h` (the directory),
-`links.h` (routes and removal) and `host_transport.h` (`admit`, `remove`). How one connection
+`links.h` (routes and removal) and `host_transport.h` (`admit_node`, `remove_node`). How one connection
 authenticates is in [host-connection.md](host-connection.md).
 
 ## The directory
@@ -28,7 +28,7 @@ first join. The local node is never removed and never re-pinned.
 
 ## Admission
 
-`HostTransport::admit(node, address, pin)` runs on `loop_of_node(node)`, the loop that owns the
+`HostTransport::admit_node(node, address, pin)` runs on `loop_of_node(node)`, the loop that owns the
 node's connections. It admits the node in the directory, then routes it: `Links::route` sets the
 address, abandons a lookup of the old name, and raises the route's serial, so an answer for the
 old name that is already posted is dropped. Dials and calls to the node start from there; before
@@ -64,11 +64,11 @@ every connection, whichever policy recorded it.
 
 ## Removal
 
-`HostTransport::remove(node)` runs on the node's loop. `Links::remove` removes it from the
+`HostTransport::remove_node(node)` runs on the node's loop. `Links::remove` removes it from the
 directory, which refuses its certificates from then on, on every loop; erases its route, so no
 dial starts and `call` ends `not_connected`; and aborts its links and its dial's offered hello on
 both lanes. The links' end fails their calls as any lost connection does (`connection_aborted`),
-and `remove` fails the calls still waiting for a connection (`not_connected`). Frames groups
+and `remove_node` fails the calls still waiting for a connection (`not_connected`). Frames groups
 queue for the node wait as for an unreachable one; removing a member from its groups is the
 groups' business.
 
@@ -78,7 +78,7 @@ epoch. `Links` records `epoch()` when each connection starts, before its handsha
 pins, and a connection becomes a link only while `current(node, since)`: the node is pinned and
 was not removed after `since`. A remove and a re-admit with a new pin in between therefore cannot
 let the old certificate's connection through. Removal through `NodePins::remove` alone refuses new
-connections but leaves established links up; the transport's `remove` is the one that closes them.
+connections but leaves established links up; the transport's `remove_node` is the one that closes them.
 
 ## Refusals
 

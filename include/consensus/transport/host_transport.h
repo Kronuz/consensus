@@ -338,14 +338,14 @@ class HostTransport {
 	// On loop_of_node(node): admits `node` at `address`, pinned to `pin` or, with none, to the
 	// certificate the trust policy accepts at its first join (NodePins::admit); its dials go to
 	// `address` from now on. Admitting it again moves its address.
-	void admit(kronuz::consensus::NodeId node, PeerAddress address, std::optional<Fingerprint> pin = std::nullopt) {
+	void admit_node(kronuz::consensus::NodeId node, PeerAddress address, std::optional<Fingerprint> pin = std::nullopt) {
 		auto &links = *loops_[loop_of_node(node)].links;
 		links.pins().admit(node, pin);
 		links.route(node, std::move(address));
 	}
 	// On loop_of_node(node): removes `node` (Links::remove): its certificates are refused, its
 	// connections abort, and its calls end; it is not dialed until admitted again.
-	void remove(kronuz::consensus::NodeId node) {
+	void remove_node(kronuz::consensus::NodeId node) {
 		auto &here = loops_[loop_of_node(node)];
 		here.links->remove(node);
 		if (auto it = here.rpc.find(node); it != here.rpc.end())

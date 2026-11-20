@@ -62,7 +62,7 @@ class ClusterCa {
 	}
 	// The default: the certificates `context` trusts, and the prefix of the URI by which the local
 	// certificate names `local`. When it names none, the CA admits none: only pins do (unpinned).
-	ClusterCa(SSL_CTX *context, kronuz::consensus::NodeId local) : ClusterCa(local_prefix(context, local)) {
+	ClusterCa(SSL_CTX *context, kronuz::consensus::NodeId local) : ClusterCa(prefix_of(SSL_CTX_get0_certificate(context), local)) {
 		std::unique_ptr<STACK_OF(X509), void (*)(STACK_OF(X509) *)> trusted(
 			X509_STORE_get1_all_certs(SSL_CTX_get_cert_store(context)),
 			[](STACK_OF(X509) *certificates) { sk_X509_pop_free(certificates, X509_free); });
@@ -97,7 +97,25 @@ class ClusterCa {
 		return node;
 	}
 
+	// The URI by which `certificate` names `node`, less the id: empty when none does.
+	static std::string prefix_of(X509 *certificate, kronuz::consensus::NodeId node) {
+		if (!certificate || !node)
+			return {};
+		const auto id = std::to_string(node);
+		for (const std::string_view uri : uris(certificate))
+			if (uri.size() > id.size() && uri.ends_with(id) && uri[uri.size() - id.size() - 1] == '/')
+				return std::string(uri.substr(0, uri.size() - id.size()));
+		return {};
+	}
+
   private:
+	static std::size_t asn1_length(const ASN1_STRING *s) {
+#if OPENSSL_VERSION_NUMBER >= 0x40100000L
+		return ASN1_STRING_get_length(s);
+#else
+		return std::size_t(ASN1_STRING_length(s));
+#endif
+	}
 	explicit ClusterCa(std::string prefix) : store_(X509_STORE_new(), X509_STORE_free), prefix_(std::move(prefix)) {
 		if (!store_)
 			throw std::runtime_error("cluster CA: X509_STORE_new");
@@ -114,21 +132,10 @@ class ClusterCa {
 		for (int i = 0; names && i < sk_GENERAL_NAME_num(names); ++i)
 			if (const GENERAL_NAME *name = sk_GENERAL_NAME_value(names, i); name->type == GEN_URI) {
 				const ASN1_STRING *uri = name->d.uniformResourceIdentifier;
-				found.emplace_back(reinterpret_cast<const char *>(ASN1_STRING_get0_data(uri)), std::size_t(ASN1_STRING_length(uri)));
+				found.emplace_back(reinterpret_cast<const char *>(ASN1_STRING_get0_data(uri)), std::size_t(asn1_length(uri)));
 			}
 		GENERAL_NAMES_free(names);
 		return found;
-	}
-	// The local certificate's URI naming `local`, less the id: empty when none does.
-	static std::string local_prefix(SSL_CTX *context, kronuz::consensus::NodeId local) {
-		X509 *own = SSL_CTX_get0_certificate(context);
-		if (!own || !local)
-			return {};
-		const auto id = std::to_string(local);
-		for (const std::string_view uri : uris(own))
-			if (uri.size() > id.size() && uri.ends_with(id) && uri[uri.size() - id.size() - 1] == '/')
-				return std::string(uri.substr(0, uri.size() - id.size()));
-		return {};
 	}
 
 	std::shared_ptr<X509_STORE> store_;

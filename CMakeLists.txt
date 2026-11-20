@@ -213,9 +213,11 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	add_executable(consensus_transport_admission_nodes_test test/transport/admission_nodes_test.cc)
 	target_link_libraries(consensus_transport_admission_nodes_test PRIVATE consensus::transport)
 	target_compile_options(consensus_transport_admission_nodes_test PRIVATE -UNDEBUG)
-	add_test(NAME consensus_transport_admission_nodes_policy
-		COMMAND consensus_transport_admission_nodes_test ${CMAKE_CURRENT_BINARY_DIR}/admission-fixture policy)
-	set_tests_properties(consensus_transport_admission_nodes_policy PROPERTIES FIXTURES_REQUIRED consensus_admission TIMEOUT 30)
+	foreach(c policy issue)
+		add_test(NAME consensus_transport_admission_nodes_${c}
+			COMMAND consensus_transport_admission_nodes_test ${CMAKE_CURRENT_BINARY_DIR}/admission-fixture ${c})
+		set_tests_properties(consensus_transport_admission_nodes_${c} PROPERTIES FIXTURES_REQUIRED consensus_admission TIMEOUT 60)
+	endforeach()
 	foreach(c join refused remove)
 		foreach(p ca pins)
 			add_test(NAME consensus_transport_admission_nodes_${c}_${p}

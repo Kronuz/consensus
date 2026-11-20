@@ -20,6 +20,9 @@ mutant_commit.MUTANTS = {
     # A1, cluster CA: a first join re-pins a node pinned to another certificate
     "no-repin-check": (T + "node_pins.h", "\t\tif (entry.pin)\n\t\t\trefuse(PinFault::repinned",
                        "\t\tif (false)\n\t\t\trefuse(PinFault::repinned"),
+    # A5: an issuer takes any token
+    "any-token": (T + "admission_join.h", "\t\tif (secret.size() != secret_.size() || CRYPTO_memcmp(secret.data(), secret_.data(), secret_.size()) != 0)",
+                  "\t\tif (false)"),
     # A2: a removal leaves the node's links up
     "remove-keeps-links": (T + "links.h", "\t\t\t\t\tif (link)\n\t\t\t\t\t\tlink->connection->abort();",
                            "\t\t\t\t\tif (link)\n\t\t\t\t\t\t(void)link;"),

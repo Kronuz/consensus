@@ -38,8 +38,8 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <unordered_map>
-#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -63,7 +63,7 @@ struct superseded : std::runtime_error { superseded() : std::runtime_error("anot
 struct compacted : std::runtime_error { compacted() : std::runtime_error("the placement is below the retained log") {} };
 struct transfer_failed : std::runtime_error { transfer_failed() : std::runtime_error("leadership transfer failed") {} };
 struct needs_peer : std::runtime_error { needs_peer() : std::runtime_error("the call needs another voting member") {} };
-struct close_in_doubt : std::runtime_error { close_in_doubt() : std::runtime_error("the group's close failed: it reopens once the host restarts") {} };
+struct close_in_doubt : std::runtime_error { using std::runtime_error::runtime_error; };
 using stalled = kronuz::journal::stalled;
 
 struct GroupOptions {
@@ -269,7 +269,7 @@ public:
 				if (call.group->founding) { call.group->worker->found(std::move(*call.group->founding)); call.group->founding.reset(); }
 				call.group->worker->create(identity); call.group->opened = true;
 			}
-			catch (...) { call.fail(std::current_exception()); }
+			catch (...) { call.fail(opening_error(id)); }
 		}
 		co_await call;
 	}
@@ -279,7 +279,7 @@ public:
 		co_await call.enter();
 		if (call.begin(id, false) && !call.resume_open()) {
 			try { call.group->worker->recover(std::move(restore)); call.group->opened = true; }
-			catch (...) { call.fail(std::current_exception()); }
+			catch (...) { call.fail(opening_error(id)); }
 		}
 		co_await call;
 	}
@@ -416,7 +416,6 @@ private:
 			if (!g || g->closing) { return fail(std::make_exception_ptr(closed{})); }
 			if (g->worker->fenced()) { return fail(std::make_exception_ptr(fenced(driver.fence_reason(*g)))); }
 			if (needs_peer_check && driver.holder_ == Holder::entry && driver.has_peer(*g)) { return fail(std::make_exception_ptr(needs_peer{})); }
-			if (waiter.kind == Kind::open && driver.in_doubt_.contains(id)) { return fail(std::make_exception_ptr(close_in_doubt{})); }
 			if (waiter.kind != Kind::open && waiter.kind != Kind::committed) { waiter.request = driver.next_request(); }
 			link(*g);
 			return true;
@@ -628,6 +627,16 @@ private:
 			step(g);
 			if (g.closed) { erase(g); host_.settle(loop_); }
 		}
+	}
+	// create's or recover's failure. The host's hold refuses a group a failed close left in
+	// doubt with EIO before any IO, holding nothing; an EIO from later IO leaves the hold held.
+	std::exception_ptr opening_error(GroupId id) {
+		auto error = std::current_exception();
+		try { std::rethrow_exception(error); }
+		catch (const std::system_error& e) {
+			if (e.code() == std::errc::io_error && !host_.holding(id)) { return std::make_exception_ptr(close_in_doubt(e.what())); }
+		} catch (...) {}
+		return error;
 	}
 	// A closed group's node goes once nothing refers to it: close_step disarmed it, and it has
 	// no waiter or IO; only the ready list can still link it. Its Worker is gone, so its hold
@@ -936,9 +945,6 @@ private:
 		if (!g.retiring) { g.retiring = true; w.close(); }
 		if (!w.drained() || g.io || g.watching) { return; }
 		disarm(g);
-		// A failed close may have left the table holding the group closed: a live reopen would
-		// append past a base a restart restores, so only a restart resolves it, from the disk.
-		if (w.close_failed()) { in_doubt_.insert(g.id); }
 		g.worker.reset(); g.closed = true;
 		for (auto* x = g.head; x;) { auto* next = x->next; complete(g, *x); x = next; }
 	}
@@ -1004,7 +1010,6 @@ private:
 	Sink& sink_;
 	std::mt19937_64 random_;
 	std::unordered_map<GroupId, std::unique_ptr<Group>> groups_;
-	std::unordered_set<GroupId> in_doubt_;  // ids whose close failed: create and recover refuse them
 	Group *ready_head_ = nullptr, *ready_tail_ = nullptr;
 	Waiter* sleeper_ = nullptr;
 	task::cancel_source shutdown_;
@@ -1023,7 +1028,7 @@ T run(Driver<Sink>& driver, task::blocking_scheduler& scheduler, task::task<T> w
 	if (!(driver.scheduler() == task::scheduler_ref::of(scheduler))) { throw std::logic_error("the Driver runs on another scheduler"); }
 	if (driver.holder_ != Driver<Sink>::Holder::none) { throw std::logic_error("the Driver is already running"); }
 	auto& turns = driver.turns();
-	kronuz::journal::TurnDriver::Hold hold(turns, kronuz::journal::TurnDriver::Holder::entry);
+	kronuz::journal::TurnDriver::Hold hold(turns, kronuz::journal::TurnDriver::Holder::entry, task::scheduler_ref::of(scheduler));
 	driver.holder_ = Driver<Sink>::Holder::entry;
 	struct Release { Driver<Sink>& d; ~Release() { d.holder_ = Driver<Sink>::Holder::none; } } release{driver};
 	task::cancel_source stop;
@@ -1057,6 +1062,8 @@ T run(Driver<Sink>& driver, task::blocking_scheduler& scheduler, task::task<T> w
 		}
 		break;
 	}
+	// A throw that ended the loop is the entry's: the Driver stays stopped.
+	if (loop_result.error) { std::rethrow_exception(loop_result.error); }
 	driver.rearm();  // the entry's stop ends this run only: the next entry starts afresh
 	if (result.error) { std::rethrow_exception(result.error); }
 	if (turn_error) { std::rethrow_exception(turn_error); }

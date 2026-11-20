@@ -14,7 +14,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	set(COMPLETION_ASIO ON)
 	FetchContent_MakeAvailable(task completion)
 endif()
-FetchContent_Declare(journal GIT_REPOSITORY https://github.com/Kronuz/journal.git GIT_TAG be8222cda090e8b062c843c40217c461926d661c)
+FetchContent_Declare(journal GIT_REPOSITORY https://github.com/Kronuz/journal.git GIT_TAG 9e11713edbb6e31681e1ae7a3f8f18f15eb7eaac)
 FetchContent_MakeAvailable(journal)
 
 add_library(consensus INTERFACE)

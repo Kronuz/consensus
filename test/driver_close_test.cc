@@ -116,8 +116,10 @@ struct Sink {
 	std::map<GroupId, Index> committed;  // each group's last committed index
 	std::map<GroupId, std::vector<std::string>> commands;  // each group's committed commands, in order
 	std::function<void(GroupId)> on_fenced;  // a Sink may call the Driver's plain calls
+	std::function<void(GroupId)> on_committed;
 	void operator()(GroupId, Send) {}
 	void operator()(GroupId g, Committed c) {
+		if (on_committed) { on_committed(g); }
 		if (c.entries.empty()) { return; }
 		committed[g] = c.entries.back().index;
 		for (auto& e : c.entries) { if (e.kind == EntryKind::Command) { commands[g].push_back(std::move(e.payload)); } }
@@ -218,7 +220,7 @@ struct Loop {
 	std::unique_ptr<j::Host> host;
 	Sink sink;
 	std::unique_ptr<Driver<Sink>> driver;
-	task::cancel_source stop;
+	task::cancel_source stop, driver_stop;  // the turn driver's run, the Driver's
 	bool turns_done = false, driver_done = false;
 	explicit Loop(jt::Disk& d, bool hold = false, std::shared_ptr<j::IO> storage = {}) : disk(d) {
 		if (!storage) { storage = std::make_shared<jt::MemoryIO>(disk, "host/"); }
@@ -228,7 +230,7 @@ struct Loop {
 		auto ref = task::scheduler_ref::of(scheduler);
 		auto turns = hold ? j::completion_ref::of(held) : j::completion_ref::of(inline_io);
 		task::spawn(ref, host->driver(0).run(turns, stop.token()), [this](std::exception_ptr) { turns_done = true; });
-		task::spawn(ref, driver->run(stop.token()), [this](std::exception_ptr) { driver_done = true; });
+		task::spawn(ref, driver->run(driver_stop.token()), [this](std::exception_ptr) { driver_done = true; });
 		run();
 	}
 	~Loop() { finish(); }
@@ -245,11 +247,13 @@ struct Loop {
 	}
 	void finish() {
 		if (!driver) { return; }
-		stop.request(task::cancel_reason::shutdown);
+		shutdown();
 		release();
 		check(turns_done && driver_done, "the turn driver's and the Driver's runs end at shutdown");
 		driver.reset(); host.reset();
 	}
+	// Stops both runs, the turn driver's first, as one shared token would.
+	void shutdown() { stop.request(task::cancel_reason::shutdown); driver_stop.request(task::cancel_reason::shutdown); }
 	void release() {
 		run();
 		for (int n = 0; held.held(); ++n) {
@@ -477,7 +481,7 @@ void shutdown_idles() {
 	auto& turns = loop.host->driver(0);
 	const auto durable = turns.sequence(g);
 	check(turns.staged(g), "the proposal's record is staged");
-	loop.stop.request(task::cancel_reason::shutdown);
+	loop.shutdown();
 	if (!loop.run_bounded(20'000)) { check(false, "the loop idles after shutdown with the barrier pending"); std::cout << checks << " driver close checks, " << failures << " failures\n"; std::exit(1); }
 	check(loop.driver->in_flight() > 0 && !loop.driver_done, "the loop waits for the IO");
 	loop.release();
@@ -504,7 +508,7 @@ void shutdown_ends() {
 	check(loop.settle(loop.driver->create(g, j::Identity{'T', 'V'}), error) && !error, "the two-voter group is created: " + what(error));
 	auto checkpoint = loop.start(loop.driver->checkpoint(h, 1 << 20, Capture{std::string(1000, 'y'), 0, placed->value->index, placed->value->term}));
 	check(!checkpoint->done && loop.held.held() > 0, "another group's IO is held");
-	loop.stop.request(task::cancel_reason::shutdown);
+	loop.shutdown();
 	check(loop.run_bounded(20'000) && loop.turns_done && !loop.driver_done, "the turn driver returns; the Driver waits for the IO");
 	auto& turns = loop.host->driver(0);
 	const auto durable = turns.sequence(g);
@@ -851,7 +855,8 @@ protected:
 
 // F2: a close whose table commit fails after the shard file was replaced (its directory sync
 // throws) fences the Store, which releases the group. The table may hold the group closed, so
-// recover and create refuse the id in this live Host with close_in_doubt. After a later
+// recover and create refuse the id in this live Host with close_in_doubt (the host's mark).
+// After a later
 // directory sync and a power cut, the restarted host resolves it from the disk: closed, and
 // it recovers every acknowledged record. Without the refusal, a record acknowledged after the
 // failed close is lost.
@@ -883,6 +888,8 @@ void failed_close() {
 			if (loop.propose(g, "x")) { acknowledged.push_back("x"); }
 			loop.apply(g);
 		} else {
+			check(loop.close(g, error) && !error && loop.driver->groups() == 0, "the refused row closes: " + what(error));
+			loop.driver->open(g, options({1}));
 			check(loop.settle(loop.driver->create(g, j::Identity{'F', 'C'}), error) && is<close_in_doubt>(error), "a live create of the id refuses with close_in_doubt: " + what(error));
 			check(loop.close(g, error) && !error && loop.driver->groups() == 0, "the refused row closes: " + what(error));
 		}
@@ -898,6 +905,71 @@ void failed_close() {
 	again.apply(g);
 	const auto state = recovered(again, g, image);
 	check(prefix(acknowledged, state) && prefix(state, attempted), "it recovers every acknowledged record and nothing unattempted: acknowledged " + join(acknowledged) + ", recovered " + join(state));
+}
+
+// A7 (D128): the failed close's doubt is the Host's, not the Driver's. A second Driver over the
+// same live Host is refused the id with close_in_doubt, and nothing acknowledged is lost at the
+// restart.
+void second_driver() {
+	constexpr GroupId g = 71;
+	jt::Disk disk; disk.random.seed(1);
+	std::vector<std::string> acknowledged, attempted;
+	{
+		auto io = std::make_shared<FlakyIO>(disk);
+		Loop loop(disk, false, io);
+		std::exception_ptr error;
+		loop.lone(g);
+		attempted.push_back("a");
+		if (loop.propose(g, "a")) { acknowledged.push_back("a"); }
+		loop.apply(g);
+		auto published = loop.start(checkpoint_of(loop, g, acknowledged));
+		loop.release();
+		io->fail_sync = 1;
+		check(loop.close(g, error) && !error && io->failed_syncs == 1, "the close's table commit fails: " + what(error));
+		loop.driver_stop.request(task::cancel_reason::shutdown);
+		loop.release();
+		check(loop.driver_done && loop.driver->groups() == 0, "the first Driver's run ends, no row left");
+		loop.driver.reset();
+		loop.driver_stop = task::cancel_source{}; loop.driver_done = false;
+		loop.driver = std::make_unique<Driver<Sink>>(Seams{task::scheduler_ref::of(loop.scheduler), j::completion_ref::of(loop.inline_io), *loop.host, 0, 7}, loop.sink);
+		task::spawn(task::scheduler_ref::of(loop.scheduler), loop.driver->run(loop.driver_stop.token()), [&loop](std::exception_ptr) { loop.driver_done = true; });
+		loop.run();
+		loop.recover(g, error, options({1}));
+		check(is<close_in_doubt>(error), "a second Driver over the same live Host refuses the id with close_in_doubt: " + what(error));
+		if (!error) {
+			loop.apply(g);
+			attempted.push_back("x");
+			if (loop.propose(g, "x")) { acknowledged.push_back("x"); }
+			loop.apply(g);
+		}
+		check(loop.close(g, error), "the row closes: " + what(error));
+		io->backend.sync_directory();
+		loop.release();
+	}
+	disk.power_loss();
+	Loop again(disk);
+	std::exception_ptr error;
+	const auto image = again.recover(g, error, options({1}));
+	check(!error, "the restarted host recovers the id: " + what(error));
+	again.apply(g);
+	const auto state = recovered(again, g, image);
+	check(prefix(acknowledged, state) && prefix(state, attempted), "every acknowledged record survives: acknowledged " + join(acknowledged) + ", recovered " + join(state));
+}
+
+// A throw that ends the Driver's loop under the blocking entry (a Sink's, which no step
+// catches) reaches the entry's caller, not as the work's task::cancelled.
+void entry_throw() {
+	constexpr GroupId g = 111;
+	jt::Disk disk; task::blocking_scheduler scheduler; j::InlineCompletion io; Sink sink;
+	j::Host host(std::make_shared<jt::MemoryIO>(disk, "host/"), host_identity, j::HostOptions{1, turn_options});
+	Driver<Sink> driver(Seams{task::scheduler_ref::of(scheduler), j::completion_ref::of(io), host, 0, 7}, sink);
+	kronuz::consensus::run(driver, scheduler, [](Driver<Sink>& d, GroupId id) -> task::task<void> { d.open(id, options({1})); co_await d.create(id, j::Identity{'E', 'T'}); }(driver, g));
+	driver.applied(g, Applied{sink.committed[g]});  // the next Committed is delivered once this one is applied
+	sink.on_committed = [](GroupId) { throw 42; };
+	int thrown = 0;
+	try { kronuz::consensus::run(driver, scheduler, [](Driver<Sink>& d, GroupId id) -> task::task<void> { co_await d.committed(id, co_await d.propose(id, "x")); co_await d.read(id); }(driver, g)); }
+	catch (int value) { thrown = value; } catch (...) {}
+	check(thrown == 42, "the loop's throw reaches the blocking entry's caller");
 }
 
 // A5: a checkpoint whose peak exceeds the replacement pool fails at once with
@@ -944,6 +1016,8 @@ const std::map<std::string, void (*)()> cases{
 	{"close_crash", &close_crash},
 	{"pool_bound", &pool_bound},
 	{"failed_close", &failed_close},
+	{"second_driver", &second_driver},
+	{"entry_throw", &entry_throw},
 };
 
 }  // namespace

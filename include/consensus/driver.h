@@ -1028,7 +1028,7 @@ T run(Driver<Sink>& driver, task::blocking_scheduler& scheduler, task::task<T> w
 	if (!(driver.scheduler() == task::scheduler_ref::of(scheduler))) { throw std::logic_error("the Driver runs on another scheduler"); }
 	if (driver.holder_ != Driver<Sink>::Holder::none) { throw std::logic_error("the Driver is already running"); }
 	auto& turns = driver.turns();
-	kronuz::journal::TurnDriver::Hold hold(turns, kronuz::journal::TurnDriver::Holder::entry, task::scheduler_ref::of(scheduler));
+	kronuz::journal::TurnDriver::Hold hold(turns, kronuz::journal::TurnDriver::Holder::entry);
 	driver.holder_ = Driver<Sink>::Holder::entry;
 	struct Release { Driver<Sink>& d; ~Release() { d.holder_ = Driver<Sink>::Holder::none; } } release{driver};
 	task::cancel_source stop;

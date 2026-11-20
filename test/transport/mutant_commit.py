@@ -59,6 +59,7 @@ MUTANTS = {
     # consensus-quiescence A2: LeaderGone dropped for one group, and in Core
     "leader-gone-skips-one": ("include/consensus/driver.h", "g.notices.emplace_back(LeaderGone{node}); mark_ready(g);",
                               "if (&g != groups_.begin()->second.get()) { g.notices.emplace_back(LeaderGone{node}); mark_ready(g); }"),
+    "node-gone-unreported": (T + "host_transport.h", "if (link.lane == LinkLane::Control && !loops_[k].stopping)", "if (false)"),
     "leader-gone-ignored": ("include/consensus/core.h", "\t\tfollower(0, output); leader_contact_ = 0;\n", "\t\t(void)output;\n"),
     # links.h (A4's tie-break, A1's lookup)
     "refuse-when-offered": (T + "links.h", "return !offered || peer < pins_.local();", "return !offered;"),

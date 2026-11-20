@@ -156,7 +156,7 @@ class Driver {
 	using Kind = driver_detail::Kind;
 
 public:
-	struct GroupState { Role role; Term term; NodeId leader; Index committed, applied; Membership membership; };
+	struct GroupState { Role role; Term term; NodeId leader; Index committed, applied; Membership membership; bool resting = false; };
 
 	Driver(Seams seams, Sink& sink)
 		: scheduler_(seams.scheduler), io_(seams.io), host_(seams.host), turns_(seams.host.driver(seams.loop)), loop_(seams.loop), sink_(sink),
@@ -255,7 +255,7 @@ public:
 		auto found = groups_.find(id);
 		if (found == groups_.end()) { return std::nullopt; }
 		const auto& w = *found->second->worker;
-		return GroupState{w.role(), w.term(), w.leader(), w.committed(), w.applied_index(), w.membership().value_or(Membership{})};
+		return GroupState{w.role(), w.term(), w.leader(), w.committed(), w.applied_index(), w.membership().value_or(Membership{}), w.resting()};
 	}
 	// The group's closed state, RFTCLOS1 (docs/mechanisms/quiescence.md), when it can close
 	// now: started, no call or frame waiting, at rest at a checkpoint covering applied

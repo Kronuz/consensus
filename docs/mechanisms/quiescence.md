@@ -33,7 +33,10 @@ each group's heartbeats and election timers.
 - **`LeaderGone{node}`** is the detector's report that `node` (a `Member::node`) stopped
   answering. A follower whose leader is on that node drops it and elects within its election
   timeout, as after a missed heartbeat. `Driver::leader_gone(node)` raises it at every open group
-  following a leader there; `Driver::wake(id)` submits `Wake`.
+  following a leader there; `Driver::wake(id)` submits `Wake`. The host transport's Control
+  connection per peer node is the detector: `HostTransport::on_node_gone` reports its end
+  ([host-transport](host-transport.md), Node gone; `groups_test driver`: a stopped leader
+  node's groups elect 1.6 s after its stop, at a 1-2 s election timeout).
 
 Rest changes no safety argument: a commit still needs a quorum's acknowledgement in the leader's
 term and a read a quorum's probe, so a leader at rest that a partition deposed commits nothing

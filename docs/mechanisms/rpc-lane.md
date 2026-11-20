@@ -33,15 +33,20 @@ frame from the wrong side (rule 6), a `Call` id that does not increase, an id ne
 `Body` off its next byte, past its credit, with a changed total or after its end (rule 7), a
 `Credit` that does not increase (rule 8), a second `Drain` or a `Drain` id that is not the
 receiver's parity or 0 or was never allocated (rule 10). A frame for a retired id is counted in
-`late()` and dropped (rule 9). On a throw the connection closes and calls `close()`.
+`late()` and dropped (rule 9). On a throw the connection closes and calls `close()`. A throw from
+this end's own code (the accept callback, a call's `body`, `credit` or `done`) is not the peer's:
+it is counted in `failed()` and fails that call alone, `Error handler_failed` from a server and
+`Cancel cancelled` from a caller, with the exception's text.
 
 A call ends once at each end, and its `done` runs once: `ok` when the response is consumed to its
 end (the caller) or queued to its end (the server); `error` or `cancel` with the frame's code;
 `not_processed` when a `Drain` did not cover it or it never queued; `connection_aborted` on
 `close()`; `timed_out` when the caller's deadline passed before its `Call` queued. The caller's
 deadline sends `Cancel deadline_exceeded`; the server's, arrival plus `timeout_ms` clamped to
-`max_call_deadline`, sends `Error deadline_exceeded`. A served call's slot frees when the call
-ends. The id is allocated when the `Call` is queued, after every wait, so ids reach the peer in
+`max_call_deadline`, sends `Error deadline_exceeded`. With `LaneOptions::late` set, `expire()`
+first gives a call whose deadline passed more than a wheel tick ago that time again, once, capped
+at its timeout (T7: `late_extension` in `deadline.h`, the transport's one late-fire rule). A served
+call's slot frees when the call ends. The id is allocated when the `Call` is queued, after every wait, so ids reach the peer in
 order.
 
 ## Credit and pools
@@ -94,20 +99,24 @@ groups' snapshot frames:
   call whose credit is full holds no group frame. A chunk's `rpc_outgoing_bytes` charge returns
   when the connection takes it, and the connection takes a feed only once its queue is out.
 - **Deadlines.** One timer per peer, at its earliest deadline: a waiting call's, the call
-  table's (`Lane::expire`), or the redial.
+  table's (`Lane::expire`), or the redial. Both kinds of call deadline take the late-fire rule
+  (T7), so a process stop does not end calls that the stop alone made late.
+- **Frame bound.** The constructor refuses a `maximum_frame` below the lane's largest frame
+  (`rpc::frame_bytes`, a `Call` with a full 64 KiB chunk: 65,584 bytes), beside the `rpc_bytes`
+  check.
 - **Accounting.** `LaneStats` per loop counts calls, served calls, frames and bytes each way and
   each outcome. Lane frames never move `HostTransportStats`, so a lane-only pair leaves every
   group counter at 0.
 
 Not built here: `lane_idle` and `Drain` on an idle or shutting-down link (the host transport
-keeps connections up until `stop()`, which aborts them), `hold(node)`, and the late-deadline rule
-for call deadlines (T7).
+keeps connections up until `stop()`, which aborts them), and `hold(node)`.
 
 ## Evidence
 
 `test/transport/rpc_test.cc` has a case per rule with values, a call's life, the pools under
 threads, and two lanes over pipes on two loops (run under TSan). Each of the model's eight
-mutants (`test/transport/rpc_mutants.py`) fails the case of its name. `fuzz/rpc_fuzz.cc` drives
+mutants (`test/transport/rpc_mutants.py`) fails the case of its name, and so does `late-deadline`
+(T7: a 2.1 s stop past a 10 s deadline gives 2.1 s once, a 30 s one gives 10 s). `fuzz/rpc_fuzz.cc` drives
 the decoder and a call table; its corpus `fuzz/corpus/rpc` replays as `consensus_fuzz_rpc_replay`.
 
 `test/transport/rpc_host_test.cc`, two hosts over loopback TLS, one ctest entry per case:
@@ -118,4 +127,8 @@ the decoder and a call table; its corpus `fuzz/corpus/rpc` replays as `consensus
 | `group-full` | a group's receiving loop stalls 4 s with its 4 MiB credit full on Bulk; calls on the same connection keep their largest latency under 250 ms | `rpc-shared-credit` (lane frames wait for the groups' credit) |
 | `call-full` | a call whose server never reads holds its 4 MiB credit and pool; heartbeats on Control keep every gap under 1,000 ms | |
 | `lane-only` | no shared group: the call dials Bulk alone, its bytes exact, one link per end, every group counter 0 | |
-| `stream` | a 32 MiB request under the lane's credit, heartbeats' gaps under 1,000 ms, the serving pool's high water within one window | `rpc-one-frame` (the body as one frame) |
+| `stream` | a 32 MiB request under the lane's credit, heartbeats' gaps under 1,000 ms, the serving pool's high water within one window | `rpc-past-credit` (chunks that ignore the peer's credit) |
+| `local-throw` | a handler acting outside its events and a body consumer that throw each end their call `handler_failed`; the link count, `malformed` 0, a group's frames on Bulk and the next 1 MiB echo show the connection went on | `local-throw-closes` (a local throw closes the connection) |
+
+`hello_test version` refuses a 32 KiB `maximum_frame` below the lane's 65,584-byte frame
+(control `lane-frame-unchecked`).

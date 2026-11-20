@@ -295,6 +295,9 @@ struct RpcOptions {
 	std::size_t calling_bytes = std::size_t{256} << 20;  // this host's calls' responses
 	std::size_t outgoing_bytes = std::size_t{64} << 20;  // lane frames queued to send; at least rpc::frame_bytes
 	rpc::LaneOptions lane;
+	// D7: a Bulk connection that carries no group, no hold and no call drains after `idle`; a
+	// drain's calls get `drain_deadline` to end before the connection aborts.
+	std::chrono::milliseconds idle{60'000}, drain_deadline{5'000};
 };
 // A call on the lane, on its connection's loop (loop_of_node(node)): one this host made or serves.
 struct RpcCall {
@@ -304,6 +307,7 @@ struct RpcCall {
 // The lane's counters of one loop, readable from any thread; no group's counter moves for it.
 struct LaneStats {
 	std::atomic<std::uint64_t> calls{0}, served{0}, frames_in{0}, frames_out{0}, bytes_in{0}, bytes_out{0};
+	std::atomic<std::uint64_t> drains{0}, retired{0};  // Drains this end sent; connections it then closed gracefully
 	std::atomic<std::uint64_t> outcomes[rpc::outcomes] = {};  // calls ended here, by rpc::Outcome
 	std::uint64_t ended(rpc::Outcome o) const noexcept { return outcomes[std::size_t(o)]; }
 };
@@ -495,9 +499,13 @@ class HostTransport {
 			events.done({rpc::Outcome::not_connected});
 			return c;
 		}
+		if (here.draining) {
+			events.done({rpc::Outcome::not_processed});
+			return c;
+		}
 		auto &peer = here.rpc[node];
 		peer.calls[c.id] = 0;
-		if (peer.lane)
+		if (peer.lane && !peer.lane->draining())
 			begin(peer, c.id, {method, std::move(options), std::move(request), std::move(events)});
 		else
 			peer.pending.push_back({c.id, {method, options, std::move(request), std::move(events)}, options.deadline - rpc::Clock::now()});
@@ -540,6 +548,47 @@ class HostTransport {
 			  std::string(text.substr(0, rpc::text_bytes))});
 	}
 
+	// On loop_of_node(node) (T3): keep a Bulk connection to `node`, dialing it when there is none,
+	// whether or not they share a group, until as many release(node) calls; then lane_idle (D7).
+	void hold(kronuz::consensus::NodeId node) {
+		const auto k = loop_of_node(node);
+		if (loops_[k].stopping || std::find(nodes_.begin(), nodes_.end(), node) == nodes_.end())
+			return;
+		++loops_[k].rpc[node].holds;
+		pump(k, node, LinkLane::Bulk);
+		arm(k, node);
+	}
+	void release(kronuz::consensus::NodeId node) {
+		const auto k = loop_of_node(node);
+		auto &peer = loops_[k].rpc[node];
+		if (peer.holds && !--peer.holds)
+			arm(k, node);
+	}
+	// On `loop`: whether a connection to `node` on `which` is up.
+	bool linked(std::uint32_t loop, kronuz::consensus::NodeId node, LinkLane which) const {
+		const auto it = loops_.at(loop).lanes.find({node, which});
+		return it != loops_.at(loop).lanes.end() && it->second.link;
+	}
+	// From any thread, before stop(), for a graceful shutdown (T8): every lane sends Drain, its
+	// calls end or get drain_deadline, and each Bulk connection closes gracefully once drained;
+	// new calls end not_processed. lanes_drained(loop) says when the loop's lanes are closed.
+	void drain() {
+		for (std::uint32_t k = 0; k != loops_.size(); ++k)
+			asio::post(loops_[k].at.executor, [this, k] {
+				auto &loop = loops_[k];
+				loop.draining = true;
+				for (auto &[node, peer] : loop.rpc) {
+					fail(peer, rpc::Outcome::not_processed);
+					start_drain(k, node);
+				}
+			});
+	}
+	bool lanes_drained(std::uint32_t loop) const {
+		for (auto &[node, peer] : loops_.at(loop).rpc)
+			if (peer.link)
+				return false;
+		return true;
+	}
 	// From any thread: every loop stops dialing and accepting and aborts its connections; calls
 	// not yet on a connection end not_connected.
 	void stop() {
@@ -650,6 +699,7 @@ class HostTransport {
 		const Link *link = nullptr;
 		std::uint64_t generation = 0, dial_after = 0;
 		bool dialing = false, lane_turn = false;  // lane_turn: Bulk's next chunk is the RPC lane's (D1)
+		bool grouped = false;  // the connection carried a group's frame either way: no lane_idle (D7)
 	};
 	// A call made before its connection is up.
 	struct Made {
@@ -677,7 +727,8 @@ class HostTransport {
 		std::vector<Pending> pending;
 		std::unordered_map<std::uint64_t, rpc::Handle> calls;
 		std::unique_ptr<asio::steady_timer> timer;
-		std::optional<rpc::Clock::time_point> armed, redial;
+		std::optional<rpc::Clock::time_point> armed, redial, idle, drain_by;
+		std::size_t holds = 0;  // hold(node) without its release (T3)
 		bool feeding = false;
 	};
 	struct Loop {
@@ -692,7 +743,7 @@ class HostTransport {
 		std::map<std::pair<kronuz::consensus::NodeId, LinkLane>, Opened> opened;  // by connection
 		std::uint64_t serial = 0;
 		HostTransportStats stats;
-		bool flushing = false, stopping = false;
+		bool flushing = false, stopping = false, draining = false;  // draining: drain() ran, calls end not_processed
 		std::map<kronuz::consensus::NodeId, RpcPeer> rpc;  // by peer node, for the connections here
 		std::uint64_t rpc_ids = 0;
 		LaneStats lane_stats;
@@ -776,6 +827,7 @@ class HostTransport {
 	void reset(Lane &lane, HostTransportStats &stats) {
 		lane.opened.clear();
 		lane.arriving.clear();
+		lane.grouped = false;
 		stats.owed -= lane.owed.held();
 		lane.owed.clear();
 		for (auto &r : lane.rings)
@@ -840,7 +892,7 @@ class HostTransport {
 							lane.dial_after = loops_[k].at.scheduler.now() +
 											  std::uint64_t(std::chrono::nanoseconds(options_.redial).count());
 							if (auto it = loops_[k].rpc.find(node); which == LinkLane::Bulk && it != loops_[k].rpc.end() &&
-																	 !it->second.pending.empty()) {
+																	 (!it->second.pending.empty() || it->second.holds)) {
 								it->second.redial = rpc::Clock::now() + options_.redial;  // calls wait to their deadlines
 								arm(k, node);
 							}
@@ -903,6 +955,10 @@ class HostTransport {
 				push(lane, data_ring, id, *a);
 			settle(lane, id, *a);
 		}
+		if (calls && calls->drained() && !calls->small_ready() && !calls->chunk_ready()) {
+			++loops_[k].lane_stats.retired;  // T8: what is queued, then close_notify
+			connection.close();
+		}
 	}
 	// The next record owed: its credit, then its closed. The records go once all are repaid.
 	std::size_t repay(std::uint32_t k, Lane &lane, HostTransportStats &stats) {
@@ -929,6 +985,7 @@ class HostTransport {
 	}
 	// Before a group's frame: its open, unless the connection carries the group's latest one.
 	std::size_t open_first(std::uint32_t k, Lane &lane, GroupId group, const Active &a) {
+		lane.grouped = true;
 		auto &carried = lane.opened[group];
 		if (carried == a.open.serial)
 			return 0;
@@ -961,7 +1018,7 @@ class HostTransport {
 		bool waiting = false;
 		if (auto it = loops_[k].rpc.find(link.peer); link.lane == LinkLane::Bulk && it != loops_[k].rpc.end()) {
 			close_rpc(it->second);
-			waiting = !it->second.pending.empty();  // calls its calls' done made again
+			waiting = !it->second.pending.empty() || it->second.holds;  // calls its calls' done made again, or a hold
 		}
 		if (!lane.active.empty() || waiting)
 			pump(k, link.peer, link.lane);
@@ -1006,6 +1063,7 @@ class HostTransport {
 			++here.stats.refused;  // a connection its lane replaced: its batches would be stale
 			return;
 		}
+		lane.grouped = true;
 		// The receive bound: what the group's frames hold here until its group loop takes them.
 		auto &held = lane.arriving[r.route.group];
 		if (open || kind == int(FrameKind::control)) {
@@ -1190,6 +1248,7 @@ class HostTransport {
 			++here.lane_stats.outcomes[std::size_t(status.outcome)];
 			if (done)
 				done(status);
+			arm(k, c.node);  // the last call's end starts lane_idle
 		};
 	}
 	// Hands a call to the peer's lane; its done may run within, and leaves no handle behind.
@@ -1212,6 +1271,8 @@ class HostTransport {
 		close_rpc(peer);
 		peer.link = &link;
 		peer.redial.reset();
+		peer.idle.reset();
+		peer.drain_by.reset();
 		if (!link.rpc)
 			return fail(peer, rpc::Outcome::protocol_not_supported);
 		auto options = options_.rpc.lane;
@@ -1227,11 +1288,35 @@ class HostTransport {
 		for (auto &p : pending)
 			if (peer.lane)
 				begin(peer, p.id, std::move(p.call));
+		if (loops_[k].draining)
+			start_drain(k, node);
 		arm(k, node);
+	}
+	// Sends the lane's Drain (D4): feed closes the connection once the lane is drained, and the
+	// connection aborts at drain_deadline if it is not.
+	void start_drain(std::uint32_t k, kronuz::consensus::NodeId node) {
+		auto &peer = loops_[k].rpc[node];
+		if (!peer.lane || peer.drain_by)
+			return;
+		++loops_[k].lane_stats.drains;
+		peer.idle.reset();
+		peer.drain_by = rpc::Clock::now() + options_.rpc.drain_deadline;
+		peer.lane->drain();
+		rpc_ready(k, node);
+		arm(k, node);
+	}
+	// D7: the peer's Bulk connection carries no group, no hold, no call and nothing waiting.
+	bool lane_idle(std::uint32_t k, kronuz::consensus::NodeId node, const RpcPeer &peer) const {
+		if (!peer.lane || peer.holds || !peer.calls.empty() || !peer.pending.empty() || peer.drain_by)
+			return false;
+		const auto it = loops_[k].lanes.find({node, LinkLane::Bulk});
+		return it != loops_[k].lanes.end() && it->second.link == peer.link && !it->second.grouped;
 	}
 	// The link ended: its calls end connection_aborted, or not_processed when never sent.
 	static void close_rpc(RpcPeer &peer) {
 		peer.link = nullptr;
+		peer.idle.reset();
+		peer.drain_by.reset();
 		if (auto lane = std::move(peer.lane))
 			lane->close();
 	}
@@ -1296,7 +1381,14 @@ class HostTransport {
 	void arm(std::uint32_t k, kronuz::consensus::NodeId node) {
 		auto &here = loops_[k];
 		auto &peer = here.rpc[node];
+		if (!lane_idle(k, node, peer))
+			peer.idle.reset();
+		else if (!peer.idle)
+			peer.idle = rpc::Clock::now() + options_.rpc.idle;
 		auto next = peer.lane ? peer.lane->next_deadline() : std::nullopt;
+		for (const auto &at : {peer.idle, peer.drain_by})
+			if (at && (!next || *at < *next))
+				next = at;
 		for (auto &p : peer.pending)
 			if (!next || p.call.options.deadline < *next)
 				next = p.call.options.deadline;
@@ -1333,9 +1425,13 @@ class HostTransport {
 			events.done({rpc::Outcome::timed_out});
 		if (peer.lane)
 			peer.lane->expire();
+		if (peer.idle && *peer.idle <= now && lane_idle(k, node, peer))
+			start_drain(k, node);
+		if (peer.drain_by && *peer.drain_by <= now && peer.link)
+			peer.link->connection->abort();  // the drain's calls did not end in time
 		if (peer.redial && *peer.redial <= now) {
 			peer.redial.reset();
-			if (!peer.pending.empty()) {
+			if (!peer.pending.empty() || peer.holds) {
 				pump(k, node, LinkLane::Bulk);
 				if (const auto &lane = loops_[k].lanes[{node, LinkLane::Bulk}]; !lane.link && !lane.dialing)
 					peer.redial = now + std::chrono::milliseconds(10);  // the dial's own spacing has not passed

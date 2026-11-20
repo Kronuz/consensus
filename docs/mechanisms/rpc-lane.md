@@ -105,10 +105,11 @@ groups' snapshot frames:
   serve)` registers a method before `serve()`; the handler gets the `RpcCall` it answers on and
   acts from the call's events.
 - **Receive.** A frame starting `DTRP` goes to the link's call table at once, from the
-  connection's buffer (T5). One that breaks a rule, or arrives on Control or with the lane off,
+  connection's buffer, on the connection's loop (T5): it never waits on another loop or a shared
+  budget. One that breaks a rule, or arrives on Control or with the lane off,
   closes the connection (`malformed`), and its calls end `connection_aborted`.
-- **Send.** A feed hands over, in order: credit owed to groups, the lane's small frames (FIFO),
-  groups' control frames, then lane chunks and groups' data frames in turn while both wait. Lane
+- **Send.** A feed hands over, in order: the lane's small frames (FIFO), groups' control frames,
+  credit owed to groups, then lane chunks and groups' data frames in turn while both wait. Lane
   frames sit outside every group's credit: a group whose window is full holds none of them, and a
   call whose credit is full holds no group frame. A chunk's `rpc_outgoing_bytes` charge returns
   when the connection takes it, and the connection takes a feed only once its queue is out.
@@ -122,8 +123,19 @@ groups' snapshot frames:
   each outcome. Lane frames never move `HostTransportStats`, so a lane-only pair leaves every
   group counter at 0.
 
-Not built here: `lane_idle` and `Drain` on an idle or shutting-down link (the host transport
-keeps connections up until `stop()`, which aborts them), and `hold(node)`.
+- **Holds and lane_idle (T3, D7).** `hold(node)` dials Bulk to `node` and keeps it, sharing a
+  group or not, until as many `release(node)`; a failed dial is tried again every `redial`. A
+  Bulk connection that has carried no group frame either way, with no hold, no call and nothing
+  waiting, drains after `RpcOptions::idle` (60 s). One that carried a group frame stays until
+  `stop()`, as Control does.
+- **Drain and the graceful close (D4, T8).** Draining sends the lane's `Drain`; once the table is
+  drained (no call live at this end), the feed closes the connection gracefully: the frames queued,
+  then `close_notify`. A call the peer started past the Drain ends `not_processed` there, and a
+  call this host makes on a lane either end drained waits for the next connection, so a call
+  racing a close ends `ok` or `not_processed`, never `connection_aborted`. A drain whose calls are
+  still live at `drain_deadline` (5 s) aborts the connection. `drain()` drains every lane for a
+  shutdown before `stop()`: new calls end `not_processed`, and `lanes_drained(loop)` says when the
+  loop's lanes are closed. `LaneStats::drains` and `retired` count them.
 
 ## Evidence
 
@@ -149,6 +161,10 @@ so calls wait for `calling`, `outgoing` and room (N4); its corpus `fuzz/corpus/r
 | `lane-only` | no shared group: the call dials Bulk alone, its bytes exact, one link per end, every group counter 0 | |
 | `stream` | a 32 MiB request under the lane's credit, heartbeats' gaps under 1,000 ms, the serving pool's and the sender's queued bytes' (`rpc_outgoing_bytes`) high water within one window | `rpc-past-credit` (chunks that ignore the peer's credit) |
 | `stalled-peer` | four calls hold 16 MiB of host 2's credit when host 2 stops reading for 4 s; host 1's 2 MiB `rpc_outgoing_bytes` holds at most that connection's queue, so a 1 MiB echo to host 3 completes before host 2 resumes | `rpc-no-queue-cap` |
+| `hold` | `hold(2)` on a lane-only pair with a 300 ms lane_idle: Bulk comes up and stays 1 s; `release(2)` drains it about 300 ms later (1 Drain, closed gracefully) | `hold-ignored` |
+| `idle-race` | host 1's 300 ms lane_idle drains while host 2's loop is held 600 ms, in which it starts 5 calls on the old connection: all 5 end `not_processed`, none `connection_aborted`, and the next call dials again and completes | `rpc-no-drain` |
+| `shutdown` | `drain()` with a 4 MiB echo streaming: it completes whole, a later call ends `not_processed`, the lanes close, no call ends `connection_aborted` | |
+| `reader` | host 2's loop that does not read node 1's connection is held; 10 echoes on that connection complete, the slowest in under 200 ms (T5) | `lane-via-other-loop` |
 | `local-throw` | a handler acting outside its events and a body consumer that throw each end their call `handler_failed`; the link count, `malformed` 0, a group's frames on Bulk and the next 1 MiB echo show the connection went on | `local-throw-closes` (a local throw closes the connection) |
 
 `hello_test version` refuses a 32 KiB `maximum_frame` below the lane's 65,584-byte frame

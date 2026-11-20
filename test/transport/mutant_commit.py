@@ -108,6 +108,12 @@ MUTANTS = {
     "no-current": (T + "host_transport.h", "const bool current = batch.peer.generation == connection.generation;", "const bool current = true;"),
     # transport-feed-scan review G1: owe's merge keeps only the first record's bytes per group
     "coalesce-drops-credit": (T + "host_transport.h", "\t\t\t\tv[m - 1].bytes += v[i].bytes;\n", "\t\t\t\t(void)0;\n"),
+    # consensus-transport A1, A2: hold (T3), Drain before a lane_idle close (D7, T8), the reader (T5)
+    "hold-ignored": (T + "host_transport.h", "\t\t++loops_[k].rpc[node].holds;\n", "\t\t(void)loops_[k].rpc[node];\n"),
+    "rpc-no-drain": (T + "host_transport.h", "\t\tpeer.lane->drain();\n\t\trpc_ready(k, node);", "\t\tpeer.link->connection->close();"),
+    "lane-via-other-loop": (T + "host_transport.h", "\t\tif (frame.size() >= 4 && frame.substr(0, 4) == \"DTRP\")\n\t\t\treturn rpc_arrived(k, link, frame);",
+                            "\t\tif (frame.size() >= 4 && frame.substr(0, 4) == \"DTRP\") {\n\t\t\tconst auto o = (k + 1) % std::uint32_t(loops_.size());\n"
+                            "\t\t\ton(o, [this, k, &link, f = std::string(frame)] { on(k, [this, k, &link, f] { rpc_arrived(k, link, f); }); });\n\t\t\treturn;\n\t\t}"),
     # transport-receive-bound: what a connection's frames hold before their group loop takes them
     "data-unbounded": (T + "host_transport.h", "} else if (held.data && held.data + frame.size() > options_.window) {", "} else if (false) {"),
     "control-unbounded": (T + "host_transport.h", "if (held.frames >= options_.arriving) {", "if (false) {"),

@@ -468,6 +468,8 @@ class Lane {
 		not_processed(~std::uint64_t{0});
 	}
 	bool drained() const noexcept { return drain_sent_ && calls_.empty(); }
+	// Either end sent Drain: the lane starts no more calls.
+	bool draining() const noexcept { return drain_sent_ || peer_drained_; }
 	// The connection failed: every call ends, every byte returns.
 	void close() {
 		if (depth_) {

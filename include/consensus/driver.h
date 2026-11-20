@@ -38,6 +38,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <unordered_map>
 #include <variant>
 #include <vector>
@@ -62,6 +63,7 @@ struct superseded : std::runtime_error { superseded() : std::runtime_error("anot
 struct compacted : std::runtime_error { compacted() : std::runtime_error("the placement is below the retained log") {} };
 struct transfer_failed : std::runtime_error { transfer_failed() : std::runtime_error("leadership transfer failed") {} };
 struct needs_peer : std::runtime_error { needs_peer() : std::runtime_error("the call needs another voting member") {} };
+struct close_in_doubt : std::runtime_error { using std::runtime_error::runtime_error; };
 using stalled = kronuz::journal::stalled;
 
 struct GroupOptions {
@@ -267,7 +269,7 @@ public:
 				if (call.group->founding) { call.group->worker->found(std::move(*call.group->founding)); call.group->founding.reset(); }
 				call.group->worker->create(identity); call.group->opened = true;
 			}
-			catch (...) { call.fail(std::current_exception()); }
+			catch (...) { call.fail(opening_error(id)); }
 		}
 		co_await call;
 	}
@@ -277,7 +279,7 @@ public:
 		co_await call.enter();
 		if (call.begin(id, false) && !call.resume_open()) {
 			try { call.group->worker->recover(std::move(restore)); call.group->opened = true; }
-			catch (...) { call.fail(std::current_exception()); }
+			catch (...) { call.fail(opening_error(id)); }
 		}
 		co_await call;
 	}
@@ -496,20 +498,24 @@ private:
 		void await_resume() const noexcept {}
 	};
 
+	// A throw that ends the loop (one step() does not catch, as a power cut's) ends it for its
+	// callers as a stop does: each completes with task::cancelled, none is left suspended.
 	task::task<void> loop(task::cancel_token stop) {
-		for (;;) {
-			if (stop.requested()) {
-				shutdown();
-				if (!in_flight_) { co_return; }
+		try {
+			for (;;) {
+				if (stop.requested()) {
+					shutdown();
+					if (!in_flight_) { co_return; }
+				}
+				if (ready_head_) {
+					pump();
+					co_await task::yield();
+					continue;
+				}
+				// Shutting down, only landing IO wakes the loop.
+				co_await Idle(*this, stopping_ ? task::cancel_token{} : stop);
 			}
-			if (ready_head_) {
-				pump();
-				co_await task::yield();
-				continue;
-			}
-			// Shutting down, only landing IO wakes the loop.
-			co_await Idle(*this, stopping_ ? task::cancel_token{} : stop);
-		}
+		} catch (...) { shutdown(); throw; }
 	}
 
 	void on_loop() const {
@@ -619,11 +625,22 @@ private:
 			if (!ready_head_) { ready_tail_ = nullptr; }
 			g.queued = false; g.ready_next = nullptr;
 			step(g);
-			if (g.closed) { erase(g); }
+			if (g.closed) { erase(g); host_.settle(loop_); }
 		}
 	}
+	// create's or recover's failure. The host's hold refuses a group a failed close left in
+	// doubt with EIO before any IO, holding nothing; an EIO from later IO leaves the hold held.
+	std::exception_ptr opening_error(GroupId id) {
+		auto error = std::current_exception();
+		try { std::rethrow_exception(error); }
+		catch (const std::system_error& e) {
+			if (e.code() == std::errc::io_error && !host_.holding(id)) { return std::make_exception_ptr(close_in_doubt(e.what())); }
+		} catch (...) {}
+		return error;
+	}
 	// A closed group's node goes once nothing refers to it: close_step disarmed it, and it has
-	// no waiter or IO; only the ready list can still link it.
+	// no waiter or IO; only the ready list can still link it. Its Worker is gone, so its hold
+	// on the group ended: settle() releases what the host still keeps of it.
 	void erase(Group& g) {
 		if (g.queued) {
 			Group* before = nullptr;
@@ -949,9 +966,12 @@ private:
 	// A shared append or publication completes at its turn's barrier: wait for the group's
 	// next record to be durable there. Shutdown cancels the watch and step never starts
 	// another, so the loop neither spins on it nor waits for a turn no one may write (D8).
+	// A group reopened from the host's table numbers its records past what its closed
+	// incarnation retired, which the log no longer counts.
 	void watch(Group& g) {
 		g.watching = true; ++g.io; ++in_flight_;
-		task::spawn(scheduler_, turns_.durable(g.id, turns_.sequence(g.id) + 1, shutdown_.token()), [this, &g](std::exception_ptr) {
+		const auto next = std::max(turns_.sequence(g.id), turns_.retired(g.id)) + 1;
+		task::spawn(scheduler_, turns_.durable(g.id, next, shutdown_.token()), [this, &g](std::exception_ptr) {
 			g.watching = false; --g.io; --in_flight_;
 			mark_ready(g);
 		});
@@ -1008,7 +1028,7 @@ T run(Driver<Sink>& driver, task::blocking_scheduler& scheduler, task::task<T> w
 	if (!(driver.scheduler() == task::scheduler_ref::of(scheduler))) { throw std::logic_error("the Driver runs on another scheduler"); }
 	if (driver.holder_ != Driver<Sink>::Holder::none) { throw std::logic_error("the Driver is already running"); }
 	auto& turns = driver.turns();
-	kronuz::journal::TurnDriver::Hold hold(turns, kronuz::journal::TurnDriver::Holder::entry);
+	kronuz::journal::TurnDriver::Hold hold(turns, kronuz::journal::TurnDriver::Holder::entry, task::scheduler_ref::of(scheduler));
 	driver.holder_ = Driver<Sink>::Holder::entry;
 	struct Release { Driver<Sink>& d; ~Release() { d.holder_ = Driver<Sink>::Holder::none; } } release{driver};
 	task::cancel_source stop;
@@ -1042,6 +1062,8 @@ T run(Driver<Sink>& driver, task::blocking_scheduler& scheduler, task::task<T> w
 		}
 		break;
 	}
+	// A throw that ended the loop is the entry's: the Driver stays stopped.
+	if (loop_result.error) { std::rethrow_exception(loop_result.error); }
 	driver.rearm();  // the entry's stop ends this run only: the next entry starts afresh
 	if (result.error) { std::rethrow_exception(result.error); }
 	if (turn_error) { std::rethrow_exception(turn_error); }

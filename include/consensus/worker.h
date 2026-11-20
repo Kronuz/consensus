@@ -45,6 +45,11 @@ struct WorkerLimits {
 struct CaptureMetadata { RequestId request; Index through; Term term; std::uint64_t epoch = 0; };
 // window: 64 KiB chunks a source reads ahead and a channel keeps in flight (Track C, D18).
 struct SnapshotLimits { std::uint32_t application_format; std::uint64_t application_bytes; std::uint32_t window = 1; };
+// A checkpoint whose peak, its bundle bound plus its application cap, exceeds the replacement
+// pool: no release ever funds it, so reserving it fails at once instead of waiting.
+struct checkpoint_exceeds_pool : std::length_error {
+	checkpoint_exceeds_pool() : std::length_error("the checkpoint's peak exceeds the replacement pool") {}
+};
 struct SnapshotContext { NodeId authenticated_peer; Term leader_term; RequestId request; Token transfer; SnapshotDescriptor descriptor; };
 enum class ValidationAck { Accepted, Stale, NotReady, Fenced };
 enum class SnapshotReason { Canceled, InvalidImage, InvalidApplication, Rejected, Installed };
@@ -175,7 +180,8 @@ public:
 	}
 	bool ready() const noexcept { return !closing_ && core_ && initialization_.empty() && store_.accounting().has_value() && !fenced(); }
 	// Close protocol interest, then reap accepted originals before invalidating
-	// their backing capabilities. No new Store operation is started after close.
+	// their backing capabilities. No new Store operation is started after close;
+	// once drained, the Worker closes its shared Store (close_store).
 	void close() noexcept { closing_ = true; }
 	bool closing() const noexcept { return closing_; }
 	bool drained() const noexcept {
@@ -269,6 +275,7 @@ public:
 		if (!closing_ && !fenced() && core_ && through != 0 && through == delivered_) { fail(std::move(reason)); }
 	}
 	std::optional<CheckpointId> reserve_checkpoint(std::uint64_t application_cap) {
+		if (!kronuz::journal::detail::resources_fit(checkpoint_floor(application_cap), replacement_pool_)) { throw checkpoint_exceeds_pool(); }
 		if (!ready() || checkpoint_ || snapshot_result_) { return std::nullopt; }
 		if (next_checkpoint_ == std::numeric_limits<Token>::max()) { throw std::length_error("checkpoint identity exhausted"); }
 		auto replacement = store_.reserve_replacement(application_cap, checkpoint_detail::maximum_size(limits_));
@@ -624,7 +631,8 @@ private:
 			if (!detail::retire_actions(output_, budget)) { return TurnResult::Maintenance; }
 			terminal_.reset();
 			if (core_) { core_->begin_retirement(); core_->retirement_step(budget); }
-			return drained() ? TurnResult::Idle : TurnResult::Maintenance;
+			if (!drained()) { return TurnResult::Maintenance; }
+			close_store(); return TurnResult::Idle;
 		} catch (const std::exception& error) {
 			// Originals reaching this branch are terminal. Preserve the existing
 			// storage fence, but do not bulk-clear retained protocol payloads.
@@ -633,6 +641,28 @@ private:
 			io_job_.reset(); maintenance_io_.reset(); io_persist_token_.reset(); io_dispatched_ = false;
 			terminal_ = Fenced{error.what()}; return TurnResult::Fenced;
 		}
+	}
+	// A drained Worker hands its shared group back to the host. Its last record a checkpoint
+	// covering every batch, the Store closes into the host's table and the host keeps nothing
+	// of it; otherwise (fenced, or batches after the checkpoint) the group is released when the
+	// Store ends, its records durable in the log (journal's docs/mechanisms/group-lifetime.md).
+	// A close that fails fences the Store, which then releases the group as a fenced one does;
+	// the host keeps the group in doubt until it reopens (journal's Host::hold refuses it).
+	void close_store() {
+		if (store_closed_ || !store_.shared() || fenced() || !store_.accounting()) { return; }
+		const auto frontier = store_.frontier();
+		if (frontier.sequence != frontier.base_sequence) { return; }
+		try { store_.close(); store_closed_ = true; }
+		catch (const std::exception& error) { failed_ = true; store_.fence_storage(); terminal_ = Fenced{error.what()}; }
+		catch (...) { failed_ = true; store_.fence_storage(); terminal_ = Fenced{"closing the store failed"}; }
+	}
+	// The least peak journal's checkpoint_plan gives a checkpoint of this cap: two artifacts,
+	// the bundle at its bound and the application at its cap (a shared group's exact peak; an
+	// owned store's adds its data file's header and manifest).
+	kronuz::journal::StorageResources checkpoint_floor(std::uint64_t application_cap) const {
+		const std::uint64_t header = kronuz::journal::detail::artifact_header_size, bundle = checkpoint_detail::maximum_size(limits_);
+		if (application_cap > std::numeric_limits<std::uint64_t>::max() - 2 * header - bundle) { return {std::numeric_limits<std::uint64_t>::max(), 2}; }
+		return {2 * header + bundle + application_cap, 2};
 	}
 	enum class MaintenanceKind { Reclaim, BeginApplication, Application, SealApplication, OpenVerification, Readback, BeginBundle, Bundle, SealBundle, Publish, SourceOpen, SourceVerify, SourceRead };
 
@@ -644,6 +674,7 @@ private:
 		return state;
 	}
 	void validate_configuration(const kronuz::journal::AdmissionLimits& admission) {
+		replacement_pool_ = admission.replacement_pool;
 		Core validate(configuration_, initial_state(), limits_, timing_, Flow{}, scheduling_.retained);
 		if (!scheduling_.foreground_burst || scheduling_.foreground_burst > 1048576 || !scheduling_.scan_entries || scheduling_.scan_entries > 4096 ||
 			admission.control_slots < 3 || admission.maximum_tickets < 5) { throw std::invalid_argument("invalid worker scheduling or control slots"); }
@@ -1135,6 +1166,7 @@ private:
 	WorkerLimits scheduling_;
 	std::optional<SnapshotLimits> snapshot_limits_;
 	kronuz::journal::Store store_;
+	kronuz::journal::StorageResources replacement_pool_{};
 	std::unique_ptr<Core> core_;
 	std::string initialization_;
 	std::array<std::optional<kronuz::journal::AppendReservation>, 3> pack_;
@@ -1167,7 +1199,7 @@ private:
 	std::unique_ptr<Source> source_;
 	Token next_source_ = 0, next_source_chunk_ = 0;
 	std::size_t source_next_ = 0; unsigned maintenance_next_ = 1;
-	bool failed_ = false, capture_funding_pressure_ = false, cutover_debt_ = false, timer_due_ = true, timer_blocked_ = false, closing_ = false;
+	bool failed_ = false, capture_funding_pressure_ = false, cutover_debt_ = false, timer_due_ = true, timer_blocked_ = false, closing_ = false, store_closed_ = false;
 };
 
 } // namespace kronuz::consensus

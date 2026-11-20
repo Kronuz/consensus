@@ -25,6 +25,7 @@ struct superseded : std::runtime_error;         // committed(): another term's e
 struct compacted : std::runtime_error;          // committed(): the index is below the retained log, its term unknown
 struct transfer_failed : std::runtime_error;    // transfer_leadership(): deadline passed, or another node leads
 struct needs_peer : std::runtime_error;         // consensus::run only: the call needs another voting member
+struct close_in_doubt : std::runtime_error;     // create(), recover(): the host holds the id in doubt after a failed close, until it reopens
 using stalled = kronuz::journal::stalled;       // consensus::run only: a lost wake
 
 struct GroupOptions {
@@ -133,10 +134,10 @@ T run(Driver<Sink>& driver, task::blocking_scheduler& scheduler, task::task<T> w
 | `transfer_leadership` | the target leads (`RoleChanged`); `transfer_failed` when Core's transfer deadline passes or another node leads | `task::cancelled`; Core carries on | `closed` |
 | `repair` | `RepairCompleted` | `task::cancelled`; Core carries on, the Sink gets `RepairCompleted` | `closed` |
 | `checkpoint` | `CheckpointPublished` | before publication starts it is cancelled and its reservation reclaimed; after, publication finishes and the Sink gets `CheckpointPublished`; the caller gets `task::cancelled` either way | started publication: completes when published; else `closed` |
-| `close` | the group's state is freed and its row erased: `groups()` no longer counts it, and the id opens again on this Driver; a late plain call is dropped and counted with the ids not open. Close completes on an open, fenced or never-created row, and on an id the Driver never held. The journal host still refuses `create` or `recover` of an id it created or recovered until the host reopens | no token | - |
+| `close` | the group's state is freed and its row erased: `groups()` no longer counts it, and the id opens again on this Driver; a late plain call is dropped and counted with the ids not open. Close completes on an open, fenced or never-created row, and on an id the Driver never held. The drained Worker hands its group back to the host: a row whose last record is a checkpoint covering every batch closes into the host's table, which then keeps nothing of it; any other row (fenced, or with records after its checkpoint) is released, its records durable in the log and its in-memory state parked. Either way the id recovers again in the same live host. A close whose table commit fails fences the row, which is then released; the host keeps the group in doubt (journal's `Host::hold` refuses it with EIO), so `create` and `recover` of that id on any Driver over that host complete with `close_in_doubt` until the host reopens and recovers it from its disk | no token | - |
 
 Every call completes with `fenced` once its group fences, and with `task::cancelled`
-(`cancel_reason::shutdown`) once the loop shuts down; a staged record is still written. A call on
+(`cancel_reason::shutdown`) once the loop shuts down; a staged record is still written. A throw that ends `run()` completes them the same way, but a staged record may or may not be written: the outcome is unknown, and a retry may duplicate it. A call on
 an id that is not open, or is closing or closed, completes with `closed` and submits nothing.
 
 **Shutdown order.** A host closes its groups while `run()` steps the loop, then requests `stop`.
@@ -208,7 +209,8 @@ loops:
 
 1. Run the scheduler until its queue is empty.
 2. If records are staged in the loop's turn, commit them inline and go to 1.
-3. If `work` finished, return its result or rethrow its exception.
+3. If `work` finished, return its result or rethrow its exception; a throw that ended the Driver's
+   loop is rethrown first, and the Driver then stays stopped.
 4. Otherwise, if an operation deadline (a `task::deadline` on the scheduler) is armed, sleep
    toward it or until another thread posts (a cancel's hop), and go to 1. Group timers never
    count, though they fire as the clock passes them.

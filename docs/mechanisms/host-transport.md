@@ -152,12 +152,12 @@ most once per `redial` (200 ms) after a failed dial.
 Every per-group table is one `GroupTable<V>`: entries dense in a vector (grown by 1.5x), found
 through an open-addressed index of `u32` slots (splitmix64, then `(h * n) >> 64` for the position,
 so no division; linear probing at load 0.5-0.75; backward-shift deletion; an erase moves the last
-entry into the hole). A set is `GroupTable<Empty>`, 8 B an entry.
+entry into the hole).
 
 | Table | Loop | Entry |
 |---|---|---|
 | `Loop::stored` | the group's | incarnation, serial, open (96 B) |
-| `Opened::groups`, per connection | the group's | the group (8 B) |
+| `Opened::groups`, per connection | the group's | the group and the last source it reported (16 B) |
 | `Lane::opened` | the connection's | the serial of the open it carries (16 B) |
 | `Lane::active` | the connection's | `Active`, while it has something to send or uncredited |
 

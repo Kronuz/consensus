@@ -355,44 +355,58 @@ void dead_peer() {
 	assert(end == ConnectionEnd::dead && ms >= 295);  // never early; a runner's stop only delays it
 }
 
-// N14 (round 3): only the dialer's loop stalls, 1 s against its 300 ms dead_after, while the
-// acceptor's keepalives arrive. The dead-peer wait takes the late rule: once the loop turns, the
-// keepalives are read within the extension and the connection stays open (mutant dead-no-extend:
-// the wait ends it dead at once). Only one end stops, so no rerun absorbs a failure.
+// N14 (round 3): only the dialer's loop stalls, 3 s against its 1 s dead_after, with nothing in
+// its socket when it turns again; the acceptor sends a frame 100 ms after. The dead-peer wait takes
+// the late rule (1 s more), so the frame arrives in time and the connection stays open (mutant
+// dead-no-extend: the wait ends it dead as the loop turns). Only one end stops: no rerun hides it.
 void dead_extends() {
 	Loop loop;
 	auto one = pins_of(1, "one"), two = pins_of(2, "two");
-	ConnectionOptions options;
-	options.keepalive = 50ms;
-	options.dead_after = 300ms;
-	ConnectionOptions accepting = options;
-	accepting.dead_after = 10s;  // the dialer's silence during its stall is not what this case tests
-	Pair p(loop, tcp_pair(loop.io), context("one"), context("two"), options, accepting);
+	ConnectionOptions dialing, accepting;
+	dialing.keepalive = 50ms;
+	dialing.dead_after = 1s;
+	accepting.keepalive = 20s;  // nothing reaches the dialer during its stall
+	accepting.dead_after = 30s;
+	Pair p(loop, tcp_pair(loop.io), context("one"), context("two"), dialing, accepting);
 	p.establish(one, two);
 	asio::io_context io;
 	task::asio_scheduler scheduler{io.get_executor()};
 	auto work = asio::make_work_guard(io);
 	p.dialer->rehome(task::scheduler_ref::of(scheduler), io.get_executor());
-	std::atomic<bool> dialer_ended{false};
+	std::atomic<bool> dialer_ended{false}, resumed{false};
+	std::atomic<int> got{0};
 	std::optional<ConnectionEnd> dialer, acceptor;
 	asio::post(io, [&] {
-		task::spawn(task::scheduler_ref::of(scheduler), p.dialer->run({}), [&](std::exception_ptr e, std::optional<ConnectionEnd> v) {
-			assert(!e);
-			dialer = v;
-			dialer_ended = true;
-		});
+		task::spawn(task::scheduler_ref::of(scheduler), p.dialer->run([&](std::string_view) { ++got; }),
+					[&](std::exception_ptr e, std::optional<ConnectionEnd> v) {
+						assert(!e);
+						dialer = v;
+						dialer_ended = true;
+					});
 	});
 	task::spawn(loop.ref(), p.acceptor->run({}), [&](std::exception_ptr e, std::optional<ConnectionEnd> v) {
 		assert(!e);
 		acceptor = v;
 	});
 	std::thread thread([&] { io.run(); });
-	loop.until([] { return false; }, 200ms);
-	asio::post(io, [] { std::this_thread::sleep_for(1000ms); });  // the dialer's loop alone stops
-	loop.until([] { return false; }, 1500ms);
-	const bool open = !dialer_ended && !acceptor;
-	std::printf("dead_extends: the dialer's loop held 1,000 ms against a 300 ms dead_after; 500 ms later %s\n",
-				open ? "both ends open" : (dialer_ended && dialer == ConnectionEnd::dead ? "the dialer ended dead" : "an end ENDED"));
+	loop.call([&] { p.acceptor->send("first"); });
+	assert(loop.until([&] { return got == 1; }, 5s));  // the reader took it and waits again, its dead-peer wait armed
+	asio::post(io, [&] {  // the dialer's loop alone stops
+		std::this_thread::sleep_for(3000ms);
+		resumed = true;
+	});
+	loop.until([&] { return resumed.load(); }, 10s);
+	loop.until([] { return false; }, 100ms);
+	loop.call([&] {
+		try {
+			p.acceptor->send("late");
+		} catch (const std::logic_error &) {  // the dialer already ended it
+		}
+	});
+	loop.until([] { return false; }, 500ms);  // past the extension's start; the next dead_after is 1 s
+	const bool open = !dialer_ended && !acceptor && got == 2;
+	std::printf("dead_extends: the dialer's loop held 3,000 ms against a 1,000 ms dead_after; %s\n",
+				open ? "both ends open" : (dialer_ended && dialer == ConnectionEnd::dead ? "the dialer ended DEAD" : "an end ENDED"));
 	asio::post(io, [&] { p.dialer->close(); });
 	loop.until([&] { return dialer_ended && acceptor.has_value(); }, 3s);
 	work.reset();

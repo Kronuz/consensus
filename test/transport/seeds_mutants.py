@@ -22,7 +22,7 @@ mutant_commit.MUTANTS = {
     # codec: a trailing byte is read as a valid announcement
     "trailing-accepted": (T + "seeds_codec.h", "return !bytes.empty() || announcement_fault(out)", "return announcement_fault(out)"),
     # rate: no burst on start
-    "no-burst": (T + "seeds.h", "burst_left_ = options_.burst;", "burst_left_ = 0;"),
+    "no-burst": (T + "seeds.h", "burst_left_ = options_.burst;", "burst_left_ = 1;"),
     # rate: announcements every burst spacing, the interval ignored
     "no-interval": (T + "seeds.h", "wait = options_.interval + std::chrono::milliseconds(jitter);", "wait = options_.burst_spacing;"),
 }

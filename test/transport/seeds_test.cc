@@ -448,7 +448,7 @@ void rate() {
 	assert(d.group == "239.192.168.1" && d.port == 58880 && d.ttl == 3 && d.interface.empty());
 	for (auto bad : {[] { SeedOptions o; o.group = "10.0.0.1"; return o; }(), [] { SeedOptions o; o.port = 0; return o; }(),
 					 [] { SeedOptions o; o.ttl = 256; return o; }(), [] { SeedOptions o; o.interval = 5ms; return o; }(),
-					 [] { SeedOptions o; o.jitter = o.interval + 1ms; return o; }(), [] { SeedOptions o; o.burst = 17; return o; }(),
+					 [] { SeedOptions o; o.jitter = o.interval + 1ms; return o; }(), [] { SeedOptions o; o.burst = 17; return o; }(), [] { SeedOptions o; o.burst = 0; return o; }(),
 					 [] { SeedOptions o; o.expire = o.interval; return o; }(), [] { SeedOptions o; o.seeds = 0; return o; }(),
 					 [] { SeedOptions o; o.backoff_max = o.backoff - 1ms; return o; }()}) {
 		bool threw = false;

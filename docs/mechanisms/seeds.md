@@ -34,7 +34,7 @@ listeners at a third host without spoofing its source.
   entries and is counted in `SeedStats::full` beyond it.
 - `SeedOptions::expire` (10 s, at least one interval and its jitter) drops a seed not heard.
 - `validate_seed_options` refuses a non-multicast group, port 0, a TTL outside 0..255, an
-  interval below 10 ms or jitter above it, a burst above 16, and a backoff above its maximum.
+  interval below 10 ms or jitter above it, a burst outside 1..16, and a backoff above its maximum.
 
 ## Drops
 

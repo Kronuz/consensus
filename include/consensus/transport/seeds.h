@@ -36,7 +36,7 @@ struct SeedOptions {
 	// One announcement per interval plus up to `jitter`, after a burst of `burst` spaced
 	// `burst_spacing` at start, so a node starting is found at once and a quiet one costs little.
 	std::chrono::milliseconds interval{2000}, jitter{1000}, burst_spacing{100};
-	std::size_t burst = 3;
+	std::size_t burst = 3;  // 1 is no burst: the first announcement, then the interval
 	std::chrono::milliseconds expire{10000};  // a seed not heard this long leaves the set
 	std::size_t seeds = 256;  // the set's bound: a flood of senders costs this many entries, no more
 	// A seed whose dial failed waits backoff, doubling per failure up to backoff_max.
@@ -53,8 +53,8 @@ inline void validate_seed_options(const SeedOptions &o) {
 		throw std::invalid_argument("seeds: ttl outside 0..255");
 	if (o.interval < std::chrono::milliseconds(10) || o.jitter.count() < 0 || o.jitter > o.interval)
 		throw std::invalid_argument("seeds: interval below 10 ms or jitter outside 0..interval");
-	if (o.burst > 16 || (o.burst && o.burst_spacing < std::chrono::milliseconds(1)))
-		throw std::invalid_argument("seeds: burst above 16 or spaced below 1 ms");
+	if (!o.burst || o.burst > 16 || o.burst_spacing < std::chrono::milliseconds(1))
+		throw std::invalid_argument("seeds: burst outside 1..16 or spaced below 1 ms");
 	if (o.expire < o.interval + o.jitter)
 		throw std::invalid_argument("seeds: expire below one interval and its jitter");
 	if (!o.seeds || o.seeds > 65536)
@@ -134,20 +134,21 @@ class Seeds {
 		const auto group = asio::ip::make_address(options_.group);
 		const asio::ip::udp::endpoint to(group, options_.port);
 		const char *step = "open";
-		if (!error)
+		const bool listens = !wanted_.empty();  // a node that only announces opens no receiver
+		if (listens)
 			receiver_.open(to.protocol(), error), step = "open";
-		if (!error)
+		if (listens && !error)
 			receiver_.set_option(asio::socket_base::reuse_address(true), error), step = "reuse address";
 #ifdef SO_REUSEPORT
-		if (!error) {
+		if (listens && !error) {
 			const int one = 1;
 			if (::setsockopt(receiver_.native_handle(), SOL_SOCKET, SO_REUSEPORT, &one, sizeof one))
 				error = asio::error_code(errno, asio::system_category()), step = "reuse port";
 		}
 #endif
-		if (!error)
+		if (listens && !error)
 			receiver_.bind(to, error), step = "bind";
-		if (!error && !wanted_.empty())
+		if (listens && !error)
 			join(group, error), step = "join";
 		if (!error)
 			sender_.open(to.protocol(), error), step = "open sender";
@@ -160,7 +161,7 @@ class Seeds {
 		if (error)
 			return fail(std::string(step) + ": " + error.message());
 		group_ = to;
-		if (!wanted_.empty())
+		if (listens)
 			receive();
 		if (!self_.services.empty()) {
 			datagram_ = encode_announcement(self_);

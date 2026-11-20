@@ -40,6 +40,8 @@ mutant_commit.MUTANTS = {
     # require: CI does not require multicast, so a broken platform reads as skipped
     "ci-skips": ("test/transport/seeds_test.cc", 'return std::getenv("CI") || std::getenv("CONSENSUS_SEEDS_REQUIRE");',
                  'return std::getenv("CONSENSUS_SEEDS_REQUIRE");'),
+    # forged (Linux, where SO_NOSIGPIPE is missing): the host does not ignore SIGPIPE
+    "sigpipe-default": ("test/transport/seeds_test.cc", "\tstd::signal(SIGPIPE, SIG_IGN);", "\t(void)0;"),
 }
 
 if __name__ == "__main__":

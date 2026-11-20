@@ -138,5 +138,8 @@ The threat model is the trusted cluster's: honest faults and the perimeter, not 
 Announcements in tests stay on the host (TTL 0) on loopback, or on the default interface where
 loopback carries no multicast; a host where neither works skips the cases with the reason. Where
 `CI` (GitHub Actions sets it, and the FreeBSD VM receives it) or `CONSENSUS_SEEDS_REQUIRE` is set,
-that is a failure, so CI never passes these cases by skipping them. `test/transport/seeds_mutants.py` seeds the
+that is a failure, so CI never passes these cases by skipping them. The `forged` cases dial over
+the transport's TLS, whose OpenSSL `write()` to a closed peer raises `SIGPIPE` where
+`SO_NOSIGPIPE` is missing (Linux): the test ignores it, the host's duty
+([host-connection.md](host-connection.md)), and raises one first to prove it. `test/transport/seeds_mutants.py` seeds the
 faults the tests must catch.

@@ -20,6 +20,7 @@
 #include <asio/io_context.hpp>
 #include <asio/ip/tcp.hpp>
 #include <cassert>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
@@ -403,6 +404,10 @@ task::task<NodeId> dial(Loop &loop, std::shared_ptr<asio::ssl::context> tls, con
 // With `rotate`, the forger first floods 256 senders from its one address, then sends a new
 // sender per datagram: the seed is the dial target, so neither skips the backoff or fills the set.
 void forged(bool rotate) {
+#ifndef SO_NOSIGPIPE
+	// A failed hello's write() to a closed peer raises SIGPIPE here: the host ignores it (main).
+	std::raise(SIGPIPE);
+#endif
 	Loop loop;
 	const auto port = run_port();
 	const auto cluster = identity('K');
@@ -724,6 +729,9 @@ int main(int argc, char **argv) {
 		std::fprintf(stderr, "usage: %s FIXTURE_DIR CASE\n", argv[0]);
 		return 2;
 	}
+#ifndef SO_NOSIGPIPE
+	std::signal(SIGPIPE, SIG_IGN);  // the host's duty where SO_NOSIGPIPE is missing (connection.h)
+#endif
 	fixture = argv[1];
 	const std::string name = argv[2];
 	if (name == "child") {

@@ -612,8 +612,10 @@ std::string sockets(std::initializer_list<std::uint16_t> ports) {
 }
 // Kernel stacks of a loop stuck in an uninterruptible kernel wait (macOS on a CI runner, or
 // GROUPS_PROBE_SPINDUMP naming the file): the first such sample starts `sudo -n spindump` on this
-// process for 3 s in the background and saves the kernel's symbols beside it; a failed run prints
-// the report's threads in write, a socket call or the sampler, kernel frames named.
+// process for 3 s in the background; a failed run prints the report's threads in write, a socket
+// call or the sampler. Kernel frames print raw, `kernel + 0xN` from the loaded kernel's base: a
+// runner's kernel exports too few symbols to name them (nearest-export names are wrong), so they are
+// symbolicated offline against the Kernel Debug Kit of the printed build and UUID (CI downloads none).
 class Spindump {
   public:
 	void start() {
@@ -623,12 +625,14 @@ class Spindump {
 			return;
 		started_ = true;
 		path_ = named && *named ? named : "spindump-upload-" + std::to_string(::getpid()) + ".txt";
-		const std::string command = "(sudo -n spindump " + std::to_string(::getpid()) + " 3 10 -o '" + path_ + "' > /dev/null 2>&1; nm -n " +
-									"/System/Library/Kernels/kernel > '" + path_ + ".nm' 2> /dev/null; touch '" + path_ + ".done') &";
+		// .build: the OS build; .text: the on-disk kernel's unslid __TEXT address.
+		const std::string command = "(sudo -n spindump " + std::to_string(::getpid()) + " 3 10 -o '" + path_ + "' > /dev/null 2>&1; sw_vers -buildVersion > '" +
+									path_ + ".build' 2> /dev/null; otool -l /System/Library/Kernels/kernel 2> /dev/null | awk '/segname __TEXT$/{f=1} f&&/vmaddr/{print $2; exit}' > '" +
+									path_ + ".text'; touch '" + path_ + ".done') &";
 		(void)std::system(command.c_str());
 #endif
 	}
-	// Waits up to 30 s for the report, then prints its threads that match.
+	// Waits up to 30 s for the report, then prints the build, the kernel's UUID, base and slide, and its threads that match.
 	void print() const {
 		if (!started_)
 			return;
@@ -639,10 +643,23 @@ class Spindump {
 			std::printf("upload: spindump %s: no report (sudo -n spindump failed)\n", path_.c_str());
 			return;
 		}
-		const auto symbols = kernel_symbols(path_ + ".nm");
-		std::printf("upload: spindump %s (%zu kernel symbols), the threads in write, a socket call or the sampler:\n", path_.c_str(),
-					symbols.size());
-		std::string line, block;
+		std::string line, block, image;
+		std::vector<std::string> lines;
+		while (std::getline(in, line)) {
+			if (image.empty() && line.find("kernel (") != std::string::npos && line.find("/System/Library/Kernels/kernel") != std::string::npos)
+				image = line;
+			lines.push_back(std::move(line));
+		}
+		const auto uuid = image.find('<') == std::string::npos ? std::string("unknown") : image.substr(image.find('<') + 1, image.find('>') - image.find('<') - 1);
+		const auto base = image.find("0x") == std::string::npos ? 0ull : std::strtoull(image.c_str() + image.find("0x"), nullptr, 16);
+		const auto unslid = std::strtoull(first_line(path_ + ".text").c_str(), nullptr, 16);
+		char slide[40] = "unknown";
+		if (base && unslid)
+			std::snprintf(slide, sizeof slide, "0x%llx", base - unslid);
+		std::printf("upload: spindump %s: kernel frames are raw (kernel + 0xN, N from the loaded base); symbolicate offline against the "
+					"Kernel Debug Kit for the OS build and UUID below (CI does not download it)\n"
+					"upload: kernel build %s uuid %s base 0x%llx slide %s unslid __TEXT 0x%llx\n",
+					path_.c_str(), first_line(path_ + ".build").c_str(), uuid.c_str(), base, slide, unslid);
 		int printed = 0;
 		const auto flush = [&] {
 			for (const char *mark : {"write", "flush", "getsockopt", "ioctl", "getsockname", "getpeername", "sockets("})
@@ -653,40 +670,35 @@ class Spindump {
 				}
 			block.clear();
 		};
-		while (std::getline(in, line)) {
-			if (line.rfind("  Thread 0x", 0) == 0)
+		for (const auto &l : lines) {
+			if (l.rfind("  Thread 0x", 0) == 0)
 				flush();
-			if (!block.empty() || line.rfind("  Thread 0x", 0) == 0)
-				block += named(line, symbols) + "\n";
+			if (!block.empty() || l.rfind("  Thread 0x", 0) == 0)
+				block += raw(l) + "\n";
 		}
 		flush();
 	}
 
   private:
-	using Symbols = std::vector<std::pair<std::uint64_t, std::string>>;
-	// `nm -n` of the kernel: address-sorted text symbols.
-	static Symbols kernel_symbols(const std::string &path) {
-		Symbols r;
+	static std::string first_line(const std::string &path) {
 		std::ifstream in(path);
-		std::string address, type, name;
-		while (in >> address >> type >> name)
-			if (type == "T" || type == "t")
-				r.emplace_back(std::strtoull(address.c_str(), nullptr, 16), name);
+		std::string r;
+		std::getline(in, r);
 		return r;
 	}
-	// A kernel frame, "??? (kernel + N) [0xADDRESS]", with the symbol at or below its address.
-	static std::string named(const std::string &line, const Symbols &symbols) {
-		const auto at = line.find("??? (kernel + "), bracket = line.find("[0x");
-		if (at == std::string::npos || bracket == std::string::npos || symbols.empty())
+	// "??? (kernel + N) [0xADDRESS]" as "kernel + 0xN [0xADDRESS]".
+	static std::string raw(const std::string &line) {
+		static const std::string mark = "??? (kernel + ";
+		const auto at = line.find(mark);
+		if (at == std::string::npos)
 			return line;
-		const std::uint64_t address = std::strtoull(line.c_str() + bracket + 1, nullptr, 16);
-		auto it = std::upper_bound(symbols.begin(), symbols.end(), address, [](std::uint64_t a, const auto &s) { return a < s.first; });
-		if (it == symbols.begin())
+		char *end = nullptr;
+		const auto offset = std::strtoull(line.c_str() + at + mark.size(), &end, 10);
+		if (*end != ')')
 			return line;
-		--it;
-		char offset[24];
-		std::snprintf(offset, sizeof offset, "+0x%llx", (unsigned long long)(address - it->first));
-		return line.substr(0, at) + it->second + offset + line.substr(at + 3);
+		char hex[40];
+		std::snprintf(hex, sizeof hex, "kernel + 0x%llx", offset);
+		return line.substr(0, at) + hex + (end + 1);
 	}
 	bool started_ = false;
 	std::string path_;

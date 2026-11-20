@@ -21,8 +21,9 @@
  */
 
 // Driver::close(id) on a row that is open, fenced, half-opened (opened, never created) or
-// unknown: it completes, the Driver erases the row and returns its bytes, and the id opens
-// again. `driver_close_test [case]`; no case runs them all.
+// unknown: it completes, the Driver erases the row and returns its bytes, the Worker hands its
+// group back to the host (closed into its table or released), and the id recovers again in the
+// same live Host. `driver_close_test [case]`; no case runs them all.
 #include "consensus/driver.h"
 #include "journal/memory_io.h"
 
@@ -33,6 +34,7 @@
 #include <iostream>
 #include <map>
 #include <new>
+#include <random>
 #include <span>
 #include <string>
 #include <vector>
@@ -42,6 +44,7 @@ namespace j = kronuz::journal;
 namespace jt = kronuz::journal::testing;
 
 // Live heap bytes, counted at the allocation and the sized free, each block carrying its size.
+// A block allocated in an Uncounted scope (a test disk's own) carries a mark and never counts.
 // Single-threaded: the loop is an inline scheduler. TSan's runtime defines operator new, so
 // there the count is off and the bytes case only reports.
 #if defined(__SANITIZE_THREAD__)
@@ -57,24 +60,34 @@ namespace jt = kronuz::journal::testing;
 #if COUNT_BYTES
 namespace {
 std::size_t live_bytes = 0;
-constexpr std::size_t header = alignof(std::max_align_t);
+bool uncounted = false;
+constexpr std::size_t header = alignof(std::max_align_t), mark = ~(~std::size_t(0) >> 1);
 }
 void* operator new(std::size_t n) {
 	void* raw = std::malloc(n + header);
 	if (!raw) { throw std::bad_alloc(); }
-	*static_cast<std::size_t*>(raw) = n; live_bytes += n;
+	*static_cast<std::size_t*>(raw) = uncounted ? n | mark : n;
+	if (!uncounted) { live_bytes += n; }
 	return static_cast<char*>(raw) + header;
 }
 void operator delete(void* p) noexcept {
 	if (!p) { return; }
 	void* raw = static_cast<char*>(p) - header;
-	live_bytes -= *static_cast<std::size_t*>(raw);
+	const auto size = *static_cast<std::size_t*>(raw);
+	if (!(size & mark)) { live_bytes -= size; }
 	std::free(raw);
 }
 void operator delete(void* p, std::size_t) noexcept { operator delete(p); }
 #else
-namespace { std::size_t live_bytes = 0; }
+namespace { std::size_t live_bytes = 0; bool uncounted = false; }
 #endif
+namespace {
+struct Uncounted {
+	bool was = uncounted;
+	Uncounted() { uncounted = true; }
+	~Uncounted() { uncounted = was; }
+};
+}
 
 namespace {
 
@@ -101,9 +114,16 @@ GroupOptions options(std::vector<NodeId> voters, NodeId local = 1) {
 struct Sink {
 	std::size_t fenced = 0;
 	std::map<GroupId, Index> committed;  // each group's last committed index
+	std::map<GroupId, std::vector<std::string>> commands;  // each group's committed commands, in order
 	std::function<void(GroupId)> on_fenced;  // a Sink may call the Driver's plain calls
+	std::function<void(GroupId)> on_committed;
 	void operator()(GroupId, Send) {}
-	void operator()(GroupId g, Committed c) { if (!c.entries.empty()) { committed[g] = c.entries.back().index; } }
+	void operator()(GroupId g, Committed c) {
+		if (on_committed) { on_committed(g); }
+		if (c.entries.empty()) { return; }
+		committed[g] = c.entries.back().index;
+		for (auto& e : c.entries) { if (e.kind == EntryKind::Command) { commands[g].push_back(std::move(e.payload)); } }
+	}
 	void operator()(GroupId, RoleChanged) {}
 	void operator()(GroupId, ActivateInstall) {}
 	void operator()(GroupId, CheckpointPublished) {}
@@ -115,6 +135,81 @@ struct Sink {
 };
 static_assert(sink<Sink>);
 
+// A flat in-memory directory whose own allocations never count: a host's files are on disk,
+// not in its heap. No power-loss model, and every operation is O(log names).
+class HeapIO final : public j::IO {
+	struct Data { std::string bytes; };
+	class File final : public j::File {
+	public:
+		explicit File(std::shared_ptr<Data> data) : data_(std::move(data)) {}
+		std::uint64_t size() override { return data_->bytes.size(); }
+		std::size_t read_at(std::uint64_t offset, std::span<char> bytes) override {
+			if (offset >= data_->bytes.size()) { return 0; }
+			const auto n = std::min<std::size_t>(bytes.size(), data_->bytes.size() - offset);
+			std::copy_n(data_->bytes.data() + offset, n, bytes.data()); return n;
+		}
+		std::size_t write_at(std::uint64_t offset, std::string_view bytes) override {
+			Uncounted scope;
+			if (data_->bytes.size() < offset + bytes.size()) { data_->bytes.resize(offset + bytes.size(), '\0'); }
+			data_->bytes.replace(offset, bytes.size(), bytes); return bytes.size();
+		}
+		void truncate(std::uint64_t size) override { Uncounted scope; data_->bytes.resize(size, '\0'); }
+		void sync() override {}
+	private:
+		std::shared_ptr<Data> data_;
+	};
+	class Cursor final : public j::DirectoryCursor {
+	public:
+		explicit Cursor(std::vector<std::string> names) : names_(std::move(names)) {}
+		std::optional<std::string> next() override { Uncounted scope; if (at_ == names_.size()) { return std::nullopt; } return names_[at_++]; }
+	private:
+		std::vector<std::string> names_; std::size_t at_ = 0;
+	};
+	std::map<std::string, std::shared_ptr<Data>, std::less<>> names_;
+	std::unique_ptr<j::File> open(std::string_view name, bool required) {
+		Uncounted scope;
+		auto found = names_.find(name);
+		if (found == names_.end()) { if (required) { throw std::runtime_error("no such file"); } return nullptr; }
+		return std::make_unique<File>(found->second);
+	}
+public:
+	~HeapIO() override { Uncounted scope; names_.clear(); }
+	std::unique_ptr<j::OwnerLock> acquire_owner(bool) override { Uncounted scope; return std::make_unique<j::OwnerLock>(); }
+	std::unique_ptr<j::File> open_existing(std::string_view name) override { return open(name, true); }
+	std::unique_ptr<j::File> open_existing_read_only(std::string_view name) override { return open(name, true); }
+	std::unique_ptr<j::File> open_reclaim_candidate_read_only(std::string_view name) override { return open(name, false); }
+	void open_existing_read_only_into(std::string_view, j::File&) override { throw std::logic_error("reusable file open unsupported"); }
+	bool open_reclaim_candidate_read_only_into(std::string_view, j::File&) override { throw std::logic_error("reusable candidate open unsupported"); }
+	std::unique_ptr<j::File> create_exclusive(std::string_view name) override {
+		Uncounted scope;
+		auto [at, fresh] = names_.try_emplace(std::string(name), std::make_shared<Data>());
+		if (!fresh) { throw std::runtime_error("file exists"); }
+		return std::make_unique<File>(at->second);
+	}
+	void replace(std::string_view source, std::string_view destination) override {
+		Uncounted scope;
+		auto found = names_.find(source);
+		if (found == names_.end()) { throw std::runtime_error("no such file"); }
+		auto data = found->second; names_.erase(found); names_[std::string(destination)] = std::move(data);
+	}
+	void remove(std::string_view name) override { Uncounted scope; if (auto found = names_.find(name); found != names_.end()) { names_.erase(found); } }
+	std::unique_ptr<j::DirectoryCursor> scan_directory() override {
+		Uncounted scope;
+		std::vector<std::string> names;
+		for (const auto& [name, data] : names_) { names.push_back(name); }
+		return std::make_unique<Cursor>(std::move(names));
+	}
+	std::optional<j::EntryFootprint> entry_footprint(std::string_view name) override {
+		auto found = names_.find(name);
+		if (found == names_.end()) { return std::nullopt; }
+		j::EntryFootprint footprint; footprint.kind = j::EntryKind::Regular; footprint.logical_bytes = found->second->bytes.size();
+		return footprint;
+	}
+	void sync_directory() override {}
+protected:
+	std::unique_ptr<j::OwnerLock> lock_owner(const j::OwnerLockOptions&) override { Uncounted scope; return std::make_unique<j::OwnerLock>(); }
+};
+
 // One host and one loop on an inline_scheduler; the Worker's IO and the turns go through
 // InlineCompletion, or through a HeldCompletion the case completes by hand.
 struct Loop {
@@ -125,16 +220,17 @@ struct Loop {
 	std::unique_ptr<j::Host> host;
 	Sink sink;
 	std::unique_ptr<Driver<Sink>> driver;
-	task::cancel_source stop;
+	task::cancel_source stop, driver_stop;  // the turn driver's run, the Driver's
 	bool turns_done = false, driver_done = false;
-	explicit Loop(jt::Disk& d, bool hold = false) : disk(d) {
-		host = std::make_unique<j::Host>(std::make_shared<jt::MemoryIO>(disk, "host/"), host_identity, j::HostOptions{1, turn_options});
+	explicit Loop(jt::Disk& d, bool hold = false, std::shared_ptr<j::IO> storage = {}) : disk(d) {
+		if (!storage) { storage = std::make_shared<jt::MemoryIO>(disk, "host/"); }
+		host = std::make_unique<j::Host>(std::move(storage), host_identity, j::HostOptions{1, turn_options});
 		auto io = hold ? j::completion_ref::of(held) : j::completion_ref::of(inline_io);
 		driver = std::make_unique<Driver<Sink>>(Seams{task::scheduler_ref::of(scheduler), io, *host, 0, 7}, sink);
 		auto ref = task::scheduler_ref::of(scheduler);
 		auto turns = hold ? j::completion_ref::of(held) : j::completion_ref::of(inline_io);
 		task::spawn(ref, host->driver(0).run(turns, stop.token()), [this](std::exception_ptr) { turns_done = true; });
-		task::spawn(ref, driver->run(stop.token()), [this](std::exception_ptr) { driver_done = true; });
+		task::spawn(ref, driver->run(driver_stop.token()), [this](std::exception_ptr) { driver_done = true; });
 		run();
 	}
 	~Loop() { finish(); }
@@ -151,11 +247,13 @@ struct Loop {
 	}
 	void finish() {
 		if (!driver) { return; }
-		stop.request(task::cancel_reason::shutdown);
+		shutdown();
 		release();
 		check(turns_done && driver_done, "the turn driver's and the Driver's runs end at shutdown");
 		driver.reset(); host.reset();
 	}
+	// Stops both runs, the turn driver's first, as one shared token would.
+	void shutdown() { stop.request(task::cancel_reason::shutdown); driver_stop.request(task::cancel_reason::shutdown); }
 	void release() {
 		run();
 		for (int n = 0; held.held(); ++n) {
@@ -195,13 +293,40 @@ struct Loop {
 	}
 	// close(g) to completion: whether it completed, and how.
 	bool close(GroupId g, std::exception_ptr& error) { return settle(driver->close(g), error); }
+	// Applies everything committed to g.
+	void apply(GroupId g) {
+		for (Index done = 0; sink.committed[g] > done;) { done = sink.committed[g]; driver->applied(g, Applied{done}); release(); }
+	}
+	// A proposal placed and committed.
+	std::optional<Placement> propose(GroupId g, const std::string& command) {
+		auto call = start(driver->propose(g, command));
+		release();
+		check(call->done && !call->error && call->value, "placed " + command + ": " + what(call->error));
+		return call->value;
+	}
+	// Recovers g in this live Host: the application image its checkpoint restores (empty
+	// without one); its commands after the image reach the Sink as they commit.
+	std::string recover(GroupId g, std::exception_ptr& error, GroupOptions o) {
+		std::string image;
+		driver->open(g, std::move(o));
+		sink.commands.erase(g); sink.committed.erase(g);
+		auto restore = [&image](j::ArtifactReader& reader) {
+			image.assign(static_cast<std::size_t>(reader.descriptor().length), '\0');
+			for (std::size_t at = 0; at < image.size();) { at += reader.read_at(at, std::span<char>(image.data() + at, image.size() - at)); }
+		};
+		if (!settle(driver->recover(g, restore), error)) { check(false, "recover completes"); }
+		release();
+		return image;
+	}
+	static std::string what(std::exception_ptr error);
 };
 
-std::string what(std::exception_ptr error) {
+std::string Loop::what(std::exception_ptr error) {
 	if (!error) { return "no error"; }
 	try { std::rethrow_exception(error); } catch (const std::exception& e) { return e.what(); } catch (...) {}
 	return "unknown";
 }
+std::string what(std::exception_ptr error) { return Loop::what(error); }
 template <class E> bool is(std::exception_ptr error) {
 	if (!error) { return false; }
 	try { std::rethrow_exception(error); } catch (const E&) { return true; } catch (...) {}
@@ -226,7 +351,6 @@ void fenced_row() {
 	check(refused->done && is<closed>(refused->error), "a call on the erased id completes with closed");
 	loop.driver->open(g, options({1}));
 	check(loop.driver->groups() == 1, "the id opens again");
-	// The host refuses a second recover of an id until it reopens: a journal guard, not Driver state.
 	check(loop.close(g, error) && !error && loop.driver->groups() == 0, "and closes again");
 }
 
@@ -357,7 +481,7 @@ void shutdown_idles() {
 	auto& turns = loop.host->driver(0);
 	const auto durable = turns.sequence(g);
 	check(turns.staged(g), "the proposal's record is staged");
-	loop.stop.request(task::cancel_reason::shutdown);
+	loop.shutdown();
 	if (!loop.run_bounded(20'000)) { check(false, "the loop idles after shutdown with the barrier pending"); std::cout << checks << " driver close checks, " << failures << " failures\n"; std::exit(1); }
 	check(loop.driver->in_flight() > 0 && !loop.driver_done, "the loop waits for the IO");
 	loop.release();
@@ -384,7 +508,7 @@ void shutdown_ends() {
 	check(loop.settle(loop.driver->create(g, j::Identity{'T', 'V'}), error) && !error, "the two-voter group is created: " + what(error));
 	auto checkpoint = loop.start(loop.driver->checkpoint(h, 1 << 20, Capture{std::string(1000, 'y'), 0, placed->value->index, placed->value->term}));
 	check(!checkpoint->done && loop.held.held() > 0, "another group's IO is held");
-	loop.stop.request(task::cancel_reason::shutdown);
+	loop.shutdown();
 	check(loop.run_bounded(20'000) && loop.turns_done && !loop.driver_done, "the turn driver returns; the Driver waits for the IO");
 	auto& turns = loop.host->driver(0);
 	const auto durable = turns.sequence(g);
@@ -396,6 +520,21 @@ void shutdown_ends() {
 	if (!loop.driver_done) { check(false, "the Driver's run ends once the IO lands: in_flight " + std::to_string(loop.driver->in_flight())); std::cout << checks << " driver close checks, " << failures << " failures\n"; std::exit(1); }
 	check(loop.driver->in_flight() == 0, "no IO in flight");
 	check(turns.staged(g) && turns.sequence(g) == durable, "the record stays staged, reported not durable");
+}
+
+// The Host's per-loop range table keeps an expired entry per view a closed row held until it
+// doubles since its last sweep (journal host.h, Ranges): spare ids from `first`, each opened
+// and closed once, grow it to that size, and the first open whose sweep returns the rows'
+// entries ends it. What is left after is what the rows keep.
+void sweep_ranges(Loop& loop, GroupId first, std::size_t rows) {
+	std::exception_ptr error;
+	for (GroupId spare = first; spare < first + 4 * rows + 64; ++spare) {  // past twice the most rows it held
+		const auto before = live_bytes;
+		loop.driver->open(spare, options({1}));
+		if (!loop.close(spare, error) || error) { check(false, "the sweeping row closes: " + what(error)); return; }
+		if (live_bytes + rows * 64 < before) { return; }
+	}
+	check(!COUNT_BYTES, "the range table sweeps");
 }
 
 // A3: 10,000 rows opened and closed leave the Driver's heap where it was.
@@ -415,13 +554,10 @@ void bytes() {
 		if (!closing->done || closing->error) { check(false, "close " + std::to_string(g) + " completes: " + what(closing->error)); break; }
 	}
 	check(loop.driver->groups() == 0, "no row held after the closes");
-	// The Host keeps an expired weak entry per group it handed an IO, until its next group_io
-	// call purges them: opening one more row is that call.
 	const auto unpurged = live_bytes;
-	loop.driver->open(rows + 1, options({1}));
-	check(loop.close(rows + 1, error) && !error, "the purging row closes");
+	sweep_ranges(loop, rows + 1, rows);
 	const auto after = live_bytes;
-	std::printf("per row: %zu bytes held open, %zu left after close before the Host's purge, %zu after\n", (opened - before) / std::size_t(rows),
+	std::printf("per row: %zu bytes held open, %zu left after close before the Host's range sweep, %zu after\n", (opened - before) / std::size_t(rows),
 		unpurged > before ? (unpurged - before) / std::size_t(rows) : std::size_t(0), after > before ? (after - before) / std::size_t(rows) : std::size_t(0));
 	// What stays is the row table's bucket array, which an unordered_map never shrinks: a pointer a row.
 	check(!COUNT_BYTES || after <= before + rows * sizeof(void*) * 2, "closed rows return their bytes: " + std::to_string(after) + " against " + std::to_string(before));
@@ -468,6 +604,401 @@ void created_pass(GroupId rows, int proposals) {
 }
 void created_bytes() { created_pass(2000, 0); created_pass(2000, 10); }
 
+// A row's application image: its applied commands, each ended by a newline.
+std::string join(const std::vector<std::string>& commands) {
+	std::string image;
+	for (const auto& c : commands) { image += c; image += '\n'; }
+	return image;
+}
+std::vector<std::string> split(const std::string& image) {
+	std::vector<std::string> commands;
+	for (std::size_t at = 0, end; (end = image.find('\n', at)) != std::string::npos; at = end + 1) { commands.push_back(image.substr(at, end - at)); }
+	return commands;
+}
+bool prefix(const std::vector<std::string>& shorter, const std::vector<std::string>& longer) {
+	return shorter.size() <= longer.size() && std::equal(shorter.begin(), shorter.end(), longer.begin());
+}
+// A checkpoint of g's applied commands at its last committed entry, the leader's term.
+task::task<CheckpointPublished> checkpoint_of(Loop& loop, GroupId g, const std::vector<std::string>& applied) {
+	const auto state = loop.driver->state(g);
+	return loop.driver->checkpoint(g, 1 << 20, Capture{join(applied), 0, loop.sink.committed[g], state ? state->term : 0});
+}
+// The commands a recovered row holds: its image's, then those committed after it.
+std::vector<std::string> recovered(Loop& loop, GroupId g, const std::string& image) {
+	auto state = split(image);
+	for (const auto& c : loop.sink.commands[g]) { state.push_back(c); }
+	return state;
+}
+
+// A1: a row closes and recovers through the Driver in the same live Host: clean with its
+// checkpoint last (closed into the host's table), clean with a record staged at close and
+// fenced, with records committed and with one staged (each released). Each recovery holds
+// every acknowledged record and nothing unattempted.
+void reopen_rows() {
+	constexpr GroupId g = 81;
+	jt::Disk disk; Loop loop(disk, true);
+	auto& turns = loop.host->driver(0);
+	std::vector<std::string> acknowledged, attempted;
+	std::exception_ptr error;
+	auto place = [&](const std::string& c) { attempted.push_back(c); if (loop.propose(g, c)) { acknowledged.push_back(c); } };
+	auto reopen = [&](const std::string& how, bool table) {
+		check(loop.driver->groups() == 0, how + ": the row is erased");
+		check((loop.host->status(g) == j::GroupStatus::closed) == table, how + (table ? ": closed into the host's table" : ": released, not closed into the table"));
+		check(table || turns.parked(g), how + ": the released group is parked");
+		const auto image = loop.recover(g, error, options({1}));
+		check(!error, how + ": recovers in the live Host: " + what(error));
+		loop.apply(g);
+		const auto state = recovered(loop, g, image);
+		check(prefix(acknowledged, state) && prefix(state, attempted), how + ": recovers every acknowledged record and nothing unattempted: " + join(state));
+		check(loop.driver->state(g) && loop.driver->state(g)->role == Role::Leader, how + ": and leads");
+		attempted = acknowledged = state;
+	};
+	loop.lone(g);
+	// Clean, committed: the checkpoint covers every record.
+	place("a"); place("b"); loop.apply(g);
+	auto published = loop.start(checkpoint_of(loop, g, acknowledged));
+	loop.release();
+	check(published->done && !published->error, "the checkpoint publishes: " + what(published->error));
+	check(loop.close(g, error) && !error, "clean close: " + what(error));
+	reopen("clean, committed", true);
+	// Clean, staged: a record staged at close, after the checkpoint.
+	place("c"); loop.apply(g);
+	attempted.push_back("d");
+	auto staged = loop.start(loop.driver->propose(g, "d"));
+	check(!staged->done && turns.staged(g), "d is staged");
+	auto closing = loop.start(loop.driver->close(g));
+	loop.release();
+	check(staged->done && !staged->error, "the staged record is placed: " + what(staged->error));
+	if (staged->done && !staged->error) { acknowledged.push_back("d"); }
+	check(closing->done && !closing->error, "close with a staged record: " + what(closing->error));
+	reopen("clean, staged", false);
+	// Fenced, committed.
+	place("e"); loop.apply(g);
+	loop.driver->application_failed(g, loop.sink.committed[g], "the application failed"); loop.release();
+	check(loop.close(g, error) && !error, "fenced close: " + what(error));
+	reopen("fenced, committed", false);
+	// Fenced, staged: the staged record's caller hears fenced; its record may be durable.
+	place("f"); loop.apply(g);
+	attempted.push_back("g");
+	staged = loop.start(loop.driver->propose(g, "g"));
+	check(!staged->done && turns.staged(g), "g is staged");
+	loop.driver->application_failed(g, loop.sink.committed[g], "the application failed"); loop.run();
+	closing = loop.start(loop.driver->close(g));
+	loop.release();
+	check(closing->done && !closing->error, "fenced close with a staged record: " + what(closing->error));
+	reopen("fenced, staged", false);
+	// And the recovered row still checkpoints and closes into the table.
+	place("h"); loop.apply(g);
+	published = loop.start(checkpoint_of(loop, g, acknowledged));
+	loop.release();
+	check(published->done && !published->error && loop.close(g, error) && !error, "a recovered row checkpoints and closes: " + what(error));
+	reopen("clean again", true);
+}
+
+// A2: 10,000 created rows, each with a record and a checkpoint covering it, opened together and
+// closed: the process heap per row (HeapIO's files left out) returns to its pre-open value,
+// the Driver's and the journal's alike. Then 10,000 rows closed with a record after their
+// checkpoint, which the host releases: each is parked, and what that keeps is reported.
+void closed_bytes() {
+	const char* scale = std::getenv("CLOSE_BYTES_ROWS");  // another count, for timing
+	const GroupId rows = scale ? std::stoull(scale) : 10'000;
+	jt::Disk unused; Loop loop(unused, false, std::make_shared<HeapIO>());
+	std::exception_ptr error;
+	auto process = [] { return live_bytes; };
+	auto open = [&](GroupId g, bool covered) {
+		loop.lone(g);
+		loop.propose(g, "p"); loop.apply(g);
+		auto published = loop.start(checkpoint_of(loop, g, {"p"}));
+		loop.run();
+		if (!published->done || published->error) { check(false, "checkpoint " + std::to_string(g) + ": " + what(published->error)); }
+		if (!covered) { loop.propose(g, "q"); }
+	};
+	// The test's Sink keeps what it heard per row: dropped with the row, it is not the library's.
+	auto close = [&](GroupId g) {
+		if (!loop.close(g, error) || error) { check(false, "close " + std::to_string(g) + ": " + what(error)); }
+		loop.sink.committed.erase(g); loop.sink.commands.erase(g);
+	};
+	open(1, true); close(1);  // one warm round
+	auto per = [&](std::size_t now, std::size_t from) { return double(now) / double(rows) - double(from) / double(rows); };
+	// A pass opens `rows` covered rows from `first` together, then closes them: the heap open,
+	// after close, and after the Host's range table sweeps.
+	auto pass = [&](GroupId first, GroupId spare) {
+		const auto from = process();
+		for (GroupId g = first; g < first + rows; ++g) { open(g, true); }
+		const auto opened = process();
+		for (GroupId g = first; g < first + rows; ++g) { close(g); }
+		const auto unswept = process();
+		sweep_ranges(loop, spare, rows);
+		const auto closed = process();
+		std::size_t table = 0;
+		for (GroupId g = first; g < first + rows; ++g) { table += loop.host->status(g) == j::GroupStatus::closed; }
+		check(table == rows && loop.driver->groups() == 0, "every covered row closes into the host's table: " + std::to_string(table));
+		std::printf("closed_bytes: %u covered rows from %u, process heap per row: %.1f B open, %.1f B after close before the Host's range sweep, %.1f B after\n",
+			unsigned(rows), unsigned(first), per(opened, from), per(unswept, from), per(closed, from));
+		return closed;
+	};
+	const auto before = process();
+	const auto first = pass(2, 10 * rows);
+	// What the first pass keeps is capacity: the Driver's row table's bucket array, which an
+	// unordered_map sizes to its most rows and never shrinks. A second pass adds nothing.
+	check(!COUNT_BYTES || first <= before + rows * sizeof(void*) * 3, "closed rows return the heap: " + std::to_string(first) + " B against " + std::to_string(before) + " B before");
+	const auto second = pass(2 + rows, 11 * rows);
+	check(!COUNT_BYTES || second <= first + rows, "a second pass of closed rows keeps nothing more: " + std::to_string(second) + " B against " + std::to_string(first) + " B");
+	const auto released_before = process();
+	for (GroupId g = 2 + 2 * rows; g < 2 + 3 * rows; ++g) { open(g, false); }
+	for (GroupId g = 2 + 2 * rows; g < 2 + 3 * rows; ++g) { close(g); }
+	sweep_ranges(loop, 20 * rows, rows);
+	const auto released = process();
+	std::size_t parked = 0;
+	for (GroupId g = 2 + 2 * rows; g < 2 + 3 * rows; ++g) { parked += loop.host->driver(0).parked(g); }
+	check(parked == rows, "every row with a record after its checkpoint is released and parked: " + std::to_string(parked));
+	std::printf("closed_bytes: %u released rows, process heap per row after close: %.1f B\n", unsigned(rows), per(released, released_before));
+}
+
+// A3: power cuts at every IO of a close-then-recover cycle, per seed. Rounds place a record and
+// then fence and close the row, close it with records after its checkpoint, checkpoint and
+// close it into the table, or go on; each close recovers the row in the live Host. After the
+// cut, a new Host recovers every acknowledged record and nothing unattempted: none lost, none
+// that a table close dropped replayed again.
+std::uint64_t crash_tables = 0, crash_releases = 0;  // the closes a sweep's runs completed, by kind
+bool close_crash_run(std::uint64_t seed, std::uint64_t cut) {
+	constexpr GroupId g = 91;
+	jt::Disk disk; disk.random.seed(seed * 7919 + cut);
+	std::vector<std::string> acknowledged, attempted;
+	std::mt19937_64 random(seed);
+	bool reached = false;
+	const auto at = "seed " + std::to_string(seed) + " cut " + std::to_string(cut);
+	std::vector<std::function<bool()>> calls;  // whether each call the run started completed
+	auto track = [&](auto call) { calls.push_back([call] { return call->done; }); return call; };
+	{
+		Loop loop(disk);
+		loop.lone(g);
+		std::exception_ptr error;
+		disk.cut = disk.operations + cut;
+		auto ok = [&](std::shared_ptr<Loop::Started<bool>> call) { loop.release(); return call->done && !call->error; };
+		bool alive = true;
+		for (unsigned round = 0; round < 6 && alive; ++round) {
+			const auto c = "r" + std::to_string(round);
+			attempted.push_back(c);
+			auto placed = track(loop.start(loop.driver->propose(g, c))); loop.release();
+			if (!placed->done || placed->error) { alive = false; break; }
+			acknowledged = attempted;
+			const auto action = random() % 4;
+			if (action == 3) { continue; }
+			if (action == 0) { loop.driver->application_failed(g, loop.sink.committed[g], "fenced by the sweep"); loop.release(); }
+			if (action == 2) {
+				loop.apply(g);
+				auto published = track(loop.start(checkpoint_of(loop, g, acknowledged))); loop.release();
+				if (!published->done || published->error) { alive = false; break; }
+			}
+			if (!ok(track(loop.start(loop.driver->close(g))))) { alive = false; break; }
+			++(loop.host->status(g) == j::GroupStatus::closed ? crash_tables : crash_releases);
+			const auto image = loop.recover(g, error, options({1}));
+			loop.apply(g);
+			// Without power nothing commits after the recover, so the state shows only before the cut.
+			if (error || disk.dead()) { alive = false; break; }
+			const auto state = recovered(loop, g, image);
+			check(state == attempted, "a recover in the live Host holds every attempted record: " + at + " " + join(state));
+		}
+		reached = alive && !disk.dead();
+		if (!reached && !disk.dead()) { check(false, "the run failed before its power cut: " + at); }
+	}
+	// The cut may end the Driver's loop by a throw: its callers still complete, none suspended.
+	check(std::all_of(calls.begin(), calls.end(), [](const auto& done) { return done(); }), "every call completes once the loop ends: " + at);
+	disk.power_loss();
+	Loop again(disk);
+	if (again.host->status(g) != j::GroupStatus::none) {
+		std::exception_ptr error;
+		const auto image = again.recover(g, error, options({1}));
+		check(!error, "recovery after the cut: " + at + ": " + what(error));
+		again.apply(g);
+		const auto state = recovered(again, g, image);
+		check(prefix(acknowledged, state) && prefix(state, attempted), "recovery keeps every acknowledged record and nothing unattempted: " + at + " recovered " + join(state) + "acknowledged " + join(acknowledged));
+	} else { check(acknowledged.empty(), "a row with acknowledged records is in the host's table: " + at); }
+	return reached;
+}
+void close_crash() {
+	const char* count = std::getenv("CLOSE_CRASH_SEEDS");
+	const std::uint64_t seeds = count ? std::stoull(count) : 8;
+	std::uint64_t runs = 0;
+	for (std::uint64_t seed = 1; seed <= seeds; ++seed) {
+		for (std::uint64_t cut = 1; !close_crash_run(seed, cut); ++cut) { ++runs; if (failures) { return; } }
+	}
+	std::printf("close_crash: %u seeds, %u power cuts; %u closes into the table, %u releases\n", unsigned(seeds), unsigned(runs), unsigned(crash_tables), unsigned(crash_releases));
+	check(crash_tables && crash_releases, "the sweep closes rows both ways");
+}
+
+// A MemoryIO whose directory sync fails once, the n-th after `fail_sync` is armed.
+class FlakyIO final : public j::IO {
+public:
+	explicit FlakyIO(jt::Disk& disk) : backend(disk, "host/") {}
+	jt::MemoryIO backend;
+	int fail_sync = 0, failed_syncs = 0;
+	std::unique_ptr<j::OwnerLock> acquire_owner(bool create) override { return backend.acquire_owner(create); }
+	std::unique_ptr<j::File> open_existing(std::string_view n) override { return backend.open_existing(n); }
+	std::unique_ptr<j::File> open_existing_read_only(std::string_view n) override { return backend.open_existing_read_only(n); }
+	std::unique_ptr<j::File> open_reclaim_candidate_read_only(std::string_view n) override { return backend.open_reclaim_candidate_read_only(n); }
+	void open_existing_read_only_into(std::string_view n, j::File& d) override { backend.open_existing_read_only_into(n, d); }
+	bool open_reclaim_candidate_read_only_into(std::string_view n, j::File& d) override { return backend.open_reclaim_candidate_read_only_into(n, d); }
+	std::unique_ptr<j::File> create_exclusive(std::string_view n) override { return backend.create_exclusive(n); }
+	void replace(std::string_view s, std::string_view d) override { backend.replace(s, d); }
+	void remove(std::string_view n) override { backend.remove(n); }
+	std::unique_ptr<j::DirectoryCursor> scan_directory() override { return backend.scan_directory(); }
+	std::optional<j::EntryFootprint> entry_footprint(std::string_view n) override { return backend.entry_footprint(n); }
+	void sync_directory() override {
+		if (fail_sync && --fail_sync == 0) { ++failed_syncs; throw std::runtime_error("injected directory sync failure"); }
+		backend.sync_directory();
+	}
+protected:
+	std::unique_ptr<j::OwnerLock> lock_owner(const j::OwnerLockOptions&) override { return std::make_unique<j::OwnerLock>(); }
+};
+
+// F2: a close whose table commit fails after the shard file was replaced (its directory sync
+// throws) fences the Store, which releases the group. The table may hold the group closed, so
+// recover and create refuse the id in this live Host with close_in_doubt (the host's mark).
+// After a later
+// directory sync and a power cut, the restarted host resolves it from the disk: closed, and
+// it recovers every acknowledged record. Without the refusal, a record acknowledged after the
+// failed close is lost.
+void failed_close() {
+	constexpr GroupId g = 71;
+	jt::Disk disk; disk.random.seed(1);
+	std::vector<std::string> acknowledged, attempted;
+	{
+		auto io = std::make_shared<FlakyIO>(disk);
+		Loop loop(disk, false, io);
+		std::exception_ptr error;
+		loop.lone(g);
+		attempted.push_back("a");
+		if (loop.propose(g, "a")) { acknowledged.push_back("a"); }
+		loop.apply(g);
+		auto published = loop.start(checkpoint_of(loop, g, acknowledged));
+		loop.release();
+		check(published->done && !published->error, "the checkpoint publishes: " + what(published->error));
+		io->fail_sync = 1;
+		check(loop.close(g, error) && !error, "close completes when its table commit fails: " + what(error));
+		check(io->failed_syncs == 1, "the table commit's directory sync failed");
+		check(loop.driver->groups() == 0, "the row is erased");
+		check(loop.host->driver(0).parked(g), "the fenced Store released the group: parked");
+		loop.recover(g, error, options({1}));
+		check(is<close_in_doubt>(error), "a live recover of the id refuses with close_in_doubt: " + what(error));
+		if (!error) {  // the reopen the refusal stops: a record acknowledged past the closed base
+			loop.apply(g);
+			attempted.push_back("x");
+			if (loop.propose(g, "x")) { acknowledged.push_back("x"); }
+			loop.apply(g);
+		} else {
+			check(loop.close(g, error) && !error && loop.driver->groups() == 0, "the refused row closes: " + what(error));
+			loop.driver->open(g, options({1}));
+			check(loop.settle(loop.driver->create(g, j::Identity{'F', 'C'}), error) && is<close_in_doubt>(error), "a live create of the id refuses with close_in_doubt: " + what(error));
+			check(loop.close(g, error) && !error && loop.driver->groups() == 0, "the refused row closes: " + what(error));
+		}
+		io->backend.sync_directory();  // any later directory sync: another group's create, a segment
+		loop.release();
+	}
+	disk.power_loss();
+	Loop again(disk);
+	check(again.host->status(g) == j::GroupStatus::closed, "the restarted host holds the group closed, as its file does");
+	std::exception_ptr error;
+	const auto image = again.recover(g, error, options({1}));
+	check(!error, "the restarted host recovers the id: " + what(error));
+	again.apply(g);
+	const auto state = recovered(again, g, image);
+	check(prefix(acknowledged, state) && prefix(state, attempted), "it recovers every acknowledged record and nothing unattempted: acknowledged " + join(acknowledged) + ", recovered " + join(state));
+}
+
+// A7 (D128): the failed close's doubt is the Host's, not the Driver's. A second Driver over the
+// same live Host is refused the id with close_in_doubt, and nothing acknowledged is lost at the
+// restart.
+void second_driver() {
+	constexpr GroupId g = 71;
+	jt::Disk disk; disk.random.seed(1);
+	std::vector<std::string> acknowledged, attempted;
+	{
+		auto io = std::make_shared<FlakyIO>(disk);
+		Loop loop(disk, false, io);
+		std::exception_ptr error;
+		loop.lone(g);
+		attempted.push_back("a");
+		if (loop.propose(g, "a")) { acknowledged.push_back("a"); }
+		loop.apply(g);
+		auto published = loop.start(checkpoint_of(loop, g, acknowledged));
+		loop.release();
+		io->fail_sync = 1;
+		check(loop.close(g, error) && !error && io->failed_syncs == 1, "the close's table commit fails: " + what(error));
+		loop.driver_stop.request(task::cancel_reason::shutdown);
+		loop.release();
+		check(loop.driver_done && loop.driver->groups() == 0, "the first Driver's run ends, no row left");
+		loop.driver.reset();
+		loop.driver_stop = task::cancel_source{}; loop.driver_done = false;
+		loop.driver = std::make_unique<Driver<Sink>>(Seams{task::scheduler_ref::of(loop.scheduler), j::completion_ref::of(loop.inline_io), *loop.host, 0, 7}, loop.sink);
+		task::spawn(task::scheduler_ref::of(loop.scheduler), loop.driver->run(loop.driver_stop.token()), [&loop](std::exception_ptr) { loop.driver_done = true; });
+		loop.run();
+		loop.recover(g, error, options({1}));
+		check(is<close_in_doubt>(error), "a second Driver over the same live Host refuses the id with close_in_doubt: " + what(error));
+		if (!error) {
+			loop.apply(g);
+			attempted.push_back("x");
+			if (loop.propose(g, "x")) { acknowledged.push_back("x"); }
+			loop.apply(g);
+		}
+		check(loop.close(g, error), "the row closes: " + what(error));
+		io->backend.sync_directory();
+		loop.release();
+	}
+	disk.power_loss();
+	Loop again(disk);
+	std::exception_ptr error;
+	const auto image = again.recover(g, error, options({1}));
+	check(!error, "the restarted host recovers the id: " + what(error));
+	again.apply(g);
+	const auto state = recovered(again, g, image);
+	check(prefix(acknowledged, state) && prefix(state, attempted), "every acknowledged record survives: acknowledged " + join(acknowledged) + ", recovered " + join(state));
+}
+
+// A throw that ends the Driver's loop under the blocking entry (a Sink's, which no step
+// catches) reaches the entry's caller, not as the work's task::cancelled.
+void entry_throw() {
+	constexpr GroupId g = 111;
+	jt::Disk disk; task::blocking_scheduler scheduler; j::InlineCompletion io; Sink sink;
+	j::Host host(std::make_shared<jt::MemoryIO>(disk, "host/"), host_identity, j::HostOptions{1, turn_options});
+	Driver<Sink> driver(Seams{task::scheduler_ref::of(scheduler), j::completion_ref::of(io), host, 0, 7}, sink);
+	kronuz::consensus::run(driver, scheduler, [](Driver<Sink>& d, GroupId id) -> task::task<void> { d.open(id, options({1})); co_await d.create(id, j::Identity{'E', 'T'}); }(driver, g));
+	driver.applied(g, Applied{sink.committed[g]});  // the next Committed is delivered once this one is applied
+	sink.on_committed = [](GroupId) { throw 42; };
+	int thrown = 0;
+	try { kronuz::consensus::run(driver, scheduler, [](Driver<Sink>& d, GroupId id) -> task::task<void> { co_await d.committed(id, co_await d.propose(id, "x")); co_await d.read(id); }(driver, g)); }
+	catch (int value) { thrown = value; } catch (...) {}
+	check(thrown == 42, "the loop's throw reaches the blocking entry's caller");
+}
+
+// A5: a checkpoint whose peak exceeds the replacement pool fails at once with
+// checkpoint_exceeds_pool, and the calls behind it go on; one at exactly the peak publishes.
+void pool_bound() {
+	constexpr std::uint64_t cap = 4096;
+	const std::uint64_t peak = 2 * j::detail::artifact_header_size + checkpoint_detail::maximum_size(limits()) + cap;
+	auto run = [&](j::StorageResources pool, bool fits) {
+		constexpr GroupId g = 101;
+		jt::Disk disk; Loop loop(disk);
+		auto o = options({1}); o.admission.replacement_pool = pool;
+		loop.driver->open(g, std::move(o));
+		std::exception_ptr error;
+		check(loop.settle(loop.driver->create(g, j::Identity{'P', 'B'}), error) && !error, "create: " + what(error));
+		loop.propose(g, "a"); loop.apply(g);
+		const auto state = loop.driver->state(g);
+		auto published = loop.start(loop.driver->checkpoint(g, cap, Capture{"a\n", 0, loop.sink.committed[g], state ? state->term : 0}));
+		auto later = loop.start(loop.driver->propose(g, "b"));
+		loop.release();
+		const auto label = "pool " + std::to_string(pool.logical_bytes) + " B, " + std::to_string(pool.entries) + " entries, peak " + std::to_string(peak) + " B: ";
+		if (fits) { check(published->done && !published->error, label + "the checkpoint publishes: " + what(published->error)); }
+		else { check(published->done && is<checkpoint_exceeds_pool>(published->error), label + "the checkpoint fails with checkpoint_exceeds_pool: " + (published->done ? what(published->error) : std::string("still waiting"))); }
+		check(later->done && !later->error, label + "a later proposal is placed: " + (later->done ? what(later->error) : std::string("still waiting")));
+	};
+	run({peak, 2}, true);
+	run({peak - 1, 2}, false);
+	run({peak, 1}, false);
+}
+
 const std::map<std::string, void (*)()> cases{
 	{"created_bytes", &created_bytes},
 	{"erase_queued", &erase_queued},
@@ -480,6 +1011,13 @@ const std::map<std::string, void (*)()> cases{
 	{"unknown_row", &unknown_row},
 	{"close_in_flight", &close_in_flight},
 	{"bytes", &bytes},
+	{"reopen_rows", &reopen_rows},
+	{"closed_bytes", &closed_bytes},
+	{"close_crash", &close_crash},
+	{"pool_bound", &pool_bound},
+	{"failed_close", &failed_close},
+	{"second_driver", &second_driver},
+	{"entry_throw", &entry_throw},
 };
 
 }  // namespace
@@ -491,7 +1029,11 @@ int main(int argc, char** argv) {
 		std::cerr << "case " << argv[1] << '\n';
 		found->second();
 	} else {
-		for (const auto& [name, run] : cases) { if (name == "created_bytes") { continue; } std::cerr << "case " << name << '\n'; run(); }  // a report, run by name
+		// A report and the two long cases run by name, each its own ctest entry.
+		for (const auto& [name, run] : cases) {
+			if (name == "created_bytes" || name == "closed_bytes" || name == "close_crash") { continue; }
+			std::cerr << "case " << name << '\n'; run();
+		}
 	}
 	std::cout << checks << " driver close checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

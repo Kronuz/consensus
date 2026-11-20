@@ -1827,7 +1827,9 @@ unsigned binary_transfer_integration(std::size_t length, unsigned mode = 0, bool
 		} receiver.application = std::move(receiver.candidate); receiver.worker.snapshot_activated(activation->snapshot, activation->token); }
 		maximum_buffers = std::max(maximum_buffers, leader.transfer.retained_bytes() + receiver.transfer.retained_bytes()); peak_flights = std::max(peak_flights, leader.transfer.chunks_in_flight());
 		allocated_buffers = std::max(allocated_buffers, leader.transfer.buffer_capacity() + receiver.transfer.buffer_capacity() + leader.worker.snapshot_buffer_capacity() + receiver.worker.snapshot_buffer_capacity());
-		if (installed_result && receiver.worker.applied_index() == 2 && leader.worker.applied_index() == 2 && healthy.worker.applied_index() == 2) { suffix = true; break; }
+		// Each node has applied the tail at 2: mode 2's clock jump re-elects the leader, which may
+		// apply its new no-op at 3 before the others apply 2.
+		if (installed_result && receiver.worker.applied_index() >= 2 && leader.worker.applied_index() >= 2 && healthy.worker.applied_index() >= 2) { suffix = true; break; }
 		if (leader.worker.fenced() || receiver.worker.fenced() || healthy.worker.fenced()) { break; }
 	}
 	if (!suffix) { std::cerr << "binary progress: bytes=" << wire_bytes << " capture=" << bool(capture) << " base=" << leader.worker.base_index() << " term=" << leader.worker.term() << " role=" << int(leader.worker.role()) << " commit=" << leader.worker.committed() << " receiver=" << receiver.worker.applied_index() << " healthy=" << healthy.worker.applied_index() << " source=" << bool(leader.worker.snapshot_source()) << "\n"; }

@@ -117,7 +117,7 @@ using SimDriver = Driver<NodeSink>;
 
 // A caller's view of one call: how it completed.
 struct Call {
-	enum Kind { open, propose, committed, read, transfer, repair, checkpoint } kind;
+	enum Kind { open, propose, committed, read, transfer, repair, checkpoint, close } kind;
 	NodeId node = 0;
 	GroupId group = 0;
 	std::string command;
@@ -287,7 +287,7 @@ struct Simulation {
 		}
 		for (auto g : groups_) {
 			if (healed(g)) { continue; }
-			fail("group " + std::to_string(g) + " did not apply a new entry on every data voter after healing");
+			fail("group " + std::to_string(g) + " did not commit a new entry on every member (applied on every data voter) after healing");
 			if (auto& c = last[g]) {
 				std::string why = "none";
 				if (c->error) { try { std::rethrow_exception(c->error); } catch (const std::exception& e) { why = e.what(); } catch (...) { why = "?"; } }
@@ -304,7 +304,9 @@ struct Simulation {
 			auto& n = nodes_.at(witness_node);
 			auto s = state(n, g);
 			if (n.replicas[g].committed_notices) { fail("a witness member's Sink received a Committed range"); }
-			if (!s || s->applied != s->committed || s->committed == 0) { fail("a witness member acknowledges its committed ranges itself"); }
+			if (!s || s->applied != s->committed || s->committed == 0) {
+				fail("group " + std::to_string(g) + "'s witness member does not acknowledge its committed ranges itself: committed " + std::to_string(s ? s->committed : 0) + ", applied " + std::to_string(s ? s->applied : 0));
+			}
 		}
 		// Repair liveness (F4): on the healed network every repair completes before shutdown.
 		auto pending = [&] { std::size_t k = 0; for (const auto& c : calls_) { k += c->kind == Call::repair && !c->completions; } return k; };
@@ -444,9 +446,11 @@ private:
 		n.run();
 	}
 	// Stops the node's loops. A crash first cuts its disk's power, so IO in flight fails and
-	// unsynced writes may be lost; a clean shutdown lets its IO complete.
+	// unsynced writes may be lost. A clean shutdown follows DRIVER.md's order: its callers cancel,
+	// it closes every group while the loops run and its IO completes, then it stops the loops.
 	void shut(Node& n, bool power_cut) {
 		if (power_cut) { n.disk.cut = n.disk.operations; n.cutting = true; }
+		else { close_all(n); }
 		for (auto& l : n.loops) { l->stop->request(task::cancel_reason::shutdown); }
 		auto stopped = [&] { for (auto& l : n.loops) { if (!l->turns_done || !l->driver_done) { return false; } } return true; };
 		for (int round = 0; round < 10000 && !(stopped() && !n.held()); ++round) {
@@ -463,6 +467,20 @@ private:
 		n.host.reset(); n.loops.clear();
 		if (power_cut) { n.disk.power_loss(); }
 		n.up = n.cutting = false;
+	}
+	void close_all(Node& n) {
+		for (auto& c : calls_) { if (c->node == n.id && !c->completions && !c->cancel_requested) { c->cancel_requested = true; c->cancel.request(); } }
+		std::vector<std::shared_ptr<Call>> closes;
+		for (auto g : groups_) {
+			auto& call = closes.emplace_back(track(n, g, Call::close));
+			start(n, call, n.driver(g).close(g));
+		}
+		auto closed = [&] { for (auto& c : closes) { if (!c->completions) { return false; } } return true; };
+		for (int round = 0; round < 10000 && !closed(); ++round) {
+			for (auto& l : n.loops) { l->run(n.id); complete_io(*l, n.id, true); }
+		}
+		if (!closed()) { fail("node " + std::to_string(n.id) + "'s groups did not close"); }
+		for (auto& c : closes) { if (c->error) { fail("node " + std::to_string(n.id) + "'s close of group " + std::to_string(c->group) + " failed"); } }
 	}
 	void crash(Node& n) { ++crashes; trace("node %llu crashes", (unsigned long long)n.id); shut(n, true); }
 
@@ -686,7 +704,8 @@ private:
 	}
 	bool healed_everywhere(GroupId g, Placement p) {
 		for (auto& [id, n] : nodes_) {
-			if (witness(id, g)) { continue; }
+			// A witness commits the entry too, and acknowledges it itself.
+			if (witness(id, g)) { auto st = state(n, g); if (!st || st->committed < p.index || st->applied != st->committed) { return false; } continue; }
 			const auto& applied = n.replicas[g].applied;
 			if (applied.size() < p.index || applied[p.index - 1].term != p.term || applied[p.index - 1].payload != "healed") { return false; }
 		}

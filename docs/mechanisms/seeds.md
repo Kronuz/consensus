@@ -73,7 +73,8 @@ failure is counted in `send_failures` and announcing continues.
 `on_dial(seed)` fires for a new seed, and again for one still announced whose backoff has passed.
 The caller dials the seed's service port at its address over the transport's TLS, with its node
 pins, and answers `joined(id)` when a pinned node authenticated, or `failed(id)` otherwise. A
-seed is not offered again until then, nor after `joined`. Each failure doubles the wait before the
+seed is not offered again until then, nor after `joined` until the caller reports the node lost
+with `failed(id)`. Each failure doubles the wait before the
 next dial, from `backoff` (1 s) to `backoff_max` (60 s). Announcements do not reset it: a forger
 repeating an announcement every 10 ms gets one dial per backoff, not one per datagram. A seed that
 stops announcing while it backs off is kept until the backoff ends, so coming back resumes the

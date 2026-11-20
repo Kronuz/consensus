@@ -92,7 +92,7 @@ class Seeds {
 
 	Seeds(asio::any_io_executor executor, kronuz::consensus::Identity cluster, std::vector<SeedService> services,
 		  std::set<std::string> wanted, SeedOptions options = {})
-		: executor_(executor), options_(std::move(options)), receiver_(executor), sender_(executor), timer_(executor),
+		: options_(std::move(options)), receiver_(executor), sender_(executor), timer_(executor),
 		  wanted_(std::move(wanted)), random_(std::random_device{}()) {
 		validate_seed_options(options_);
 		self_.cluster = cluster;
@@ -186,11 +186,11 @@ class Seeds {
 				r.push_back(e.seed);
 		return r;
 	}
-	// The caller's dial of a seed failed (no connection, a failed TLS hello, an unpinned node):
-	// its next dial waits backoff, doubled per failure since its last join.
+	// The caller's dial of a seed failed (no connection, a failed TLS hello, an unpinned node), or
+	// the node it joined was lost: its next dial waits backoff, doubled per failure since its last join.
 	void failed(std::uint64_t id) {
 		auto *e = find(id);
-		if (!e || e->state != State::dialing)
+		if (!e || e->state == State::idle)
 			return;
 		++stats_.failures;
 		e->state = State::idle;
@@ -200,7 +200,7 @@ class Seeds {
 		++e->failures;
 		e->next = Clock::now() + std::min(wait, options_.backoff_max);
 	}
-	// The caller's dial of a seed authenticated a node: no further dials until failed().
+	// The caller's dial of a seed authenticated a node: no further dials unless failed() says it was lost.
 	void joined(std::uint64_t id) {
 		if (auto *e = find(id); e && e->state == State::dialing) {
 			e->state = State::joined;
@@ -373,7 +373,6 @@ class Seeds {
 		return i == index_.end() ? nullptr : &entries_.at(i->second);
 	}
 
-	asio::any_io_executor executor_;
 	SeedOptions options_;
 	asio::ip::udp::socket receiver_, sender_;
 	asio::steady_timer timer_;

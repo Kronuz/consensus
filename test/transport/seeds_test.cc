@@ -385,8 +385,12 @@ void forged() {
 	std::set<NodeId> members;
 	std::map<std::uint16_t, int> dials;
 	std::map<std::uint16_t, std::vector<Clock::time_point>> at;
+	std::uint64_t genuine_id = 0;
+	int joins = 0;
 	seeds.on_dial = [&](const Seed &seed) {
 		const auto service = seed.port("node");
+		if (service == two.port())
+			genuine_id = seed.id;
 		++dials[service];
 		at[service].push_back(Clock::now());
 		task::spawn(loop.ref(), dial(loop, tls, pins, {seed.address, service}),
@@ -394,6 +398,7 @@ void forged() {
 						if (e || !node)
 							return seeds.failed(id);
 						members.insert(*node);
+						++joins;
 						seeds.joined(id);
 					});
 	};
@@ -425,6 +430,10 @@ void forged() {
 	for (std::size_t i = 1; i < times.size(); ++i)
 		assert(times[i] - times[i - 1] >= 100ms * (1 << (i - 1)));
 	assert(seeds.stats().failures + 1 >= std::uint64_t(dials[impostor.port()]));  // the last may be in flight
+	// A joined node reported lost is dialed again once its backoff passes, and joins again.
+	seeds.failed(genuine_id);
+	assert(loop.until([&] { return joins == 2; }, 3s));
+	assert(dials[two.port()] == 2 && members == std::set<NodeId>{2});
 	two.acceptor.close();
 	impostor.acceptor.close();
 	stop(loop, seeds);

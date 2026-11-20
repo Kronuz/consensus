@@ -123,6 +123,17 @@ groups' snapshot frames:
   each outcome. Lane frames never move `HostTransportStats`, so a lane-only pair leaves every
   group counter at 0.
 
+- **Fetch is method 1 (D8).** `fetch(node, name, done)` on `loop_of_node(node)` is a call of
+  method 1 whose request is the name, with `fetch_deadline` (30 s); `done` runs on that loop,
+  never within the call. With `RpcOptions::reader` set, the host serves method 1: the reader's
+  bytes under the call's credit with `total` the file's size, `Error` 256 (`fetch_missing`) for a
+  name it holds none of, `handler_failed` when the reader throws and `message_size` past its
+  `fetch_bytes`. The fetcher maps them to bytes, nullopt and `io_error`; it cancels a reply past
+  its own `fetch_bytes` (`message_size`) once the bytes it holds would exceed it; past `fetches`
+  (4) awaiting the node a fetch ends `resource_unavailable_try_again`, as does one a drain refused
+  (`not_processed`); `timed_out`, `connection_aborted` and `not_connected` pass through. Its reply
+  shares the lane's pools and Bulk's alternation with groups' data frames, so heartbeats on Control
+  keep their gaps (`fetch`). `Peers` and `DTFT0001` stay until worker-pump-removal deletes them.
 - **Holds and lane_idle (T3, D7).** `hold(node)` dials Bulk to `node` and keeps it, sharing a
   group or not, until as many `release(node)`; a failed dial is tried again every `redial`. A
   Bulk connection that has carried no group frame either way, with no hold, no call and nothing
@@ -164,6 +175,7 @@ so calls wait for `calling`, `outgoing` and room (N4); its corpus `fuzz/corpus/r
 | `hold` | `hold(2)` on a lane-only pair with a 300 ms lane_idle: Bulk comes up and stays 1 s; `release(2)` drains it about 300 ms later (1 Drain, closed gracefully) | `hold-ignored` |
 | `idle-race` | host 1's 300 ms lane_idle drains while host 2's loop is held 600 ms, in which it starts 5 calls on the old connection: all 5 end `not_processed`, none `connection_aborted`, and the next call dials again and completes | `rpc-no-drain` |
 | `shutdown` | `drain()` with a 4 MiB echo streaming: it completes whole, a later call ends `not_processed`, the lanes close, no call ends `connection_aborted` | |
+| `fetch` | host 2 uploads 4 groups' 1 MiB data frames to host 1 on Bulk while host 1 fetches 16 MiB on the same connection: it arrives exact in about 1.1 s beside 131 MiB of uploads, heartbeats on Control keep a 210 ms longest gap; a missing name gives nullopt, a throwing reader `io_error`, 48 MiB against a 32 MiB `fetch_bytes` `message_size`, and past 4 awaiting `resource_unavailable_try_again` | |
 | `reader` | host 2's loop that does not read node 1's connection is held; 10 echoes on that connection complete, the slowest in under 200 ms (T5) | `lane-via-other-loop` |
 | `local-throw` | a handler acting outside its events and a body consumer that throw each end their call `handler_failed`; the link count, `malformed` 0, a group's frames on Bulk and the next 1 MiB echo show the connection went on | `local-throw-closes` (a local throw closes the connection) |
 

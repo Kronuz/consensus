@@ -23,6 +23,10 @@
 //               call dials again (control: rpc-no-drain)
 //   shutdown    T8: drain() with a 4 MiB echo in flight: it completes, a new call ends
 //               not_processed, and the Bulk connection closes gracefully
+//   fetch       D8, A4: fetch is method 1. Beside 4 groups uploading 1 MiB data frames on the same
+//               Bulk connection, a 16 MiB fetch arrives exact while heartbeats on Control keep
+//               every gap under 1,000 ms; a missing name, a reader that throws, a reply over this
+//               host's fetch_bytes and a fifth concurrent fetch end as D8's table says
 //   reader      T5: with host 2's other loop held 2 s, calls whose frames its connection's loop
 //               reads keep their latency (control: lane-via-other-loop)
 //   consensus_transport_rpc_host_test <fixture dir> case
@@ -643,6 +647,115 @@ bool shutdown() {
 	return ok;
 }
 
+// D8, A4: fetch beside a maximal upload on one Bulk connection, against heartbeats.
+bool fetch() {
+	constexpr std::uint32_t L = 2;
+	Host one(1, L), two(2, L);
+	HostTransportOptions client, server;
+	client.rpc.fetch_bytes = 32 << 20;
+	server.rpc.reader = [](std::string_view name) -> std::optional<std::string> {
+		if (name == "throws")
+			throw std::runtime_error("the disk broke");
+		if (name == "big")
+			return bytes_at(0, 16 << 20);
+		if (name == "huge")
+			return std::string(48 << 20, 'h');
+		if (name == "slow")
+			return bytes_at(0, 4 << 20);
+		return std::nullopt;
+	};
+	one.open(addresses({&two}), client);
+	two.open(addresses({&one}), server);
+	const auto reader = one.transport->loop_of_node(2);
+	const auto beat = groups_on(L, reader, 1)[0];
+	const auto uploads = groups_on(L, 1 - reader, 4);
+	for (auto *h : {&one, &two}) {
+		h->stores({beat});
+		h->stores(uploads);
+	}
+	Beats beats;
+	std::atomic<std::uint64_t> uploaded{0};
+	for (std::uint32_t k = 0; k != L; ++k)
+		one.transport->on_deliver(k, [&](const Received &r) {
+			if (r.route.group == beat)
+				beats.beat();
+			else
+				uploaded += r.payload.size();
+			return true;
+		});
+	one.start();
+	two.start();
+	const auto hb = two.transport->loop_of_group(beat), up = two.transport->loop_of_group(uploads[0]);
+	auto heartbeat = [&] { two.post(hb, [&] { two.transport->send(hb, LinkLane::Control, FrameKind::control, {beat, 2, 1}, 1, "beat"); }); };
+	auto upload = [&] {
+		two.post(up, [&] {
+			for (auto g : uploads)
+				for (int i = 0; i != 8; ++i)
+					two.transport->send(up, LinkLane::Bulk, FrameKind::data, {g, 2, 1}, 1, std::string(1 << 20, 'u'));
+		});
+	};
+	if (!until([&] { heartbeat(); return beats.count > 0; }, 10s))
+		return false;
+	beats.worst = 0;
+	struct Got {
+		std::atomic<bool> done{false};
+		std::error_code error;
+		std::optional<std::string> bytes;
+	};
+	auto fetch = [&](const char *name) {
+		auto got = std::make_shared<Got>();
+		one.at(2, [&] {
+			one.transport->fetch(2, name, [got](std::error_code e, std::optional<std::string> b) {
+				got->error = e;
+				got->bytes = std::move(b);
+				got->done = true;
+			});
+			return 0;
+		});
+		return got;
+	};
+	const auto start = steady::now();
+	upload();
+	std::this_thread::sleep_for(200ms);
+	const auto before = uploaded.load();
+	auto big = fetch("big");
+	for (std::int64_t tick = 0; !big->done && ms_since(start) < 30'000; ++tick) {
+		heartbeat();
+		if (tick % 2 == 0)
+			upload();
+		std::this_thread::sleep_until(start + (tick + 1) * 100ms);
+	}
+	const auto fetched_ms = ms_since(start);
+	const auto beside = uploaded.load() - before;
+	const bool exact = big->done && !big->error && big->bytes && *big->bytes == bytes_at(0, 16 << 20);
+	auto missing = fetch("none"), throws = fetch("throws"), huge = fetch("huge");
+	std::vector<std::shared_ptr<Got>> slow;
+	for (int i = 0; i != 5; ++i)
+		slow.push_back(fetch("slow"));
+	const bool ended = until([&] {
+		bool all = missing->done && throws->done && huge->done;
+		for (auto &g : slow)
+			all &= g->done.load();
+		return all;
+	}, 30s);
+	int busy = 0, slow_ok = 0;
+	for (auto &g : slow) {
+		busy += g->error == std::errc::resource_unavailable_try_again;
+		slow_ok += !g->error && g->bytes && g->bytes->size() == 4 << 20;
+	}
+	const bool table = ended && !missing->error && !missing->bytes && throws->error == std::errc::io_error &&
+					   huge->error == std::errc::message_size && busy >= 1 && busy + slow_ok == 5;
+	const bool ok = exact && beside > 0 && beats.worst < 1000 && table;
+	std::printf("fetch: 16 MiB arrived exact %s in %llu ms beside %llu MiB of group uploads on Bulk; heartbeats' longest gap %llu ms; missing %s, "
+				"a throwing reader %s, 48 MiB over 32 MiB %s, five 4 MiB at once: %d ok, %d refused %s\n",
+				exact ? "yes" : "NO", (unsigned long long)fetched_ms, (unsigned long long)(beside >> 20), (unsigned long long)beats.worst,
+				!missing->error && !missing->bytes ? "nullopt" : "WRONG", throws->error.message().c_str(), huge->error.message().c_str(), slow_ok,
+				busy, ok ? "ok" : "FAILED");
+	one.stop();
+	two.stop();
+	return ok;
+}
+
 // T5: host 2's loop that does not read node 1's connection is held 2 s; calls served on the
 // connection's loop keep their latency, since a lane frame never waits on another loop.
 bool reader() {
@@ -680,7 +793,7 @@ bool reader() {
 
 int main(int argc, char **argv) {
 	if (argc != 3) {
-		std::fprintf(stderr, "usage: %s <fixture dir> calls|group-full|call-full|lane-only|stream|local-throw|stalled-peer|hold|idle-race|shutdown|reader\n", argv[0]);
+		std::fprintf(stderr, "usage: %s <fixture dir> calls|group-full|call-full|lane-only|stream|local-throw|stalled-peer|hold|idle-race|shutdown|fetch|reader\n", argv[0]);
 		return 2;
 	}
 	fixture = argv[1];
@@ -709,6 +822,8 @@ int main(int argc, char **argv) {
 		ok = reader();
 	else if (which == "shutdown")
 		ok = shutdown();
+	else if (which == "fetch")
+		ok = fetch();
 	else
 		return 2;
 	std::fflush(stdout);

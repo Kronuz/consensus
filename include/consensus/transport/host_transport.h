@@ -1,5 +1,6 @@
 #pragma once
 #include "codec.h"
+#include "fetch.h"
 #include "hello.h"
 #include "links.h"
 #include "rpc.h"
@@ -298,7 +299,16 @@ struct RpcOptions {
 	// D7: a Bulk connection that carries no group, no hold and no call drains after `idle`; a
 	// drain's calls get `drain_deadline` to end before the connection aborts.
 	std::chrono::milliseconds idle{60'000}, drain_deadline{5'000};
+	// D8: fetch is method 1. `reader` serves this host's names (none: unknown_method); at most
+	// `fetches` of this host's fetches await each peer; a reply holds at most `fetch_bytes` and
+	// arrives within `fetch_deadline`.
+	FetchReader reader;
+	std::size_t fetches = 4, fetch_bytes = std::size_t{64} << 20;
+	std::chrono::milliseconds fetch_deadline{30'000};
 };
+// Fetch on the lane: method 1, and the Error code a server sends for a name it holds none of.
+inline constexpr rpc::MethodId fetch_method = 1;
+inline constexpr rpc::Code fetch_missing = rpc::Code(256);
 // A call on the lane, on its connection's loop (loop_of_node(node)): one this host made or serves.
 struct RpcCall {
 	kronuz::consensus::NodeId node = 0;
@@ -401,6 +411,8 @@ class HostTransport {
 			loop.links->on_ended = [this, k](const Link &link) { ended(k, link); };
 			loop.links->on_frame = [this, k](const Link &link, std::string_view frame) { arrived(k, link, frame); };
 		}
+		if (options_.rpc.reader)
+			serves_[fetch_method] = [this](RpcCall c, const rpc::Incoming &in) { return serve_fetch(c, in); };
 	}
 	HostTransport(const HostTransport &) = delete;
 	HostTransport &operator=(const HostTransport &) = delete;
@@ -478,8 +490,8 @@ class HostTransport {
 
 	// Before serve(): the handler of `method` (D6). Calls of a method with none end unknown_method.
 	void handle(rpc::MethodId method, Serve serve) {
-		if (!method)
-			throw std::invalid_argument("host transport: method 0");
+		if (!method || (method == fetch_method && options_.rpc.reader))
+			throw std::invalid_argument("host transport: method 0, or 1 with a fetch reader");
 		serves_[method] = std::move(serve);
 	}
 	// On loop_of_node(node): starts a call on the lane to `node` (rpc::Lane::call), on its Bulk
@@ -548,6 +560,66 @@ class HostTransport {
 			  std::string(text.substr(0, rpc::text_bytes))});
 	}
 
+	// On loop_of_node(node) (D8): asks `node` for `name` on the lane, method 1. `done` runs once,
+	// on this loop and never within this call: the bytes, nullopt when the node holds none, or an
+	// error (io_error: the reader failed or the file is over its fetch_bytes; message_size: over
+	// this host's; timed_out; resource_unavailable_try_again: `fetches` already await the node,
+	// or a drain refused it; connection_aborted; not_connected).
+	void fetch(kronuz::consensus::NodeId node, std::string name, FetchDone done) {
+		if (!done || name.empty() || name.size() > rpc::chunk_bytes)
+			throw std::invalid_argument("host transport: fetch");
+		const auto k = loop_of_node(node);
+		auto later = [this, k, done = std::move(done)](std::error_code e, std::optional<std::string> bytes) mutable {
+			on(k, [done = std::move(done), e, bytes = std::move(bytes)]() mutable { done(e, std::move(bytes)); });
+		};
+		auto &peer = loops_[k].rpc[node];
+		if (peer.fetching >= options_.rpc.fetches)
+			return later(std::make_error_code(std::errc::resource_unavailable_try_again), std::nullopt);
+		++peer.fetching;
+		struct State {
+			std::string bytes;
+			RpcCall call;
+			bool over = false;
+		};
+		auto state = std::make_shared<State>();
+		rpc::Events events;
+		events.body = [this, state](std::string_view bytes, bool) {
+			if (state->over)
+				return;
+			if (state->bytes.size() + bytes.size() > options_.rpc.fetch_bytes) {
+				state->over = true;
+				return stop(state->call, rpc::Code::message_size);
+			}
+			state->bytes.append(bytes);
+			consume(state->call, bytes.size());
+		};
+		events.done = [this, k, node, state, later = std::move(later)](const rpc::Status &status) mutable {
+			if (auto it = loops_[k].rpc.find(node); it != loops_[k].rpc.end() && it->second.fetching)
+				--it->second.fetching;
+			using std::errc;
+			switch (status.outcome) {
+			case rpc::Outcome::ok:
+				return later({}, std::move(state->bytes));
+			case rpc::Outcome::error:
+				if (status.code == std::uint32_t(fetch_missing))
+					return later({}, std::nullopt);
+				return later(std::make_error_code(errc::io_error), std::nullopt);
+			case rpc::Outcome::cancel:
+				return later(std::make_error_code(state->over ? errc::message_size : errc::io_error), std::nullopt);
+			case rpc::Outcome::timed_out:
+				return later(std::make_error_code(errc::timed_out), std::nullopt);
+			case rpc::Outcome::not_processed:
+				return later(std::make_error_code(errc::resource_unavailable_try_again), std::nullopt);
+			case rpc::Outcome::connection_aborted:
+				return later(std::make_error_code(errc::connection_aborted), std::nullopt);
+			default:
+				return later(std::make_error_code(errc::not_connected), std::nullopt);
+			}
+		};
+		const auto size = name.size();
+		state->call = call(node, fetch_method, {.deadline = rpc::Clock::now() + options_.rpc.fetch_deadline, .total = size},
+						   std::move(name), std::move(events));
+	}
 	// On loop_of_node(node) (T3): keep a Bulk connection to `node`, dialing it when there is none,
 	// whether or not they share a group, until as many release(node) calls; then lane_idle (D7).
 	void hold(kronuz::consensus::NodeId node) {
@@ -728,7 +800,8 @@ class HostTransport {
 		std::unordered_map<std::uint64_t, rpc::Handle> calls;
 		std::unique_ptr<asio::steady_timer> timer;
 		std::optional<rpc::Clock::time_point> armed, redial, idle, drain_by;
-		std::size_t holds = 0;  // hold(node) without its release (T3)
+		std::size_t holds = 0;     // hold(node) without its release (T3)
+		std::size_t fetching = 0;  // this host's fetches awaiting the peer (D8)
 		bool feeding = false;
 	};
 	struct Loop {
@@ -1341,6 +1414,53 @@ class HostTransport {
 		}
 		++here.lane_stats.served;
 		events->done = ending(k, c, std::move(events->done));
+		return events;
+	}
+	// Method 1's server (D8): the name, then the reader's bytes under the call's credit, or
+	// fetch_missing, handler_failed (the reader threw) or message_size (over fetch_bytes).
+	std::optional<rpc::Events> serve_fetch(RpcCall c, const rpc::Incoming &in) {
+		if (in.total > rpc::chunk_bytes)
+			return std::nullopt;
+		struct State {
+			std::string name, bytes;
+			std::size_t sent = 0;
+			bool replying = false;
+		};
+		auto state = std::make_shared<State>();
+		auto pump = [this, c, state] {
+			while (state->replying && state->sent < state->bytes.size()) {
+				const auto n = std::min(sendable(c), state->bytes.size() - state->sent);
+				if (!n)
+					return;
+				write(c, state->bytes.substr(state->sent, n), state->sent + n == state->bytes.size());
+				state->sent += n;
+			}
+		};
+		rpc::Events events;
+		events.credit = pump;
+		events.body = [this, c, state, pump](std::string_view bytes, bool end) {
+			state->name.append(bytes);
+			consume(c, bytes.size());
+			if (!end)
+				return;
+			std::optional<std::string> file;
+			try {
+				file = options_.rpc.reader(state->name);
+			} catch (...) {
+				return stop(c, rpc::Code::handler_failed);
+			}
+			if (!file)
+				return stop(c, fetch_missing);
+			if (file->size() > options_.rpc.fetch_bytes)
+				return stop(c, rpc::Code::message_size);
+			total(c, file->size());
+			if (file->empty())
+				return write(c, {}, true);
+			state->bytes = std::move(*file);
+			state->replying = true;
+			pump();
+		};
+		events.done = [state](const rpc::Status &) { std::string().swap(state->bytes); };
 		return events;
 	}
 	// The lane has a frame to write: the connection is fed once the running work yields.

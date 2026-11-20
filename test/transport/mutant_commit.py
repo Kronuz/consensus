@@ -33,6 +33,8 @@ MUTANTS = {
     # connection.h (security review S1, N2)
     "fail-closes-fd": (T + "connection.h", "\t\t\t::shutdown(socket_.native_handle(), SHUT_RDWR);\n\t\t\tsocket_.cancel(ignored);",
                        "\t\t\tsocket_.close(ignored);"),
+    # links.h (transport-admission N9): an unknown address evicts a peer's pending handshake
+    "no-peer-priority": (T + "links.h", "const bool peer = routed(source);", "const bool peer = false;"),
     "ssl-after-end": (T + "connection.h", "if (end_ != ConnectionEnd::open)\n\t\t\tthrow", "if (false)\n\t\t\tthrow"),
     # one stuck deadline for all of a flush's waits, not one per wait
     "stuck-spans-flush": [

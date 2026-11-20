@@ -328,7 +328,10 @@ void refused_case() {
 	std::printf("  refused %s: %llu\n", pin_fault_name(never), (unsigned long long)(one.pins->refused(never) - before));
 	check(one.pins->refused(never) > before, by_ca ? "its accept is refused: cluster" : "its accept is refused: unpinned");
 
-	// Node 3 again on another address with another certificate: node 1 pinned its first.
+	// Node 3 again on another address with another certificate: node 1 pinned its first. The
+	// first node 3 stops, so no link of it carries the calls.
+	three.stop();
+	std::this_thread::sleep_for(300ms);
 	const auto other = by_ca ? PinFault::repinned : PinFault::unpinned;
 	const auto rekeyed_before = one.pins->refused(other);
 	one.at(3, [&] {
@@ -345,12 +348,15 @@ void refused_case() {
 	std::printf("  refused %s: %llu\n", pin_fault_name(other), (unsigned long long)(one.pins->refused(other) - rekeyed_before));
 	check(one.pins->refused(other) >= rekeyed_before + 2, by_ca ? "both refused: repinned" : "both refused: unpinned");
 	check(one.pins->pin(3) == pin_of("n3"), "node 3 keeps its first pin");
+	Host back(3, "n3", 2);
+	back.start();
+	back.admit(one);
 	one.at(3, [&] {
-		one.transport->admit_node(3, three.address());
+		one.transport->admit_node(3, back.address());
 		return 0;
 	});
-	check(one.echoes(3), "back at its own address, node 3 answers");
-	for (auto *h : {&one, &three, &four, &rekeyed})
+	check(one.echoes(3), "with its first certificate again, node 3 answers");
+	for (auto *h : {&one, &back, &four, &rekeyed})
 		h->stop();
 }
 
@@ -518,8 +524,10 @@ void issue_case() {
 		Host five(5, "joined5/node", 2);
 		five.start();
 		five.admit(one);
-		check(five.echoes(1) && one.echoes(5), "with no key or certificate configured by hand, it joins and calls");
+		check(five.echoes(1), "with no key or certificate configured by hand, it joins and calls");
 		check(one.pins->pin(5) == pin_of("joined5/node"), "node 1 pinned its issued certificate at its first join");
+		one.admit(five);
+		check(one.echoes(5), "routed to it, node 1 calls it back");
 		five.stop();
 	}
 	asio::post(at.io, [&] {

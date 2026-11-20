@@ -239,6 +239,18 @@ public:
 		const auto& w = *found->second->worker;
 		return GroupState{w.role(), w.term(), w.leader(), w.committed(), w.applied_index(), w.membership().value_or(Membership{})};
 	}
+	// The group's closed state, RFTCLOS1 (docs/mechanisms/quiescence.md), when it can close
+	// now: started, no call or frame waiting, at rest at a checkpoint covering applied
+	// (Core::closed_state). The host keeps it beside the checkpoint and hands it to recover.
+	std::optional<std::string> closed_state(GroupId id) const {
+		auto found = groups_.find(id);
+		if (found == groups_.end()) { return std::nullopt; }
+		const auto& g = *found->second;
+		if (!g.started || g.closing || g.head || !g.inbox.empty()) { return std::nullopt; }
+		auto state = g.worker->closed_state();
+		if (!state) { return std::nullopt; }
+		return encode_closed_state(*state, closed_identity(id, *g.worker));
+	}
 	// The groups whose wheel entry is armed: group timers, which the blocking entry never
 	// counts as a reason to wait (D5 step 4).
 	std::size_t armed_group_timers() const {
@@ -275,10 +287,24 @@ public:
 	}
 	template <class Restore>
 	task::task<void> recover(GroupId id, Restore restore, task::cancel_token token = {}) {
+		return recover(id, std::move(restore), std::nullopt, std::move(token));
+	}
+	// Recovers the group and reopens it with the closed state the host kept at close
+	// (closed_state): a matching one resumes its term with no election, a stale one is unused.
+	// Damaged bytes or another replica's fail the call with kronuz::journal::Corruption.
+	template <class Restore>
+	task::task<void> recover(GroupId id, Restore restore, std::optional<std::string> closed, task::cancel_token token = {}) {
 		Call call(*this, Kind::open, std::move(token));
 		co_await call.enter();
 		if (call.begin(id, false) && !call.resume_open()) {
-			try { call.group->worker->recover(std::move(restore)); call.group->opened = true; }
+			try {
+				auto& w = *call.group->worker;
+				std::optional<ClosedState> reopen;  // refused before any recovery IO
+				if (closed) { reopen = decode_closed_state(*closed, closed_identity(id, w)); }
+				w.recover(std::move(restore));
+				if (reopen) { w.reopen(*reopen); }
+				call.group->opened = true;
+			}
 			catch (...) { call.fail(opening_error(id)); }
 		}
 		co_await call;
@@ -627,6 +653,14 @@ private:
 			step(g);
 			if (g.closed) { erase(g); host_.settle(loop_); }
 		}
+	}
+	// What binds a closed state to this replica: its configuration's identities and member
+	// incarnation, and the host table's incarnation of the group.
+	ClosedIdentity closed_identity(GroupId id, const Worker& w) const {
+		auto entry = host_.entry(id);
+		if (!entry) { throw kronuz::journal::Corruption("closed state of a group the host does not hold"); }
+		const auto& c = w.configuration();
+		return {c.cluster, c.configuration, id, entry->incarnation, c.local};
 	}
 	// create's or recover's failure. The host's hold refuses a group a failed close left in
 	// doubt with EIO before any IO, holding nothing; an EIO from later IO leaves the hold held.

@@ -91,6 +91,23 @@ one turn, so the reopen adds no barrier: the first write costs its entry's barri
 commit index's, as on an open group. The log after the closed state starts with the hard state
 the replica resumed under.
 
+### Through the Driver
+
+`Driver::closed_state(id)` gives the record's bytes, bound to the configuration's identities, the
+member incarnation and the host table's incarnation of the group, when the group can close now:
+started, no call or frame waiting, and `Core::closed_state()`. The host checkpoints, takes the
+record, then calls `close(id)`; the row closes into the host's table. `recover(id, restore,
+closed)` decodes the record against the same identity before any recovery IO (damaged or
+another replica's bytes complete the call with `Corruption`), recovers, and hands it to
+`Core::reopen` before `Start`.
+
+The journal stages a group reopened from its table with the table's checkpoint record as its
+first record (journal's `recover_shared`). A request issued with the recover rides that turn: the
+reopened leader's entry and term record go in it, and the request costs two barriers, as on an
+open group. A request issued after the recover completes finds that turn written and costs a
+third. Reopened without the record, a lone voter's request costs five (`driver_close_test
+reopen_barriers`).
+
 ### Why reopening without an election is safe
 
 A term has at most one leader, so a replica that led term `T` and still holds term `T` can lead

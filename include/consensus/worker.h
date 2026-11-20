@@ -205,6 +205,14 @@ public:
 	bool transferring() const noexcept { return core_ && core_->transferring(); }
 	Index last_index() const noexcept { return core_ ? core_->last_index() : 0; }
 	std::optional<Term> term_at(Index index) const { return core_ ? core_->term_at(index) : std::nullopt; }
+	// The closed state, when this replica can close now (Core::closed_state): open, not fenced.
+	std::optional<ClosedState> closed_state() const { return core_ && !closing_ && !fenced() ? core_->closed_state() : std::nullopt; }
+	// After create or recover, before Start: resumes the closed term when `closed` matches the
+	// recovered state (Core::reopen); false for a stale one.
+	bool reopen(const ClosedState& closed) {
+		if (!core_) { throw std::logic_error("reopen before create or recover"); }
+		return core_->reopen(closed);
+	}
 	// When the Core next needs a Tick (Core::next_deadline), as Tick::now; the maximum for none.
 	std::uint64_t next_deadline() const {
 		return core_ && !closing_ && !fenced() ? core_->next_deadline() : std::numeric_limits<std::uint64_t>::max();

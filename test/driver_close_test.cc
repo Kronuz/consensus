@@ -34,6 +34,7 @@
 #include <iostream>
 #include <map>
 #include <new>
+#include <optional>
 #include <random>
 #include <span>
 #include <string>
@@ -306,7 +307,7 @@ struct Loop {
 	}
 	// Recovers g in this live Host: the application image its checkpoint restores (empty
 	// without one); its commands after the image reach the Sink as they commit.
-	std::string recover(GroupId g, std::exception_ptr& error, GroupOptions o) {
+	std::string recover(GroupId g, std::exception_ptr& error, GroupOptions o, std::optional<std::string> closed = std::nullopt) {
 		std::string image;
 		driver->open(g, std::move(o));
 		sink.commands.erase(g); sink.committed.erase(g);
@@ -314,7 +315,7 @@ struct Loop {
 			image.assign(static_cast<std::size_t>(reader.descriptor().length), '\0');
 			for (std::size_t at = 0; at < image.size();) { at += reader.read_at(at, std::span<char>(image.data() + at, image.size() - at)); }
 		};
-		if (!settle(driver->recover(g, restore), error)) { check(false, "recover completes"); }
+		if (!settle(driver->recover(g, restore, std::move(closed)), error)) { check(false, "recover completes"); }
 		release();
 		return image;
 	}
@@ -828,6 +829,87 @@ void close_crash() {
 	check(crash_tables && crash_releases, "the sweep closes rows both ways");
 }
 
+// Quiescence A1: a lone voter closed at a checkpoint with its closed state reopens on a request
+// leading in its term, and the request costs an open group's two barriers: the journal's
+// re-staged checkpoint record and the entry with the term record in one turn, then the commit
+// index. Reopened without the record it costs five (ballot, no-op, commit, entry, commit).
+// Damaged bytes fail the recover with Corruption.
+void reopen_barriers() {
+	constexpr GroupId g = 121;
+	jt::Disk disk; Loop loop(disk);
+	auto& log = loop.host->driver(0).log();
+	auto barriers = [&] { return log.stats().barriers; };
+	std::vector<std::string> applied;
+	std::exception_ptr error;
+	// A write placed and committed: the turn barriers it took.
+	auto write = [&](const std::string& c) {
+		const auto before = barriers();
+		auto placed = loop.propose(g, c);
+		loop.apply(g); applied.push_back(c);
+		check(placed && loop.sink.committed[g] >= placed->index, c + " commits");
+		return barriers() - before;
+	};
+	// Checkpoints at the applied position, takes the closed state, and closes into the table.
+	auto close = [&](const std::string& how) {
+		check(!loop.driver->closed_state(g), how + ": no closed state before a checkpoint covers applied");
+		auto published = loop.start(checkpoint_of(loop, g, applied));
+		loop.release();
+		check(published->done && !published->error, how + ": the checkpoint publishes: " + what(published->error));
+		auto closed = loop.driver->closed_state(g);
+		check(closed && closed->size() == 192, how + ": a lone voter's closed state is 192 bytes");
+		check(loop.close(g, error) && !error && loop.host->status(g) == j::GroupStatus::closed, how + ": closes into the host's table: " + what(error));
+		return closed.value_or(std::string{});
+	};
+	// The closed group reopens on a request: recover and the write issued together. The barriers
+	// from the recover to the write's commit.
+	auto reopen_on = [&](std::optional<std::string> closed, const std::string& c) {
+		const auto before = barriers();
+		loop.driver->open(g, options({1}));
+		loop.sink.commands.erase(g); loop.sink.committed.erase(g);
+		std::string image;
+		auto restore = [&image](j::ArtifactReader& reader) {
+			image.assign(static_cast<std::size_t>(reader.descriptor().length), '\0');
+			for (std::size_t at = 0; at < image.size();) { at += reader.read_at(at, std::span<char>(image.data() + at, image.size() - at)); }
+		};
+		auto ref = task::scheduler_ref::of(loop.scheduler);
+		bool recovered = false, placed = false;
+		std::exception_ptr recover_error, place_error;
+		task::spawn(ref, loop.driver->recover(g, restore, std::move(closed)), [&](std::exception_ptr e) { recovered = true; recover_error = e; });
+		task::spawn(ref, loop.driver->propose(g, c), [&](std::exception_ptr e, std::optional<Placement>) { placed = true; place_error = e; });
+		loop.release(); loop.apply(g);
+		check(recovered && !recover_error && split(image) == applied, c + ": recovers: " + what(recover_error));
+		check(placed && !place_error, c + ": the request is placed: " + what(place_error));
+		applied.push_back(c);
+		return barriers() - before;
+	};
+	loop.lone(g);
+	write("a");
+	const auto open = write("b");
+	check(open == 2, "a write to an open lone voter costs two barriers, not " + std::to_string(open));
+	const auto term = loop.driver->state(g)->term;
+	auto closed = close("first close");
+	auto damaged = closed; damaged[100] ^= 1;
+	loop.recover(g, error, options({1}), damaged);
+	check(is<j::Corruption>(error), "a damaged closed state fails the recover with Corruption: " + what(error));
+	check(loop.close(g, error) && !error && loop.driver->groups() == 0, "the refused row closes: " + what(error));
+	auto cost = reopen_on(closed, "c");
+	check(cost == open, "a request reopening with its closed state costs an open group's " + std::to_string(open) + " barriers, not " + std::to_string(cost));
+	auto state = loop.driver->state(g);
+	check(state && state->role == Role::Leader && state->term == term, "the reopened lone voter leads in its closed term, no election");
+	check(write("d") == open, "and the next write costs the same");
+	// Recovered first, written after: the journal's re-staged checkpoint record takes its own turn.
+	closed = close("second close");
+	auto before = barriers();
+	loop.recover(g, error, options({1}), closed);
+	check(!error && barriers() - before == 1, "a reopen alone writes only the journal's checkpoint record: " + std::to_string(barriers() - before));
+	check(write("e") == open && loop.driver->state(g)->term == term, "then a write costs an open group's barriers, in the same term");
+	// Without the record: an election before the write.
+	close("third close");
+	cost = reopen_on(std::nullopt, "f");
+	check(cost == 5, "a request reopening without the record costs five barriers, not " + std::to_string(cost));
+	check(loop.driver->state(g)->term > term, "and a new term");
+}
+
 // A MemoryIO whose directory sync fails once, the n-th after `fail_sync` is armed.
 class FlakyIO final : public j::IO {
 public:
@@ -1014,6 +1096,7 @@ const std::map<std::string, void (*)()> cases{
 	{"reopen_rows", &reopen_rows},
 	{"closed_bytes", &closed_bytes},
 	{"close_crash", &close_crash},
+	{"reopen_barriers", &reopen_barriers},
 	{"pool_bound", &pool_bound},
 	{"failed_close", &failed_close},
 	{"second_driver", &second_driver},

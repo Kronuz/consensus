@@ -59,8 +59,10 @@ inline EventAdmissionPlan plan_event(const Event& event, bool busy, Limits limit
 			if (!busy) { add(AdmissionClass::Control, hard); add(AdmissionClass::Control, noop); add(AdmissionClass::Control, hard); }
 		} else if constexpr (std::is_same_v<T, Propose>) {
 			if (value.command.size() > limits.command_bytes) { throw std::length_error("proposal exceeds admission bound"); }
+			// The entry's batch reserves the hard state too: a reopen's first batch carries
+			// the term record (docs/mechanisms/quiescence.md).
 			if (!busy) {
-				add(AdmissionClass::Normal, storage_batch_size(false, true, 1, value.command.size()));
+				add(AdmissionClass::Normal, storage_batch_size(true, true, 1, value.command.size()));
 				add(AdmissionClass::Control, hard);
 			}
 		} else if constexpr (std::is_same_v<T, Receive>) {
@@ -106,7 +108,7 @@ inline EventAdmissionPlan plan_event(const Event& event, bool busy, Limits limit
 			}, value.message);
 		} else if constexpr (std::is_same_v<T, ChangeMembership>) {
 			if (!busy) {
-				add(AdmissionClass::Control, storage_batch_size(false, true, 1, encode_membership(value.next).size()));
+				add(AdmissionClass::Control, storage_batch_size(true, true, 1, encode_membership(value.next).size()));
 				add(AdmissionClass::Control, hard);
 			}
 		} else if constexpr (std::is_same_v<T, Start> || std::is_same_v<T, Read> || std::is_same_v<T, Repair> || std::is_same_v<T, TransferLeadership> || std::is_same_v<T, PeerLimits>) {

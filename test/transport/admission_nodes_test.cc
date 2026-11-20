@@ -252,8 +252,9 @@ void policy_case() {
 		  "the default takes its CA from the context and its prefix from the local certificate");
 	auto bare = context("bare");
 	const ClusterCa nameless(bare->native_handle(), 4);
-	check(nameless.prefix().empty() && !nameless(certificate("n2").get(), nullptr).node,
-		  "a local certificate naming no node admits none by the CA");
+	const auto none = nameless(certificate("n2").get(), nullptr);
+	check(nameless.prefix().empty() && !none.node && none.fault == PinFault::unpinned,
+		  "a local certificate naming no node leaves only pins admitting (unpinned)");
 	NodePins pins(1, {{1, pin_of("n1")}}, tls->native_handle(), pre_approved_pins());
 	auto copy = pins;
 	auto throws = [](auto f, std::optional<PinFault> fault) {

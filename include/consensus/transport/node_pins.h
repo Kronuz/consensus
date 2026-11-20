@@ -163,7 +163,8 @@ class NodePins {
 	// is refused anyway; throws when the policy admits none, or the node has a pin or was removed.
 	kronuz::consensus::NodeId first_join(const Fingerprint &digest, Trust trust, kronuz::consensus::NodeId expected) const {
 		if (!trust.node)
-			refuse(trust.fault, std::string("the trust policy refused it: ") + pin_fault_name(trust.fault));
+			refuse(trust.fault, trust.fault == PinFault::unpinned ? std::string("unpinned peer certificate")
+																  : std::string("the trust policy refused it: ") + pin_fault_name(trust.fault));
 		if (trust.node == local_ || (expected && trust.node != expected))
 			return trust.node;  // refused by authenticate's own checks, unrecorded
 		auto &d = *directory_;

@@ -61,7 +61,7 @@ class ClusterCa {
 		(void)X509_check_purpose(ca, -1, 0);  // cached before loops verify against it (tls.h)
 	}
 	// The default: the certificates `context` trusts, and the prefix of the URI by which the local
-	// certificate names `local`. A local certificate naming no node admits none by the CA (cluster).
+	// certificate names `local`. When it names none, the CA admits none: only pins do (unpinned).
 	ClusterCa(SSL_CTX *context, kronuz::consensus::NodeId local) : ClusterCa(local_prefix(context, local)) {
 		std::unique_ptr<STACK_OF(X509), void (*)(STACK_OF(X509) *)> trusted(
 			X509_STORE_get1_all_certs(SSL_CTX_get_cert_store(context)),
@@ -75,11 +75,13 @@ class ClusterCa {
 	}
 	const std::string &prefix() const noexcept { return prefix_; }
 	Trust operator()(X509 *leaf, STACK_OF(X509) *chain) const {
+		if (prefix_.empty())
+			return {0, PinFault::unpinned};  // a cluster that names no nodes: only pins admit
 		std::unique_ptr<X509_STORE_CTX, decltype(&X509_STORE_CTX_free)> context(X509_STORE_CTX_new(), X509_STORE_CTX_free);
 		if (!context || X509_STORE_CTX_init(context.get(), store_.get(), leaf, chain) != 1 ||
 			X509_verify_cert(context.get()) != 1)
 			return {0, PinFault::unpinned};
-		return {prefix_.empty() ? 0 : node_of(leaf, prefix_), PinFault::cluster};
+		return {node_of(leaf, prefix_), PinFault::cluster};
 	}
 	// The node `leaf`'s URIs name under `prefix`, or 0 when they name none, or several.
 	static kronuz::consensus::NodeId node_of(X509 *leaf, std::string_view prefix) {

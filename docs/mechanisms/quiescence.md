@@ -47,6 +47,10 @@ it was the leader, its own pre-vote is not refused. A follower that alone hears 
 wakes the other with its pre-vote, and the two elect within two timeouts (`simulation_test`, quiescence cases; half of
 the random seeds quiesce under a detector oracle).
 
+What rest saves: at 1M groups on one host, no wake and no timer against 1,000 wakes/s and
+about 168 us of CPU per group per second with per-group heartbeats
+([quiescence-idle-cpu](../perf/quiescence-idle-cpu.md)).
+
 ## The closed state
 
 The closed state is the replica's consensus position at close: its hard state, the end of its

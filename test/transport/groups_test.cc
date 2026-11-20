@@ -610,9 +610,10 @@ std::string sockets(std::initializer_list<std::uint16_t> ports) {
 	}
 	return r;
 }
-// Kernel stacks of a stuck loop (macOS on a CI runner, or GROUPS_PROBE_SPINDUMP naming the file):
-// the first stuck sample starts `sudo -n spindump` on this process for 3 s in the background, and
-// a failed run prints the report's threads that are in write, a socket call or the probe.
+// Kernel stacks of a loop stuck in an uninterruptible kernel wait (macOS on a CI runner, or
+// GROUPS_PROBE_SPINDUMP naming the file): the first such sample starts `sudo -n spindump` on this
+// process for 3 s in the background and saves the kernel's symbols beside it; a failed run prints
+// the report's threads in write, a socket call or the sampler, kernel frames named.
 class Spindump {
   public:
 	void start() {
@@ -622,8 +623,8 @@ class Spindump {
 			return;
 		started_ = true;
 		path_ = named && *named ? named : "spindump-upload-" + std::to_string(::getpid()) + ".txt";
-		const std::string command = "(sudo -n spindump " + std::to_string(::getpid()) + " 3 10 -o '" + path_ + "' > /dev/null 2>&1; touch '" +
-									path_ + ".done') &";
+		const std::string command = "(sudo -n spindump " + std::to_string(::getpid()) + " 3 10 -o '" + path_ + "' > /dev/null 2>&1; nm -n " +
+									"/System/Library/Kernels/kernel > '" + path_ + ".nm' 2> /dev/null; touch '" + path_ + ".done') &";
 		(void)std::system(command.c_str());
 #endif
 	}
@@ -638,12 +639,14 @@ class Spindump {
 			std::printf("upload: spindump %s: no report (sudo -n spindump failed)\n", path_.c_str());
 			return;
 		}
-		std::printf("upload: spindump %s, the threads in write, a socket call or the probe:\n", path_.c_str());
+		const auto symbols = kernel_symbols(path_ + ".nm");
+		std::printf("upload: spindump %s (%zu kernel symbols), the threads in write, a socket call or the sampler:\n", path_.c_str(),
+					symbols.size());
 		std::string line, block;
 		int printed = 0;
 		const auto flush = [&] {
-			for (const char *mark : {"write", "flush", "getsockopt", "ioctl", "getsockname", "getpeername", "sample"})
-				if (block.find(mark) != std::string::npos && printed < 400) {
+			for (const char *mark : {"write", "flush", "getsockopt", "ioctl", "getsockname", "getpeername", "sockets("})
+				if (block.find(mark) != std::string::npos && printed < 600) {
 					std::fputs(block.c_str(), stdout);
 					printed += int(std::count(block.begin(), block.end(), '\n'));
 					break;
@@ -654,12 +657,37 @@ class Spindump {
 			if (line.rfind("  Thread 0x", 0) == 0)
 				flush();
 			if (!block.empty() || line.rfind("  Thread 0x", 0) == 0)
-				block += line + "\n";
+				block += named(line, symbols) + "\n";
 		}
 		flush();
 	}
 
   private:
+	using Symbols = std::vector<std::pair<std::uint64_t, std::string>>;
+	// `nm -n` of the kernel: address-sorted text symbols.
+	static Symbols kernel_symbols(const std::string &path) {
+		Symbols r;
+		std::ifstream in(path);
+		std::string address, type, name;
+		while (in >> address >> type >> name)
+			if (type == "T" || type == "t")
+				r.emplace_back(std::strtoull(address.c_str(), nullptr, 16), name);
+		return r;
+	}
+	// A kernel frame, "??? (kernel + N) [0xADDRESS]", with the symbol at or below its address.
+	static std::string named(const std::string &line, const Symbols &symbols) {
+		const auto at = line.find("??? (kernel + "), bracket = line.find("[0x");
+		if (at == std::string::npos || bracket == std::string::npos || symbols.empty())
+			return line;
+		const std::uint64_t address = std::strtoull(line.c_str() + bracket + 1, nullptr, 16);
+		auto it = std::upper_bound(symbols.begin(), symbols.end(), address, [](std::uint64_t a, const auto &s) { return a < s.first; });
+		if (it == symbols.begin())
+			return line;
+		--it;
+		char offset[24];
+		std::snprintf(offset, sizeof offset, "+0x%llx", (unsigned long long)(address - it->first));
+		return line.substr(0, at) + it->second + offset + line.substr(at + 3);
+	}
 	bool started_ = false;
 	std::string path_;
 };
@@ -693,7 +721,8 @@ class LoopProbe {
 			l.cpu = cpu;
 			r += line;
 			if (age >= 250) {
-				spindump_.start();
+				if (state == 'U')
+					spindump_.start();
 				r += stack(*l.loop);
 			}
 			r += "}";
@@ -916,12 +945,7 @@ bool upload() {
 			samples.push_back(line + sockets({one.port(), two.port()}) + loops.sample() + kernel.sample());
 		}
 	});
-	// GROUPS_UPLOAD_HOLD_MS holds host 1's connection loop that long at 300 ms: a stuck loop on demand.
-	const char *hold = std::getenv("GROUPS_UPLOAD_HOLD_MS");
-	const auto hold_ms = std::chrono::milliseconds(hold ? std::atoll(hold) : 0);
 	for (std::int64_t tick = 0; ms_since(start) < 4000; ++tick) {  // signed: see reader()
-		if (tick == 3 && hold_ms.count() > 0)
-			one.post(one.transport->loop_of_node(2), [hold_ms] { std::this_thread::sleep_for(hold_ms); });
 		for (auto g : uploads) {
 			const auto k = one.transport->loop_of_group(g);
 			one.post(k, [&, g, k] { send_message(*one.transport, k, g, 1, 2, Send{2, chunk}); });

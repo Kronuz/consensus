@@ -50,6 +50,13 @@ thread; resolvers and deliveries must not exit the process. `test/transport/reso
 measures the wait: destruction with a resolver stuck until 300 ms later took 307 ms, and exit
 with a 200 ms lookup in its resolver waited 206 ms.
 
+Fork is not supported. A child made by `fork()` without an exec has only the forking thread,
+but it inherits `LookupThreads` as the parent left it: the entries of every lookup thread
+that was running or not yet joined, a busy count, and a mutex that a vanished thread may hold. Its lookups can
+wait forever on a thread that does not exist, and its exit closes `LookupThreads`, which waits
+for those entries to leave. A child must exec or `_exit` before it touches a `Peers` or a
+`Lookup`.
+
 A peer has at most one lookup in flight, and a new lookup of a name starts only once the
 last one's deadline has passed. A dial that finds a lookup already running, or one started
 within the deadline, does not start another. Each peer name therefore holds at most one

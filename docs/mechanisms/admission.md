@@ -80,6 +80,40 @@ was not removed after `since`. A remove and a re-admit with a new pin in between
 let the old certificate's connection through. Removal through `NodePins::remove` alone refuses new
 connections but leaves established links up; the transport's `remove_node` is the one that closes them.
 
+## Joining with a token
+
+Every node speaks TLS under the cluster CA; there is no unauthenticated mode (D150). A node with
+no key and no certificate gets both by joining (`admission_join.h`): it holds only the cluster's
+join token, `DTJT` and two hex fields, 132 characters: the CA certificate's SHA-256 fingerprint
+and a 32-byte secret (`fresh_join_token`, `encode_join_token`, `decode_join_token`). Creating the
+CA on first start and printing the token are the caller's (Xapiand's cluster A7).
+
+`join(executor, loop, endpoint, token, requested)` connects to an `Issuer`, a node holding the CA
+key, over TLS that authenticates neither end yet. The DTJN0001 exchange, length-prefixed frames
+of at most 64 KiB, within one deadline:
+
+```
+issuer -> joiner   the CA certificate                      joiner: its fingerprint is the token's,
+                                                           and the issuer's leaf chains to it (ca)
+joiner -> issuer   the secret, the node it asks for, a CSR  issuer: the secret (token), the CSR's
+                   for a P-256 key it made just now        signature (malformed), the hook (node)
+issuer -> joiner   a fault, or the node and its certificate joiner: the key and the CA (issued)
+```
+
+The joiner sends its secret only after it pinned the CA by the token, so a host that is not the
+cluster's never sees it. The issuer compares the secret in constant time; a wrong or empty one is
+`token`. Its `assign` hook names the node a joiner becomes, or refuses it (`node`); `issued` may
+record the certificate. The certificate names the node under the CA policy's prefix
+(`URI:<prefix><node>`), CA:FALSE, server and client auth, signed with SHA-256 for a year by
+default. `Joined::save(directory)` writes the key (owner-only), the certificate and the CA, and
+returns the options a Peer context loads; the joined node then connects as any node does, and the
+cluster CA policy records its pin at its first connection. Refusals are `JoinRefused` with a
+`JoinFault`, counted at the issuer in `refused(fault)`.
+
+The exchange runs on whatever socket the caller accepts for it, not on the transport's own
+listener: the transport's handshake requires a client certificate, which a joiner does not have
+yet.
+
 ## Refusals
 
 Every refusal throws `PinRefused` with its `PinFault` before any hello or frame, and counts in
@@ -105,7 +139,12 @@ node). The messages of the faults that existed before keep their text.
   and 2, which share a loop with node 3 on node 1: each removal ends node 3's calls both ways at
   once, its dials are refused (`removed`), node 1 does not dial it, it answers once admitted again,
   and no call between 1 and 2 fails. It runs under TSan.
+- `issue` (the CA policy alone): the token's round trip; a wrong token and a missing one refused
+  (`token`), a token of another CA refused by the joiner before its secret goes out (`ca`), a node
+  the hook refuses (`node`), nothing issued for them; then a node with no key or certificate joins,
+  calls node 1, and node 1 pins its issued certificate at its first join.
 
 Mutants (`test/transport/admission_mutants.py`): `no-pin-check` (a dial takes any certificate as
 the node it meant) fails `refused_pins`; `no-repin-check` (a first join re-pins a pinned node)
-fails `refused_ca`; `remove-keeps-links` fails `remove_*`.
+fails `refused_ca`; `remove-keeps-links` fails `remove_*`; `any-token` (an issuer takes any
+secret) fails `issue`.

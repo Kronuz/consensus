@@ -116,8 +116,7 @@ Since transport-group-bytes the open is the host's (`open_of(group)`, host-trans
 Identity), and the last source a connection reported sits beside its id in the group loop's set
 (16 B, not 8). Stored is the id, incarnation and serial, 24 B; per peer, 16 and 16, 32 B. So the
 minimum is `24 + 32P` and the bound `44 + 64P` (24 x 1.5 + 8; 2 x (16 x 1.5 + 8)), and the bench
-also fails a group stored over D108's 64 B. The rows at the new commit are in transport-group-bytes'
-section below.
+also fails a group stored over D108's 64 B. The rows at the new commit are in the next section.
 
 The per-end and per-host rows below are job 261118-075717-797949 (light, consensus:33f8540, Release
 and no build type, 3 runs each; byte counts do not depend on load).
@@ -127,6 +126,21 @@ Release build; 45,128 B and 46,736-46,737 B with no build type. Budget: 48 KB (4
 armed timers per end, keepalive and dead peer. The L = 4 slope still sits about 1.7 KB above
 L = 1's: per end, the C++ heap holds 400-600 B more at L = 4 (Asio's per-thread handler memory,
 not set apart), while OpenSSL's per-end bytes match L = 1's within 300 B.
+
+### Per-group bytes, before and after transport-group-bytes
+
+Before is consensus:c2b0133, after consensus:0a65af1; each row is one strict job (byte counts do
+not move with load).
+
+| Row | Before | After | Jobs (before / after) |
+|---|---|---|---|
+| Idle group, `cost one 2 1 10000` (P = 1) | 180.2 B (stored 127.8, frames 52.4) | 88.4 B (stored 36.0, frames 52.4) | 261120-095143-778a7a / -095049-c97307 |
+| Bytes per group in flight, 10,000 groups | 4,746.1 B (47.5 MB per host) | 594.7 B (5.9 MB per host) | 261120-095136-7a0672 / -095040-68a827 |
+| Once credited | 52.5 B | 52.5 B | same jobs |
+
+A group in flight held its Active's `std::deque` blocks (the 4,096-byte block per group in the
+before row's C++ blocks); the vector FIFO holds only what is queued. Stored is 36.0 B, under D108's
+64 B, and an idle group (88.4 B) is under `44 + 64P` (108 B at P = 1).
 
 ### Each loop's thread state, set apart
 

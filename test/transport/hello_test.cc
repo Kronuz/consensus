@@ -77,6 +77,7 @@ struct Cores {
 	std::map<NodeId, Node> nodes;
 	std::deque<std::tuple<NodeId, NodeId, Message>> wire;
 	std::uint64_t now = 100, big_to_3 = 0;  // appends from 1 to 3 that carried an entry past 3's command limit
+	bool cut = false;                        // messages between 1 and 3 are lost
 	static FixedConfiguration config(NodeId local) {
 		FixedConfiguration c;
 		c.cluster[0] = 'P';
@@ -100,6 +101,8 @@ struct Cores {
 			if (auto p = std::get_if<Persist>(&a)) {
 				consume(n, node.core->step(Persisted{p->token}));
 			} else if (auto s = std::get_if<Send>(&a)) {
+				if (cut && ((n == 1 && s->peer == 3) || (n == 3 && s->peer == 1)))
+					continue;
 				if (auto *append = std::get_if<AppendRequest>(&s->message); append && n == 1 && s->peer == 3)
 					for (auto &e : append->entries)
 						big_to_3 += e.payload.size() > low().command_bytes;
@@ -173,18 +176,20 @@ bool leader() {
 	}
 	const bool reported = arrived && got.size() == 1 && got[0].incarnation == 3 && got[0].limits == low();
 
-	// The leader takes the report as its PeerLimits, then a 512 KiB command: 1 and 2 commit it,
-	// and no append to 3 carries it.
+	// A 512 KiB command reaches the leader's log while 3 is cut off (M8: a leader admits only what
+	// every reported member takes), then the report arrives: 1 and 2 commit it, no append to 3 carries it.
 	Cores cores;
 	cores.consume(1, cores.nodes.at(1).core->step(Tick{cores.now, 100}));
 	cores.run(400);
 	auto &lead = *cores.nodes.at(1).core;
 	bool ok = reported && lead.role() == Role::Leader;
+	cores.cut = true;
+	cores.consume(1, lead.step(Propose{1, std::string(512 << 10, 'x')}));
+	cores.run(100);
 	for (auto &report : got)
 		cores.consume(1, lead.step(report));
-	cores.consume(1, lead.step(Propose{1, std::string(512 << 10, 'x')}));
-	cores.consume(1, lead.step(Propose{2, std::string(1000, 'y')}));
-	cores.run(2000);
+	cores.cut = false;
+	cores.run(3000);
 	ok &= cores.has(1, 512 << 10) && cores.has(2, 512 << 10) && !cores.has(3, 512 << 10) && !cores.big_to_3;
 	std::printf("leader: host 1 reported %zu limits for incarnation %llu (command_bytes %zu); leader %s; the 512 KiB entry applied on 1: %s, 2: %s, 3: %s; appends to 3 carrying it: %llu %s\n",
 				got.size(), (unsigned long long)(got.empty() ? 0 : got[0].incarnation), got.empty() ? 0 : got[0].limits.command_bytes,
@@ -220,7 +225,7 @@ bool version() {
 	HostTransportOptions tight;
 	tight.links.connection.maximum_frame = 1 << 20;  // below a 2 MiB rpc_bytes frame
 	Host three(3, 1);
-	const bool small = refuses<std::invalid_argument>([&] { three.open(addresses({&one}), tight); }, "maximum_frame below");
+	const bool small = refuses<std::invalid_argument>([&] { three.open({{1, {"127.0.0.1", 1}}}, tight); }, "maximum_frame below");
 	const bool ok = refused && !links && !delivered && small;
 	std::printf("version: hellos refused by wire version on host 1: %s; links established %llu; frames delivered %d; a 1 MiB frame for 2 MiB rpc_bytes refused: %s %s\n",
 				refused ? "yes" : "no", (unsigned long long)links, delivered.load(), small ? "yes" : "no", ok ? "ok" : "FAILED");

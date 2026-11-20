@@ -39,7 +39,7 @@ MUTANTS = {
                    ("\t\tc.method = method;\n", "\t\tc.method = method;\n\t\tallocate(c, h);\n")],
     # group-full: lane frames wait while the groups' data holds the credit (one credit for both)
     "rpc-shared-credit": [(HOST, "rpc::Lane *calls = lane.link->lane == LinkLane::Bulk ? rpc_lane(k, *lane.link) : nullptr;",
-                           "rpc::Lane *calls = lane.link->lane == LinkLane::Bulk && stats.uncredited < options_.window ? rpc_lane(k, *lane.link) : nullptr;")],
+                           "rpc::Lane *calls = lane.link->lane == LinkLane::Bulk && stats.uncredited + rpc::chunk_bytes + frame_header <= options_.window ? rpc_lane(k, *lane.link) : nullptr;")],
     # stream: a body goes as one frame, past chunk and credit
     "rpc-one-frame": [("\t\treturn std::min<std::uint64_t>(chunk_bytes, o.limit - o.sent);",
                        "\t\treturn o.total == unknown_total ? chunk_bytes : o.total - o.sent;")],

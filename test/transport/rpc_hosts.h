@@ -20,24 +20,23 @@ using namespace std::chrono_literals;
 using tcp = asio::ip::tcp;
 using steady = std::chrono::steady_clock;
 
-namespace {
-std::filesystem::path fixture;
-const char *names[] = {"", "one", "two", "three", "four"};
+inline std::filesystem::path fixture;
+inline const char *names[] = {"", "one", "two", "three", "four"};
 
-Fingerprint pin_of(const std::string &name) {
+inline Fingerprint pin_of(const std::string &name) {
 	std::unique_ptr<BIO, decltype(&BIO_free)> input(BIO_new_file((fixture / (name + ".pem")).c_str(), "r"), BIO_free);
 	std::unique_ptr<X509, decltype(&X509_free)> leaf(PEM_read_bio_X509(input.get(), nullptr, nullptr, nullptr), X509_free);
 	assert(leaf);
 	return certificate_fingerprint(leaf.get());
 }
-std::shared_ptr<asio::ssl::context> context(const std::string &name) {
+inline std::shared_ptr<asio::ssl::context> context(const std::string &name) {
 	auto c = std::make_shared<asio::ssl::context>(asio::ssl::context::tls);
 	reactor::tls::configure(*c, {(fixture / (name + ".pem")).string(), (fixture / (name + ".key")).string(),
 								 (fixture / "ca.pem").string()},
 							reactor::tls::Role::Peer);
 	return c;
 }
-std::uint64_t ms_since(steady::time_point t) {
+inline std::uint64_t ms_since(steady::time_point t) {
 	return std::uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(steady::now() - t).count());
 }
 
@@ -146,20 +145,20 @@ struct Host {
 	}
 	~Host() { stop(); }
 };
-std::map<NodeId, PeerAddress> addresses(std::initializer_list<const Host *> hosts) {
+inline std::map<NodeId, PeerAddress> addresses(std::initializer_list<const Host *> hosts) {
 	std::map<NodeId, PeerAddress> r;
 	for (auto *h : hosts)
 		r[h->node] = {"127.0.0.1", h->port()};
 	return r;
 }
-std::vector<GroupId> groups_on(std::uint32_t L, std::uint32_t k, std::size_t n) {
+inline std::vector<GroupId> groups_on(std::uint32_t L, std::uint32_t k, std::size_t n) {
 	std::vector<GroupId> r;
 	for (GroupId g = 1000; r.size() < n; ++g)
 		if (kronuz::journal::host_detail::loop(kronuz::journal::host_detail::slot(g), L) == k)
 			r.push_back(g);
 	return r;
 }
-template <class P> bool until(P done, std::chrono::milliseconds limit) {
+template <class P> inline bool until(P done, std::chrono::milliseconds limit) {
 	const auto start = steady::now();
 	while (!done()) {
 		if (steady::now() - start > limit)
@@ -179,5 +178,3 @@ struct Beats {
 		++count;
 	}
 };
-
-}  // namespace

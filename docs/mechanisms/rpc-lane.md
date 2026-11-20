@@ -115,7 +115,7 @@ the decoder and a call table; its corpus `fuzz/corpus/rpc` replays as `consensus
 | Case | What it shows | Control |
 |---|---|---|
 | `calls` | a 1 MiB streamed echo exact; a 300 ms deadline ends both ends `deadline_exceeded`; a cancel mid-stream ends each end once; every pool back to 0 | |
-| `group-full` | a group's receiving loop stalls 3 s with its 4 MiB credit full on Bulk; calls on the same connection keep their largest latency under 250 ms | `rpc-shared-credit` (lane frames wait for the groups' credit) |
+| `group-full` | a group's receiving loop stalls 4 s with its 4 MiB credit full on Bulk; calls on the same connection keep their largest latency under 250 ms | `rpc-shared-credit` (lane frames wait for the groups' credit) |
 | `call-full` | a call whose server never reads holds its 4 MiB credit and pool; heartbeats on Control keep every gap under 1,000 ms | |
 | `lane-only` | no shared group: the call dials Bulk alone, its bytes exact, one link per end, every group counter 0 | |
 | `stream` | a 32 MiB request under the lane's credit, heartbeats' gaps under 1,000 ms, the serving pool's high water within one window | `rpc-one-frame` (the body as one frame) |

@@ -2,7 +2,7 @@
 // loop on its own thread (docs/mechanisms/rpc-lane.md, On Bulk):
 //   calls       deadlines and cancels over shared connections: a caller's deadline ends the
 //               server's call, a cancel mid-stream ends both ends once, and every pool is back to 0
-//   group-full  a group whose receiving loop stalls 3 s fills its credit on Bulk; calls on the
+//   group-full  a group whose receiving loop stalls 4 s fills its credit on Bulk; calls on the
 //               same connection keep their latency (control: rpc-shared-credit)
 //   call-full   a call whose server never reads fills its credit and pool; another group's
 //               heartbeats keep every gap under the 1,000 ms election timeout
@@ -218,7 +218,7 @@ bool calls() {
 	return ok;
 }
 
-// reader_test's shape for the lane: group 1's receiving loop stalls 3 s while its sender fills the
+// reader_test's shape for the lane: group 1's receiving loop stalls 4 s while its sender fills the
 // group's credit on Bulk; small calls on the same Bulk connection keep their latency.
 bool group_full() {
 	constexpr std::uint32_t L = 4;
@@ -242,27 +242,28 @@ bool group_full() {
 	if (!until([&] { return warm->done.load(); }, 10s))
 		return false;
 	const auto sender = one.transport->loop_of_node(2), at = one.transport->loop_of_group(g1);
-	two.post((reading + 1) % L, [] { std::this_thread::sleep_for(3000ms); });
+	two.post((reading + 1) % L, [] { std::this_thread::sleep_for(4000ms); });
 	one.post(at, [&] {
 		for (int i = 0; i != 100; ++i)
 			one.transport->send(at, LinkLane::Bulk, FrameKind::data, {g1, 1, 2}, 2, std::string(64 * 1024, 'g'));
 	});
-	const bool full = until([&] { return one.transport->stats(sender).uncredited >= 4u << 20; }, 2s);
+	// The window less one frame: the next 64 KiB frame no longer fits.
+	const bool full = until([&] { return one.transport->stats(sender).uncredited > (4u << 20) - (64u << 10) - frame_header; }, 2s);
+	const auto uncredited = one.transport->stats(sender).uncredited.load();
 	std::uint64_t worst = 0, done = 0;
 	const auto start = steady::now();
-	while (ms_since(start) < 2000) {
+	while (ms_since(start) < 1500) {
 		auto c = start_call(one, 2, echo, 64, 10s);
 		if (until([&] { return c->done.load(); }, 5s) && c->status.outcome == rpc::Outcome::ok)
 			++done;
 		worst = std::max<std::uint64_t>(worst, std::chrono::duration_cast<std::chrono::milliseconds>(c->finished - c->started).count());
 		std::this_thread::sleep_for(50ms);
 	}
-	const auto uncredited = one.transport->stats(sender).uncredited.load();
 	until([&] { return delivered == 100; }, 10s);
 	one.stop();
 	two.stop();
-	const bool ok = full && done >= 20 && worst < 250 && delivered == 100;
-	std::printf("group-full: group 1's credit full (%s, %llu bytes uncredited during the calls); %llu calls, largest latency %llu ms; group 1 delivered %llu of 100 %s\n",
+	const bool ok = full && done >= 15 && worst < 250 && delivered == 100;
+	std::printf("group-full: group 1's credit full (%s, %llu bytes uncredited as the calls began); %llu calls, largest latency %llu ms; group 1 delivered %llu of 100 %s\n",
 				full ? "yes" : "no", (unsigned long long)uncredited, (unsigned long long)done, (unsigned long long)worst,
 				(unsigned long long)delivered.load(), ok ? "ok" : "FAILED");
 	return ok;
@@ -301,7 +302,8 @@ bool call_full() {
 		std::this_thread::sleep_until(start + (tick + 1) * 100ms);
 	}
 	std::this_thread::sleep_for(150ms);
-	const auto held = two.transport->serving_pool().used(), sent = one.at(2, [&] { return c->out.sent; });
+	const std::size_t held = two.transport->serving_pool().used();
+	const std::uint64_t sent = one.at(2, [&] { return c->out.sent; });
 	one.at(2, [&] {
 		one.transport->stop(c->out.call, rpc::Code::cancelled);
 		return 0;
@@ -380,8 +382,8 @@ bool stream() {
 					!served->mismatched && beats.worst < 1000 && serving <= window && outgoing <= HostTransportOptions{}.rpc.outgoing_bytes;
 	std::printf("stream: %llu MiB in %llu ms (%.1f MB/s), outcome %d, the server read %llu bytes, %llu mismatched; heartbeats' longest gap %llu ms; serving high water %zu (window %zu), outgoing %zu %s\n",
 				(unsigned long long)(body >> 20), (unsigned long long)elapsed, double(body) / 1e3 / double(elapsed),
-				int(c->status.outcome), (unsigned long long)(served ? served->received : 0),
-				(unsigned long long)(served ? served->mismatched : 0), (unsigned long long)beats.worst, serving, window, outgoing,
+				int(c->status.outcome), (unsigned long long)(served ? served->received.load() : 0),
+				(unsigned long long)(served ? served->mismatched.load() : 0), (unsigned long long)beats.worst, serving, window, outgoing,
 				ok ? "ok" : "FAILED");
 	one.stop();
 	two.stop();

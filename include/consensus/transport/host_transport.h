@@ -2,8 +2,10 @@
 #include "codec.h"
 #include "hello.h"
 #include "links.h"
+#include "rpc.h"
 #include <algorithm>
 #include <asio/post.hpp>
+#include <asio/steady_timer.hpp>
 #include <atomic>
 #include <deque>
 #include <functional>
@@ -16,7 +18,7 @@
 // posts each batch once per read. Senders keep per-group queues and ready rings: control frames
 // first, round robin across ready groups, and data frames within each group's credit; a feed
 // does O(1) work per frame. A group's frames are admitted per frame (R7) once the peer's group
-// open matched on that connection.
+// open matched on that connection. The RPC lane rides Bulk beside them (docs/mechanisms/rpc-lane.md).
 namespace kronuz::consensus::transport {
 using GroupId = std::uint64_t;
 
@@ -200,8 +202,28 @@ template <class V> class GroupTable {
 	std::vector<std::uint32_t> index_;  // an entry's slot + 1; 0 is empty
 };
 
+// The RPC lane's host-wide pools (D5) and each connection's call table.
+struct RpcOptions {
+	std::size_t serving_bytes = std::size_t{256} << 20;  // served requests' bodies
+	std::size_t calling_bytes = std::size_t{256} << 20;  // this host's calls' responses
+	std::size_t outgoing_bytes = std::size_t{64} << 20;  // body bytes queued to send
+	rpc::LaneOptions lane;
+};
+// A call on the lane, on its connection's loop (loop_of_node(node)): one this host made or serves.
+struct RpcCall {
+	kronuz::consensus::NodeId node = 0;
+	std::uint64_t id = 0;
+};
+// The lane's counters of one loop, readable from any thread; no group's counter moves for it.
+struct LaneStats {
+	std::atomic<std::uint64_t> calls{0}, served{0}, frames_in{0}, frames_out{0}, bytes_in{0}, bytes_out{0};
+	std::atomic<std::uint64_t> outcomes[rpc::outcomes] = {};  // calls ended here, by rpc::Outcome
+	std::uint64_t ended(rpc::Outcome o) const noexcept { return outcomes[std::size_t(o)]; }
+};
+
 struct HostTransportOptions {
 	LinkOptions links;
+	RpcOptions rpc;
 	std::uint64_t window = 4 << 20;     // data bytes a group may have sent and not yet credited, per connection
 	std::size_t control_queue = 64;     // control frames a group queues per connection; more are dropped
 	std::uint64_t data_queue = 8 << 20; // data bytes a group queues per connection; more are dropped
@@ -237,10 +259,17 @@ class HostTransport {
 	// returns either way.
 	using Deliver = std::function<bool(const Received &)>;
 
+	// A served call: its events, or none to answer unknown_method. The handler acts on the call
+	// from its events, which run on the call's loop; `call` names it to write, consume and stop.
+	using Serve = std::function<std::optional<rpc::Events>(RpcCall call, const rpc::Incoming &)>;
+
 	HostTransport(std::vector<HostLoop> loops, std::shared_ptr<asio::ssl::context> tls, const NodePins &pins,
 				  kronuz::consensus::Identity cluster, const std::map<kronuz::consensus::NodeId, PeerAddress> &addresses,
 				  HostTransportOptions options = {})
-		: options_(std::move(options)), loops_(loops.size()) {
+		: options_(std::move(options)), loops_(loops.size()), serving_(options_.rpc.serving_bytes),
+		  calling_(options_.rpc.calling_bytes), outgoing_(options_.rpc.outgoing_bytes) {
+		for (auto &[node, address] : addresses)
+			nodes_.push_back(node);
 		if (loops_.empty() || loops_.size() > 4096)
 			throw std::invalid_argument("host transport: 1 to 4,096 loops");
 		if (!options_.member_of)
@@ -268,6 +297,10 @@ class HostTransport {
 		return kronuz::journal::host_detail::loop(kronuz::journal::host_detail::slot(node), loops());
 	}
 	const HostTransportStats &stats(std::uint32_t loop) const { return loops_.at(loop).stats; }
+	const LaneStats &lane_stats(std::uint32_t loop) const { return loops_.at(loop).lane_stats; }
+	const rpc::ByteBudget &serving_pool() const noexcept { return serving_; }
+	const rpc::ByteBudget &calling_pool() const noexcept { return calling_; }
+	const rpc::ByteBudget &outgoing_pool() const noexcept { return outgoing_; }
 	// Before any frame arrives: what loop `loop` delivers.
 	void on_deliver(std::uint32_t loop, Deliver deliver) { loops_.at(loop).deliver = std::move(deliver); }
 	// On the group's loop: the host stores `group` as its incarnation `incarnation`. A peer's
@@ -322,12 +355,87 @@ class HostTransport {
 		}
 	}
 
-	// From any thread: every loop stops dialing and accepting and aborts its connections.
+	// Before serve(): the handler of `method` (D6). Calls of a method with none end unknown_method.
+	void handle(rpc::MethodId method, Serve serve) {
+		if (!method)
+			throw std::invalid_argument("host transport: method 0");
+		serves_[method] = std::move(serve);
+	}
+	// On loop_of_node(node): starts a call on the lane to `node` (rpc::Lane::call), on its Bulk
+	// connection, which it dials when there is none: any node with an address, sharing a group or
+	// not. Its events run on this loop; `done` runs once, at once when the node has no address.
+	RpcCall call(kronuz::consensus::NodeId node, rpc::MethodId method, rpc::CallOptions options, std::string request,
+				 rpc::Events events) {
+		const auto total = options.total.value_or(request.size());
+		if (!method || request.size() > rpc::chunk_bytes || !options.window || request.size() > total)
+			throw std::invalid_argument("host transport: rpc call");
+		const auto k = loop_of_node(node);
+		auto &here = loops_[k];
+		const RpcCall c{node, ++here.rpc_ids};
+		++here.lane_stats.calls;
+		events.done = ending(k, c, std::move(events.done));
+		if (here.stopping || std::find(nodes_.begin(), nodes_.end(), node) == nodes_.end()) {
+			events.done({rpc::Outcome::not_connected});
+			return c;
+		}
+		auto &peer = here.rpc[node];
+		peer.calls[c.id] = 0;
+		if (peer.lane)
+			begin(peer, c.id, {method, std::move(options), std::move(request), std::move(events)});
+		else
+			peer.pending.push_back({c.id, method, std::move(options), std::move(request), std::move(events)});
+		pump(k, node, LinkLane::Bulk);
+		arm(k, node);
+		return c;
+	}
+	// On the call's loop, each as rpc::Lane's own; a call that ended, or waits for its connection,
+	// takes nothing (sendable 0).
+	std::size_t sendable(RpcCall c) const {
+		const auto *lane = lane_of(c);
+		return lane ? lane->sendable(handle_of(c)) : 0;
+	}
+	void write(RpcCall c, std::string bytes, bool end) {
+		if (auto *lane = lane_of(c))
+			lane->send(handle_of(c), std::move(bytes), end);
+	}
+	void consume(RpcCall c, std::size_t n) {
+		if (auto *lane = lane_of(c))
+			lane->consume(handle_of(c), n);
+	}
+	void total(RpcCall c, std::uint64_t total) {
+		if (auto *lane = lane_of(c))
+			lane->total(handle_of(c), total);
+	}
+	void stop(RpcCall c, rpc::Code code, std::string_view text = {}) {
+		auto &here = loops_[loop_of_node(c.node)];
+		const auto it = here.rpc.find(c.node);
+		if (it == here.rpc.end() || !it->second.calls.contains(c.id))
+			return;
+		if (auto *lane = lane_of(c))
+			return lane->stop(handle_of(c), code, text);
+		auto &pending = it->second.pending;  // not yet on a connection: it ends here alone
+		const auto p = std::find_if(pending.begin(), pending.end(), [&](const Pending &p) { return p.id == c.id; });
+		if (p == pending.end())
+			return;
+		auto done = std::move(p->call.events.done);
+		pending.erase(p);
+		done({code == rpc::Code::deadline_exceeded ? rpc::Outcome::timed_out : rpc::Outcome::cancel, std::uint32_t(code),
+			  std::string(text.substr(0, rpc::text_bytes))});
+	}
+
+	// From any thread: every loop stops dialing and accepting and aborts its connections; calls
+	// not yet on a connection end not_connected.
 	void stop() {
-		for (auto &loop : loops_)
-			asio::post(loop.at.executor, [&loop] {
+		for (std::uint32_t k = 0; k != loops_.size(); ++k)
+			asio::post(loops_[k].at.executor, [this, k] {
+				auto &loop = loops_[k];
 				loop.stopping = true;
 				loop.links->stop();
+				for (auto &[node, peer] : loop.rpc) {
+					if (peer.timer)
+						peer.timer->cancel();
+					fail(peer, rpc::Outcome::not_connected);
+				}
 			});
 	}
 	// On `loop`: its connections and their tasks are gone.
@@ -403,7 +511,29 @@ class HostTransport {
 		Ring rings[2];
 		const Link *link = nullptr;
 		std::uint64_t generation = 0, dial_after = 0;
-		bool dialing = false;
+		bool dialing = false, lane_turn = false;  // lane_turn: Bulk's next chunk is the RPC lane's (D1)
+	};
+	// A call made before its connection is up.
+	struct Made {
+		rpc::MethodId method;
+		rpc::CallOptions options;
+		std::string request;
+		rpc::Events events;
+	};
+	struct Pending {
+		std::uint64_t id;
+		Made call;
+	};
+	// The lane to one peer node, on the loop of its connections: the Bulk link's call table, the
+	// calls waiting for it, and each live call's handle there (0 while it waits).
+	struct RpcPeer {
+		const Link *link = nullptr;
+		std::unique_ptr<rpc::Lane> lane;
+		std::vector<Pending> pending;
+		std::unordered_map<std::uint64_t, rpc::Handle> calls;
+		std::unique_ptr<asio::steady_timer> timer;
+		std::optional<rpc::Clock::time_point> armed, redial;
+		bool feeding = false;
 	};
 	struct Loop {
 		HostLoop at;
@@ -417,6 +547,9 @@ class HostTransport {
 		std::uint64_t serial = 0;
 		HostTransportStats stats;
 		bool flushing = false, stopping = false;
+		std::map<kronuz::consensus::NodeId, RpcPeer> rpc;  // by peer node, for the connections here
+		std::uint64_t rpc_ids = 0;
+		LaneStats lane_stats;
 	};
 
 	template <class F> void on(std::uint32_t loop, F f) {
@@ -566,9 +699,15 @@ class HostTransport {
 					[this, k, node, which](std::exception_ptr, std::optional<bool> ok) {
 						auto &lane = loops_[k].lanes[{node, which}];
 						lane.dialing = false;
-						if (!lane.link && !(ok && *ok))
+						if (!lane.link && !(ok && *ok)) {
 							lane.dial_after = loops_[k].at.scheduler.now() +
 											  std::uint64_t(std::chrono::nanoseconds(options_.redial).count());
+							if (auto it = loops_[k].rpc.find(node); which == LinkLane::Bulk && it != loops_[k].rpc.end() &&
+																	 !it->second.pending.empty()) {
+								it->second.redial = rpc::Clock::now() + options_.redial;  // calls wait to their deadlines
+								arm(k, node);
+							}
+						}
 					});
 	}
 	std::size_t put(std::uint32_t k, Lane &lane, std::string_view frame) {
@@ -584,9 +723,17 @@ class HostTransport {
 		if (connection.queued() || connection.draining())
 			return;
 		auto &stats = loops_[k].stats;
+		// D1: on Bulk the lane's small frames go first, and its chunks alternate with groups' data.
+		rpc::Lane *calls = lane.link->lane == LinkLane::Bulk ? rpc_lane(k, *lane.link) : nullptr;
 		for (std::size_t fed = 0; fed < options_.feed;) {
 			if (lane.repaid != lane.owed.size()) {
 				fed += repay(k, lane, stats);
+				continue;
+			}
+			if (calls && (calls->small_ready() || (calls->chunk_ready() && (lane.lane_turn || !lane.rings[data_ring].size)))) {
+				const bool chunk = !calls->small_ready();
+				fed += put_rpc(k, lane, *calls->next());
+				lane.lane_turn = lane.lane_turn && !chunk;
 				continue;
 			}
 			GroupId id;
@@ -609,6 +756,7 @@ class HostTransport {
 				a.outstanding += frame.size();
 				stats.uncredited += frame.size();
 				fed += put(k, lane, frame);
+				lane.lane_turn = true;
 				if (data_ready(a))
 					push(lane, data_ring, id, a);
 			} else {
@@ -662,6 +810,8 @@ class HostTransport {
 			if (lane.link)
 				feed(k, lane);
 		};
+		if (link.lane == LinkLane::Bulk)
+			open_rpc(k, link);
 		feed(k, lane);
 	}
 	void ended(std::uint32_t k, const Link &link) {
@@ -670,13 +820,20 @@ class HostTransport {
 			return;
 		lane.link = nullptr;
 		reset(lane, loops_[k].stats);
-		if (!lane.active.empty())
+		bool waiting = false;
+		if (auto it = loops_[k].rpc.find(link.peer); link.lane == LinkLane::Bulk && it != loops_[k].rpc.end()) {
+			close_rpc(it->second);
+			waiting = !it->second.pending.empty();  // calls its calls' done made again
+		}
+		if (!lane.active.empty() || waiting)
 			pump(k, link.peer, link.lane);
 	}
 	// On the connection's loop, each frame: credit and closed apply here; a message or an open
-	// joins its group loop's batch for this read.
+	// joins its group loop's batch for this read; a lane frame goes to the call table at once (T5).
 	void arrived(std::uint32_t k, const Link &link, std::string_view frame) {
 		auto &here = loops_[k];
+		if (frame.size() >= 4 && frame.substr(0, 4) == "DTRP")
+			return rpc_arrived(k, link, frame);
 		const auto kind = frame.empty() ? 0 : int(static_cast<unsigned char>(frame[0]));
 		auto rest = frame.substr(std::min<std::size_t>(frame.size(), 1));
 		if (kind == int(FrameKind::closed) && frame.size() == closed_frame) {
@@ -839,8 +996,177 @@ class HostTransport {
 		return true;
 	}
 
+	// The RPC lane (docs/mechanisms/rpc-lane.md, On Bulk), on the connection's loop.
+	rpc::Lane *rpc_lane(std::uint32_t k, const Link &link) {
+		const auto it = loops_[k].rpc.find(link.peer);
+		return it != loops_[k].rpc.end() && it->second.link == &link ? it->second.lane.get() : nullptr;
+	}
+	const rpc::Lane *lane_of(RpcCall c) const {
+		const auto &here = loops_[loop_of_node(c.node)];
+		const auto it = here.rpc.find(c.node);
+		if (it == here.rpc.end() || !it->second.lane)
+			return nullptr;
+		const auto call = it->second.calls.find(c.id);
+		return call != it->second.calls.end() && call->second ? it->second.lane.get() : nullptr;
+	}
+	rpc::Lane *lane_of(RpcCall c) { return const_cast<rpc::Lane *>(std::as_const(*this).lane_of(c)); }
+	rpc::Handle handle_of(RpcCall c) const { return loops_[loop_of_node(c.node)].rpc.at(c.node).calls.at(c.id); }
+	// A call's done, wrapped: the call leaves its peer's table and is counted, then the caller's runs.
+	std::function<void(const rpc::Status &)> ending(std::uint32_t k, RpcCall c, std::function<void(const rpc::Status &)> done) {
+		return [this, k, c, done = std::move(done)](const rpc::Status &status) {
+			auto &here = loops_[k];
+			if (auto it = here.rpc.find(c.node); it != here.rpc.end())
+				it->second.calls.erase(c.id);
+			++here.lane_stats.outcomes[std::size_t(status.outcome)];
+			if (done)
+				done(status);
+		};
+	}
+	// Hands a call to the peer's lane; its done may run within, and leaves no handle behind.
+	static void begin(RpcPeer &peer, std::uint64_t id, Made made) {
+		const auto h = peer.lane->call(made.method, std::move(made.options), std::move(made.request), std::move(made.events));
+		if (auto it = peer.calls.find(id); it != peer.calls.end())
+			it->second = h;
+	}
+	// Ends every call still waiting for a connection.
+	static void fail(RpcPeer &peer, rpc::Outcome outcome) {
+		auto pending = std::move(peer.pending);
+		peer.pending.clear();
+		for (auto &p : pending)
+			p.call.events.done({outcome});
+	}
+	// A Bulk link is up: its call table, at the version the hellos agreed (T1), takes the calls
+	// that waited for it. A link with the lane off ends them protocol_not_supported.
+	void open_rpc(std::uint32_t k, const Link &link) {
+		auto &peer = loops_[k].rpc[link.peer];
+		close_rpc(peer);
+		peer.link = &link;
+		peer.redial.reset();
+		if (!link.rpc)
+			return fail(peer, rpc::Outcome::protocol_not_supported);
+		auto options = options_.rpc.lane;
+		options.version = link.rpc;
+		const auto node = link.peer;
+		peer.lane = std::make_unique<rpc::Lane>(
+			link.dialed, rpc::Pools{serving_, calling_, outgoing_}, options,
+			[this, k, node](const rpc::Incoming &in) { return accept_rpc(k, node, in); },
+			[this, k](std::function<void()> f) { on(k, std::move(f)); }, [this, k, node] { rpc_ready(k, node); });
+		auto pending = std::move(peer.pending);
+		peer.pending.clear();
+		for (auto &p : pending)
+			if (peer.lane)
+				begin(peer, p.id, std::move(p.call));
+		arm(k, node);
+	}
+	// The link ended: its calls end connection_aborted, or not_processed when never sent.
+	static void close_rpc(RpcPeer &peer) {
+		peer.link = nullptr;
+		if (auto lane = std::move(peer.lane))
+			lane->close();
+	}
+	std::optional<rpc::Events> accept_rpc(std::uint32_t k, kronuz::consensus::NodeId node, const rpc::Incoming &in) {
+		const auto serve = serves_.find(in.method);
+		if (serve == serves_.end())
+			return std::nullopt;
+		auto &here = loops_[k];
+		const RpcCall c{node, ++here.rpc_ids};
+		auto &peer = here.rpc[node];
+		peer.calls[c.id] = in.handle;
+		auto events = serve->second(c, in);
+		if (!events) {
+			peer.calls.erase(c.id);
+			return std::nullopt;
+		}
+		++here.lane_stats.served;
+		events->done = ending(k, c, std::move(events->done));
+		return events;
+	}
+	// The lane has a frame to write: the connection is fed once the running work yields.
+	void rpc_ready(std::uint32_t k, kronuz::consensus::NodeId node) {
+		auto &peer = loops_[k].rpc[node];
+		if (std::exchange(peer.feeding, true))
+			return;
+		on(k, [this, k, node] {
+			loops_[k].rpc[node].feeding = false;
+			if (auto &lane = loops_[k].lanes[{node, LinkLane::Bulk}]; lane.link)
+				feed(k, lane);
+		});
+	}
+	std::size_t put_rpc(std::uint32_t k, Lane &lane, rpc::Outgoing out) {
+		lane.link->connection->send(out.bytes);
+		auto &stats = loops_[k].lane_stats;
+		++stats.frames_out;
+		stats.bytes_out += out.bytes.size();
+		return out.bytes.size();  // the frame's charge returns here, at the connection's queue
+	}
+	void rpc_arrived(std::uint32_t k, const Link &link, std::string_view frame) {
+		auto &here = loops_[k];
+		auto *lane = link.lane == LinkLane::Bulk ? rpc_lane(k, link) : nullptr;
+		if (lane) {
+			++here.lane_stats.frames_in;
+			here.lane_stats.bytes_in += frame.size();
+			try {
+				lane->receive(frame);
+				return arm(k, link.peer);
+			} catch (...) {
+				close_rpc(here.rpc[link.peer]);  // D3: a frame that breaks a rule closes the connection
+			}
+		}
+		++here.stats.malformed;
+		link.connection->abort();
+	}
+	// The peer's timer, at its earliest deadline: a waiting call's, the lane's, or the redial.
+	void arm(std::uint32_t k, kronuz::consensus::NodeId node) {
+		auto &here = loops_[k];
+		auto &peer = here.rpc[node];
+		auto next = peer.lane ? peer.lane->next_deadline() : std::nullopt;
+		for (auto &p : peer.pending)
+			if (!next || p.call.options.deadline < *next)
+				next = p.call.options.deadline;
+		if (peer.redial && (!next || *peer.redial < *next))
+			next = peer.redial;
+		if (!next || here.stopping || (peer.armed && *peer.armed <= *next))
+			return;
+		if (!peer.timer)
+			peer.timer = std::make_unique<asio::steady_timer>(here.at.executor);
+		peer.armed = next;
+		peer.timer->expires_at(*next);
+		peer.timer->async_wait([this, k, node](asio::error_code error) {
+			if (!error)
+				expire_rpc(k, node);
+		});
+	}
+	void expire_rpc(std::uint32_t k, kronuz::consensus::NodeId node) {
+		auto &peer = loops_[k].rpc[node];
+		const auto now = rpc::Clock::now();
+		peer.armed.reset();
+		std::vector<rpc::Events> due;
+		std::erase_if(peer.pending, [&](Pending &p) {
+			if (p.call.options.deadline > now)
+				return false;
+			due.push_back(std::move(p.call.events));
+			return true;
+		});
+		for (auto &events : due)
+			events.done({rpc::Outcome::timed_out});
+		if (peer.lane)
+			peer.lane->expire();
+		if (peer.redial && *peer.redial <= now) {
+			peer.redial.reset();
+			if (!peer.pending.empty()) {
+				pump(k, node, LinkLane::Bulk);
+				if (const auto &lane = loops_[k].lanes[{node, LinkLane::Bulk}]; !lane.link && !lane.dialing)
+					peer.redial = now + std::chrono::milliseconds(10);  // the dial's own spacing has not passed
+			}
+		}
+		arm(k, node);
+	}
+
 	HostTransportOptions options_;
 	std::vector<Loop> loops_;
+	rpc::ByteBudget serving_, calling_, outgoing_;   // the lane's pools, shared by every loop (D5)
+	std::vector<kronuz::consensus::NodeId> nodes_;  // the nodes with an address
+	std::map<rpc::MethodId, Serve> serves_;          // set before serve(), then only read
 };
 
 // The Driver's Send for `group`, from its incarnation `local` to the member on `node`: Raft

@@ -285,7 +285,8 @@ struct ProtocolError : std::runtime_error {
 	using std::runtime_error::runtime_error;
 };
 
-enum class Outcome : std::uint8_t { ok, error, cancel, not_processed, connection_aborted, timed_out, not_connected };
+enum class Outcome : std::uint8_t { ok, error, cancel, not_processed, connection_aborted, timed_out, not_connected, protocol_not_supported };
+inline constexpr std::size_t outcomes = 8;
 // How a call ended at this end: `error` and `cancel` name the frame and carry its code and text.
 struct Status {
 	Outcome outcome = Outcome::ok;
@@ -547,6 +548,9 @@ class Lane {
 	}
 	std::uint64_t late() const noexcept { return late_; }
 	std::size_t live() const noexcept { return calls_.size(); }
+	// What next() would return: a small frame, or else a chunk.
+	bool small_ready() const noexcept { return !small_.empty(); }
+	bool chunk_ready() const noexcept { return !chunks_.empty(); }
 
   private:
 	struct Pending {

@@ -220,6 +220,14 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	target_link_libraries(consensus_transport_rpc_test PRIVATE consensus::transport)
 	target_compile_options(consensus_transport_rpc_test PRIVATE -UNDEBUG)
 	add_test(NAME consensus_transport_rpc COMMAND consensus_transport_rpc_test)
+	# The RPC lane on the host transport's Bulk connection, one ctest entry per case.
+	add_executable(consensus_transport_rpc_host_test test/transport/rpc_host_test.cc)
+	target_link_libraries(consensus_transport_rpc_host_test PRIVATE consensus::transport)
+	target_compile_options(consensus_transport_rpc_host_test PRIVATE -UNDEBUG)
+	foreach(c calls group-full call-full lane-only stream)
+		add_test(NAME consensus_transport_rpc_host_${c} COMMAND consensus_transport_rpc_host_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture ${c})
+		set_tests_properties(consensus_transport_rpc_host_${c} PROPERTIES FIXTURES_REQUIRED consensus_tls TIMEOUT 150)
+	endforeach()
 	set_tests_properties(consensus_transport_rpc PROPERTIES TIMEOUT 120)
 	# The host transport's idle cost per group, connection end and host, and its hop's CPU
 	# (docs/perf/transport-idle-cost.md); ctest checks the counts on every platform.

@@ -8,6 +8,8 @@
 #include <asio/io_context.hpp>
 #include <asio/post.hpp>
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <cassert>
 #include <csignal>
 #include <cstdio>
@@ -449,13 +451,61 @@ void churn() {
 	two.stop();
 }
 
+// N5 (transport-connection review): a lookup's thread outlives its Links. The resolver blocks on
+// a gate until Links, its hosts and their io_context are destroyed; released, its answer finds
+// nothing to deliver to (run under ASan: no use after free).
+void resolver_outlives() {
+	struct Gate {
+		std::mutex mutex;
+		std::condition_variable cv;
+		bool open = false, entered = false, returned = false;
+	};
+	auto gate = std::make_shared<Gate>();
+	{
+		Loop loop;
+		Host one(1, loop), two(2, loop);
+		LinkOptions options;
+		options.resolve_deadline = 100ms;
+		options.resolver = [gate](const std::string &) {
+			std::unique_lock hold(gate->mutex);
+			gate->entered = true;
+			gate->cv.notify_all();
+			gate->cv.wait(hold, [&] { return gate->open; });
+			gate->returned = true;
+			gate->cv.notify_all();
+			return std::vector<asio::ip::address>{asio::ip::address_v4::loopback()};
+		};
+		one.open({{2, {"gate.test", two.port()}}}, options);
+		two.open(to(one));
+		Result<bool> dialed;
+		dialed.spawn(loop, one.links->dial(2, LinkLane::Control));
+		assert(loop.until([&] { return dialed.value.has_value(); }));
+		std::unique_lock hold(gate->mutex);
+		assert(gate->entered && !*dialed.value);
+		hold.unlock();
+		one.stop();
+		two.stop();
+		one.links.reset();
+		two.links.reset();
+	}
+	std::unique_lock hold(gate->mutex);
+	gate->open = true;
+	gate->cv.notify_all();
+	const bool returned = gate->cv.wait_for(hold, 5s, [&] { return gate->returned; });
+	hold.unlock();
+	std::this_thread::sleep_for(200ms);  // the answer's delivery runs after the resolver returns
+	std::printf("resolver_outlives: the lookup's thread returned %s after Links and its loop were gone\n", returned ? "and ended" : "NEVER");
+	assert(returned);
+}
+
 struct Case {
 	const char *name;
 	void (*run)();
 };
 constexpr Case cases[] = {{"dial", dial},	  {"simultaneous", simultaneous},	  {"draining", draining},
 						  {"lookup", lookup}, {"threads", threads}, {"abandoned_dial", abandoned_dial},
-						  {"flood", flood}, {"churn", churn}};
+						  {"flood", flood}, {"churn", churn},
+						  {"resolver_outlives", resolver_outlives}};
 } // namespace
 
 int main(int argc, char **argv) {

@@ -395,7 +395,6 @@ void remove_case() {
 	});
 
 	bool closed = true, refused = true, dial_refused = true, back = true;
-	std::uint64_t removed = 0;
 	constexpr int cycles = 8;
 	for (int cycle = 0; cycle != cycles; ++cycle) {
 		auto out = one.call(3, hang, "out", 30000ms), in = three.call(1, hang, "in", 30000ms);
@@ -411,7 +410,6 @@ void remove_case() {
 				   one.pins->refused(PinFault::removed) > before;
 		auto dial = one.call(3, echo, "dial", 1000ms);
 		dial_refused &= until([&] { return dial->done.load(); }, 500ms) && dial->status.outcome == rpc::Outcome::not_connected;
-		removed += one.pins->refused(PinFault::removed) - before;
 		one.admit(three);
 		const bool answered = one.echoes(3) && three.echoes(1);
 		back &= answered;

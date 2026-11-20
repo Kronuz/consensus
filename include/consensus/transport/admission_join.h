@@ -1,6 +1,7 @@
 #pragma once
 #include "admission.h"
 #include "deadline.h"
+#include <asio/ip/tcp.hpp>
 #include <asio/read.hpp>
 #include <asio/ssl/stream.hpp>
 #include <asio/write.hpp>
@@ -86,17 +87,19 @@ using Certificate = std::unique_ptr<X509, Freer<X509, X509_free>>;
 using Request = std::unique_ptr<X509_REQ, Freer<X509_REQ, X509_REQ_free>>;
 using Stream = asio::ssl::stream<asio::ip::tcp::socket>;
 
-template <class T, int (*Encode)(T *, unsigned char **)> std::string der(T *object) {
+template <class T, class Encode> std::string der(T *object, Encode encode) {
 	unsigned char *bytes = nullptr;
-	const int n = Encode(object, &bytes);
+	const int n = encode(object, &bytes);
 	if (n <= 0)
 		throw std::runtime_error("join: DER encoding");
 	std::string r(reinterpret_cast<char *>(bytes), std::size_t(n));
 	OPENSSL_free(bytes);
 	return r;
 }
-inline std::string der(X509 *c) { return der<X509, i2d_X509>(c); }
-inline std::string der(X509_REQ *r) { return der<X509_REQ, i2d_X509_REQ>(r); }
+inline std::string der(X509 *c) { return der(c, [](X509 *x, unsigned char **out) { return i2d_X509(x, out); }); }
+inline std::string der(X509_REQ *r) {
+	return der(r, [](X509_REQ *x, unsigned char **out) { return i2d_X509_REQ(x, out); });
+}
 inline Certificate certificate_of(std::string_view bytes) {
 	auto *p = reinterpret_cast<const unsigned char *>(bytes.data());
 	Certificate c(d2i_X509(nullptr, &p, long(bytes.size())));
@@ -334,10 +337,10 @@ inline task::task<Joined> join(asio::any_io_executor executor, task::scheduler_r
 		throw std::invalid_argument("join: a secret past 255 bytes");
 	Key key(EVP_EC_gen("P-256"));
 	Request csr(X509_REQ_new());
-	if (!key || !csr || X509_REQ_set_pubkey(csr.get(), key.get()) != 1 ||
-		X509_NAME_add_entry_by_txt(X509_REQ_get_subject_name(csr.get()), "CN", MBSTRING_ASC,
-								   reinterpret_cast<const unsigned char *>("joiner"), -1, -1, 0) != 1 ||
-		X509_REQ_sign(csr.get(), key.get(), EVP_sha256()) <= 0)
+	std::unique_ptr<X509_NAME, decltype(&X509_NAME_free)> subject(X509_NAME_new(), X509_NAME_free);
+	if (!key || !csr || !subject || X509_REQ_set_pubkey(csr.get(), key.get()) != 1 ||
+		X509_NAME_add_entry_by_txt(subject.get(), "CN", MBSTRING_ASC, reinterpret_cast<const unsigned char *>("joiner"), -1, -1, 0) != 1 ||
+		X509_REQ_set_subject_name(csr.get(), subject.get()) != 1 || X509_REQ_sign(csr.get(), key.get(), EVP_sha256()) <= 0)
 		throw std::runtime_error("join: key and request");
 	asio::ssl::context tls(asio::ssl::context::tls_client);
 	SSL_CTX_set_min_proto_version(tls.native_handle(), TLS1_2_VERSION);

@@ -81,7 +81,7 @@ MUTANTS = {
                              "\t\t\tif (true) {\n\t\t\t\tdeliver(k, std::move(moved));"),
     "no-hand-off": (T + "links.h", "Links *home = owner ? owner(peer) : nullptr;", "Links *home = nullptr;"),
     # host_transport.h (transport-groups review F3: credit comes back)
-    "no-credit-on-refuse": (T + "host_transport.h", "\t\t\tif (r.data) {", "\t\t\tif (r.data && taken) {"),
+    "no-credit-on-refuse": (T + "host_transport.h", "\t\t\tif (r.data)\n\t\t\t\towe_for", "\t\t\tif (r.data && taken)\n\t\t\t\towe_for"),
     "no-reset-on-end": (T + "host_transport.h", "\t\t\ta.outstanding = 0;\n\t\t\ta.in = 0;", "\t\t\ta.in = 0;"),
     # host_transport.h (transport-identity A1: the per-frame rule, R7, and the group-open exchange)
     "admit-unstored": (T + "host_transport.h", "\tif (!held)\n\t\treturn Admission::unstored;\n", ""),

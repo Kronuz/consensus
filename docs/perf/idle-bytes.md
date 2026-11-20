@@ -60,6 +60,22 @@ inline. Those now live behind a pointer allocated only while in use (consensus:9
 `sizeof(Core)` 1,688 to 1,008 B, inside macOS malloc's tiny size classes (up to 1,008 B);
 `sizeof(Worker)` 1,832 to 1,416 B.
 
+## A three-voter leader: its peers' flights
+
+A lone voter has no peers. A three-voter leader kept, per peer, a `std::deque<Flight>`, and
+libc++'s deque holds a 4 KiB block once it has held a flight, empty or not: 8 KiB of an idle
+leader. The flights are a vector now (consensus:8611768), at most `Flow::pipeline` of them.
+`driver_close_test idle_cpu`, 100,000 leaders at rest, process RSS (the HeapIO files and two
+256 MiB turn-log segments included):
+
+| | Flights in a deque | In a vector |
+|---|---:|---:|
+| RSS, 100,000 idle leaders | 2,143 MB | 1,306 MB |
+| per leader, the difference | | **8.4 KB less** |
+
+Jobs 261120-111929-1f3e62 (probe 03e3b99, 8611768's tree with d291fac's `core.h`) and
+261120-111932-71ec5b.
+
 ## What stays, and why
 
 - **The Worker's admission pack (240 B) and pending persist (96 B), the Core's pending

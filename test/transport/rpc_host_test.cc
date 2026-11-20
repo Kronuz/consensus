@@ -14,6 +14,21 @@
 //   local-throw a handler and a body consumer that throw fail their own call handler_failed; the
 //               Bulk connection, a group's frames on it and the next call go on (control:
 //               local-throw-closes)
+//   stalled-peer a peer that stops reading holds at most its connection's queue of the host's
+//               rpc_outgoing_bytes, so a call to another peer goes on (A3; control: rpc-no-queue-cap)
+//   hold        T3: hold(node) keeps a lane-only Bulk connection past lane_idle; release drains
+//               it, Drain then close_notify (control: hold-ignored)
+//   idle-race   D7, T8: host 1's lane_idle drains the connection while host 2, its loop held, starts
+//               calls on it: each ends ok or not_processed, never connection_aborted, and the next
+//               call dials again (control: rpc-no-drain)
+//   shutdown    T8: drain() with a 4 MiB echo in flight: it completes, a new call ends
+//               not_processed, and the Bulk connection closes gracefully
+//   fetch       D8, A4: fetch is method 1. Beside 4 groups uploading 1 MiB data frames on the same
+//               Bulk connection, a 16 MiB fetch arrives exact while heartbeats on Control keep
+//               every gap under 1,000 ms; a missing name, a reader that throws, a reply over this
+//               host's fetch_bytes and a fifth concurrent fetch end as D8's table says
+//   reader      T5: with host 2's other loop held 2 s, calls whose frames its connection's loop
+//               reads keep their latency (control: lane-via-other-loop)
 //   consensus_transport_rpc_host_test <fixture dir> case
 #include "rpc_hosts.h"
 
@@ -462,11 +477,323 @@ bool local_throw() {
 	two.stop();
 	return ok;
 }
+// A3 (R2, Xapiand:a3b4b4903): four calls to host 2 hold 16 MiB of its credit when host 2 stops
+// reading for 4 s; host 1's 2 MiB rpc_outgoing_bytes holds at most host 2's connection queue, so a
+// 1 MiB echo to host 3 completes while host 2 is still stopped.
+bool stalled_peer() {
+	constexpr std::uint32_t L = 2;
+	Host one(1, L), two(2, L), three(3, L);
+	Server s2, s3;
+	HostTransportOptions options;
+	options.rpc.outgoing_bytes = 2 << 20;
+	one.open(addresses({&two, &three}), options);
+	two.open(addresses({&one}));
+	three.open(addresses({&one}));
+	s2.install(*two.transport);
+	s3.install(*three.transport);
+	one.start();
+	two.start();
+	three.start();
+	auto w2 = start_call(one, 2, echo, 64, 10s), w3 = start_call(one, 3, echo, 64, 10s);
+	if (!until([&] { return w2->done && w3->done; }, 10s))
+		return false;
+	std::vector<std::shared_ptr<Seen>> held;
+	for (int i = 0; i != 4; ++i)
+		held.push_back(start_call(one, 2, sink, 4 << 20, 30s, 1024));  // the writer waits after the Call
+	const bool credited = until([&] {
+		return one.at(2, [&] {
+			for (auto &c : held)
+				if (one.transport->sendable(c->out.call) == 0)
+					return false;
+			return true;
+		});
+	}, 10s);
+	const auto stalled = steady::now();
+	two.post(two.transport->loop_of_node(1), [] { std::this_thread::sleep_for(4000ms); });
+	std::this_thread::sleep_for(100ms);
+	one.at(2, [&] {
+		for (auto &c : held) {
+			c->out.limit = ~std::uint64_t{0};
+			c->out.pump();
+		}
+		return 0;
+	});
+	std::this_thread::sleep_for(500ms);  // host 2's socket and host 1's queue to it fill
+	const auto outgoing = one.transport->outgoing_pool().used();
+	auto live = start_call(one, 3, echo, 1 << 20, 30s);
+	const bool done = until([&] { return live->done.load(); }, 10s);
+	const auto took = live->done ? std::uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(live->finished - live->started).count()) : 0;
+	const bool before = live->done && live->finished < stalled + 4000ms;
+	const bool all = until([&] {
+		for (auto &c : held)
+			if (!c->done)
+				return false;
+		return true;
+	}, 20s);
+	bool ok_all = all;
+	for (auto &c : held)
+		ok_all &= c->status.outcome == rpc::Outcome::ok && !c->out.failed;
+	const bool freed = until([&] { return pools_empty(one) && pools_empty(two) && pools_empty(three); }, 5s);
+	const bool ok = credited && done && before && live->status.outcome == rpc::Outcome::ok && live->received == 1 << 20 &&
+					!live->mismatched && ok_all && freed;
+	std::printf("stalled-peer: host 2 stopped with 16 MiB credited; host 1's rpc_outgoing_bytes held %zu of %zu; the echo to host 3 took %llu ms, %s host 2 resumed; the stopped calls %s; pools freed: %s %s\n",
+				outgoing, std::size_t(2) << 20, (unsigned long long)took, before ? "before" : "after", ok_all ? "all ok" : "NOT ok",
+				freed ? "yes" : "no", ok ? "ok" : "FAILED");
+	one.stop();
+	two.stop();
+	three.stop();
+	return ok;
+}
 } // namespace
+
+// T3: a lane-only Bulk connection held past lane_idle, then released and drained.
+bool hold() {
+	Host one(1, 2), two(2, 2);
+	HostTransportOptions options;
+	options.rpc.idle = 300ms;
+	one.open(addresses({&two}), options);
+	two.open(addresses({&one}));
+	one.start();
+	two.start();
+	const auto k = one.transport->loop_of_node(2);
+	auto linked = [&] { return one.at(2, [&] { return one.transport->linked(k, 2, LinkLane::Bulk); }); };
+	one.at(2, [&] { return one.transport->hold(2), 0; });
+	const bool up = until(linked, 10s);
+	std::this_thread::sleep_for(1s);
+	const bool kept = linked() && !one.lane(&LaneStats::drains);
+	one.at(2, [&] { return one.transport->release(2), 0; });
+	const auto released = steady::now();
+	const bool closed = until([&] { return !linked(); }, 5s);
+	const auto after = ms_since(released);
+	const bool ok = up && kept && closed && one.lane(&LaneStats::drains) == 1 && one.lane(&LaneStats::retired) >= 1 &&
+					one.total(&HostTransportStats::links) == 1;
+	std::printf("hold: Bulk up %s, kept 1 s past a 300 ms lane_idle %s; released, it closed after %llu ms (drains %llu, retired %llu) %s\n",
+				up ? "yes" : "NO", kept ? "yes" : "NO", (unsigned long long)after, (unsigned long long)one.lane(&LaneStats::drains),
+				(unsigned long long)one.lane(&LaneStats::retired), ok ? "ok" : "FAILED");
+	one.stop();
+	two.stop();
+	return ok;
+}
+
+// D7, T8: host 1's lane_idle (300 ms) drains the connection while host 2's loop is held 600 ms;
+// in that turn host 2 starts 5 calls on it. Host 1 sent Drain before closing, so each ends
+// not_processed (or ok), never connection_aborted, and host 2's next call dials again.
+bool idle_race() {
+	Host one(1, 2), two(2, 2);
+	Server server;
+	HostTransportOptions options;
+	options.rpc.idle = 300ms;
+	one.open(addresses({&two}), options);
+	two.open(addresses({&one}));
+	server.install(*one.transport);
+	one.start();
+	two.start();
+	auto first = start_call(two, 1, echo, 64, 10s);
+	const bool done = until([&] { return first->done.load(); }, 10s);
+	std::vector<std::shared_ptr<Seen>> racing;
+	two.at(1, [&] {
+		std::this_thread::sleep_for(600ms);  // host 1 drains and closes meanwhile, unread here
+		for (int i = 0; i != 5; ++i) {
+			auto seen = std::make_shared<Seen>();
+			seen->out.transport = two.transport.get();
+			seen->out.call = two.transport->call(1, echo, {.deadline = rpc::Clock::now() + 10s}, bytes_at(0, 64), checking(*two.transport, seen));
+			racing.push_back(seen);
+		}
+		return 0;
+	});
+	const bool ended = until([&] { return std::all_of(racing.begin(), racing.end(), [](auto &s) { return s->done.load(); }); }, 10s);
+	int ok_n = 0, not_processed = 0, aborted = 0;
+	for (auto &r : racing) {
+		ok_n += r->status.outcome == rpc::Outcome::ok;
+		not_processed += r->status.outcome == rpc::Outcome::not_processed;
+		aborted += r->status.outcome == rpc::Outcome::connection_aborted;
+	}
+	auto next = start_call(two, 1, echo, 64, 10s);
+	const bool again = until([&] { return next->done.load(); }, 10s) && next->status.outcome == rpc::Outcome::ok;
+	const bool ok = done && first->status.outcome == rpc::Outcome::ok && ended && ok_n + not_processed == 5 && !aborted &&
+					one.lane(&LaneStats::drains) >= 1 && again;
+	std::printf("idle-race: host 1 drained %llu time(s); of 5 calls racing the close %d ok, %d not_processed, %d connection_aborted; the next call %s %s\n",
+				(unsigned long long)one.lane(&LaneStats::drains), ok_n, not_processed, aborted, again ? "completed" : "FAILED", ok ? "ok" : "FAILED");
+	one.stop();
+	two.stop();
+	return ok;
+}
+
+// T8: a graceful shutdown drains the lane; the call in flight completes.
+bool shutdown() {
+	Host one(1, 2), two(2, 2);
+	Server server;
+	one.open(addresses({&two}));
+	two.open(addresses({&one}));
+	server.install(*two.transport);
+	one.start();
+	two.start();
+	auto big = start_call(one, 2, echo, 4 << 20, 20s);
+	const bool streaming = until([&] { return big->received > 0; }, 10s);
+	one.transport->drain();
+	const bool done = until([&] { return big->done.load(); }, 20s);
+	auto late = start_call(one, 2, echo, 64, 10s);
+	const bool refused = until([&] { return late->done.load(); }, 5s) && late->status.outcome == rpc::Outcome::not_processed;
+	const auto k = one.transport->loop_of_node(2);
+	const bool closed = until([&] { return one.at(2, [&] { return one.transport->lanes_drained(k); }); }, 10s);
+	const bool ok = streaming && done && big->status.outcome == rpc::Outcome::ok && big->received == 4 << 20 && !big->mismatched && refused &&
+					closed && one.lane(&LaneStats::drains) == 1 && one.lane(&LaneStats::retired) >= 1 &&
+					!one.ended(rpc::Outcome::connection_aborted) && !two.ended(rpc::Outcome::connection_aborted);
+	std::printf("shutdown: the 4 MiB echo in flight ended %d with %llu bytes; a call after drain() ended %d; the lanes closed %s; aborted %llu %s\n",
+				int(big->status.outcome), (unsigned long long)big->received, int(late->status.outcome), closed ? "yes" : "NO",
+				(unsigned long long)(one.ended(rpc::Outcome::connection_aborted) + two.ended(rpc::Outcome::connection_aborted)), ok ? "ok" : "FAILED");
+	one.stop();
+	two.stop();
+	return ok;
+}
+
+// D8, A4: fetch beside a maximal upload on one Bulk connection, against heartbeats.
+bool fetch() {
+	constexpr std::uint32_t L = 2;
+	Host one(1, L), two(2, L);
+	HostTransportOptions client, server;
+	client.rpc.fetch_bytes = 32 << 20;
+	server.rpc.reader = [](std::string_view name) -> std::optional<std::string> {
+		if (name == "throws")
+			throw std::runtime_error("the disk broke");
+		if (name == "big")
+			return bytes_at(0, 16 << 20);
+		if (name == "huge")
+			return std::string(48 << 20, 'h');
+		if (name == "slow")
+			return bytes_at(0, 4 << 20);
+		return std::nullopt;
+	};
+	one.open(addresses({&two}), client);
+	two.open(addresses({&one}), server);
+	const auto reader = one.transport->loop_of_node(2);
+	const auto beat = groups_on(L, reader, 1)[0];
+	const auto uploads = groups_on(L, 1 - reader, 4);
+	for (auto *h : {&one, &two}) {
+		h->stores({beat});
+		h->stores(uploads);
+	}
+	Beats beats;
+	std::atomic<std::uint64_t> uploaded{0};
+	for (std::uint32_t k = 0; k != L; ++k)
+		one.transport->on_deliver(k, [&](const Received &r) {
+			if (r.route.group == beat)
+				beats.beat();
+			else
+				uploaded += r.payload.size();
+			return true;
+		});
+	one.start();
+	two.start();
+	const auto hb = two.transport->loop_of_group(beat), up = two.transport->loop_of_group(uploads[0]);
+	auto heartbeat = [&] { two.post(hb, [&] { two.transport->send(hb, LinkLane::Control, FrameKind::control, {beat, 2, 1}, 1, "beat"); }); };
+	auto upload = [&] {
+		two.post(up, [&] {
+			for (auto g : uploads)
+				for (int i = 0; i != 8; ++i)
+					two.transport->send(up, LinkLane::Bulk, FrameKind::data, {g, 2, 1}, 1, std::string(1 << 20, 'u'));
+		});
+	};
+	if (!until([&] { heartbeat(); return beats.count > 0; }, 10s))
+		return false;
+	beats.worst = 0;
+	struct Got {
+		std::atomic<bool> done{false};
+		std::error_code error;
+		std::optional<std::string> bytes;
+	};
+	auto fetch = [&](const char *name) {
+		auto got = std::make_shared<Got>();
+		one.at(2, [&] {
+			one.transport->fetch(2, name, [got](std::error_code e, std::optional<std::string> b) {
+				got->error = e;
+				got->bytes = std::move(b);
+				got->done = true;
+			});
+			return 0;
+		});
+		return got;
+	};
+	const auto start = steady::now();
+	upload();
+	std::this_thread::sleep_for(200ms);
+	const auto before = uploaded.load();
+	auto big = fetch("big");
+	for (std::int64_t tick = 0; !big->done && ms_since(start) < 30'000; ++tick) {
+		heartbeat();
+		if (tick % 2 == 0)
+			upload();
+		std::this_thread::sleep_until(start + (tick + 1) * 100ms);
+	}
+	const auto fetched_ms = ms_since(start);
+	const auto beside = uploaded.load() - before;
+	const bool exact = big->done && !big->error && big->bytes && *big->bytes == bytes_at(0, 16 << 20);
+	auto missing = fetch("none"), throws = fetch("throws"), huge = fetch("huge");
+	std::vector<std::shared_ptr<Got>> slow;
+	for (int i = 0; i != 5; ++i)
+		slow.push_back(fetch("slow"));
+	const bool ended = until([&] {
+		bool all = missing->done && throws->done && huge->done;
+		for (auto &g : slow)
+			all &= g->done.load();
+		return all;
+	}, 30s);
+	int busy = 0, slow_ok = 0;
+	for (auto &g : slow) {
+		busy += g->error == std::errc::resource_unavailable_try_again;
+		slow_ok += !g->error && g->bytes && g->bytes->size() == 4 << 20;
+	}
+	const bool table = ended && !missing->error && !missing->bytes && throws->error == std::errc::io_error &&
+					   huge->error == std::errc::message_size && busy >= 1 && busy + slow_ok == 5;
+	const bool ok = exact && beside > 0 && beats.worst < 1000 && table;
+	std::printf("fetch: 16 MiB arrived exact %s in %llu ms beside %llu MiB of group uploads on Bulk; heartbeats' longest gap %llu ms; missing %s, "
+				"a throwing reader %s, 48 MiB over 32 MiB %s, five 4 MiB at once: %d ok, %d refused %s\n",
+				exact ? "yes" : "NO", (unsigned long long)fetched_ms, (unsigned long long)(beside >> 20), (unsigned long long)beats.worst,
+				!missing->error && !missing->bytes ? "nullopt" : "WRONG", throws->error.message().c_str(), huge->error.message().c_str(), slow_ok,
+				busy, ok ? "ok" : "FAILED");
+	one.stop();
+	two.stop();
+	return ok;
+}
+
+// T5: host 2's loop that does not read node 1's connection is held 2 s; calls served on the
+// connection's loop keep their latency, since a lane frame never waits on another loop.
+bool reader() {
+	constexpr std::uint32_t L = 2;
+	Host one(1, L), two(2, L);
+	Server server;
+	one.open(addresses({&two}));
+	two.open(addresses({&one}));
+	server.install(*two.transport);
+	one.start();
+	two.start();
+	auto warm = start_call(one, 2, echo, 64, 10s);
+	const bool warmed = until([&] { return warm->done.load(); }, 10s);
+	const auto other = 1 - two.transport->loop_of_node(1);
+	std::atomic<bool> held{true};
+	two.post(other, [&] {
+		while (held)
+			std::this_thread::sleep_for(1ms);
+	});
+	std::uint64_t worst = 0;
+	bool all = true;
+	for (int i = 0; i != 10; ++i) {
+		auto c = start_call(one, 2, echo, 4096, 10s);
+		all &= until([&] { return c->done.load(); }, 5s) && c->status.outcome == rpc::Outcome::ok && !c->mismatched;
+		worst = std::max<std::uint64_t>(worst, std::uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(c->finished - c->started).count()));
+	}
+	held = false;
+	const bool ok = warmed && all && worst < 200;
+	std::printf("reader: with host 2's other loop held, 10 calls completed %s, the slowest in %llu ms %s\n", all ? "yes" : "NO",
+				(unsigned long long)worst, ok ? "ok" : "FAILED");
+	one.stop();
+	two.stop();
+	return ok;
+}
 
 int main(int argc, char **argv) {
 	if (argc != 3) {
-		std::fprintf(stderr, "usage: %s <fixture dir> calls|group-full|call-full|lane-only|stream|local-throw\n", argv[0]);
+		std::fprintf(stderr, "usage: %s <fixture dir> calls|group-full|call-full|lane-only|stream|local-throw|stalled-peer|hold|idle-race|shutdown|fetch|reader\n", argv[0]);
 		return 2;
 	}
 	fixture = argv[1];
@@ -485,6 +812,18 @@ int main(int argc, char **argv) {
 		ok = stream();
 	else if (which == "local-throw")
 		ok = local_throw();
+	else if (which == "stalled-peer")
+		ok = stalled_peer();
+	else if (which == "hold")
+		ok = hold();
+	else if (which == "idle-race")
+		ok = idle_race();
+	else if (which == "reader")
+		ok = reader();
+	else if (which == "shutdown")
+		ok = shutdown();
+	else if (which == "fetch")
+		ok = fetch();
 	else
 		return 2;
 	std::fflush(stdout);

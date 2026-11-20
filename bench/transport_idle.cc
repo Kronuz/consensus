@@ -34,13 +34,16 @@
 //                   control (series 0) and data (1) frames, and per frame sent alone every 1 ms
 //                   (2; each wakes the idle group loop; `frames` per run, default 2,000); rounds
 //                   of same, hop, hop, same (default 7); every series unless one is named.
-//   consensus_transport_idle <fixture dir> cost|hop [...]
+//   inflight [G]    host 1 (one loop) sends one data frame for each of G groups (default
+//                   10,000) to host 2, whose group loop is held, so none is credited: host 1's
+//                   bytes per group in flight, then every credit back once the loop goes on
+//   consensus_transport_idle <fixture dir> cost|hop|inflight [...]
 // Bytes are counted exactly: OpenSSL's allocations (CRYPTO_set_mem_functions) and the C++ heap
 // (operator new), by usable size, on macOS and glibc without a sanitizer; zone statistics are
 // printed beside them only. cost exits nonzero when an idle group holds a descriptor, an armed
-// timer or a frame, or more than 164 + 52P bytes (the minimum per group at the tables' worst
-// slack, docs/perf/transport-idle-cost.md); when an idle connection end holds more
-// than 48 KB (the fit's slope); or, without --quick, when a host is more than 10% over
+// timer or a frame, more than 64 bytes stored (D108) or 44 + 64P in all (the minimum at the
+// tables' worst slack, docs/perf/transport-idle-cost.md); when an idle connection end holds
+// more than 48 KB (the fit's slope); or, without --quick, when a host is more than 10% over
 // 52 KB + 2P x 44 KB.
 #include "consensus/transport/host_transport.h"
 #include <asio/executor_work_guard.hpp>
@@ -305,6 +308,8 @@ struct Host {
 					return std::nullopt;
 				return kronuz::consensus::Member{incarnation, incarnation, kronuz::consensus::MemberRole::Voter};
 			};
+		if (!options.open_of)
+			options.open_of = [](GroupId g) { return open_of(g); };
 		auto tls = context(node);
 		std::map<NodeId, Fingerprint> pins;
 		for (NodeId n = 1; n <= max_node; ++n)
@@ -324,18 +329,21 @@ struct Host {
 			});
 		loops[0]->at([this] { transport->serve(*acceptor); });
 	}
-	// On loop k, the groups': stores each as incarnation `node`, every group with its own open.
+	// Every group's own open, as a host computes it: the transport keeps none.
+	static GroupOpen open_of(GroupId g) {
+		GroupOpen o;
+		o.cluster.fill('T');
+		o.group.fill('G');
+		std::memcpy(o.group.data(), &g, sizeof g);
+		o.epoch.fill('E');
+		o.profile.fill(0x5A);
+		return o;
+	}
+	// On loop k, the groups': stores each as incarnation `node`.
 	void stores(std::uint32_t k, const std::vector<GroupId> &groups) {
 		loops[k]->at([&] {
-			for (auto g : groups) {
-				GroupOpen o;
-				o.cluster.fill('T');
-				o.group.fill('G');
-				std::memcpy(o.group.data(), &g, sizeof g);
-				o.epoch.fill('E');
-				o.profile.fill(0x5A);
-				transport->store(g, node, o);
-			}
+			for (auto g : groups)
+				transport->store(g, node);
 		});
 	}
 	std::uint64_t total() const {
@@ -658,8 +666,11 @@ Cost cost(int H, std::uint32_t L, std::size_t G, double idle_seconds, bool print
 		expect(group_timers == 0, "no armed timer per idle group" + at);
 		expect(end_timers == 2, "two armed timers per idle connection end, keepalive and dead peer" + at);
 		expect(host_fds == 1 + 2 * P, "1 + 2P descriptors per host" + at);
-		if (heap_measured)
-			expect(std::abs(group) <= 164 + 52 * P, "an idle group within 164 + 52P bytes" + at);
+		if (heap_measured) {
+			const double stored = (counted(after_stores) - counted(before_groups)) / double(G * H);
+			expect(stored <= 64, "an idle group stored within 64 bytes (D108)" + at);
+			expect(std::abs(group) <= 44 + 64 * P, "an idle group within 44 + 64P bytes" + at);
+		}
 	}
 	watched = nullptr;
 	return {P, L, host, false};
@@ -817,6 +828,61 @@ struct Hop {
 	}
 };
 
+// G groups each with one data frame sent and not credited: what host 1 holds per group in flight.
+int run_inflight(std::size_t G) {
+	std::printf("openssl=%s\n", OpenSSL_version(OPENSSL_VERSION));
+	std::vector<std::unique_ptr<Host>> hosts;
+	hosts.push_back(std::make_unique<Host>(1, 1));
+	hosts.push_back(std::make_unique<Host>(2, 2));
+	for (auto &h : hosts)
+		h->listen();
+	for (auto &h : hosts)
+		h->open(peers_of(hosts, h->node));
+	watched = &hosts;
+	auto &one = *hosts[0], &two = *hosts[1];
+	const auto R = two.transport->loop_of_node(1), held = 1 - R;
+	std::vector<GroupId> groups;
+	for (GroupId g = 1'000'000; groups.size() < G; ++g)
+		if (two.transport->loop_of_group(g) == held)
+			groups.push_back(g);
+	one.stores(0, groups);
+	two.stores(held, groups);
+	one.on(0, [&] { one.transport->send(0, LinkLane::Control, FrameKind::control, {groups[0], 1, 2}, 2, payload39); });
+	wait_for([&] { return two.total() == 1; }, "the connection comes up");
+	std::this_thread::sleep_for(200ms);
+	auto sample = [&] {
+		std::vector<std::unique_ptr<Host>> only;
+		only.push_back(std::move(hosts[0]));
+		const auto s = paused(only);
+		hosts[0] = std::move(only[0]);
+		return s;
+	};
+	const auto s0 = sample();
+	std::promise<void> go;
+	auto gate = go.get_future().share();
+	two.on(held, [gate] { gate.wait(); });  // host 2's group loop: nothing delivered, nothing credited
+	const auto sent0 = one.sum().sent;
+	one.on(0, [&] {
+		for (auto g : groups)
+			one.transport->send(0, LinkLane::Control, FrameKind::data, {g, 1, 2}, 2, payload39);
+	});
+	wait_for([&] { return one.sum().sent >= sent0 + G && one.sum().uncredited == G * 64; }, "every group's frame is sent");
+	std::this_thread::sleep_for(100ms);
+	const auto s1 = sample();
+	go.set_value();
+	const bool credited = wait_for([&] { return one.sum().uncredited == 0 && two.total() == G + 1; }, "every credit returns", 30s, false);
+	std::this_thread::sleep_for(200ms);
+	const auto s2 = sample();
+	auto counted = [](const Sample &x) { return double(x.ssl + x.cxx - x.big); };
+	std::printf("inflight groups=%zu: host 1 holds %.1f bytes per group in flight (%.0f in all), %.1f once credited; C++ blocks per 100 groups in flight:%s\n",
+				G, (counted(s1) - counted(s0)) / double(G), counted(s1) - counted(s0), (counted(s2) - counted(s0)) / double(G),
+				sizes(s0, s1, double(G) / 100).c_str());
+	expect(credited, "every credit back once host 2's loop goes on");
+	watched = nullptr;
+	std::printf("transport inflight: %s\n", failures ? "FAILED" : "ok");
+	return failures ? 1 : 0;
+}
+
 double median(std::vector<double> v) {
 	std::sort(v.begin(), v.end());
 	const auto n = v.size();
@@ -879,7 +945,7 @@ int run_hop(int rounds, int only, std::uint64_t alone_frames) {
 
 int main(int argc, char **argv) {
 	if (argc < 3) {
-		std::fprintf(stderr, "usage: consensus_transport_idle <fixture dir> cost [--quick] | one H L G | hop [rounds [series [frames]]]\n");
+		std::fprintf(stderr, "usage: consensus_transport_idle <fixture dir> cost [--quick] | one H L G | hop [rounds [series [frames]]] | inflight [G]\n");
 		return 2;
 	}
 #ifndef SO_NOSIGPIPE
@@ -898,6 +964,8 @@ int main(int argc, char **argv) {
 		measured(std::atoi(argv[3]), std::uint32_t(std::atoi(argv[4])), std::size_t(std::atoll(argv[5])), 0);
 		return failures ? 1 : 0;
 	}
+	if (mode == "inflight")
+		return run_inflight(argc > 3 ? std::size_t(std::atoll(argv[3])) : 10'000);
 	if (mode == "hop")
 		return run_hop(argc > 3 ? std::atoi(argv[3]) : 7, argc > 4 ? std::atoi(argv[4]) : -1, argc > 5 ? std::uint64_t(std::atoll(argv[5])) : 2000);
 	std::fprintf(stderr, "unknown mode %s\n", mode.c_str());

@@ -24,7 +24,9 @@
 // Each node's storage is modeled as durable hard state and log plus at most one pending
 // batch; a crash restarts the node and keeps or loses that batch at random. Messages are
 // delayed, reordered, duplicated, dropped, and partitioned; each node's clock runs at its
-// own rate (0.5x to 2x). After every step the oracles check:
+// own rate (0.5x to 2x). Half the seeds quiesce (docs/mechanisms/quiescence.md): a group at
+// rest stops its timers, and a node-pair detector raises LeaderGone at a node for every node it
+// lost its connection to (down, isolated or cut). After every step the oracles check:
 //   - election safety: at most one leader per term;
 //   - leader completeness: a new leader's durable log holds every entry any node applied;
 //   - log matching: two durable logs that agree on an index's term agree before it;
@@ -45,6 +47,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <limits>
 #include <map>
 #include <optional>
 #include <random>
@@ -125,7 +128,8 @@ struct Envelope {
 
 class Simulation {
 public:
-	Simulation(std::uint64_t seed, std::size_t voters, bool membership, bool witness = false) : random_(seed), voters_(voters), membership_changes_(membership) {
+	Simulation(std::uint64_t seed, std::size_t voters, bool membership, bool witness = false, bool quiesce = false) : random_(seed), voters_(voters), membership_changes_(membership) {
+		timing_.quiesce = quiesce;
 		// D9: a 2 + witness group, founded with its roles.
 		if (witness && voters == 3) { founding_.members.back().role = MemberRole::Witness; witness_ = true; }
 		// Small RPC batches leave replication partial across leader changes.
@@ -183,9 +187,10 @@ public:
 			if (membership_changes_ && step == forced_at_) { force_replaced_configuration(); }
 			if (forced_leader_ && step == forced_at_ + 1500) { isolated_.erase(*forced_leader_); forced_leader_.reset(); }
 
+			detect();
 			if (step % 16 == 0) { check_logs(); check_memberships(); }
 			bool any = false;
-			for (auto& [i, m] : nodes_) { any |= m.up && m.core->role() == Role::Leader; }
+			for (auto& [i, m] : nodes_) { any |= m.up && m.core->role() == Role::Leader; rested_steps += m.up && m.core->resting(); }
 			led_steps += any;
 		}
 		check_logs();
@@ -196,6 +201,7 @@ public:
 	// at 2,000 steps stayed leaderless while its vote requests reset slower voters' timers.
 	void quiet_round() {
 		advance(5);
+		detect();
 		for (auto& [id, n] : nodes_) {
 			tick(n);
 			if (n.up && (n.pending || n.checkpointing || n.installing)) { complete_storage(n); }
@@ -268,6 +274,7 @@ public:
 	std::uint64_t forced_replacements = 0, removals_with_snapshot = 0, removals_with_read = 0, delayed_timeout_nows = 0;
 	std::uint64_t held_back = 0;  // empty appends to peers below their next entry (M8)
 	std::uint64_t closes = 0, resumed = 0, stale = 0;  // closed at rest; reopens that resumed their term; records refused as stale
+	std::uint64_t leader_gones = 0, rested_steps = 0;  // LeaderGone raised; node-steps spent at rest
 	std::uint64_t held_back_total() const { auto total = held_back; for (const auto& [_, n] : nodes_) { if (n.core) { total += n.core->held_back(); } } return total; }
 	std::map<int, std::uint64_t> reject_reasons;
 	Term max_term() const {
@@ -384,11 +391,25 @@ private:
 			if (from.up) { act(from, from.core->step(SnapshotTransferFailed{n.id, n.installing->key})); }
 		}
 		n.up = false;
+		std::erase_if(lost_, [&](const auto& pair) { return pair.first == n.id; });  // its detector restarts with it
 		held_back += n.core->held_back();
 		n.core.reset();
 		if (random_() % 2) { restart(n); }
 	}
 
+	// Quiescence's node-pair detector: an up node hears LeaderGone{b} once for each node b it
+	// lost its connection to (down, isolated or cut), within a step of the loss.
+	void detect() {
+		if (!timing_.quiesce) { return; }
+		for (auto& [a, n] : nodes_) {
+			if (!n.up) { continue; }
+			for (auto& [b, m] : nodes_) {
+				if (a == b) { continue; }
+				if (m.up && !isolated_.count(a) && !isolated_.count(b) && !cut_.count({a, b})) { lost_.erase({a, b}); continue; }
+				if (lost_.insert({a, b}).second) { ++leader_gones; act(n, n.core->step(LeaderGone{b})); }
+			}
+		}
+	}
 	void tick(Node& n) {
 		if (!n.up) { return; }
 		act(n, n.core->step(Tick{local_time(n), election_delay()}));
@@ -952,6 +973,7 @@ private:
 	Token prepared_ = 0;
 	std::size_t forced_at_ = 2000 + random_() % 4000;
 	std::set<std::pair<NodeId, NodeId>> cut_;  // (from, to) links down
+	std::set<std::pair<NodeId, NodeId>> lost_;  // (at, of): connections the detector reported lost
 	std::optional<NodeId> forced_leader_;
 	bool hold_snapshots_ = false;
 	std::optional<NodeId> removal_leader_;
@@ -973,13 +995,15 @@ struct Replica {
 	std::vector<StorageBatch> batches;
 	std::vector<RoleChanged> roles;
 	std::size_t vote_traffic = 0;  // pre-vote and vote requests sent
+	std::size_t sends = 0;  // every message sent
 	std::size_t granted = 0;  // votes granted
 	Index applied = 0;
 };
 
 class Group {
 public:
-	explicit Group(std::size_t voters) : voters_(voters) {
+	explicit Group(std::size_t voters, bool quiesce = false) : voters_(voters) {
+		timing_.quiesce = quiesce;
 		for (NodeId id = 1; id <= voters; ++id) { open(id, std::nullopt); }
 	}
 	std::map<NodeId, Replica> replicas;
@@ -1019,7 +1043,7 @@ public:
 		for (int n = 0; !network_.empty() && n < 100000; ++n) {
 			auto e = std::move(network_.front()); network_.pop_front();
 			auto& r = replicas.at(e.to);
-			if (r.core) { act(e.to, r.core->step(Receive{e.from, std::move(e.message)})); }
+			if (r.core && replicas.at(e.from).core) { act(e.to, r.core->step(Receive{e.from, std::move(e.message)})); }
 		}
 	}
 	// Proposes on `id` and settles; true once `id` applied it.
@@ -1033,6 +1057,8 @@ public:
 		for (const auto& [id, r] : replicas) { if (r.core && r.core->role() == Role::Leader) { return id; } }
 		return 0;
 	}
+	std::uint64_t now() const { return now_; }
+	std::uint64_t election_max() const { return timing_.election_max; }
 	void act(NodeId id, Actions actions) {
 		auto& r = replicas.at(id);
 		for (auto& a : actions) {
@@ -1044,7 +1070,7 @@ public:
 			} else if (auto c = std::get_if<Committed>(&a)) {
 				r.applied = c->entries.back().index; act(id, r.core->step(Applied{r.applied}));
 			} else if (auto s = std::get_if<Send>(&a)) {
-				r.vote_traffic += std::holds_alternative<VoteRequest>(s->message) || std::holds_alternative<PreVoteRequest>(s->message);
+				r.vote_traffic += std::holds_alternative<VoteRequest>(s->message) || std::holds_alternative<PreVoteRequest>(s->message); ++r.sends;
 				if (auto v = std::get_if<VoteResponse>(&s->message); v && v->granted) { ++r.granted; }
 				network_.push_back({id, s->peer, s->message, 0});
 			} else if (auto role = std::get_if<RoleChanged>(&a)) {
@@ -1199,6 +1225,108 @@ bool run() {
 
 }  // namespace closing
 
+// Quiescence (docs/mechanisms/quiescence.md): a group at rest sends nothing and arms no timer;
+// a request or a frame wakes it in its term; LeaderGone makes its followers elect within their
+// timeout; a restarted member neither deposes a leader at rest nor is locked out by one.
+namespace quiescence {
+
+using closing::Group;
+void expect(bool value, const std::string& what) { if (!value) { fail("quiescence: " + what); } }
+constexpr auto never = std::numeric_limits<std::uint64_t>::max();
+
+// Elects three voters, commits, and lets the heartbeat carry the commit: all at rest.
+NodeId rest(Group& g, const std::string& command) {
+	for (int n = 0; n < 200 && !g.leader(); ++n) { g.tick(97); }
+	const NodeId leader = g.leader();
+	expect(leader != 0 && g.write(leader, command), "three voters elect and commit " + command);
+	g.tick(70);
+	for (auto& [id, r] : g.replicas) {
+		expect(r.core->resting() && r.core->next_deadline() == never, "replica " + std::to_string(id) + " rests with no timer armed");
+	}
+	return leader;
+}
+
+// At rest nothing is sent for a long while, and no term moves; a request wakes the leader in its
+// term, and the group rests again once the commit is heard.
+void at_rest() {
+	Group g(3, true);
+	const NodeId leader = rest(g, "a");
+	const Term term = g.replicas.at(leader).core->term();
+	for (auto& [id, r] : g.replicas) { r.sends = 0; }
+	for (int n = 0; n < 1000; ++n) { g.tick(97); }  // 97,000 units: 80 election timeouts
+	for (auto& [id, r] : g.replicas) {
+		expect(r.sends == 0, "replica " + std::to_string(id) + " sends nothing at rest, not " + std::to_string(r.sends));
+		expect(r.core->term() == term, "no term moves at rest");
+	}
+	expect(g.write(leader, "b"), "a request wakes the leader and commits");
+	expect(g.leader() == leader && g.replicas.at(leader).core->term() == term, "in the same term: CheckQuorum's window starts at the wake");
+	g.tick(70);
+	for (auto& [id, r] : g.replicas) { expect(r.core->resting(), "replica " + std::to_string(id) + " rests again"); }
+	// Without quiescence the same group keeps its timers: the control.
+	Group control(3);
+	for (int n = 0; n < 200 && !control.leader(); ++n) { control.tick(97); }
+	expect(control.write(control.leader(), "a"), "the control commits");
+	control.tick(70);
+	for (auto& [id, r] : control.replicas) { expect(!r.core->resting() && r.core->next_deadline() != never, "without quiesce a replica keeps a timer"); }
+}
+
+// LeaderGone at both followers of a crashed leader at rest: they elect within the timeout. When
+// one hears it, its pre-vote wakes the other, and they elect within two.
+void leader_gone() {
+	for (bool both : {true, false}) {
+		Group g(3, true);
+		const NodeId leader = rest(g, "a");
+		const Term term = g.replicas.at(leader).core->term();
+		g.replicas.at(leader).core.reset();  // the leader's node is gone
+		std::vector<NodeId> followers;
+		for (NodeId id = 1; id <= 3; ++id) { if (id != leader) { followers.push_back(id); } }
+		for (auto id : followers) {
+			if (both || id == followers[0]) { g.act(id, g.replicas.at(id).core->step(LeaderGone{leader})); }
+		}
+		const auto from = g.now();
+		NodeId elected = 0;
+		for (int n = 0; n < 100 && !elected; ++n) { g.tick(20); elected = g.leader(); }
+		if (both) {
+			expect(elected != 0 && elected != leader && g.replicas.at(elected).core->term() > term, "LeaderGone elects a new leader in a later term");
+			expect(g.now() - from <= 2 * g.election_max(), "within the election timeout and a round: " + std::to_string(g.now() - from));
+		} else {
+			expect(elected != 0 && elected != leader, "one follower's pre-vote wakes the other, and they elect");
+			expect(g.now() - from <= 3 * g.election_max(), "within two election timeouts and a round: " + std::to_string(g.now() - from));
+		}
+	}
+}
+
+// A restarted follower's campaign reaches the leader at rest, which wakes and heartbeats it; the
+// other follower at rest refuses its pre-vote. No term moves. A restarted leader's own campaign
+// is not refused by followers at rest under it: the group elects.
+void restarts() {
+	Group g(3, true);
+	NodeId leader = rest(g, "a");
+	Term term = g.replicas.at(leader).core->term();
+	const NodeId follower = leader % 3 + 1;
+	g.replicas.at(follower).core.reset();
+	g.open(follower, std::nullopt);
+	for (int n = 0; n < 100 && g.replicas.at(follower).core->leader() != leader; ++n) { g.tick(97); }
+	expect(g.replicas.at(follower).core->leader() == leader && g.leader() == leader, "a restarted follower finds the leader at rest");
+	for (auto& [id, r] : g.replicas) { expect(r.core->term() == term, "a restarted follower deposes no one"); }
+	g.tick(70);
+	g.replicas.at(leader).core.reset();
+	g.open(leader, std::nullopt);
+	NodeId elected = 0;
+	for (int n = 0; n < 200 && !elected; ++n) { g.tick(97); elected = g.leader(); }
+	expect(elected != 0 && g.replicas.at(elected).core->term() > term, "a restarted leader is not locked out: the group elects");
+}
+
+bool run() {
+	at_rest();
+	leader_gone();
+	restarts();
+	std::printf("quiescence: at rest, LeaderGone and restarts: %s\n", failures ? "FAILED" : "ok");
+	return !failures;
+}
+
+}  // namespace quiescence
+
 }  // namespace
 
 namespace kronuz::consensus::driver_simulation { bool run(std::uint64_t seeds, std::uint64_t steps, std::uint64_t first); }
@@ -1209,11 +1337,12 @@ int main(int argc, char** argv) {
 	const std::uint64_t first = argc > 3 ? std::strtoull(argv[3], nullptr, 10) : 1;
 	std::uint64_t restarts = 0, kept = 0, lost = 0, elections = 0, repairs = 0, transfers = 0, changes = 0, committed_changes = 0;
 	std::uint64_t reads = 0, checkpoints = 0, installs = 0, limit_changes = 0, replaced = 0, removals = 0, replacements = 0, with_snapshot = 0, with_read = 0, duplicated = 0, held = 0;
-	std::uint64_t closes = 0, resumed = 0, stale = 0;
-	if (!closing::run()) { return EXIT_FAILURE; }
+	std::uint64_t closes = 0, resumed = 0, stale = 0, quiescent = 0, leader_gones = 0, rested = 0;
+	if (!closing::run() || !quiescence::run()) { return EXIT_FAILURE; }
 	for (std::uint64_t seed = first; seed < first + seeds && !failures; ++seed) {
 		current_seed = seed;
-		Simulation sim(seed, 3 + 2 * (seed % 3 == 0), seed % 2 == 0, seed % 5 == 1);  // even seeds change membership
+		Simulation sim(seed, 3 + 2 * (seed % 3 == 0), seed % 2 == 0, seed % 5 == 1, seed % 4 >= 2);  // even seeds change membership; half quiesce
+		quiescent += seed % 4 >= 2;
 		sim.run(steps);
 		if (std::getenv("SIM_DEBUG")) {
 			for (auto [r, n] : sim.reject_reasons) { std::fprintf(stderr, "  reject %d: %llu\n", r, (unsigned long long)n); } std::fprintf(stderr, "seed %llu: elections %llu led %llu of %llu steps, max term %llu\n", (unsigned long long)seed, (unsigned long long)sim.elections, (unsigned long long)sim.led_steps, (unsigned long long)steps, (unsigned long long)sim.max_term()); }
@@ -1237,7 +1366,7 @@ int main(int argc, char** argv) {
 		with_read += sim.removals_with_read;
 		duplicated += sim.delayed_timeout_nows;
 		held += sim.held_back_total();
-		closes += sim.closes; resumed += sim.resumed; stale += sim.stale;
+		closes += sim.closes; resumed += sim.resumed; stale += sim.stale; leader_gones += sim.leader_gones; rested += sim.rested_steps;
 	}
 	std::printf("simulation: %llu seeds x %llu steps, %llu elections, %llu restarts (%llu kept a pending batch, %llu lost one), %llu repairs, %llu transfers, %llu membership changes proposed, %llu committed memberships applied: %s\n",
 		(unsigned long long)seeds, (unsigned long long)steps, (unsigned long long)elections, (unsigned long long)restarts, (unsigned long long)kept,
@@ -1247,6 +1376,7 @@ int main(int argc, char** argv) {
 	std::printf("  forced: %llu crashes between promotion and removal; removals committed with a snapshot in flight %llu, with a read in flight %llu; %llu delayed duplicate TimeoutNows; %llu appends held back from peers below their next entry\n",
 		(unsigned long long)replacements, (unsigned long long)with_snapshot, (unsigned long long)with_read, (unsigned long long)duplicated, (unsigned long long)held);
 	std::printf("  %llu closes at rest; %llu reopens resumed their closed term, %llu records refused as stale\n", (unsigned long long)closes, (unsigned long long)resumed, (unsigned long long)stale);
+	std::printf("  %llu quiescent seeds: %llu LeaderGone raised, %llu node-steps at rest\n", (unsigned long long)quiescent, (unsigned long long)leader_gones, (unsigned long long)rested);
 	if (failures) { return EXIT_FAILURE; }
 	const auto* driver_seeds = std::getenv("SIM_DRIVER_SEEDS");  // the Driver's seeds alone, when set
 	const bool driver = driver_simulation::run(driver_seeds ? std::strtoull(driver_seeds, nullptr, 10) : (seeds + 9) / 10, std::min<std::uint64_t>(steps, 3000), first);

@@ -225,7 +225,25 @@ public:
 		on_loop();
 		auto* g = live(id);
 		if (!g || g->closing) { count_drop(id); return; }
-		g->limits.push_back(limits); mark_ready(*g);
+		g->notices.emplace_back(limits); mark_ready(*g);
+	}
+	// Quiescence (docs/mechanisms/quiescence.md): ends the group's rest, as a request or a frame
+	// due for it would.
+	void wake(GroupId id) {
+		on_loop();
+		auto* g = live(id);
+		if (!g || g->closing) { count_drop(id); return; }
+		g->notices.emplace_back(Wake{}); mark_ready(*g);
+	}
+	// The node-pair detector's report: `node` stopped answering. Every open group following a
+	// leader on it drops that leader and elects within its election timeout.
+	void leader_gone(NodeId node) {
+		on_loop();
+		for (auto& [id, group] : groups_) {
+			auto& g = *group;
+			if (g.closing || !g.started || g.worker->role() != Role::Follower || g.worker->leader_node() != node) { continue; }
+			g.notices.emplace_back(LeaderGone{node}); mark_ready(g);
+		}
 	}
 	// An open group's own count; an id not open (closed, never opened) reads the count of plain
 	// calls dropped on every id not open.
@@ -396,7 +414,7 @@ private:
 		std::optional<std::pair<Index, std::string>> application_failure;
 		std::optional<std::pair<Token, std::optional<std::string>>> activation;
 		std::unique_ptr<SnapshotActivation> activating;
-		std::vector<PeerLimits> limits;
+		std::vector<Event> notices;  // PeerLimits, Wake and LeaderGone, in order
 		std::string fence_reason;
 		Group* ready_next = nullptr;
 		std::uint64_t dropped = 0;
@@ -740,7 +758,7 @@ private:
 		auto& w = *g.worker;
 		std::uint64_t at = w.next_deadline();
 		at = at > max_ms ? never : at * 1'000'000;
-		const bool waiting = !g.inbox.empty() || !g.limits.empty() || unadmitted(g) || g.retiring;
+		const bool waiting = !g.inbox.empty() || !g.notices.empty() || unadmitted(g) || g.retiring;
 		if (waiting && !g.io && !g.watching) { at = std::min(at, scheduler_.now() + retry_ns); }
 		if (at == never) { disarm(g); return; }
 		scheduler_.arm(g, at);
@@ -780,10 +798,10 @@ private:
 			return true;
 		}
 		bool progress = false;
-		while (!g.closing && !g.limits.empty()) {
-			Event event = g.limits.front();
+		while (!g.closing && !g.notices.empty()) {
+			Event event = g.notices.front();
 			if (w.try_submit_retained(event) != SubmitResult::Accepted) { break; }
-			g.limits.erase(g.limits.begin()); progress = true;
+			g.notices.erase(g.notices.begin()); progress = true;
 		}
 		std::size_t taken = 0;
 		while (!g.closing && taken < g.inbox.size()) {
@@ -945,7 +963,7 @@ private:
 	// record; the rest drain as they complete.
 	void begin_close(Group& g) {
 		g.closing = true;
-		g.inbox.clear(); std::vector<Receive>().swap(g.inbox); g.limits.clear();
+		g.inbox.clear(); std::vector<Receive>().swap(g.inbox); g.notices.clear();
 		for (auto* x = g.head; x;) {
 			auto* next = x->next;
 			if (!holds_record(g, *x)) { complete(g, *x, std::make_exception_ptr(closed{})); }

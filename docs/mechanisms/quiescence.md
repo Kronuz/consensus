@@ -7,6 +7,43 @@ frame or a request without an election when the leader it closed under is unchan
 reopened lone voter's first write costs the same two barriers as a write to an open group: its
 entry, and the commit index after it.
 
+## Rest
+
+With `Timing::quiesce`, an open group at rest arms no timer and sends nothing; the host's
+node-pair detector (one per connection, not one per group) watches for a lost peer in place of
+each group's heartbeats and election timers.
+
+- **A leader rests** once every replica has acknowledged its whole log and an append carrying its
+  commit index, its term's entry is committed, the membership in force is committed with no
+  voter leaving, and no read, transfer or snapshot is in progress: no heartbeat, no CheckQuorum.
+- **A follower rests** on an append from its leader whose commit index covers the follower's
+  whole log, under a committed membership in which that leader votes and is not leaving (a
+  removed leader steps down without a frame): its leader's next frame may be long off, so it
+  stops its election timer. While at
+  rest it holds its leader current: it refuses pre-votes and votes as within `election_min` of a
+  heartbeat, except from that leader itself, whose campaign shows it no longer leads.
+- **A rest ends** for a leader on any frame, a request (`Propose`, `Read`, `ChangeMembership`,
+  `TransferLeadership`, `Repair`), a `PeerLimits` report or `Wake`: it heartbeats at once and
+  starts CheckQuorum's window afresh, and rests again once every replica acknowledges that
+  round. A follower's rest ends on `Wake` or on another member's pre-vote or vote (refused, as
+  within `election_min`), on a frame that leaves it behind its leader's commit, or on a term
+  change. Its election timer then runs, and it re-acknowledges its durable log to its leader: a
+  leader that still leads wakes on that frame and heartbeats it back to rest; one that no longer
+  leads ignores it, and the follower elects at its timeout.
+- **`LeaderGone{node}`** is the detector's report that `node` (a `Member::node`) stopped
+  answering. A follower whose leader is on that node drops it and elects within its election
+  timeout, as after a missed heartbeat. `Driver::leader_gone(node)` raises it at every open group
+  following a leader there; `Driver::wake(id)` submits `Wake`.
+
+Rest changes no safety argument: a commit still needs a quorum's acknowledgement in the leader's
+term and a read a quorum's probe, so a leader at rest that a partition deposed commits nothing
+and serves no read in its old term. What it trades is detection: a follower at rest under a
+leader it cannot reach elects only on `LeaderGone`, so a host enables `quiesce` only with a
+detector. A restarted member is never locked out: its campaign wakes the leader at rest, or, if
+it was the leader, its own pre-vote is not refused. A follower that alone hears `LeaderGone`
+wakes the other with its pre-vote, and the two elect within two timeouts (`simulation_test`, quiescence cases; half of
+the random seeds quiesce under a detector oracle).
+
 ## The closed state
 
 The closed state is the replica's consensus position at close: its hard state, the end of its

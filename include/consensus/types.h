@@ -114,6 +114,9 @@ struct Timing {
 	std::uint64_t heartbeat = 100, rpc_timeout = 500;
 	std::uint64_t election_min = 1000, election_max = 2000;
 	std::uint64_t snapshot_timeout = 60000;
+	// Quiescence (docs/mechanisms/quiescence.md): a group at rest stops its timers, and the
+	// host's node-pair detector raises LeaderGone in their place.
+	bool quiesce = false;
 };
 
 // Pipelined replication (Track C, D15): Append RPCs and bytes in flight per peer. One
@@ -215,7 +218,11 @@ struct TransferLeadership { RequestId request; NodeId target; };
 // keeps commands and RPCs within every reported member's; one not reported is taken to
 // match the leader's own node.
 struct PeerLimits { NodeId incarnation; Limits limits; };
-using Event = std::variant<Start, Tick, Receive, Propose, Read, Persisted, Applied, Failed, LocalCheckpoint, StorageFault, InstallPrepared, InstallActivated, InstallActivationFailed, SnapshotSourceReady, SnapshotTransferFailed, Repair, ChangeMembership, TransferLeadership, PeerLimits>;
+// Quiescence: the host ends a group's rest (a request or a frame is due for it), or reports
+// that a node (Member::node) stopped answering on its connection, for every group it hosts.
+struct Wake {};
+struct LeaderGone { NodeId node; };
+using Event = std::variant<Start, Tick, Receive, Propose, Read, Persisted, Applied, Failed, LocalCheckpoint, StorageFault, InstallPrepared, InstallActivated, InstallActivationFailed, SnapshotSourceReady, SnapshotTransferFailed, Repair, ChangeMembership, TransferLeadership, PeerLimits, Wake, LeaderGone>;
 
 enum class Role : std::uint8_t { Follower, Candidate, Leader, Fenced };
 enum class RejectReason { Busy, NotLeader, NotReady, LogFull, TooLarge, DuplicateRequest, InvalidCheckpoint, InvalidRepair, LeaderMustTransfer, InvalidMembership, InvalidTarget };

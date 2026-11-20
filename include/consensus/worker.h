@@ -202,6 +202,8 @@ public:
 	std::size_t retired_log_entries() const noexcept { return core_ ? core_->retired_log_entries() : 0; }
 	bool owns_io_operation(const std::shared_ptr<kronuz::journal::IOOperation>& operation) const noexcept { return operation && (operation == io_job_ || operation == maintenance_io_); }
 	NodeId leader() const noexcept { return core_ ? core_->leader() : 0; }
+	NodeId leader_node() const { return core_ ? core_->leader_node() : 0; }
+	bool resting() const noexcept { return core_ && core_->resting(); }
 	bool transferring() const noexcept { return core_ && core_->transferring(); }
 	Index last_index() const noexcept { return core_ ? core_->last_index() : 0; }
 	std::optional<Term> term_at(Index index) const { return core_ ? core_->term_at(index) : std::nullopt; }

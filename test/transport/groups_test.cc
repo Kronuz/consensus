@@ -2174,6 +2174,13 @@ void fetch_alongside() {
 		});
 		return got;
 	};
+	std::uint64_t quiet = 0;
+	for (int i = 0; i != 4; ++i) {
+		const auto begun = steady::now();
+		assert(commit_everywhere(all, g, "quiet " + std::to_string(i), 2'000));
+		quiet = std::max(quiet, ms_since(begun));
+		std::this_thread::sleep_for(50ms);
+	}
 	const std::vector<std::pair<NodeId, NodeId>> pairs{{1, 2}, {1, 3}, {3, 2}, {2, 3}};
 	constexpr unsigned rounds = 4;
 	unsigned round = 0, exact = 0, commits = 0;
@@ -2202,9 +2209,10 @@ void fetch_alongside() {
 	auto s = c.nodes[leader]->state(g);
 	const bool kept = s && s->role == Role::Leader && s->term == term;
 	std::printf("fetch-alongside: %u rounds of %zu x 8 MiB fetched through 1 MiB lane budgets in %llu ms, %u of %u exact; %u commits "
-				"beside them, each on all three within 2 s: %s (slowest %llu ms); node %llu leads in term %llu throughout: %s\n",
+				"beside them, each on all three within 2 s: %s (slowest %llu ms; 4 quiet ones before, slowest %llu ms); node %llu leads in "
+				"term %llu throughout: %s\n",
 				round, pairs.size(), (unsigned long long)elapsed, exact, rounds * unsigned(pairs.size()), commits, committed ? "yes" : "NO",
-				(unsigned long long)slowest, (unsigned long long)leader, (unsigned long long)term, kept ? "yes" : "NO");
+				(unsigned long long)slowest, (unsigned long long)quiet, (unsigned long long)leader, (unsigned long long)term, kept ? "yes" : "NO");
 	assert(round == rounds && exact == rounds * pairs.size() && committed && kept);
 }
 

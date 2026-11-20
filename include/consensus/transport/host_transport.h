@@ -271,8 +271,6 @@ class HostTransport {
 				  HostTransportOptions options = {})
 		: options_(std::move(options)), serving_(options_.rpc.serving_bytes), calling_(options_.rpc.calling_bytes),
 		  outgoing_(options_.rpc.outgoing_bytes), loops_(loops.size()) {
-		for (auto &[node, address] : addresses)
-			nodes_.push_back(node);
 		if (loops_.empty() || loops_.size() > 4096)
 			throw std::invalid_argument("host transport: 1 to 4,096 loops");
 		if (!options_.member_of)
@@ -337,6 +335,23 @@ class HostTransport {
 		unopen(here, group);
 	}
 
+	// On loop_of_node(node): admits `node` at `address`, pinned to `pin` or, with none, to the
+	// certificate the trust policy accepts at its first join (NodePins::admit); its dials go to
+	// `address` from now on. Admitting it again moves its address.
+	void admit(kronuz::consensus::NodeId node, PeerAddress address, std::optional<Fingerprint> pin = std::nullopt) {
+		auto &links = *loops_[loop_of_node(node)].links;
+		links.pins().admit(node, pin);
+		links.route(node, std::move(address));
+	}
+	// On loop_of_node(node): removes `node` (Links::remove): its certificates are refused, its
+	// connections abort, and its calls end; it is not dialed until admitted again.
+	void remove(kronuz::consensus::NodeId node) {
+		auto &here = loops_[loop_of_node(node)];
+		here.links->remove(node);
+		if (auto it = here.rpc.find(node); it != here.rpc.end())
+			fail(it->second, rpc::Outcome::not_connected);
+	}
+
 	// Accepts on `acceptor`, a socket of loop 0, until stop().
 	void serve(asio::ip::tcp::acceptor &acceptor) { task::spawn(loops_[0].at.scheduler, loops_[0].links->serve(acceptor)); }
 
@@ -386,7 +401,7 @@ class HostTransport {
 		const RpcCall c{node, ++here.rpc_ids};
 		++here.lane_stats.calls;
 		events.done = ending(k, c, std::move(events.done));
-		if (here.stopping || std::find(nodes_.begin(), nodes_.end(), node) == nodes_.end()) {
+		if (here.stopping || !here.links->routed(node)) {
 			events.done({rpc::Outcome::not_connected});
 			return c;
 		}
@@ -1209,7 +1224,6 @@ class HostTransport {
 	HostTransportOptions options_;
 	rpc::ByteBudget serving_, calling_, outgoing_;  // the lane's pools, shared by every loop (D5); outlive every Lane
 	std::vector<Loop> loops_;
-	std::vector<kronuz::consensus::NodeId> nodes_;  // the nodes with an address
 	std::map<rpc::MethodId, Serve> serves_;          // set before serve(), then only read
 };
 

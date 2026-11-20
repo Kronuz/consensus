@@ -13,11 +13,13 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 - The journal pin moves to journal:9e11713, past journal-reopen-closed (journal:4d364f1) and journal-close-in-doubt (journal:8c92ed9), and completion to completion:d8b538c, journal's own. Durable syncs go through `IO::sync_files` and `IO::sync_data_files`.
 - A closing Worker hands its shared group back to the host once drained: closed into the host's table when its last record is a checkpoint covering every batch (`Host::close_group`, `TurnDriver::forget`), otherwise released when its Store ends. The Driver settles the host after erasing a row, so a released group is parked at once. A closed id recovers in the same live host, and 10,000 covered rows closed leave the process heap where it was (`driver_close_test closed_bytes`).
 - A close whose table commit fails fences the row and releases it; the host keeps the group in doubt, so `create` and `recover` of that id on any Driver over that host complete with `close_in_doubt` (journal's EIO from `Host::hold`) until the host reopens, since the table may hold the group closed and a record appended live would be lost at the next restart (`driver_close_test failed_close`, `second_driver`).
+- Exit waits for running lookups ([docs/mechanisms/peer-dns.md](docs/mechanisms/peer-dns.md)): the process's lookup threads close from an atexit handler, which waits for each running resolver to return, so a stuck `getaddrinfo` delays exit by up to the system resolver's timeout, and a resolver or delivery must not call `std::exit`. Fork is not supported: a forked child must exec or `_exit` before it uses a `Peers` or a `Lookup`.
 
 ### Fixed
 
 - A throw that ends the Driver's loop (one a step does not catch) completes every waiting call with `task::cancelled`, as a stop does, instead of leaving it suspended (`driver_close_test close_crash`); under `consensus::run` the throw reaches the caller and the Driver stays stopped (`entry_throw`).
 - A checkpoint whose peak (its bundle bound plus its application cap) exceeds the replacement pool fails at once with `checkpoint_exceeds_pool` instead of waiting forever and blocking the calls behind it.
+- A `LookupThreads::start` that throws while making a thread's list entry no longer leaves its lookup queued: the entry is made inside the try, so no resolver runs for a caller that saw the exception (`test/transport/resolve_test.cc`, case `start_fails`, fails `start()` at each of its allocations).
 
 ## 2026-11-18
 

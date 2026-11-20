@@ -205,11 +205,13 @@ class LookupThreads {
 		for (auto &thread : owner.exited)
 			thread.join();  // past its last use of the mutex, which this thread holds
 		owner.exited.clear();
-		auto self = owner.running.emplace(owner.running.end());
+		auto self = owner.running.end();
 		try {
+			self = owner.running.emplace(self);
 			*self = std::thread([&owner, self] { owner.run(self); });
 		} catch (...) {
-			owner.running.erase(self);
+			if (self != owner.running.end())
+				owner.running.erase(self);
 			if (!owner.running.empty())
 				return lookup;  // a running thread takes it once its resolver returns
 			owner.queue.erase(lookup->place_);

@@ -21,6 +21,8 @@ and its journal group (Xapiand:d5b84cdf4, at 64 groups).
 Jobs: before 261120-101850-c631af (the test over b8de3b8's `core.h`, `worker.h`, `types.h`),
 after 261120-101900-6202e7. The idle row is 1,104 B (16%) smaller, and 1,281 B below Xapiand's
 measure.
+With the rest and the node-pair detector (consensus:3f3f664) the stages are 3,285, 5,609, 5,939
+and 5,719 B, 16 B more idle (job 261120-124658-f2feae), still 1,265 B below Xapiand's.
 
 ## By owner
 

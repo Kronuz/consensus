@@ -258,6 +258,10 @@ class HostTransport {
 	// group cannot take it now, and the frame is dropped and counted (Raft resends). Its credit
 	// returns either way.
 	using Deliver = std::function<bool(const Received &)>;
+	// On the group's loop: the node limits its peer's hello reported for a source incarnation, once
+	// per incarnation and connection, before that source's first admitted frame on it (Core's
+	// PeerLimits, which caps what the group's leader sends that member).
+	using ReportLimits = std::function<void(GroupId, const kronuz::consensus::PeerLimits &)>;
 
 	// A served call: its events, or none to answer unknown_method. The handler acts on the call
 	// from its events, which run on the call's loop; `call` names it to write, consume and stop.
@@ -274,6 +278,9 @@ class HostTransport {
 			throw std::invalid_argument("host transport: 1 to 4,096 loops");
 		if (!options_.member_of)
 			throw std::invalid_argument("host transport: member_of is required");
+		kronuz::consensus::validate_limits(options_.links.limits);
+		if (options_.links.connection.maximum_frame < frame_header + control_frame_bound(options_.links.limits))
+			throw std::invalid_argument("host transport: maximum_frame below a frame of this node's rpc_bytes");
 		for (std::uint32_t k = 0; k != loops_.size(); ++k) {
 			auto &loop = loops_[k];
 			loop.at = loops[k];
@@ -303,6 +310,10 @@ class HostTransport {
 	const rpc::ByteBudget &outgoing_pool() const noexcept { return outgoing_; }
 	// Before any frame arrives: what loop `loop` delivers.
 	void on_deliver(std::uint32_t loop, Deliver deliver) { loops_.at(loop).deliver = std::move(deliver); }
+	// Before any frame arrives: where loop `loop` reports its peers' limits.
+	void on_peer_limits(std::uint32_t loop, ReportLimits report) { loops_.at(loop).report = std::move(report); }
+	// On `loop`: its connections' counters, hellos refused by version among them.
+	const LinkStats &link_stats(std::uint32_t loop) const { return loops_.at(loop).links->stats(); }
 	// On the group's loop: the host stores `group` as its incarnation `incarnation`. A peer's
 	// frames for it are admitted on a connection once that peer's open matches `open`; storing
 	// again replaces both and opens the group again on every connection. A zero cluster, group
@@ -472,11 +483,13 @@ class HostTransport {
 	struct Opened {
 		std::uint64_t generation = 0;
 		GroupTable<Empty> groups;
+		GroupTable<kronuz::consensus::NodeId> reported;  // the source whose limits were reported last
 	};
 	// One read's message and open frames for one loop, and the connection they came on.
 	struct Batch {
 		std::uint32_t from = 0;
 		Peer peer;
+		kronuz::consensus::Limits limits;  // the node limits the connection's peer sent in its hello
 		std::vector<std::pair<Received, bool>> frames;  // the frame and whether it is an open
 	};
 	// The ready rings of a lane's sending groups: control, data.
@@ -539,6 +552,7 @@ class HostTransport {
 		HostLoop at;
 		std::unique_ptr<Links> links;
 		Deliver deliver;
+		ReportLimits report;
 		std::map<std::pair<kronuz::consensus::NodeId, LinkLane>, Lane> lanes;
 		std::vector<std::vector<Outgoing>> out;  // this loop's groups' frames, by connection loop
 		std::vector<Batch> in;                   // this read's frames, by group loop
@@ -557,8 +571,10 @@ class HostTransport {
 	}
 	// The group opens again on every connection: a store or a forget.
 	static void unopen(Loop &here, GroupId group) {
-		for (auto &[peer, opened] : here.opened)
+		for (auto &[peer, opened] : here.opened) {
 			opened.groups.erase(group);
+			opened.reported.erase(group);
+		}
 	}
 	// The group loop's queued frames, one post per connection loop.
 	void flush(std::uint32_t k) {
@@ -892,6 +908,7 @@ class HostTransport {
 			any = true;
 			batch.from = k;
 			batch.peer = {link.peer, link.lane, generation};
+			batch.limits = link.remote.limits;
 			auto moved = std::move(batch);
 			batch = Batch{};
 			if (to == k) {
@@ -912,6 +929,7 @@ class HostTransport {
 		if (batch.peer.generation > connection.generation) {
 			connection.generation = batch.peer.generation;
 			connection.groups.clear();
+			connection.reported.clear();
 		}
 		const bool current = batch.peer.generation == connection.generation;
 		std::vector<Owed> owed;  // a run of one group's frames shares a record
@@ -934,6 +952,7 @@ class HostTransport {
 				const bool opened = stored && current && connection.groups.contains(r.route.group);
 				switch (admit(r.route, r.node, stored ? stored->incarnation : 0, opened, options_.member_of)) {
 				case Admission::admitted:
+					report(here, connection, r.route, batch.limits);
 					taken = here.deliver && here.deliver(r);
 					here.stats.refused += !taken;
 					break;
@@ -974,6 +993,14 @@ class HostTransport {
 			on(batch.from, std::move(grant));
 	}
 
+	// A source's node limits, once per connection, before its first admitted frame there.
+	static void report(Loop &here, Opened &connection, const Route &route, const kronuz::consensus::Limits &limits) {
+		auto &last = connection.reported[route.group];
+		if (last == route.source || !here.report)
+			return;
+		last = route.source;
+		here.report(route.group, {route.source, limits});
+	}
 	// A peer's open on its connection: it opens the group there when the group is stored here and
 	// every field matches; otherwise it closes it there (false: tell the peer).
 	static bool opening(Loop &here, const Stored *stored, bool current, Opened &connection, GroupId group, std::string_view frame) {

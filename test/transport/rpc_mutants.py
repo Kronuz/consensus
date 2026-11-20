@@ -43,6 +43,9 @@ MUTANTS = {
     # stream: a body goes as one frame, past chunk and credit
     "rpc-one-frame": [("\t\treturn std::min<std::uint64_t>(chunk_bytes, o.limit - o.sent);",
                        "\t\treturn o.total == unknown_total ? chunk_bytes : o.total - o.sent;")],
+    # hello_test leader: the transport reports default limits, not the ones the peer's hello carried
+    "hello-limits-ignored": [(HOST, "here.report(route.group, {route.source, limits});",
+                              "here.report(route.group, {route.source, kronuz::consensus::Limits{}});")],
 }
 
 

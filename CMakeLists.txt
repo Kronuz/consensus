@@ -228,6 +228,14 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 		add_test(NAME consensus_transport_rpc_host_${c} COMMAND consensus_transport_rpc_host_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture ${c})
 		set_tests_properties(consensus_transport_rpc_host_${c} PROPERTIES FIXTURES_REQUIRED consensus_tls TIMEOUT 150)
 	endforeach()
+	# The node hello's limits and wire versions (docs/mechanisms/hello.md).
+	add_executable(consensus_transport_hello_test test/transport/hello_test.cc)
+	target_link_libraries(consensus_transport_hello_test PRIVATE consensus::transport)
+	target_compile_options(consensus_transport_hello_test PRIVATE -UNDEBUG)
+	foreach(c codec leader version)
+		add_test(NAME consensus_transport_hello_${c} COMMAND consensus_transport_hello_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture ${c})
+		set_tests_properties(consensus_transport_hello_${c} PROPERTIES FIXTURES_REQUIRED consensus_tls TIMEOUT 120)
+	endforeach()
 	set_tests_properties(consensus_transport_rpc PROPERTIES TIMEOUT 120)
 	# The host transport's idle cost per group, connection end and host, and its hop's CPU
 	# (docs/perf/transport-idle-cost.md); ctest checks the counts on every platform.

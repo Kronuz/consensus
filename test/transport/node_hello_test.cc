@@ -51,6 +51,10 @@ int main() {
 	expect += std::string("\x02\0\0\0", 4) + std::string(4, '\0');
 	expect += std::string(16, 'K') + std::string(16, 'c');
 	expect += std::string("\x01\0\0\0\x03\0\0\0", 8);
+	expect += std::string("\x01\0\0\0\x01\0\0\0", 8);  // wire versions 1-1; the default limits follow
+	kronuz::consensus::Limits limits;
+	for (auto *field : limit_fields(limits))
+		kronuz::journal::put64(expect, *field);
 	assert(bytes == expect && bytes.size() == node_hello_size);
 	assert(decode_node_hello(bytes) == sample());
 	auto refusal = sample();

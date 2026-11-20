@@ -23,9 +23,12 @@ struct LinkOptions {
 	// from one address (a node dials each lane once at a time); a newcomer replaces the oldest.
 	std::size_t handshakes = 4, handshakes_per_source = 2;
 	std::uint32_t rpc_min = 1, rpc_max = 1;
+	std::uint32_t wire_min = wire_version, wire_max = wire_version;
+	kronuz::consensus::Limits limits{};  // the node's own, in its hellos (docs/mechanisms/hello.md)
 };
 struct LinkStats {
 	std::uint64_t established = 0, refused = 0, abandoned = 0, rejected = 0, evicted = 0;
+	std::uint64_t version_refused = 0;  // hellos whose wire versions shared none with this node's
 	std::uint64_t lookups = 0, lookup_failures = 0, lookup_timeouts = 0;
 };
 // An established connection and the hellos that made it.
@@ -148,6 +151,8 @@ class Links {
 				if (established)
 					start(std::move(link));
 			}
+		} catch (const WireVersionRefused &) {
+			++stats_.version_refused;
 		} catch (...) {
 		}
 		auto &now = slots_[{peer, lane}];
@@ -225,6 +230,8 @@ class Links {
 				start(reserved);
 				established = true;
 			}
+		} catch (const WireVersionRefused &) {
+			++stats_.version_refused;
 		} catch (...) {
 		}
 		if (!established) {
@@ -314,7 +321,8 @@ class Links {
 	};
 
 	NodeHello hello(LinkLane lane) const {
-		return {pins_.local(), lane, false, cluster_, fresh_connection_identity(), options_.rpc_min, options_.rpc_max};
+		return {pins_.local(), lane, false, cluster_, fresh_connection_identity(), options_.rpc_min, options_.rpc_max,
+				options_.wire_min, options_.wire_max, options_.limits};
 	}
 	// The tie-break (T6) for an incoming hello from `peer`: an undrained link of the lane wins;
 	// else, when this host's own dial already offered its hello, the dial of the lower node wins.

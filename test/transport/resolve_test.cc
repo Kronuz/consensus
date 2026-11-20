@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <new>
 #include <pthread.h>
 #include <string>
 #include <thread>
@@ -38,6 +39,29 @@
 #ifndef SANITIZER_THREADS
 #define SANITIZER_THREADS 0
 #endif
+
+
+// Fails the calling thread's nth allocation from arm() on, so that start() fails at each of its
+// allocations in turn.
+namespace {
+thread_local long fail_in = -1;
+bool failed = false;
+void arm(long nth) {
+	failed = false;
+	fail_in = nth;
+}
+}
+void *operator new(std::size_t size) {
+	if (fail_in >= 0 && fail_in-- == 0) {
+		failed = true;
+		throw std::bad_alloc();
+	}
+	if (void *p = std::malloc(size ? size : 1))
+		return p;
+	throw std::bad_alloc();
+}
+void operator delete(void *p) noexcept { std::free(p); }
+void operator delete(void *p, std::size_t) noexcept { std::free(p); }
 
 using namespace kronuz::consensus::transport;
 using namespace std::chrono_literals;
@@ -364,6 +388,43 @@ void rebuilds() {
 	CHECK(answers->size() == 0 && gate->returned == bound);
 }
 
+// A start() that throws, whichever of its allocations failed, leaves nothing behind: no queued
+// lookup, no thread running or unjoined, and its resolver never runs.
+void start_fails() {
+	CHECK(settles(baseline));
+	unsigned thrown = 0;
+	for (long nth = 0;; ++nth) {
+		auto threads = std::make_unique<LookupThreads>(4);
+		auto ran = std::make_shared<std::atomic<unsigned>>(0);
+		auto answers = std::make_shared<Answers>();
+		std::shared_ptr<Lookup> lookup;
+		bool threw = false;
+		arm(nth);
+		try {
+			lookup = threads->start([ran](const std::string &) { return ++*ran, std::vector<asio::ip::address>{}; },
+									"host", answers->delivery(answers));
+		} catch (const std::bad_alloc &) {
+			threw = true;
+		}
+		fail_in = -1;
+		CHECK(threw == failed);
+		if (!threw) {
+			CHECK(until([&] { return answers->size() == 1; }));
+			break;
+		}
+		++thrown;
+		CHECK(threads->queued() == 0 && threads->threads() == 0);
+		// A later lookup runs alone: the failed one's resolver is never called.
+		auto later = threads->start([](const std::string &) { return std::vector<asio::ip::address>{}; }, "later",
+									answers->delivery(answers));
+		CHECK(until([&] { return answers->size() == 1; }));
+		threads.reset();
+		CHECK(*ran == 0 && answers->size() == 1);
+	}
+	CHECK(settles(baseline));
+	std::printf("start_fails: start() failed at each of its %u allocations in turn and left no lookup or thread\n", thrown);
+}
+
 // A2 at exit: runs after the process's LookupThreads is closed (registered before it was
 // built); every thread it ran has been joined, and a lookup started now throws.
 void exited() {
@@ -407,7 +468,7 @@ int main(int argc, char **argv) {
 	std::atexit(exited);
 	const std::pair<const char *, void (*)()> cases[] = {
 		{"delivers", delivers}, {"abandoned", abandoned}, {"abandon_waits", abandon_waits},
-		{"shutdown", shutdown}, {"rebuilds", rebuilds}};
+		{"shutdown", shutdown}, {"rebuilds", rebuilds}, {"start_fails", start_fails}};
 	bool ran = false;
 	for (const auto &[name, run] : cases)
 		if (argc < 2 || std::strcmp(argv[1], name) == 0) {

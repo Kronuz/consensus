@@ -4,11 +4,35 @@
 #include <asio/ip/address.hpp>
 #include <asio/ssl.hpp>
 #include <map>
+#include <memory>
 #include <openssl/rand.h>
 #include <openssl/x509.h>
+#include <openssl/x509v3.h>
 #include <set>
 
 namespace kronuz::consensus::transport {
+// Caches the decoded extensions of every certificate the context holds. OpenSSL caches them on
+// a certificate's first verification and publishes them with an atomic flag ThreadSanitizer
+// cannot see in libcrypto; cached before loops share the context, handshakes only read them.
+inline void cache_certificates(asio::ssl::context &context) {
+	SSL_CTX *ctx = context.native_handle();
+	auto cache = [](STACK_OF(X509) *certificates) {
+		for (int i = 0; i < sk_X509_num(certificates); ++i)
+			(void)X509_check_purpose(sk_X509_value(certificates, i), -1, 0);
+	};
+	if (X509 *own = SSL_CTX_get0_certificate(ctx))
+		(void)X509_check_purpose(own, -1, 0);
+	STACK_OF(X509) *chain = nullptr;
+	if (SSL_CTX_get0_chain_certs(ctx, &chain) == 1)
+		cache(chain);
+	chain = nullptr;
+	if (SSL_CTX_get_extra_chain_certs_only(ctx, &chain) == 1)
+		cache(chain);
+	std::unique_ptr<STACK_OF(X509), void (*)(STACK_OF(X509) *)> trusted(
+		X509_STORE_get1_all_certs(SSL_CTX_get_cert_store(ctx)),
+		[](STACK_OF(X509) *certificates) { sk_X509_pop_free(certificates, X509_free); });
+	cache(trusted.get());
+}
 inline Fingerprint certificate_fingerprint(X509 *certificate) {
 	if (!certificate)
 		throw std::invalid_argument("missing certificate");

@@ -191,6 +191,11 @@ public:
 	// and the newest committed one (Track C, D1).
 	const Membership& membership() const noexcept { return configs_.empty() ? base_membership_ : configs_.rbegin()->second; }
 	const Membership& committed_membership() const noexcept { return membership_at(durable_.commit_index); }
+	// The membership in force at `index`: the newest Configuration entry at or below it.
+	const Membership& membership_at(Index index) const {
+		auto it = configs_.upper_bound(index);
+		return it == configs_.begin() ? base_membership_ : std::prev(it)->second;
+	}
 	// Whether a ChangeMembership would pass D3's preconditions now: a leader, not busy or
 	// transferring and not a witness, that committed an entry of its term, with no
 	// configuration above its commit index.
@@ -204,6 +209,38 @@ public:
 		if (incarnation == configuration_.local) { return last_index(); }
 		auto found = peers_.find(incarnation);
 		return found == peers_.end() ? std::nullopt : std::optional<Index>(found->second.matched);
+	}
+
+	// The leader this node knows of in its term; 0 for none.
+	NodeId leader() const noexcept { return leader_; }
+	// The term of the entry at `index`, while the retained log or its base holds it.
+	std::optional<Term> term_at(Index index) const {
+		if (index < base_index_ || index > last_index() || (index == 0 && base_index_ == 0)) { return std::nullopt; }
+		return log_term(index);
+	}
+	// The earliest Tick time (as Tick::now) by which a Tick may change anything; `maximum` when
+	// none would: before Start, while a persistence is outstanding (its Persisted is the next
+	// event), fenced, retiring, or a member that never campaigns. A host that ticks by then
+	// misses no timer; an earlier Tick is harmless. A due leader heartbeat or election may be
+	// now or past; every other deadline counts only while ahead of the clock.
+	std::uint64_t next_deadline() const {
+		if (!started_ || retiring_ || role_ == Role::Fenced || busy()) { return maximum; }
+		if (role_ != Role::Leader) { return is_voter(configuration_.local) && hard_.term != maximum ? election_deadline_ : maximum; }
+		auto at = peers_.empty() ? maximum : heartbeat_deadline_;  // a leader with nobody to heartbeat sleeps
+		auto later = [&](std::uint64_t base, std::uint64_t delay) {
+			const auto due = delay > maximum - base ? maximum : base + delay;
+			if (due > now_) { at = std::min(at, due); }
+		};
+		for (const auto& [id, answer] : answered_) { if (is_voter(id)) { later(answer, timing_.election_max); } }  // CheckQuorum
+		if (transfer_) { later(transfer_->until, 0); }
+		for (const auto& [id, peer] : peers_) {
+			later(peer.retry_after, 0);
+			if (peer.snapshot_retry_clock) { later(*peer.snapshot_retry_clock, 1); }
+			if (!peer.flights.empty()) { later(peer.flights.front().sent, timing_.rpc_timeout); }
+			if (peer.snapshot) { later(peer.snapshot->started, timing_.snapshot_timeout); }
+			if (peer.snapshot && peer.keepalive) { later(peer.keepalive->sent, timing_.heartbeat); }
+		}
+		return at;
 	}
 
 	class FrozenCheckpoint {
@@ -269,20 +306,18 @@ private:
 	struct SnapshotFlight { SnapshotKey key; SnapshotPhase phase; std::uint64_t started; };
 	// Up to `pipeline` Append RPCs and `window_bytes` in flight (D15), oldest first, `next`
 	// past the last; one flight at verified progress until a first success, and after a
-	// failure or timeout. A snapshot's keepalive flies outside the window.
+	// failure or timeout. A snapshot's keepalive flies outside the window. `lacks_base`: the
+	// peer's last refusal, unanswered by any append or image since, put `next` at or below the
+	// base; only then does an install start, and a `next` there for any other reason probes the base.
 	struct Peer {
 		Index next = 1, matched = 0; std::deque<Flight> flights; std::uint64_t retry_after = 0; std::optional<SnapshotFlight> snapshot{}; std::optional<std::uint64_t> snapshot_retry_clock{}; bool blocked = false;
-		std::optional<Flight> keepalive{}; bool verified = false; std::uint64_t window = 0;
+		std::optional<Flight> keepalive{}; bool verified = false, lacks_base = false; std::uint64_t window = 0;
 		// Back to one flight, resuming at `from` (the oldest flight's start: nothing before it is in doubt).
 		void reset_flights(Index from) { flights.clear(); window = 0; verified = false; next = std::max(matched + 1, from); }
 	};
 	struct PendingRead { RequestId request; Token probe; Term term; Index index; std::set<NodeId> acknowledgements; };
 	struct Transfer { NodeId target; Token token; std::uint64_t until; bool sent = false; };
 	static constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
-	const Membership& membership_at(Index index) const {
-		auto it = configs_.upper_bound(index);
-		return it == configs_.begin() ? base_membership_ : std::prev(it)->second;
-	}
 	bool is_voter(NodeId incarnation) const { return votes_in(membership(), incarnation); }
 	std::vector<NodeId> voters() const {
 		std::vector<NodeId> out;
@@ -429,7 +464,15 @@ private:
 	}
 	void handle(Start, Actions& output) {
 		if (started_) { return; }
-		started_ = true; reset_election(); deliver(output);
+		started_ = true; reset_election();
+		// X5: the only voter, with no witness, needs nobody's vote: its election is due at once,
+		// so the next Tick campaigns at the same clock and its admission funds the ballot.
+		if (lone_voter()) { election_deadline_ = now_; }
+		deliver(output);
+	}
+	bool lone_voter() const {
+		auto self = find_member(membership(), configuration_.local);
+		return self && self->role == MemberRole::Voter && voter_count(membership()) == 1;
 	}
 	void handle(Tick tick, Actions& output) {
 		if (tick.now < now_ || tick.election_delay < timing_.election_min || tick.election_delay > timing_.election_max) { return; }
@@ -540,7 +583,7 @@ private:
 		auto key = peer.snapshot->key; output.emplace_back(SnapshotReleased{id, key, reason}); peer.snapshot.reset();
 		peer.keepalive.reset();
 		peer.retry_after = deadline(timing_.rpc_timeout); peer.snapshot_retry_clock = now_;
-		if (probe) { peer.next = std::max(peer.matched + 1, key.boundary.index + 1); }
+		if (probe) { peer.next = std::max(peer.matched + 1, key.boundary.index + 1); peer.lacks_base = false; }
 	}
 	void handle(SnapshotSourceReady ready, Actions& output) {
 		if (busy() || role_ != Role::Leader || !valid_snapshot_key(ready.key)) { return; }
@@ -629,6 +672,12 @@ private:
 			validate_change(current, change.next, limits_in_force());
 		} catch (const std::invalid_argument&) {
 			reject(RejectReason::InvalidMembership); return;
+		}
+		// A witness incarnation holds no application state (its ranges were acknowledged, never
+		// applied): it leaves only by removal, and a data member joins under a new incarnation.
+		for (const auto& x : change.next.members) {
+			auto old = find_member(current, x.incarnation);
+			if (old && old->role == MemberRole::Witness && x.role != MemberRole::Witness) { reject(RejectReason::InvalidMembership); return; }
 		}
 		// A group's limits stay within the node's, which bound its transport, admission,
 		// codec, and Worker; a group lowers and raises them beneath (R16).
@@ -966,6 +1015,7 @@ private:
 			} else {
 				peer.next = std::max(peer.matched + 1, std::min(response.next_hint, peer.next > 1 ? peer.next - 1 : 1));
 			}
+			peer.lacks_base = peer.next <= base_index_;
 			// Capacity rejection or an unusable hint must not form an immediate
 			// request/response loop. Retry on a later monotonic tick.
 			peer.retry_after = peer.next < previous_next ? 0 : deadline(timing_.rpc_timeout);
@@ -1001,7 +1051,7 @@ private:
 			auto boundary = peer.snapshot->key.boundary;
 			output.emplace_back(SnapshotReleased{source, response.key, SnapshotReleaseReason::Installed}); peer.snapshot.reset();
 			peer.keepalive.reset(); peer.flights.clear(); peer.window = 0;
-			peer.matched = std::max(peer.matched, boundary.index); peer.next = peer.matched + 1; peer.retry_after = 0; peer.snapshot_retry_clock.reset();
+			peer.matched = std::max(peer.matched, boundary.index); peer.next = peer.matched + 1; peer.retry_after = 0; peer.snapshot_retry_clock.reset(); peer.lacks_base = false;
 			replicate(source, peer, output, needed_probe(source));
 		} else { release_snapshot(source, peer, response.result == SnapshotReply::CaughtUp ? SnapshotReleaseReason::CaughtUp : SnapshotReleaseReason::Rejected, output, response.result == SnapshotReply::CaughtUp); }
 	}
@@ -1117,9 +1167,13 @@ private:
 		if (peer.flights.size() >= depth || (!peer.flights.empty() && (peer.next > last_index() || peer.window >= flow_.window_bytes))) { return; }
 		if (peer.next <= base_index_) {
 			if (!peer.flights.empty()) { return; }  // an install starts once nothing is in flight
-			SnapshotKey key{durable_.term, token(), {base_index_, base_term_}};
-			peer.snapshot.emplace(SnapshotFlight{key, SnapshotPhase::AwaitSource, now_}); peer.snapshot_retry_clock.reset();
-			output.emplace_back(SnapshotNeeded{id, key}); snapshot_keepalive(id, peer, output); return;
+			if (!peer.lacks_base) {
+				peer.next = base_index_ + 1;  // a timeout or the leader's own compaction, not the peer, put it here
+			} else {
+				SnapshotKey key{durable_.term, token(), {base_index_, base_term_}};
+				peer.snapshot.emplace(SnapshotFlight{key, SnapshotPhase::AwaitSource, now_}); peer.snapshot_retry_clock.reset();
+				output.emplace_back(SnapshotNeeded{id, key}); snapshot_keepalive(id, peer, output); return;
+			}
 		}
 		Index previous = peer.next - 1;
 		std::vector<Entry> batch; std::size_t bytes = 0;
@@ -1136,7 +1190,7 @@ private:
 		// An entry above this peer's limits goes by install: until then it hears heartbeats.
 		peer.blocked = batch.empty() && peer.next <= last_index();
 		if (peer.blocked) { peer.retry_after = deadline(timing_.heartbeat); ++held_back_; }
-		auto rpc = token();
+		auto rpc = token(); peer.lacks_base = false;  // this append may change what the peer holds
 		peer.flights.push_back(Flight{rpc, previous, previous + batch.size(), probe, now_, false, bytes});
 		peer.window += bytes;
 		peer.next = previous + batch.size() + 1;  // optimistic (Raft §10.2.1)

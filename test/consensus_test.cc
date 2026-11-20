@@ -119,6 +119,7 @@ struct Network {
 	std::map<NodeId, std::unique_ptr<Host>> hosts;
 	std::deque<Envelope> network;
 	std::set<NodeId> isolated;
+	std::set<std::pair<NodeId, NodeId>> cut;  // one-way: (from, to) messages are lost
 	std::vector<SnapshotNeeded> snapshots;  // requested by leaders; the test drives each transfer
 	std::uint64_t now = 0;
 	explicit Network(std::size_t count = 3, Limits limits = {}) {
@@ -179,7 +180,7 @@ struct Network {
 	void pump(std::size_t bound = 10000) {
 		while (!network.empty() && bound--) {
 			auto envelope = std::move(network.front()); network.pop_front();
-			if (isolated.contains(envelope.from) || isolated.contains(envelope.to) || !hosts.contains(envelope.to)) { continue; }
+			if (isolated.contains(envelope.from) || isolated.contains(envelope.to) || cut.contains({envelope.from, envelope.to}) || !hosts.contains(envelope.to)) { continue; }
 			consume(envelope.to, host(envelope.to).core->step(Tick{now, 100 + 20 * (envelope.to - 1)}));
 			consume(envelope.to, host(envelope.to).core->step(Receive{envelope.from, std::move(envelope.message)}));
 		}
@@ -645,6 +646,32 @@ void late_append_responses() {
 	for (NodeId id : {1u, 2u, 3u}) { check(cluster.host(id).applied_commands == std::vector<std::string>{"late"}, "each voter applies the late command once"); }
 }
 
+// A read's probe flight times out and is re-sent; the follower's answer to the superseded
+// flight still proves contact after the read's admission, so it releases the read.
+void late_append_read_probe() {
+	Network cluster; cluster.start(); cluster.elect();
+	auto& leader = *cluster.host(1).core; auto& follower = *cluster.host(2).core;
+	cluster.consume(1, leader.step(Read{60}));
+	std::deque<Envelope> probes; std::swap(probes, cluster.network);
+	auto probe = std::find_if(probes.begin(), probes.end(), [](const Envelope& e) { return e.to == 2; });
+	auto request = probe == probes.end() ? nullptr : std::get_if<AppendRequest>(&probe->message);
+	check(request && request->read_probe != 0 && cluster.host(1).ready_reads.empty(), "a read sends a probe to voter two and waits for its quorum");
+	if (!request) { return; }
+	const auto original = request->rpc, token = request->read_probe;
+	cluster.consume(1, leader.step(Tick{140, 100}));
+	std::deque<Envelope> resent; std::swap(resent, cluster.network);
+	auto again = std::find_if(resent.begin(), resent.end(), [&](const Envelope& e) {
+		auto repeat = std::get_if<AppendRequest>(&e.message); return e.to == 2 && repeat && repeat->rpc != original && repeat->read_probe == token;
+	});
+	check(again != resent.end(), "past rpc_timeout the probe flight is re-sent under the same probe");
+	cluster.consume(2, follower.step(Receive{1, std::move(probe->message)}));
+	std::deque<Envelope> answers; std::swap(answers, cluster.network);
+	check(answers.size() == 1 && answers[0].to == 1, "voter two answers the superseded probe request");
+	if (answers.size() != 1) { return; }
+	cluster.consume(1, leader.step(Receive{2, std::move(answers[0].message)}));
+	check(cluster.host(1).ready_reads == std::vector<RequestId>{60}, "the superseded flight's success acknowledges the read probe");
+}
+
 // A success from an older term never counts, though the follower held those entries then:
 // here a later leader has truncated them, and counting it would commit index 4 on two voters.
 void stale_append_responses() {
@@ -873,6 +900,55 @@ void compacted_replication() {
 	check(crossing.base_index() == 2 && crossing.role() == Role::Leader && find<Persist>(acknowledged), "pre-cutover flight verifies its original suffix after local compaction");
 }
 
+// A late success while the peer installs a snapshot is dropped: the install owns its progress.
+void late_append_during_snapshot() {
+	auto state = empty(1); state.hard = HardState{1, 1, 2};
+	for (Index index = 1; index <= 3; ++index) { state.entries.push_back(Entry{index, 1, EntryKind::Command, "value"}); }
+	state.base_index = state.applied_index = 2; state.base_term = 1; state.entries.erase(state.entries.begin(), state.entries.begin() + 2);
+	TestCore core(config(1), state, {}, patient()); auto election = elect_checkpoint_fixture(core); auto append = append_to(election, 2);
+	if (!append) { throw std::runtime_error("snapshot fixture flight"); }
+	const auto superseded = append->rpc;
+	auto needed = core.step(Receive{2, AppendResponse{2, superseded, false, 0, 1, 0}});
+	check(find<SnapshotNeeded>(needed) && core.awaiting_snapshot(2), "a compacted-history failure starts the install");
+	auto late = core.step(Receive{2, AppendResponse{2, superseded, true, 3, 4, 0}});
+	check(late.empty() && core.progress(2) == Index{0} && core.awaiting_snapshot(2), "a late success during the install changes nothing");
+}
+
+// A peer whose replies are lost holds the entries while the leader's record of its match stays
+// stale, and the leader checkpoints past that match: after the heal the peer catches up by an
+// append at the base within two heartbeats, with no install. A peer that lacks the entries still
+// gets one once it refuses that append.
+void heal_after_checkpoint_past_stale_match() {
+	for (bool holds : {true, false}) {
+		Network cluster(3); cluster.start(); cluster.elect(1);
+		auto& leader = *cluster.host(1).core;
+		auto round = [&](unsigned count) { for (unsigned i = 0; i < count; ++i) { cluster.tick(cluster.now + 10); cluster.pump(); } };
+		for (RequestId r = 1; r <= 2; ++r) { cluster.consume(1, leader.step(Propose{r, "c" + std::to_string(r)})); cluster.pump(); }
+		round(4);
+		const Index stale = leader.progress(2).value_or(0);
+		if (holds) { cluster.cut.insert({2, 1}); } else { cluster.isolated.insert(2); }
+		for (RequestId r = 3; r <= 8; ++r) { cluster.consume(1, leader.step(Propose{r, "c" + std::to_string(r)})); cluster.pump(); round(2); }
+		round(10);  // flights to 2 time out, back to its stale match
+		const Index through = leader.applied();
+		check(stale > 0 && leader.progress(2) == stale && through > stale && (cluster.host(2).core->last_index() == leader.last_index()) == holds,
+			"heal setup: the leader's match for 2 is stale and 2 holds the entries only if its replies alone were lost");
+		auto published = leader.step(LocalCheckpoint{300, 1, through, cluster.host(1).applied_entries.at(through - 1).term, config(1).cluster, config(1).configuration, leader.epoch()});
+		auto checkpoint = find<PersistCheckpoint>(published);
+		if (!checkpoint) { check(false, "heal setup: the leader checkpoints past the stale match"); continue; }
+		cluster.consume(1, leader.step(Persisted{checkpoint->token}));
+		round(10);  // flights time out again, now below the base
+		cluster.cut.clear(); cluster.isolated.clear();
+		const auto healed = cluster.now, bound = healed + 2 * compact.heartbeat;
+		auto needed = [&] { return std::any_of(cluster.snapshots.begin(), cluster.snapshots.end(), [](const SnapshotNeeded& n) { return n.peer == 2; }); };
+		while (cluster.now < bound && leader.progress(2) != leader.last_index() && !needed()) { round(1); }
+		if (holds) {
+			check(leader.progress(2) == leader.last_index() && !needed(), "a peer holding the entries catches up within two heartbeats of the heal, with no install");
+		} else {
+			check(needed() && leader.awaiting_snapshot(2) && leader.awaiting_snapshot(2)->boundary.index == through, "a peer lacking the entries gets an install at the base within two heartbeats of the heal");
+		}
+	}
+}
+
 void checkpoint_semantic_recovery() {
 	auto state = empty(1); state.base_index = state.applied_index = 5; state.base_term = state.hard.term = 2; state.hard.commit_index = 260;
 	for (Index index = 6; index <= 265; ++index) { state.entries.push_back(Entry{index, 2, EntryKind::Command, "retained"}); }
@@ -1096,7 +1172,7 @@ void repair_at_or_below_commit() {
 	}
 	check(repaired == applied - follower.core->base_index() + 1, "every repair replays to the undamaged applied sequence");
 	auto reason = [](const Actions& actions) { auto r = find<Reject>(actions); return r ? std::optional<RejectReason>(r->reason) : std::nullopt; };
-	check(reason(follower.core->step(Repair{200, {applied + 1, term_at(applied)}})) == RejectReason::InvalidRepair, "a boundary above applied is refused");
+	check(reason(follower.core->step(Repair{200, {applied + 1, term_at(applied)}})) == RejectReason::InvalidRepair, "a boundary above commit is refused");
 	check(reason(follower.core->step(Repair{201, {applied, term_at(applied) + 1}})) == RejectReason::InvalidRepair, "a boundary whose term differs is refused");
 	check(reason(cluster.host(1).core->step(Repair{202, {applied, term_at(applied)}})) == RejectReason::LeaderMustTransfer, "a leader transfers before it repairs");
 	// A capture from before the repair's epoch is rejected; one under the current epoch is not.
@@ -1109,12 +1185,15 @@ void repair_at_or_below_commit() {
 	if (checkpoint) { cluster.consume(2, follower.core->step(Persisted{checkpoint->token})); }
 	check(follower.core->base_index() == through, "the checkpoint raised the base");
 	check(reason(follower.core->step(Repair{205, {through - 1, term_at(through - 1)}})) == RejectReason::InvalidRepair, "a boundary below base_index is refused");
+	check(reason(follower.core->step(Repair{207, {through, term_at(through) + 1}})) == RejectReason::InvalidRepair, "a boundary at base_index with another term is refused");
 	// A delivery outstanding refuses a repair.
 	follower.auto_apply = false;
 	cluster.consume(1, cluster.host(1).core->step(Propose{7, "c7"})); cluster.pump();
 	for (unsigned round = 0; round < 4; ++round) { cluster.tick(cluster.now + 10); cluster.pump(); }
 	check(follower.applying.has_value(), "repair setup: a delivery outstanding");
 	check(reason(follower.core->step(Repair{206, {through, term_at(through)}})) == RejectReason::Busy, "a repair waits for the outstanding delivery");
+	check(follower.core->applied() < follower.core->committed() && reason(follower.core->step(Repair{208, {follower.core->applied(), term_at(follower.core->applied())}})) == RejectReason::Busy,
+		"a repair while applied is below commit answers Busy");
 	cluster.complete_apply(2); follower.auto_apply = true;
 	// The voter keeps voting and following: a new leader commits, and the repaired voter applies it.
 	cluster.isolated.insert(1);
@@ -1126,6 +1205,20 @@ void repair_at_or_below_commit() {
 		cluster.consume(leader, cluster.host(leader).core->step(Propose{8, "c8"})); cluster.pump();
 		for (unsigned round = 0; round < 4; ++round) { cluster.tick(cluster.now + 10); cluster.pump(); }
 		check(follower.applied_commands.back() == "c8" && cluster.host(3).applied_commands == follower.applied_commands, "after repair the voter applies what the group commits");
+	}
+	// The commit bound: a follower holding an appended entry it has not seen committed
+	// refuses a repair at that boundary even when the term matches.
+	{
+		Network c(3); c.start(); c.elect(1);
+		for (RequestId r = 500; r < 503; ++r) { c.consume(1, c.host(1).core->step(Propose{r, "k" + std::to_string(r)})); c.pump(); }
+		auto& h = c.host(2);
+		const Index commit = h.core->committed();
+		check(commit > 0 && h.core->last_index() > commit && h.core->applied() == commit, "commit bound setup: an appended entry above commit");
+		const Index last = h.core->last_index();
+		const Term last_term = h.core->term();
+		for (Index b = commit + 1; b <= last; ++b) {
+			check(reason(h.core->step(Repair{510 + b, {b, last_term}})) == RejectReason::InvalidRepair, "a boundary above commit is refused");
+		}
 	}
 	// The core refuses a repair while busy (a storage batch pending).
 	{
@@ -2019,7 +2112,7 @@ void recovered_delivery_byte_bound() {
 }
 
 int main() {
-	try { recovered_delivery_byte_bound(); terminal_retirement(); snapshot_sender_maximum_fanout(); snapshot_sender_lost_ack_and_terms(); snapshot_sender_receiver_contact(); snapshot_sender_restart_clock_and_admission(); snapshot_sender_correlation(); snapshot_sender_keepalive_pacing(); snapshot_sender_retries_and_retention(); snapshot_timeout_retries(); portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); late_append_responses(); stale_append_responses(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); repair_at_or_below_commit(); prevote_guard_checkquorum(); membership_scripts(); membership_formats(); leadership_transfer(); witnesses(); checkpoint_with_configuration_suffix(); founding_records(); limits_by_position(); learner_install_and_promotion(); }
+	try { recovered_delivery_byte_bound(); terminal_retirement(); snapshot_sender_maximum_fanout(); snapshot_sender_lost_ack_and_terms(); snapshot_sender_receiver_contact(); snapshot_sender_restart_clock_and_admission(); snapshot_sender_correlation(); snapshot_sender_keepalive_pacing(); snapshot_sender_retries_and_retention(); snapshot_timeout_retries(); portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); late_append_responses(); late_append_read_probe(); stale_append_responses(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); late_append_during_snapshot(); heal_after_checkpoint_past_stale_match(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); repair_at_or_below_commit(); prevote_guard_checkquorum(); membership_scripts(); membership_formats(); leadership_transfer(); witnesses(); checkpoint_with_configuration_suffix(); founding_records(); limits_by_position(); learner_install_and_promotion(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " consensus checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

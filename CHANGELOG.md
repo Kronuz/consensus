@@ -6,6 +6,119 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#consensus) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-20
+
+### Changed
+
+- A Worker on a journal host refuses at construction (`std::invalid_argument`, "worker batch exceeds the host's turn room") a configuration whose largest record exceeds one empty segment of the host's turn log (D132): a batch of `Limits::rpc_entries` and `rpc_bytes` (or `WorkerLimits::follower_batch_*` when larger), or the founding record. Before, it reached the journal and fenced its group at the first append. A caller sets segments big enough for the batch, or lower `rpc_bytes` (and `command_bytes`, which it must not exceed); the default 2 MiB rpc batch needs 64 MiB segments or lower limits. A merged `Receive` a caller submits beyond the operating limits can still fence its group (`worker_test --turn-room`).
+
+## 2026-11-19
+
+### Changed
+
+- The journal pin moves to journal:9e11713, past journal-reopen-closed (journal:4d364f1) and journal-close-in-doubt (journal:8c92ed9), and completion to completion:d8b538c, journal's own. Durable syncs go through `IO::sync_files` and `IO::sync_data_files`.
+- A closing Worker hands its shared group back to the host once drained: closed into the host's table when its last record is a checkpoint covering every batch (`Host::close_group`, `TurnDriver::forget`), otherwise released when its Store ends. The Driver settles the host after erasing a row, so a released group is parked at once. A closed id recovers in the same live host, and 10,000 covered rows closed leave the process heap where it was (`driver_close_test closed_bytes`).
+- A close whose table commit fails fences the row and releases it; the host keeps the group in doubt, so `create` and `recover` of that id on any Driver over that host complete with `close_in_doubt` (journal's EIO from `Host::hold`) until the host reopens, since the table may hold the group closed and a record appended live would be lost at the next restart (`driver_close_test failed_close`, `second_driver`).
+- Exit waits for running lookups ([docs/mechanisms/peer-dns.md](docs/mechanisms/peer-dns.md)): the process's lookup threads close from an atexit handler, which waits for each running resolver to return, so a stuck `getaddrinfo` delays exit by up to the system resolver's timeout, and a resolver or delivery must not call `std::exit`. Fork is not supported: a forked child must exec or `_exit` before it uses a `Peers` or a `Lookup`.
+
+### Fixed
+
+- A throw that ends the Driver's loop (one a step does not catch) completes every waiting call with `task::cancelled`, as a stop does, instead of leaving it suspended (`driver_close_test close_crash`); under `consensus::run` the throw reaches the caller and the Driver stays stopped (`entry_throw`).
+- A checkpoint whose peak (its bundle bound plus its application cap) exceeds the replacement pool fails at once with `checkpoint_exceeds_pool` instead of waiting forever and blocking the calls behind it.
+- The leader starts an install only after a peer refuses an append at or below its base. A next index there for any other reason, a flight timeout or the leader's own checkpoint, first appends at the base, so a peer that already holds the entries catches up within rpc_timeout of a heal instead of waiting out snapshot_timeout (60 s) (`consensus_test heal_after_checkpoint_past_stale_match`).
+- A `LookupThreads::start` that throws while making a thread's list entry no longer leaves its lookup queued: the entry is made inside the try, so no resolver runs for a caller that saw the exception (`test/transport/resolve_test.cc`, case `start_fails`, fails `start()` at each of its allocations).
+
+## 2026-11-18
+
+### Fixed
+
+- A wave of groups opened at once no longer fences them: the journal pin moves to journal:4272229, whose turns are bounded to one segment (a turn takes what one fresh segment encodes; a record that can't encode alone fails only its group). `test/wave_open_test.cc` opens 64 and 256 groups at once, all committed, 0 fenced.
+
+## 2026-11-17
+
+### Added
+
+- The host transport's `HostTransportStats::visited`: the groups a feed examined to choose its
+  frames, one per frame; and `HostTransportStats::uncredited`, a level: the data bytes a loop's
+  connections sent that their peers have not credited yet.
+
+- Identity on the host transport ([docs/mechanisms/host-transport.md](docs/mechanisms/host-transport.md),
+  Identity): the host stores its groups (`store`, `forget`); each group opens per connection by
+  an exchange of its cluster, group identity, epoch and profile; and a message frame reaches
+  `Deliver` only for a stored group, opened on that connection, to the incarnation held here,
+  from a source whose node is the connection's where the membership (`member_of`, now
+  required) names it (R7). `admit` and `open_fault` are the rule as values. `store` refuses a
+  zero cluster, group or epoch, and a connection's `on_read` also follows a read that fails
+  after handing frames over, so they leave under their own connection.
+
+### Changed
+
+- The host transport feeds a connection from ready rings ([docs/mechanisms/host-transport.md](docs/mechanisms/host-transport.md),
+  Send): one pop per frame instead of a walk of every group with something queued or uncredited,
+  so a feed's work no longer grows with the groups a host stores (at 10,000 groups a loop
+  stalled past `dead_after`). Round robin is in the order groups became ready. Every per-group
+  table is one `GroupTable`, an idle group's open is held by value, and its opens matched per
+  connection, so an idle group holds less (Tables). What the receiver owes back, credit and
+  `closed`, goes as each batch's vector of records, repaid in order, with no per-group table.
+
+- The RPC lane's codec and call machinery ([docs/mechanisms/rpc-lane.md](docs/mechanisms/rpc-lane.md)):
+  `transport/rpc.h` encodes and checks its six frame kinds, keeps one connection's call table
+  (ids, credit, deadlines, `Drain`), and draws credit from thread-safe host pools with an atomic
+  `ByteBudget::renew`. It does no I/O and is not yet on Bulk.
+- The host transport ([docs/mechanisms/host-transport.md](docs/mechanisms/host-transport.md)),
+  beside `Peers`: `transport/host_transport.h` shares a Control and a Bulk connection per peer
+  node among every group, each connection on the loop its node places on. Frames reach their
+  group's loop in one post per read; senders keep per-group queues with credit and control
+  frames first, round robin across groups. `send_message` and `receive_message` wire the
+  Driver's Sink `Send` and `receive` to it. `Connection` gains `on_read`, `on_drained`
+  and `rehome()`; each write wait, `close_notify`'s included, ends the connection after
+  `dead_after` only when the socket's send queue did not drain during it; `Links` moves an accept to the loop that owns its peer.
+- The host connection ([docs/mechanisms/host-connection.md](docs/mechanisms/host-connection.md)),
+  beside `Peers`: `transport/connection.h` drives OpenSSL on the non-blocking socket with
+  released buffers, length-prefixed frames, a keepalive per connection and a graceful close
+  (queued frames, then `close_notify`); `transport/node_pins.h` pins one certificate per node
+  per host; `transport/node_hello.h` is the DTHL0002 hello with the RPC lane's version range;
+  `transport/links.h` dials, accepts and settles duplicate dials before any frame.
+- `transport/deadline.h`: `late_deadline`, the one rule for a transport deadline that fires
+  late after a process stop (extend once by the lateness, capped at one timeout).
+
+### Fixed
+
+- The host transport's loops no longer race, as ThreadSanitizer sees it, on the TLS context's
+  certificates: `Links` caches their extensions (`cache_certificates`) before any loop
+  handshakes, instead of the first handshake caching the CA's while another loop reads it.
+- A loop's `HostTransportStats` count a read before its cross-loop posts, so a snapshot that
+  loads `posts` first never shows more than `L - 1` posts a read.
+
+## 2026-11-16
+
+### Added
+
+- `consensus::Driver` (`driver.h`, [docs/DRIVER.md](docs/DRIVER.md)): one per reactor loop, it
+  steps each group only on work and exposes `create`, `recover`, `propose`, `committed`,
+  `change_membership`, `transfer_leadership`, `repair`, `checkpoint`, `read` and `close` as
+  `task::task` calls, with a Sink for what no caller awaits. `consensus::run` is the blocking
+  entry over it. The Worker pump API stays beside it.
+- `Core::next_deadline()`, `Core::term_at()` and `Core::leader()`.
+- `Worker::runnable()`: `run_one` has work beyond a Tick (a record to persist, finished IO, a
+  completion, runnable maintenance), so a driver steps the group again.
+- `Worker::fence(reason)`: the host fences a group whose action handler failed partway.
+
+### Changed
+
+- A lone voter (the only voting member) is due to campaign at `Start`, so its first proposal
+  after create or recover needs no election timeout.
+- A leader with no peers arms no heartbeat.
+- A leader rejects a membership change that turns a witness incarnation into a learner or
+  voter (`InvalidMembership`): the witness never applied its ranges, so it leaves by removal
+  and rejoins under a new incarnation.
+- `SnapshotChannel` allocates a frame's buffer when its length prefix arrives and frees it once
+  processed: an idle channel holds no 64 KiB array per peer. Its transfer state (a send, a
+  receive, pending frames, a peer's last result) is allocated only while in use, so an idle
+  three-voter channel holds 296 bytes instead of 1,648.
+- The journal pin moves to journal:7c08540; the Worker's shared constructor takes a
+  `journal::Host` and its migration calls are gone.
+
 ## 2026-11-15
 
 ### Fixed

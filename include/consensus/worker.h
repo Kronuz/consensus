@@ -45,6 +45,11 @@ struct WorkerLimits {
 struct CaptureMetadata { RequestId request; Index through; Term term; std::uint64_t epoch = 0; };
 // window: 64 KiB chunks a source reads ahead and a channel keeps in flight (Track C, D18).
 struct SnapshotLimits { std::uint32_t application_format; std::uint64_t application_bytes; std::uint32_t window = 1; };
+// A checkpoint whose peak, its bundle bound plus its application cap, exceeds the replacement
+// pool: no release ever funds it, so reserving it fails at once instead of waiting.
+struct checkpoint_exceeds_pool : std::length_error {
+	checkpoint_exceeds_pool() : std::length_error("the checkpoint's peak exceeds the replacement pool") {}
+};
 struct SnapshotContext { NodeId authenticated_peer; Term leader_term; RequestId request; Token transfer; SnapshotDescriptor descriptor; };
 enum class ValidationAck { Accepted, Stale, NotReady, Fenced };
 enum class SnapshotReason { Canceled, InvalidImage, InvalidApplication, Rejected, Installed };
@@ -107,14 +112,16 @@ public:
 		if (scheduling_.async_storage) { scheduling_.async_appends = true; }
 		validate_configuration(admission);
 	}
-	// D11: the group persists through its core's turn driver (journal's shared Store), so
-	// its appends and checkpoint records are asynchronous and complete at turn barriers.
-	Worker(std::shared_ptr<kronuz::journal::IO> io, kronuz::journal::TurnDriver& turns, std::uint64_t group, FixedConfiguration configuration,
+	// D11: the group is one of a journal host's (journal/host.h): its batches and checkpoint
+	// records go to its loop's turn log, so its appends and publications are asynchronous and
+	// complete at turn barriers; its artifacts are its own names in the host's directory.
+	Worker(kronuz::journal::Host& host, std::uint64_t group, FixedConfiguration configuration,
 		kronuz::journal::AdmissionLimits admission, Limits limits = {}, Timing timing = {}, WorkerLimits scheduling = {}, std::optional<SnapshotLimits> snapshots = {})
 		: configuration_(std::move(configuration)), limits_(limits), timing_(timing), scheduling_(scheduling),
-		snapshot_limits_(snapshots), store_(std::move(io), turns, group, admission, batch_limit(configuration_, limits, scheduling), artifact_limit(snapshots)) {
+		snapshot_limits_(snapshots), store_(host, group, admission, batch_limit(configuration_, limits, scheduling), artifact_limit(snapshots)) {
 		scheduling_.async_appends = scheduling_.async_storage = true;
 		validate_configuration(admission);
+		validate_turn_room(host.driver_of(group).log().options());
 	}
 	Worker(const Worker&) = delete;
 	Worker& operator=(const Worker&) = delete;
@@ -163,10 +170,7 @@ public:
 					recovery.restore(std::move(decoded.state), decoded.storage_sequence);
 					restore_application(dependencies[0]); // Build unpublished application state.
 				};
-			// A shared group whose directory still holds a per-group journal migrates (R20);
-			// the host calls finish_migration() once the driver's turns are durable.
-			auto frontier = store_.shared() && store_.layout() == kronuz::journal::Journal::Layout::Legacy
-				? store_.migrate(replay, restore) : store_.recover(replay, restore);
+			auto frontier = store_.recover(replay, restore);
 			if (frontier.sequence == 0 && frontier.base_sequence == 0 && frontier.version == 1 && !frontier.checkpoint && frontier.dependencies.empty()) {
 				// Generic bootstrap is already durable; typed initialization may
 				// have been queued when the previous process exited.
@@ -175,14 +179,10 @@ public:
 			} else { core_ = std::make_unique<Core>(configuration_, recovery.finish(frontier.sequence), limits_, timing_, Flow{}, scheduling_.retained); }
 		} catch (const std::exception& error) { fail(error.what()); throw; }
 	}
-	// R20: after a migrating recover, once the turn driver has made its records durable.
-	bool migrating() const noexcept { return store_.migrating(); }
-	void finish_migration() {
-		try { store_.finish_migration(); } catch (const std::exception& error) { fail(error.what()); throw; }
-	}
 	bool ready() const noexcept { return !closing_ && core_ && initialization_.empty() && store_.accounting().has_value() && !fenced(); }
 	// Close protocol interest, then reap accepted originals before invalidating
-	// their backing capabilities. No new Store operation is started after close.
+	// their backing capabilities. No new Store operation is started after close;
+	// once drained, the Worker closes its shared Store (close_store).
 	void close() noexcept { closing_ = true; }
 	bool closing() const noexcept { return closing_; }
 	bool drained() const noexcept {
@@ -194,12 +194,35 @@ public:
 	bool busy() const noexcept { return core_ && core_->busy(); }
 	Term term() const noexcept { return core_ ? core_->term() : 0; }
 	std::optional<Membership> membership() const { return core_ ? std::optional<Membership>(core_->membership()) : std::nullopt; }
+	std::optional<Membership> membership_at(Index index) const { return core_ ? std::optional<Membership>(core_->membership_at(index)) : std::nullopt; }
 	Index committed() const noexcept { return core_ ? core_->committed() : 0; }
 	Index applied_index() const noexcept { return core_ ? core_->applied() : 0; }
 	std::size_t retained_log_bytes() const noexcept { return core_ ? core_->retained_log_bytes() : 0; }
 	std::size_t retired_log_bytes() const noexcept { return core_ ? core_->retired_log_bytes() : 0; }
 	std::size_t retired_log_entries() const noexcept { return core_ ? core_->retired_log_entries() : 0; }
 	bool owns_io_operation(const std::shared_ptr<kronuz::journal::IOOperation>& operation) const noexcept { return operation && (operation == io_job_ || operation == maintenance_io_); }
+	NodeId leader() const noexcept { return core_ ? core_->leader() : 0; }
+	bool transferring() const noexcept { return core_ && core_->transferring(); }
+	Index last_index() const noexcept { return core_ ? core_->last_index() : 0; }
+	std::optional<Term> term_at(Index index) const { return core_ ? core_->term_at(index) : std::nullopt; }
+	// When the Core next needs a Tick (Core::next_deadline), as Tick::now; the maximum for none.
+	std::uint64_t next_deadline() const {
+		return core_ && !closing_ && !fenced() ? core_->next_deadline() : std::numeric_limits<std::uint64_t>::max();
+	}
+	// A shared store's append or publication waits for its turn's barrier, which no IO the host
+	// runs completes: the host learns of it from the turn driver.
+	bool awaiting_turn() const noexcept {
+		if (!store_.shared()) { return false; }
+		return (io_job_ && !io_job_->done()) || (maintenance_io_ && maintenance_kind_ == MaintenanceKind::Publish && !maintenance_io_->done());
+	}
+	// run_one has work beyond submitting a Tick: a record to persist, finished IO to take, a
+	// completion to step, or maintenance that can run now. A driver steps the group again.
+	bool runnable() const noexcept {
+		if (closing_ || fenced() || !core_) { return false; }
+		if (maintenance_io_ || io_job_) { return (maintenance_io_ && maintenance_io_->done()) || (io_job_ && io_job_->done()); }
+		return !store_.accounting() || !initialization_.empty() || maintenance_due() || persist_ || application_ || completion_ ||
+			activation_completion_ || installation_waiting() || (timer_blocked_ && !cutover_debt_) || preparation_runnable() || source_runnable() || !held_.empty();
+	}
 	Index base_index() const noexcept { return core_ ? core_->base_index() : 0; }
 	LogBoundary base_boundary() const noexcept { return core_ ? core_->base_boundary() : LogBoundary{}; }
 	auto storage_frontier() const { return store_.frontier(); }
@@ -246,11 +269,14 @@ public:
 	}
 	// The application epoch, which a repair advances; a capture records it (CaptureMetadata).
 	std::uint64_t epoch() const noexcept { return core_ ? core_->epoch() : 0; }
+	// The host fences the group: a handler of its actions failed partway.
+	void fence(std::string reason) { if (!fenced()) { fail(std::move(reason)); } }
 	void application_failed(Index through, std::string reason) {
 		// A stale/duplicate report cannot fence unrelated application work.
 		if (!closing_ && !fenced() && core_ && through != 0 && through == delivered_) { fail(std::move(reason)); }
 	}
 	std::optional<CheckpointId> reserve_checkpoint(std::uint64_t application_cap) {
+		if (!kronuz::journal::detail::resources_fit(checkpoint_floor(application_cap), replacement_pool_)) { throw checkpoint_exceeds_pool(); }
 		if (!ready() || checkpoint_ || snapshot_result_) { return std::nullopt; }
 		if (next_checkpoint_ == std::numeric_limits<Token>::max()) { throw std::length_error("checkpoint identity exhausted"); }
 		auto replacement = store_.reserve_replacement(application_cap, checkpoint_detail::maximum_size(limits_));
@@ -606,7 +632,8 @@ private:
 			if (!detail::retire_actions(output_, budget)) { return TurnResult::Maintenance; }
 			terminal_.reset();
 			if (core_) { core_->begin_retirement(); core_->retirement_step(budget); }
-			return drained() ? TurnResult::Idle : TurnResult::Maintenance;
+			if (!drained()) { return TurnResult::Maintenance; }
+			close_store(); return TurnResult::Idle;
 		} catch (const std::exception& error) {
 			// Originals reaching this branch are terminal. Preserve the existing
 			// storage fence, but do not bulk-clear retained protocol payloads.
@@ -615,6 +642,28 @@ private:
 			io_job_.reset(); maintenance_io_.reset(); io_persist_token_.reset(); io_dispatched_ = false;
 			terminal_ = Fenced{error.what()}; return TurnResult::Fenced;
 		}
+	}
+	// A drained Worker hands its shared group back to the host. Its last record a checkpoint
+	// covering every batch, the Store closes into the host's table and the host keeps nothing
+	// of it; otherwise (fenced, or batches after the checkpoint) the group is released when the
+	// Store ends, its records durable in the log (journal's docs/mechanisms/group-lifetime.md).
+	// A close that fails fences the Store, which then releases the group as a fenced one does;
+	// the host keeps the group in doubt until it reopens (journal's Host::hold refuses it).
+	void close_store() {
+		if (store_closed_ || !store_.shared() || fenced() || !store_.accounting()) { return; }
+		const auto frontier = store_.frontier();
+		if (frontier.sequence != frontier.base_sequence) { return; }
+		try { store_.close(); store_closed_ = true; }
+		catch (const std::exception& error) { failed_ = true; store_.fence_storage(); terminal_ = Fenced{error.what()}; }
+		catch (...) { failed_ = true; store_.fence_storage(); terminal_ = Fenced{"closing the store failed"}; }
+	}
+	// The least peak journal's checkpoint_plan gives a checkpoint of this cap: two artifacts,
+	// the bundle at its bound and the application at its cap (a shared group's exact peak; an
+	// owned store's adds its data file's header and manifest).
+	kronuz::journal::StorageResources checkpoint_floor(std::uint64_t application_cap) const {
+		const std::uint64_t header = kronuz::journal::detail::artifact_header_size, bundle = checkpoint_detail::maximum_size(limits_);
+		if (application_cap > std::numeric_limits<std::uint64_t>::max() - 2 * header - bundle) { return {std::numeric_limits<std::uint64_t>::max(), 2}; }
+		return {2 * header + bundle + application_cap, 2};
 	}
 	enum class MaintenanceKind { Reclaim, BeginApplication, Application, SealApplication, OpenVerification, Readback, BeginBundle, Bundle, SealBundle, Publish, SourceOpen, SourceVerify, SourceRead };
 
@@ -625,7 +674,18 @@ private:
 		else if (founding_ && encode_initialization(configuration_, founding_) != encode_initialization(configuration_)) { state.membership = founding_; }
 		return state;
 	}
+	// The group's largest record, an operating-limit batch or the founding record, must fit one
+	// empty segment of the host's turn log; a larger one fences its group at the first append.
+	void validate_turn_room(const kronuz::journal::TurnLogOptions& turns) const {
+		const auto batch = storage_batch_size(true, true, std::max(limits_.rpc_entries, scheduling_.follower_batch_entries),
+			std::max(limits_.rpc_bytes, scheduling_.follower_batch_bytes));
+		const auto cost = kronuz::journal::turn_log_detail::record_cost(std::max(storage_detail::maximum_initialization_size, batch));
+		if (cost > kronuz::journal::turn_log_detail::turn_room(turns.segment_bytes, turns.block_bytes)) {
+			throw std::invalid_argument("worker batch exceeds the host's turn room");
+		}
+	}
 	void validate_configuration(const kronuz::journal::AdmissionLimits& admission) {
+		replacement_pool_ = admission.replacement_pool;
 		Core validate(configuration_, initial_state(), limits_, timing_, Flow{}, scheduling_.retained);
 		if (!scheduling_.foreground_burst || scheduling_.foreground_burst > 1048576 || !scheduling_.scan_entries || scheduling_.scan_entries > 4096 ||
 			admission.control_slots < 3 || admission.maximum_tickets < 5) { throw std::invalid_argument("invalid worker scheduling or control slots"); }
@@ -1117,6 +1177,7 @@ private:
 	WorkerLimits scheduling_;
 	std::optional<SnapshotLimits> snapshot_limits_;
 	kronuz::journal::Store store_;
+	kronuz::journal::StorageResources replacement_pool_{};
 	std::unique_ptr<Core> core_;
 	std::string initialization_;
 	std::array<std::optional<kronuz::journal::AppendReservation>, 3> pack_;
@@ -1149,7 +1210,7 @@ private:
 	std::unique_ptr<Source> source_;
 	Token next_source_ = 0, next_source_chunk_ = 0;
 	std::size_t source_next_ = 0; unsigned maintenance_next_ = 1;
-	bool failed_ = false, capture_funding_pressure_ = false, cutover_debt_ = false, timer_due_ = true, timer_blocked_ = false, closing_ = false;
+	bool failed_ = false, capture_funding_pressure_ = false, cutover_debt_ = false, timer_due_ = true, timer_blocked_ = false, closing_ = false, store_closed_ = false;
 };
 
 } // namespace kronuz::consensus

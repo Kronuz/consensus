@@ -490,6 +490,26 @@ void witness_replaced_while_lagging() {
 }
 
 
+// R16: a witness incarnation never becomes a data member. Its ranges were acknowledged, never
+// applied, so it leaves by removal and a data member joins under a new incarnation.
+void witness_stays_witness() {
+	Membership founding{{{1, 1, MemberRole::Voter}, {2, 2, MemberRole::Voter}, {3, 3, MemberRole::Witness}}, 4, 0};
+	ProbeCluster c;
+	for (NodeId id : {1u, 2u, 3u}) {
+		RecoveredState state; state.configuration = founding_config(id); state.membership = founding;
+		c.add(id, founding_config(id), std::move(state));
+	}
+	c.now = 100; c.consume(1, c.core(1).step(Tick{c.now, 100}));
+	c.run(400);
+	check(c.leader() == 1u && c.commit_one("a"), "data voter 1 leads the 2 + witness group");
+	auto as = [&](MemberRole role) { Membership m = c.core(1).membership(); for (auto& x : m.members) { if (x.incarnation == 3) { x.role = role; } } return m; };
+	RejectReason reason{};
+	check(!c.change(1, as(MemberRole::Learner), &reason) && reason == RejectReason::InvalidMembership, "the witness incarnation is not demoted to a learner");
+	check(!c.change(1, as(MemberRole::Voter), &reason) && reason == RejectReason::InvalidMembership, "nor promoted to a voter");
+	Membership removed = c.core(1).membership(); std::erase_if(removed.members, [](const Member& x) { return x.incarnation == 3; });
+	check(c.change(1, removed), "the witness leaves by removal");
+}
+
 // M4's remainder: a leader keeps commands and group limits within every reported member's
 // node limits, so members with unequal node limits never wedge.
 void unequal_node_limits() {
@@ -736,6 +756,7 @@ int main() {
 		disk_lost_rejoin();
 		witness_at_limit();
 		witness_replaced_while_lagging();
+		witness_stays_witness();
 		unequal_node_limits();
 		founding_limits();
 		joiner_retained_install();

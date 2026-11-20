@@ -33,8 +33,10 @@
 //   - one grant per voter per term, across restarts;
 //   - durability when sent: a vote grant, or an append acknowledgement, is backed by the
 //     sender's durable state at the moment it is sent.
-// After the run the group heals, elects a leader, and commits a new entry.
-//   simulation_test [seeds] [steps] [first seed]   (defaults 200, 10000, 1)
+// After the run the group heals, elects a leader, and commits a new entry. Then the same
+// group runs through the Driver on journal hosts (driver_simulation.cc), a tenth of the seeds.
+//   simulation_test [seeds] [steps] [first seed]   (defaults 200, 10000, 1; SIM_DRIVER_SEEDS
+//   sets the Driver's seed count)
 #include "consensus/core.h"
 #include "consensus/membership.h"
 
@@ -935,6 +937,8 @@ private:
 
 }  // namespace
 
+namespace kronuz::consensus::driver_simulation { bool run(std::uint64_t seeds, std::uint64_t steps, std::uint64_t first); }
+
 int main(int argc, char** argv) {
 	const std::uint64_t seeds = argc > 1 ? std::strtoull(argv[1], nullptr, 10) : 200;
 	const std::uint64_t steps = argc > 2 ? std::strtoull(argv[2], nullptr, 10) : 10000;
@@ -975,5 +979,8 @@ int main(int argc, char** argv) {
 		(unsigned long long)checkpoints, (unsigned long long)installs, (unsigned long long)limit_changes, (unsigned long long)replaced, (unsigned long long)removals);
 	std::printf("  forced: %llu crashes between promotion and removal; removals committed with a snapshot in flight %llu, with a read in flight %llu; %llu delayed duplicate TimeoutNows; %llu appends held back from peers below their next entry\n",
 		(unsigned long long)replacements, (unsigned long long)with_snapshot, (unsigned long long)with_read, (unsigned long long)duplicated, (unsigned long long)held);
-	return failures ? EXIT_FAILURE : EXIT_SUCCESS;
+	if (failures) { return EXIT_FAILURE; }
+	const auto* driver_seeds = std::getenv("SIM_DRIVER_SEEDS");  // the Driver's seeds alone, when set
+	const bool driver = driver_simulation::run(driver_seeds ? std::strtoull(driver_seeds, nullptr, 10) : (seeds + 9) / 10, std::min<std::uint64_t>(steps, 3000), first);
+	return driver ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -22,7 +22,7 @@
 
 // libFuzzer target for consensus's decoders (Track C, T8): control frames, memberships,
 // founding and join records, storage batches, checkpoint bundles, snapshot descriptors,
-// and snapshot transfer frames. data[0] picks the decoder; the rest is its input. Each must decode or
+// snapshot transfer frames, and the host connection's hello. data[0] picks the decoder; the rest is its input. Each must decode or
 // throw, never crash or read out of bounds, and what decodes must re-encode to the same
 // bytes where the encoding is canonical.
 #include "consensus/checkpoint.h"
@@ -32,6 +32,7 @@
 #include "consensus/storage.h"
 #include "consensus/transport/codec.h"
 #include "consensus/transport/fetch.h"
+#include "consensus/transport/node_hello.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -65,7 +66,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
 	try {
 		// FUZZ_DECODER pins every input to one decoder, so each gets measured hours of its own.
 		static const int pinned = std::getenv("FUZZ_DECODER") ? std::atoi(std::getenv("FUZZ_DECODER")) : -1;
-		switch (pinned >= 0 ? pinned : data[0] % 9) {
+		switch (pinned >= 0 ? pinned : data[0] % 10) {
 		case 0: {
 			auto message = transport::decode(input);
 			require(transport::encode(message) == input);
@@ -115,9 +116,14 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
 			require(transport::encode_fetch(frame) == input);
 			break;
 		}
+		case 9: {
+			auto hello = transport::decode_node_hello(input);
+			require(transport::encode_node_hello(hello) == input);
+			break;
+		}
 		}
 	} catch (const std::exception& error) {
-		if (std::getenv("FUZZ_DEBUG")) { std::fprintf(stderr, "decoder %u: %s\n", data[0] % 9u, error.what()); }
+		if (std::getenv("FUZZ_DEBUG")) { std::fprintf(stderr, "decoder %u: %s\n", data[0] % 10u, error.what()); }
 	}
 	return 0;
 }

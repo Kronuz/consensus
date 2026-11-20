@@ -37,7 +37,7 @@ namespace jt = kronuz::journal::testing;
 
 namespace {
 int checks = 0, failures = 0;
-std::uint64_t delivered_commands = 0, published_checkpoints = 0, restored_images = 0, migrated_groups = 0;
+std::uint64_t delivered_commands = 0, published_checkpoints = 0, restored_images = 0;
 void check(bool value, const std::string& what) {
 	++checks;
 	if (!value) { ++failures; if (failures < 20) { std::cerr << "FAIL: " << what << '\n'; } }
@@ -90,22 +90,29 @@ struct Group {
 
 struct Node {
 	jt::Disk& disk;
-	jt::MemoryIO log_io;
-	std::unique_ptr<j::TurnDriver> driver;
+	std::unique_ptr<j::Host> host;
+	j::TurnDriver* driver = nullptr;
 	std::map<std::uint64_t, Group> groups;
 	std::uint64_t now = 100;
 	RequestId next_request = 1;
-	explicit Node(jt::Disk& d) : disk(d), log_io(d, "log/") {}
+	explicit Node(jt::Disk& d) : disk(d) {}
+	~Node() { close(); }
+	// The process ends: the Workers, then the host and its lock.
+	void close() {
+		for (auto& [g, group] : groups) { group.worker.reset(); }
+		driver = nullptr; host.reset();
+	}
 
 	void open() {
-		driver = std::make_unique<j::TurnDriver>(log_io, log_identity, options);
+		close();
+		host = std::make_unique<j::Host>(std::make_shared<jt::MemoryIO>(disk, "host/"), log_identity, j::HostOptions{1, options});
+		driver = &host->driver(0);
 		for (std::uint64_t g = 1; g <= group_count; ++g) {
 			auto& group = groups[g];
-			group.worker.reset(); group.checkpoint.reset(); group.offered = false;
-			auto io = std::make_shared<jt::MemoryIO>(disk, "g" + std::to_string(g) + "/");
-			group.worker = std::make_unique<Worker>(io, *driver, g, configuration(g), admission, limits(), compact, WorkerLimits{16, 128});
-			const auto layout = j::Journal::layout(*io);
-			if (layout == j::Journal::Layout::Legacy || (layout == j::Journal::Layout::Shared && driver->has_group(g))) {
+			group.checkpoint.reset(); group.offered = false;
+			group.worker = std::make_unique<Worker>(*host, g, configuration(g), admission, limits(), compact, WorkerLimits{16, 128});
+			const auto status = host->status(g);
+			if (status == j::GroupStatus::stored || status == j::GroupStatus::closed) {
 				group.application = {};
 				group.worker->recover([&](j::ArtifactReader& reader) {
 					std::string bytes(static_cast<std::size_t>(reader.descriptor().length), '\0');
@@ -113,16 +120,14 @@ struct Node {
 					group.application.restore(bytes); ++restored_images;
 				});
 			} else {
-				check(group.acknowledged.empty(), "a group without records delivered nothing");
+				check(group.acknowledged.empty() && status == j::GroupStatus::none, "a group without records delivered nothing");
 				group.application = {};
 				j::Identity identity{'W'}; identity[1] = static_cast<char>(g);
 				group.worker->create(identity);
 			}
 			group.started = false;
 		}
-		// R20: migrated groups' records reach a barrier, then the turn log is authoritative.
 		while (!driver->idle()) { driver->commit(); }
-		for (auto& [g, group] : groups) { if (group.worker->migrating()) { group.worker->finish_migration(); ++migrated_groups; } }
 	}
 	void pump(std::uint64_t g) {
 		auto& group = groups.at(g); auto& worker = *group.worker;
@@ -181,62 +186,6 @@ struct Node {
 	}
 };
 
-// Legacy groups: Workers on per-group journals (the synchronous backend) commit commands
-// before any power cut; each command delivered there is acknowledged.
-void legacy(jt::Disk& disk, std::mt19937_64& random, std::map<std::uint64_t, Group>& out) {
-	for (std::uint64_t g = 1; g <= group_count; ++g) {
-		jt::MemoryIO io(disk, "g" + std::to_string(g) + "/");
-		Worker worker(io, configuration(g), admission, limits(), compact, WorkerLimits{16, 128});
-		j::Identity identity{'L'}; identity[1] = static_cast<char>(g);
-		worker.create(identity);
-		auto& group = out[g];
-		bool started = false; std::uint64_t now = 100; RequestId request = 1000 * g;
-		for (unsigned turn = 0; turn < 400 && group.acknowledged.size() < 5 + random() % 10; ++turn) {
-			now += 10;
-			worker.run_one(Tick{now, 100 + 7 * g});
-			for (const auto& action : worker.take_actions()) {
-				if (auto batch = std::get_if<Committed>(&action)) {
-					for (const auto& entry : batch->entries) { if (entry.kind == EntryKind::Command) { group.acknowledged.push_back(entry.payload); } }
-					group.acknowledged_through = batch->entries.back().index;
-					worker.applied({batch->entries.back().index});
-				}
-			}
-			if (!worker.ready()) { continue; }
-			if (!started) { started = worker.try_submit(Start{}) == SubmitResult::Accepted; continue; }
-			if (worker.role() == Role::Leader && !worker.busy()) { worker.try_submit(Propose{request++, "legacy-" + std::to_string(g) + "-" + std::to_string(random() % 1000000)}); }
-		}
-		check(!group.acknowledged.empty(), "a legacy group commits commands");
-	}
-}
-
-std::uint64_t run_migration(std::uint64_t seed, std::uint64_t cut) {
-	jt::Disk disk; disk.random.seed(seed * 7 + cut);
-	std::mt19937_64 random(seed);
-	Node node(disk);
-	legacy(disk, random, node.groups);
-	try {
-		disk.cut = cut;
-		node.open();
-		for (unsigned r = 0; r < 30; ++r) { node.round(random); }
-	} catch (const jt::PowerLoss&) {}
-	const auto operations = disk.operations;
-	disk.power_loss();
-	const auto at = "migration seed " + std::to_string(seed) + " cut " + std::to_string(cut);
-	try {
-		Node again(disk); again.now = node.now + 1000; again.next_request = node.next_request;
-		for (auto& [g, group] : node.groups) { again.groups[g].acknowledged = group.acknowledged; }
-		again.open();
-		for (unsigned r = 0; r < 60; ++r) { again.round(random); }
-		for (auto& [g, group] : again.groups) {
-			const auto& before = node.groups[g].acknowledged;
-			auto recovered = group.application.commands();
-			check(recovered.size() >= before.size() && std::equal(before.begin(), before.end(), recovered.begin()), "group " + std::to_string(g) + " keeps its legacy and later commands: " + at);
-			check(j::Journal::layout(*std::make_shared<jt::MemoryIO>(disk, "g" + std::to_string(g) + "/")) == j::Journal::Layout::Shared, "a reopened group is shared: " + at);
-		}
-	} catch (const std::exception& error) { check(false, at + ": " + error.what()); }
-	return operations;
-}
-
 std::uint64_t run(std::uint64_t seed, std::uint64_t cut, unsigned rounds) {
 	jt::Disk disk; disk.random.seed(seed * 31 + cut);
 	std::mt19937_64 random(seed);
@@ -247,6 +196,7 @@ std::uint64_t run(std::uint64_t seed, std::uint64_t cut, unsigned rounds) {
 		for (unsigned r = 0; r < rounds; ++r) { node.round(random); }
 	} catch (const jt::PowerLoss&) {}
 	const auto operations = disk.operations;
+	node.close();
 	disk.power_loss();
 	const auto at = "seed " + std::to_string(seed) + " cut " + std::to_string(cut);
 	try {
@@ -275,11 +225,7 @@ int main(int argc, char** argv) {
 		const auto total = run(seed, std::numeric_limits<std::uint64_t>::max(), 150);
 		for (std::uint64_t cut = 1; cut <= total; cut += stride, ++points) { run(seed, cut, 150); }
 	}
-	for (std::uint64_t seed = 1; seed <= seeds; ++seed) {
-		const auto total = run_migration(seed, std::numeric_limits<std::uint64_t>::max());
-		for (std::uint64_t cut = 1; cut <= total; cut += stride, ++points) { run_migration(seed, cut); }
-	}
 	std::cout << points << " crash points, " << checks << " shared worker checks, " << failures << " failures (" << delivered_commands
-		<< " commands delivered, " << published_checkpoints << " checkpoints published, " << restored_images << " images restored, " << migrated_groups << " groups migrated)\n";
+		<< " commands delivered, " << published_checkpoints << " checkpoints published, " << restored_images << " images restored)\n";
 	return failures ? 1 : 0;
 }

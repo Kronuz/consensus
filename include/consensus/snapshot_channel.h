@@ -61,12 +61,12 @@ public:
 				return membership && std::any_of(membership->members.begin(), membership->members.end(), [&](const Member& x) { return x.incarnation == peer; });
 			};
 			for (auto& c : channels_) {
-				if (!c.session && !c.control && !member(c.peer)) { c.peer = session.peer; c.used = 0; c.completed.reset(); channel = &c; break; }
+				if (!c.session && !c.control && !member(c.peer)) { c.peer = session.peer; drop_input(c); c.completed.reset(); channel = &c; break; }
 			}
 			if (!channel) { channel = &channels_.emplace_back(session.peer); }
 		}
 		if (channel->session) { session_closed(*channel->session); }
-		channel->session = session; channel->used = 0;
+		channel->session = session; drop_input(*channel);
 	}
 	bool session_open(const TrustedSession& session) const { auto channel = find(session.peer); return channel && channel->session == session; }
 	void session_closed(const TrustedSession& session) {
@@ -76,7 +76,7 @@ public:
 		if (sending_ && sending_->info.peer == session.peer) { worker_.source_failed(sending_->info.source); sending_.reset(); }
 		if (receiving_ && receiving_->session == session) { receiving_->connected = false; cancel_receiving(); }
 		if (data_ && data_->peer == session.peer) { data_.reset(); }
-		channel->control.reset(); channel->completed.reset(); channel->used = 0; channel->session.reset(); if (closes_selected) { selected_ = 0; }
+		channel->control.reset(); channel->completed.reset(); drop_input(*channel); channel->session.reset(); if (closes_selected) { selected_ = 0; }
 	}
 	TransferInput receive(const TrustedSession& session, std::span<const char> bytes) {
 		auto channel = find(session.peer); if (!channel || channel->session != session) { return {TransferReceive::Closed, 0}; }
@@ -84,14 +84,18 @@ public:
 		std::size_t consumed = 0;
 		try {
 			if (channel->used >= 12 && channel->used == frame_length(*channel)) {
-				if (!process(*channel)) { return {TransferReceive::Busy, 0}; } channel->used = 0; return {TransferReceive::Accepted, 0};
+				if (!process(*channel)) { return {TransferReceive::Busy, 0}; } drop_input(*channel); return {TransferReceive::Accepted, 0};
 			}
 			while (consumed < bytes.size()) {
 				auto target = channel->used < 12 ? std::size_t{12} : frame_length(*channel);
 				auto count = std::min(target - channel->used, bytes.size() - consumed);
-				std::copy_n(bytes.data() + consumed, count, channel->input.data() + channel->used); channel->used += count; consumed += count;
+				std::copy_n(bytes.data() + consumed, count, input(*channel) + channel->used); channel->used += count; consumed += count;
+				// D9: the frame's buffer exists only while it arrives, at its declared length.
+				if (channel->used == 12 && !channel->input) {
+					channel->input = std::make_unique<char[]>(frame_length(*channel)); std::copy_n(channel->prefix.data(), 12, channel->input.get());
+				}
 				if (channel->used >= 12 && channel->used == frame_length(*channel)) {
-					if (!process(*channel)) { return {TransferReceive::Busy, consumed}; } channel->used = 0; return {TransferReceive::Accepted, consumed};
+					if (!process(*channel)) { return {TransferReceive::Busy, consumed}; } drop_input(*channel); return {TransferReceive::Accepted, consumed};
 				}
 			}
 			return {TransferReceive::Accepted, consumed};
@@ -122,7 +126,7 @@ public:
 		for (auto& channel : channels_) {
 			if (channel.session && channel.used >= 12) {
 				auto session = *channel.session;
-				try { if (channel.used == frame_length(channel) && process(channel)) { channel.used = 0; } }
+				try { if (channel.used == frame_length(channel) && process(channel)) { drop_input(channel); } }
 				catch (const kronuz::journal::Corruption&) { session_closed(session); }
 				catch (const std::invalid_argument&) { session_closed(session); }
 			}
@@ -136,7 +140,7 @@ public:
 				else if (!channel->control) {
 					auto terminal = worker_.take_snapshot_result(); auto outcome = terminal->reason == SnapshotReason::Installed ? TransferOutcome::Installed : terminal->rejection == InstallRejectReason::CaughtUp ? TransferOutcome::CaughtUp : (terminal->receiver_term && *terminal->receiver_term) ? TransferOutcome::Rejected : TransferOutcome::Failed;
 					std::string body(1, static_cast<char>(outcome)); body.append(7, '\0'); kronuz::journal::put64(body, terminal->receiver_term.value_or(0));
-					channel->completed.emplace(Completed{receiving_->key, receiving_->descriptor, body});
+					channel->completed = std::make_unique<Completed>(Completed{receiving_->key, receiving_->descriptor, body});
 					control(*channel, TransferKind::Result, receiving_->key, body); receiving_.reset();
 				}
 			}
@@ -153,13 +157,13 @@ public:
 			auto channel = find(source->peer); if (!channel->session) { worker_.source_failed(source->source); return; }
 			if (channel->control) { return; }
 			auto policy = worker_.snapshot_policy(); if (!policy) { throw std::logic_error("source without snapshot policy"); }
-			control(*channel, TransferKind::Begin, source->key, encode_snapshot(source->descriptor, *policy)); sending_.emplace(*source); return;
+			control(*channel, TransferKind::Begin, source->key, encode_snapshot(source->descriptor, *policy)); sending_ = std::make_unique<Sending>(*source); return;
 		}
 		// Up to the window's chunks in flight; each Credit retires the oldest (D18).
 		if (sending_ && sending_->accepted && !sending_->final && !data_ && sending_->flights.size() < worker_.snapshot_window()) {
 			auto chunk = worker_.source_chunk(sending_->flights.size()); if (!chunk) { return; }
 			auto channel = find(sending_->info.peer); if (!channel->session) { return; }
-			data_.emplace(make_frame(*channel, TransferKind::Chunk, sending_->info.key, transfer_chunk_body(chunk->chunk, chunk->offset, std::string_view(chunk->bytes.data(), chunk->bytes.size()), chunk->final)));
+			data_ = std::make_unique<Output>(make_frame(*channel, TransferKind::Chunk, sending_->info.key, transfer_chunk_body(chunk->chunk, chunk->offset, std::string_view(chunk->bytes.data(), chunk->bytes.size()), chunk->final)));
 			sending_->flights.push_back({chunk->chunk, data_->token, chunk->offset + chunk->bytes.size(), chunk->final}); sending_->final = chunk->final;
 		}
 	}
@@ -172,8 +176,8 @@ public:
 		for (const auto& channel : channels_) { result += channel.used + (channel.control ? channel.control->bytes.size() : 0); } return result;
 	}
 	std::size_t buffer_capacity() const {
-		std::size_t result = channels_.capacity() * maximum_transfer_bytes + (data_ ? data_->bytes.capacity() : 0);
-		for (const auto& channel : channels_) { result += channel.control ? channel.control->bytes.capacity() : 0; } return result;
+		std::size_t result = data_ ? data_->bytes.capacity() : 0;
+		for (const auto& channel : channels_) { result += (channel.input ? frame_length(channel) : 0) + (channel.control ? channel.control->bytes.capacity() : 0); } return result;
 	}
 	std::size_t channel_count() const noexcept { return channels_.size(); }
 	std::size_t chunks_in_flight() const noexcept { return sending_ ? sending_->flights.size() : 0; }
@@ -182,7 +186,7 @@ private:
 	struct Completed { SnapshotKey key; SnapshotDescriptor descriptor; std::string body; };
 	struct Channel {
 		explicit Channel(NodeId node) : peer(node) {}
-		NodeId peer; std::optional<TrustedSession> session; std::array<char, maximum_transfer_bytes> input{}; std::size_t used = 0; std::optional<Output> control; std::optional<Completed> completed;
+		NodeId peer; std::optional<TrustedSession> session; std::array<char, 12> prefix{}; std::unique_ptr<char[]> input; std::size_t used = 0; std::unique_ptr<Output> control; std::unique_ptr<Completed> completed;
 	};
 	struct Flight { Token chunk, output; std::uint64_t next; bool final; };
 	struct Sending { explicit Sending(SourceInfo source) : info(std::move(source)) {} SourceInfo info; bool accepted = false, final = false; std::deque<Flight> flights; };
@@ -193,13 +197,16 @@ private:
 	}
 	void close_fenced() {
 		// Worker fencing already invalidated storage and application ownership.
-		for (auto& channel : channels_) { channel.session.reset(); channel.control.reset(); channel.completed.reset(); channel.used = 0; }
+		for (auto& channel : channels_) { channel.session.reset(); channel.control.reset(); channel.completed.reset(); drop_input(channel); }
 		receiving_.reset(); sending_.reset(); data_.reset(); selected_ = 0;
 	}
+	// Where the next byte of a channel's frame goes: the prefix, then the frame's own buffer.
+	static char* input(Channel& channel) noexcept { return channel.used < 12 ? channel.prefix.data() : channel.input.get(); }
+	static void drop_input(Channel& channel) noexcept { channel.used = 0; channel.input.reset(); }
 	Channel* find(NodeId peer) { for (auto& channel : channels_) { if (channel.peer == peer) { return &channel; } } return nullptr; }
 	const Channel* find(NodeId peer) const { for (const auto& channel : channels_) { if (channel.peer == peer) { return &channel; } } return nullptr; }
 	std::size_t frame_length(const Channel& channel) const {
-		std::string_view prefix(channel.input.data(), 12); if (prefix.substr(0, 8) != "RFTXFR01") { throw kronuz::journal::Corruption("invalid frame magic"); }
+		std::string_view prefix(channel.prefix.data(), 12); if (prefix.substr(0, 8) != "RFTXFR01") { throw kronuz::journal::Corruption("invalid frame magic"); }
 		prefix.remove_prefix(8); auto size = kronuz::journal::get32(prefix); if (size < transfer_header_bytes || size > maximum_transfer_bytes) { throw kronuz::journal::Corruption("invalid frame bound"); } return size;
 	}
 	Output make_frame(const Channel& channel, TransferKind kind, SnapshotKey key, std::string_view body) {
@@ -207,11 +214,11 @@ private:
 		auto& configuration = worker_.configuration(); auto& session = *channel.session;
 		return {channel.peer, ++next_output_, encode_transfer(kind, {configuration.cluster, configuration.configuration, session.local, session.remote, configuration.local, channel.peer, key}, body), 0, kind};
 	}
-	void control(Channel& channel, TransferKind kind, SnapshotKey key, std::string_view body) { if (channel.control) { throw std::logic_error("transfer control output occupied"); } channel.control.emplace(make_frame(channel, kind, key, body)); }
+	void control(Channel& channel, TransferKind kind, SnapshotKey key, std::string_view body) { if (channel.control) { throw std::logic_error("transfer control output occupied"); } channel.control = std::make_unique<Output>(make_frame(channel, kind, key, body)); }
 	Output* selected_frame() { if (data_ && data_->token == selected_) { return &*data_; } for (auto& channel : channels_) { if (channel.control && channel.control->token == selected_) { return &*channel.control; } } return nullptr; }
 	bool process(Channel& channel) {
 		using namespace kronuz::journal;
-		auto frame = decode_transfer(std::string_view(channel.input.data(), channel.used)); auto& envelope = frame.envelope; auto& configuration = worker_.configuration(); auto& session = *channel.session;
+		auto frame = decode_transfer(std::string_view(channel.input.get(), channel.used)); auto& envelope = frame.envelope; auto& configuration = worker_.configuration(); auto& session = *channel.session;
 		if (envelope.cluster != configuration.cluster || envelope.configuration != configuration.configuration || envelope.source != session.peer || envelope.destination != configuration.local || envelope.source_session != session.remote || envelope.destination_session != session.local) { throw Corruption("unbound transfer session"); }
 		auto key = envelope.key;
 		switch (frame.kind) {
@@ -232,7 +239,7 @@ private:
 				control(channel, TransferKind::Accepted, key, {}); return true;
 			}
 			auto id = worker_.reserve_snapshot({session.peer, key.leader_term, key.transfer, key.transfer, descriptor}); if (!id) { return false; }
-			receiving_.emplace(Receiving{session, *id, key, descriptor, 0, now_}); control(channel, TransferKind::Accepted, key, {}); return true;
+			receiving_ = std::make_unique<Receiving>(Receiving{session, *id, key, descriptor, 0, now_}); control(channel, TransferKind::Accepted, key, {}); return true;
 		}
 		case TransferKind::Accepted:
 			if (sending_ && sending_->info.peer == session.peer && sending_->info.key == key) { sending_->accepted = true; } return true;
@@ -272,7 +279,8 @@ private:
 		} throw Corruption("unsupported frame");
 	}
 	Worker& worker_; std::uint64_t timeout_, now_ = 0; Token next_output_ = 0, selected_ = 0;
-	std::vector<Channel> channels_; std::optional<Output> data_; std::optional<Sending> sending_; std::optional<Receiving> receiving_;
+	// D9: a transfer's state, its frames and a peer's last result exist only while in use.
+	std::vector<Channel> channels_; std::unique_ptr<Output> data_; std::unique_ptr<Sending> sending_; std::unique_ptr<Receiving> receiving_;
 };
 
 } // namespace kronuz::consensus

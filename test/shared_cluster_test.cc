@@ -71,8 +71,8 @@ struct Message { std::uint64_t group; NodeId from; kronuz::consensus::Message me
 struct Node {
 	NodeId id;
 	jt::Disk disk;
-	std::unique_ptr<jt::MemoryIO> log_io;
-	std::unique_ptr<j::TurnDriver> driver;
+	std::unique_ptr<j::Host> host;
+	j::TurnDriver* driver = nullptr;
 	std::map<std::uint64_t, std::unique_ptr<Worker>> workers;
 	std::map<std::uint64_t, bool> started;
 	std::deque<Message> inbox;
@@ -97,14 +97,14 @@ struct Cluster {
 	Node& at(NodeId id) { return nodes[id - 1]; }
 
 	void open(Node& node) {
-		node.workers.clear(); node.driver.reset(); node.inbox.clear();
-		node.log_io = std::make_unique<jt::MemoryIO>(node.disk, "log/");
-		node.driver = std::make_unique<j::TurnDriver>(*node.log_io, j::Identity{'N', static_cast<char>(node.id)}, options);
+		node.workers.clear(); node.driver = nullptr; node.host.reset(); node.inbox.clear();
+		node.host = std::make_unique<j::Host>(std::make_shared<jt::MemoryIO>(node.disk, "host/"), j::Identity{'N', static_cast<char>(node.id)}, j::HostOptions{1, options});
+		node.driver = &node.host->driver(0);
 		check(!node.driver->recovered().damaged && node.driver->recovered().lost.empty(), "power loss alone damages no turn log: node " + std::to_string(node.id) + " at " + std::to_string(now));
 		for (std::uint64_t g = 1; g <= group_count; ++g) {
-			auto io = std::make_shared<jt::MemoryIO>(node.disk, "g" + std::to_string(g) + "/");
-			auto worker = std::make_unique<Worker>(io, *node.driver, g, configuration(g, node.id), admission, limits(), compact, WorkerLimits{16, 128});
-			if (j::Journal::layout(*io) == j::Journal::Layout::Shared && node.driver->has_group(g)) {
+			auto worker = std::make_unique<Worker>(*node.host, g, configuration(g, node.id), admission, limits(), compact, WorkerLimits{16, 128});
+			const auto status = node.host->status(g);
+			if (status == j::GroupStatus::stored || status == j::GroupStatus::closed) {
 				worker->recover([&](j::ArtifactReader&) {});
 			} else {
 				j::Identity identity{'G', static_cast<char>(node.id), static_cast<char>(g)};
@@ -117,7 +117,7 @@ struct Cluster {
 	}
 	void crash(Node& node) {
 		++crashes;
-		node.workers.clear(); node.driver.reset(); node.log_io.reset(); node.inbox.clear();
+		node.workers.clear(); node.driver = nullptr; node.host.reset(); node.inbox.clear();
 		node.disk.power_loss();
 		node.up = false; node.down_until = now + 200 + random() % 600;
 	}
@@ -181,8 +181,10 @@ struct Cluster {
 			}
 			while (!node.driver->idle()) {
 				const auto& write = node.driver->begin();
-				for (auto& [g, worker] : node.workers) { pump(node, g); }
+				// A power cut anywhere until the barrier fails the turn in flight, so the host
+				// tears down with no operation left submitted.
 				try {
+					for (auto& [g, worker] : node.workers) { pump(node, g); }
 					if (write.file->write_at(write.offset, write.bytes) != write.bytes.size()) { throw std::runtime_error("short turn write"); }
 					write.file->sync_data();
 				} catch (...) { node.driver->failed(std::current_exception()); throw; }

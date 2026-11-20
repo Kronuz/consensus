@@ -98,7 +98,7 @@ Source verification completion always observes the authentic typed IO result bef
 
 ### Many groups on one core
 
-`Worker(io, TurnDriver&, group, ...)` opens a group on journal's shared turn log (D11): the core's groups stage their batches and checkpoint records there, and one data barrier per turn persists all of them. A group checkpoints and recovers from its latest checkpoint record, and a per-group journal migrates into the turn log at every crash point (R20). `test/shared_worker_test.cc` and `test/shared_cluster_test.cc` run single- and multi-voter groups through it.
+`Worker(journal::Host&, group, ...)` opens a group of a journal host (`journal/host.h`, D11): the group's batches and checkpoint records go to its loop's shared turn log, so its appends and publications complete at turn barriers, and one data barrier per turn persists every group on the loop. Its artifacts are its own names in the host's directory. A group checkpoints and recovers from its latest checkpoint record. `test/shared_worker_test.cc` and `test/shared_cluster_test.cc` run single- and multi-voter groups through it.
 
 ## Local immutable checkpoints
 
@@ -110,7 +110,7 @@ Matching `Persisted` alone compacts the live prefix through `A`. Newer live appl
 
 Recover with the journal's restore callback: require the declared application dependency, decode the bundle against that exact descriptor and `frontier.base_sequence`, call `Recovery::restore`, then replay suffix batches. Call `finish` only after the entire journal recovery succeeds. Recover the application image at `A` and apply committed entries above it again. Never import these local hard-state/configuration bundles as network snapshots; portable installation is a separate protocol.
 
-A compacted follower reports its boundary index and term. A correlated matching hint can choose the next prefix probe but never counts as an acknowledgement. A leader needing unavailable history emits a correlated `SnapshotNeeded` for that peer. The sender flight protocol below bounds waiting and retries; requesting or transmitting an image does not prove successful catch-up. Legacy wire shapes remain unchanged.
+A compacted follower reports its boundary index and term. A correlated matching hint can choose the next prefix probe but never counts as an acknowledgement. A leader needing unavailable history emits a correlated `SnapshotNeeded` for that peer. An install starts only after the peer refuses an append at or below the leader's base; a next index there for any other reason (a flight timeout, the leader's own checkpoint) first appends at the base. The sender flight protocol below bounds waiting and retries; requesting or transmitting an image does not prove successful catch-up. Legacy wire shapes remain unchanged.
 
 The full retained suffix is copied and encoded after freeze. Payload and entry limits bound this work, but production timing must budget its measured pause. Worker-owned Store admission reserves replacement capacity before capture and charges obsolete generations until bounded, durable reclamation removes them. Backend mutation outside the exclusive Store contract invalidates these accounting guarantees.
 
@@ -210,6 +210,11 @@ writes, and RPC timing. It needs Asio (through `reactor`) and OpenSSL 3.
 `PeerHost` concept), configured by a `PeerConfiguration`: the voters, the consensus
 limits, the group's identities, and the fingerprint from `profile_fingerprint`, which
 hashes the application's own profile bytes with the membership and limits.
+
+The host transport replaces it for Driver hosts: one Control and one Bulk connection per peer
+node, shared by every group and each run on one loop, with frames batched to their groups'
+loops, per-group credit and control frames first
+([docs/mechanisms/host-transport.md](docs/mechanisms/host-transport.md)).
 
 ## Bounds
 

@@ -1,3 +1,7 @@
+# A failed groups_upload on a macOS runner prints a spindump of its stuck connection loop with raw
+# kernel frames (kernel + 0xN) and the OS build, kernel UUID and slide. Symbolicate offline against
+# the matching Kernel Debug Kit (Apple developer login); CI downloads none. See
+# docs/mechanisms/host-transport.md, Checks.
 name: CI
 on:
   push:
@@ -7,7 +11,7 @@ on:
     inputs:
       nightly: { type: boolean, default: false }
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 jobs:
   ci:

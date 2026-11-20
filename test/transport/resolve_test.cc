@@ -42,7 +42,8 @@
 
 
 // Fails the calling thread's nth allocation from arm() on, so that start() fails at each of its
-// allocations in turn.
+// allocations in turn. Not under a sanitizer: its runtime defines the global operators too.
+#if !SANITIZER_THREADS
 namespace {
 thread_local long fail_in = -1;
 bool failed = false;
@@ -62,6 +63,7 @@ void *operator new(std::size_t size) {
 }
 void operator delete(void *p) noexcept { std::free(p); }
 void operator delete(void *p, std::size_t) noexcept { std::free(p); }
+#endif
 
 using namespace kronuz::consensus::transport;
 using namespace std::chrono_literals;
@@ -391,6 +393,9 @@ void rebuilds() {
 // A start() that throws, whichever of its allocations failed, leaves nothing behind: no queued
 // lookup, no thread running or unjoined, and its resolver never runs.
 void start_fails() {
+#if SANITIZER_THREADS
+	std::printf("start_fails: skipped, a sanitizer's runtime owns operator new\n");
+#else
 	CHECK(settles(baseline));
 	unsigned thrown = 0;
 	for (long nth = 0;; ++nth) {
@@ -423,6 +428,7 @@ void start_fails() {
 	}
 	CHECK(settles(baseline));
 	std::printf("start_fails: start() failed at each of its %u allocations in turn and left no lookup or thread\n", thrown);
+#endif
 }
 
 // A2 at exit: runs after the process's LookupThreads is closed (registered before it was

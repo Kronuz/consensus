@@ -1,6 +1,5 @@
 # Probe for groups-upload-loop-stall (never lands): first the capture itself, upload with host
-# 1's connection loop held 1.3 s (GROUPS_UPLOAD_HOLD_MS) under GITHUB_ACTIONS; then the whole suite as CI runs it on
-# macos-15-intel (ctest --parallel 2), 10 times a shard. When upload's connection loop is stuck
+# 1's connection loop held 1.3 s (GROUPS_UPLOAD_HOLD_MS) under GITHUB_ACTIONS; on macos-15-intel. When upload's connection loop is stuck
 # 250 ms the test starts spindump on itself (GROUPS_PROBE_SPINDUMP): the stuck thread's kernel
 # stack names what write(2) waits on.
 name: CI
@@ -16,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2]
+        shard: [1]
     steps:
       - uses: actions/checkout@v5
       - name: Configure
@@ -32,19 +31,9 @@ jobs:
           sw_vers; ctest --test-dir build -R '^consensus_tls_certificates$' > /dev/null
           (cd build && GITHUB_ACTIONS=true GROUPS_UPLOAD_HOLD_MS=1300 ./consensus_transport_groups_test tls-fixture upload > ../hold.txt 2>&1; echo "hold rc $?")
           grep -E 'longest gap|age [0-9]{3}' hold.txt | cut -c1-300 | head -4
-          awk '/upload: spindump/{f=1} f' hold.txt | head -300
-          fails=0
-          for i in $(seq 1 10); do
-            export GROUPS_PROBE_SPINDUMP="$PWD/spindump-$i.txt"
-            ctest --test-dir build --output-on-failure --no-tests=ignore --parallel 2 > suite-$i.txt 2>&1
-            rc=$?
-            echo "== suite $i rc $rc $(date -u +%H:%M:%S): $(grep -E 'tests passed|\(Failed\)|\(Timeout\)' suite-$i.txt | tr '\n' ' ')"
-            if grep -q 'groups_upload (Failed)' suite-$i.txt; then
-              fails=$((fails+1))
-              awk '/Start +[0-9]+: consensus_transport_groups_upload$/{f=1} f&&/upload: FAILED/{print; exit} f' suite-$i.txt
-            fi
-          done
-          echo "probe: groups_upload failed in $fails of 10 suites"
+          grep -E '^upload: (spindump|kernel build)' hold.txt
+          grep -c 'kernel + 0x' hold.txt; grep -E 'kernel \+ 0x' hold.txt | head -12
+          grep -c '??? (kernel' hold.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -645,6 +645,32 @@ void late_append_responses() {
 	for (NodeId id : {1u, 2u, 3u}) { check(cluster.host(id).applied_commands == std::vector<std::string>{"late"}, "each voter applies the late command once"); }
 }
 
+// A read's probe flight times out and is re-sent; the follower's answer to the superseded
+// flight still proves contact after the read's admission, so it releases the read.
+void late_append_read_probe() {
+	Network cluster; cluster.start(); cluster.elect();
+	auto& leader = *cluster.host(1).core; auto& follower = *cluster.host(2).core;
+	cluster.consume(1, leader.step(Read{60}));
+	std::deque<Envelope> probes; std::swap(probes, cluster.network);
+	auto probe = std::find_if(probes.begin(), probes.end(), [](const Envelope& e) { return e.to == 2; });
+	auto request = probe == probes.end() ? nullptr : std::get_if<AppendRequest>(&probe->message);
+	check(request && request->read_probe != 0 && cluster.host(1).ready_reads.empty(), "a read sends a probe to voter two and waits for its quorum");
+	if (!request) { return; }
+	const auto original = request->rpc, token = request->read_probe;
+	cluster.consume(1, leader.step(Tick{140, 100}));
+	std::deque<Envelope> resent; std::swap(resent, cluster.network);
+	auto again = std::find_if(resent.begin(), resent.end(), [&](const Envelope& e) {
+		auto repeat = std::get_if<AppendRequest>(&e.message); return e.to == 2 && repeat && repeat->rpc != original && repeat->read_probe == token;
+	});
+	check(again != resent.end(), "past rpc_timeout the probe flight is re-sent under the same probe");
+	cluster.consume(2, follower.step(Receive{1, std::move(probe->message)}));
+	std::deque<Envelope> answers; std::swap(answers, cluster.network);
+	check(answers.size() == 1 && answers[0].to == 1, "voter two answers the superseded probe request");
+	if (answers.size() != 1) { return; }
+	cluster.consume(1, leader.step(Receive{2, std::move(answers[0].message)}));
+	check(cluster.host(1).ready_reads == std::vector<RequestId>{60}, "the superseded flight's success acknowledges the read probe");
+}
+
 // A success from an older term never counts, though the follower held those entries then:
 // here a later leader has truncated them, and counting it would commit index 4 on two voters.
 void stale_append_responses() {
@@ -871,6 +897,20 @@ void compacted_replication() {
 	if (!checkpoint) { throw std::runtime_error("crossing fixture checkpoint"); } crossing.step(Persisted{checkpoint->token});
 	auto acknowledged = crossing.step(Receive{2, AppendResponse{2, rpc, true, 4, 5, 0}});
 	check(crossing.base_index() == 2 && crossing.role() == Role::Leader && find<Persist>(acknowledged), "pre-cutover flight verifies its original suffix after local compaction");
+}
+
+// A late success while the peer installs a snapshot is dropped: the install owns its progress.
+void late_append_during_snapshot() {
+	auto state = empty(1); state.hard = HardState{1, 1, 2};
+	for (Index index = 1; index <= 3; ++index) { state.entries.push_back(Entry{index, 1, EntryKind::Command, "value"}); }
+	state.base_index = state.applied_index = 2; state.base_term = 1; state.entries.erase(state.entries.begin(), state.entries.begin() + 2);
+	TestCore core(config(1), state, {}, patient()); auto election = elect_checkpoint_fixture(core); auto append = append_to(election, 2);
+	if (!append) { throw std::runtime_error("snapshot fixture flight"); }
+	const auto superseded = append->rpc;
+	auto needed = core.step(Receive{2, AppendResponse{2, superseded, false, 0, 1, 0}});
+	check(find<SnapshotNeeded>(needed) && core.awaiting_snapshot(2), "a compacted-history failure starts the install");
+	auto late = core.step(Receive{2, AppendResponse{2, superseded, true, 3, 4, 0}});
+	check(late.empty() && core.progress(2) == Index{0} && core.awaiting_snapshot(2), "a late success during the install changes nothing");
 }
 
 void checkpoint_semantic_recovery() {
@@ -2036,7 +2076,7 @@ void recovered_delivery_byte_bound() {
 }
 
 int main() {
-	try { recovered_delivery_byte_bound(); terminal_retirement(); snapshot_sender_maximum_fanout(); snapshot_sender_lost_ack_and_terms(); snapshot_sender_receiver_contact(); snapshot_sender_restart_clock_and_admission(); snapshot_sender_correlation(); snapshot_sender_keepalive_pacing(); snapshot_sender_retries_and_retention(); snapshot_timeout_retries(); portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); late_append_responses(); stale_append_responses(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); repair_at_or_below_commit(); prevote_guard_checkquorum(); membership_scripts(); membership_formats(); leadership_transfer(); witnesses(); checkpoint_with_configuration_suffix(); founding_records(); limits_by_position(); learner_install_and_promotion(); }
+	try { recovered_delivery_byte_bound(); terminal_retirement(); snapshot_sender_maximum_fanout(); snapshot_sender_lost_ack_and_terms(); snapshot_sender_receiver_contact(); snapshot_sender_restart_clock_and_admission(); snapshot_sender_correlation(); snapshot_sender_keepalive_pacing(); snapshot_sender_retries_and_retention(); snapshot_timeout_retries(); portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); late_append_responses(); late_append_read_probe(); stale_append_responses(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); late_append_during_snapshot(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); repair_at_or_below_commit(); prevote_guard_checkquorum(); membership_scripts(); membership_formats(); leadership_transfer(); witnesses(); checkpoint_with_configuration_suffix(); founding_records(); limits_by_position(); learner_install_and_promotion(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " consensus checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

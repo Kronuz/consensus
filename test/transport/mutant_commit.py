@@ -113,7 +113,8 @@ MUTANTS = {
     "rpc-no-drain": (T + "host_transport.h", "\t\tpeer.lane->drain();\n\t\trpc_ready(k, node);", "\t\tpeer.link->connection->close();"),
     "lane-via-other-loop": (T + "host_transport.h", "\t\tif (frame.size() >= 4 && frame.substr(0, 4) == \"DTRP\")\n\t\t\treturn rpc_arrived(k, link, frame);",
                             "\t\tif (frame.size() >= 4 && frame.substr(0, 4) == \"DTRP\") {\n\t\t\tconst auto o = (k + 1) % std::uint32_t(loops_.size());\n"
-                            "\t\t\ton(o, [this, k, &link, f = std::string(frame)] { on(k, [this, k, &link, f] { rpc_arrived(k, link, f); }); });\n\t\t\treturn;\n\t\t}"),
+                            "\t\t\ton(o, [this, k, node = link.peer, f = std::string(frame)] { on(k, [this, k, node, f] {\n"
+                            "\t\t\t\tif (auto *l = loops_[k].rpc[node].link)\n\t\t\t\t\trpc_arrived(k, *l, f);\n\t\t\t}); });\n\t\t\treturn;\n\t\t}"),
     # transport-receive-bound: what a connection's frames hold before their group loop takes them
     "data-unbounded": (T + "host_transport.h", "} else if (held.data && held.data + frame.size() > options_.window) {", "} else if (false) {"),
     "control-unbounded": (T + "host_transport.h", "if (held.frames >= options_.arriving) {", "if (false) {"),

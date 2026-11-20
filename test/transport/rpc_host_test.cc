@@ -8,8 +8,9 @@
 //               heartbeats keep every gap under the 1,000 ms election timeout
 //   lane-only   two nodes that share no group: a streamed call dials Bulk alone, completes, and
 //               no group's counter moves
-//   stream      a 32 MiB request streams under the lane's credit while heartbeats on Control keep
-//               every gap under 1,000 ms (control: rpc-past-credit)
+//   stream      a 32 MiB request streams under the lane's credit (the sender's queued bytes within
+//               one window) while heartbeats on Control keep every gap under 1,000 ms (control:
+//               rpc-past-credit)
 //   local-throw a handler and a body consumer that throw fail their own call handler_failed; the
 //               Bulk connection, a group's frames on it and the next call go on (control:
 //               local-throw-closes)
@@ -382,7 +383,7 @@ bool stream() {
 	const auto window = HostTransportOptions{}.rpc.lane.window;
 	const auto serving = two.transport->serving_pool().high_water(), outgoing = one.transport->outgoing_pool().high_water();
 	const bool ok = c->done && c->status.outcome == rpc::Outcome::ok && !c->out.failed && served && served->received == body &&
-					!served->mismatched && beats.worst < 1000 && serving <= window && outgoing <= HostTransportOptions{}.rpc.outgoing_bytes;
+					!served->mismatched && beats.worst < 1000 && serving <= window && outgoing <= window;  // queued within one credit
 	std::printf("stream: %llu MiB in %llu ms (%.1f MB/s), outcome %d, the server read %llu bytes, %llu mismatched; heartbeats' longest gap %llu ms; serving high water %zu (window %zu), outgoing %zu %s\n",
 				(unsigned long long)(body >> 20), (unsigned long long)elapsed, double(body) / 1e3 / double(elapsed),
 				int(c->status.outcome), (unsigned long long)(served ? served->received.load() : 0),

@@ -127,7 +127,7 @@ the decoder and a call table; its corpus `fuzz/corpus/rpc` replays as `consensus
 | `group-full` | a group's receiving loop stalls 4 s with its 4 MiB credit full on Bulk; calls on the same connection keep their largest latency under 250 ms | `rpc-shared-credit` (lane frames wait for the groups' credit) |
 | `call-full` | a call whose server never reads holds its 4 MiB credit and pool; heartbeats on Control keep every gap under 1,000 ms | |
 | `lane-only` | no shared group: the call dials Bulk alone, its bytes exact, one link per end, every group counter 0 | |
-| `stream` | a 32 MiB request under the lane's credit, heartbeats' gaps under 1,000 ms, the serving pool's high water within one window | `rpc-past-credit` (chunks that ignore the peer's credit) |
+| `stream` | a 32 MiB request under the lane's credit, heartbeats' gaps under 1,000 ms, the serving pool's and the sender's queued bytes' (`rpc_outgoing_bytes`) high water within one window | `rpc-past-credit` (chunks that ignore the peer's credit) |
 | `local-throw` | a handler acting outside its events and a body consumer that throw each end their call `handler_failed`; the link count, `malformed` 0, a group's frames on Bulk and the next 1 MiB echo show the connection went on | `local-throw-closes` (a local throw closes the connection) |
 
 `hello_test version` refuses a 32 KiB `maximum_frame` below the lane's 65,584-byte frame

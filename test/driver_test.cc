@@ -23,16 +23,20 @@
 // The consensus Driver (docs/DRIVER.md) on one loop: a lone voter's calls through Driver on
 // inline_scheduler (no real time; the manual clock moves only when a case says so), each
 // call's completion and cancellation row (async-drivers D8), close, and the blocking entry
-// (D5). `driver_test [case]`; no case runs them all.
+// (D5), whose cross-thread wake case runs under TSan. `driver_test [case]`; no case runs them all.
 #include "consensus/driver.h"
 #include "journal/memory_io.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <functional>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace kronuz::consensus;
@@ -626,6 +630,61 @@ void witness_removal_restart() {
 	witness_case::expect(loop, g, 7, 0, 7, "removed at 7 after a restart at 6");
 }
 
+// A wake() from another thread ends the blocking entry's sleep toward an operation deadline
+// within 50 ms (journal turn-seal.md): a journal group beside the Driver's, sealed on the same
+// turn driver, gets its open record written and the work's wait returns, round after round. A
+// deaf entry sleeps until its deadline's wheel pass; the first such round ends the case.
+void entry_wake_threads() {
+	constexpr int rounds = 20;
+	constexpr std::uint64_t other = 77;
+	constexpr auto budget = std::chrono::milliseconds(50);
+	jt::Disk disk;
+	task::blocking_scheduler scheduler;
+	j::InlineCompletion io;
+	j::Host host(std::make_shared<jt::MemoryIO>(disk, "host/"), host_identity, j::HostOptions{1, turn_options});
+	Sink sink;
+	Driver<Sink> driver(Seams{task::scheduler_ref::of(scheduler), j::completion_ref::of(io), host, 0, 7}, sink);
+	auto& turns = driver.turns();
+	struct Open { std::mutex mutex; std::string payload; std::uint64_t sequence = 0; } open;
+	turns.seal(other, [&](std::uint64_t, bool) -> std::optional<j::TurnRecord> {
+		std::lock_guard hold(open.mutex);
+		if (open.payload.empty()) { return std::nullopt; }
+		return j::TurnRecord{other, open.sequence, j::TurnRecordKind::Batch, std::exchange(open.payload, {})};
+	});
+	auto wait = [](task::blocking_scheduler& s, j::TurnDriver& t, std::uint64_t sequence, std::atomic<bool>& waiting) -> task::task<void> {
+		task::deadline<task::blocking_scheduler> limit(s, std::chrono::steady_clock::now() + std::chrono::seconds(2));
+		waiting.store(true, std::memory_order_release);
+		co_await t.durable(other, sequence, limit.token());  // the sealer has nothing yet: the entry sleeps
+	};
+	int durable = 0;
+	auto slowest = std::chrono::steady_clock::duration::zero();
+	for (int round = 0; round < rounds; ++round) {
+		const auto sequence = turns.sequence(other) + 1;
+		std::atomic<bool> waiting{false};
+		std::atomic<std::chrono::steady_clock::rep> woken{0};
+		std::thread writer([&] {
+			while (!waiting.load(std::memory_order_acquire)) { std::this_thread::yield(); }
+			std::this_thread::sleep_for(std::chrono::milliseconds(2));
+			std::lock_guard hold(open.mutex);
+			open.sequence = sequence; open.payload = "w";
+			woken.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
+			turns.wake();  // the record's first transaction, under its mutex
+		});
+		bool ok = true;
+		try { run(driver, scheduler, wait(scheduler, turns, sequence, waiting)); ++durable; }
+		catch (const std::exception& error) { ok = false; check(false, std::string("a woken round threw: ") + error.what()); }
+		const auto returned = std::chrono::steady_clock::now();
+		waiting.store(true, std::memory_order_release);  // a round that threw first still frees the writer
+		writer.join();
+		const auto latency = returned - std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(woken.load(std::memory_order_acquire)));
+		slowest = std::max(slowest, latency);
+		if (!ok || latency >= budget) { break; }
+	}
+	check(durable == rounds && turns.sequence(other) == std::uint64_t(rounds), "every woken record is durable (" + std::to_string(durable) + " of " + std::to_string(rounds) + ")");
+	check(slowest < budget, "each wake ends the entry's sleep within 50 ms");
+	std::cerr << " entry_wake_threads: slowest wake to return " << std::chrono::duration_cast<std::chrono::microseconds>(slowest).count() << " us\n";
+}
+
 const std::map<std::string, void (*)()> cases{
 	{"lone_voter", &lone_voter},
 	{"rows", &rows},
@@ -638,6 +697,7 @@ const std::map<std::string, void (*)()> cases{
 	{"witness_promotion", &witness_promotion},
 	{"witness_removal", &witness_removal},
 	{"witness_removal_restart", &witness_removal_restart},
+	{"entry_wake_threads", &entry_wake_threads},
 };
 
 }  // namespace

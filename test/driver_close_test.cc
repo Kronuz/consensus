@@ -804,8 +804,12 @@ void idle_bytes() {
 // then fence and close the row, close it with records after its checkpoint, checkpoint and
 // close it into the table, or go on; each close recovers the row in the live Host. After the
 // cut, a new Host recovers every acknowledged record and nothing unattempted: none lost, none
-// that a table close dropped replayed again.
+// that a table close dropped replayed again. Quiescence A5: a close into the table takes the
+// closed state and the recover reopens with it, resuming the closed term; after the cut the last
+// closed state reopens again, resuming its term when it still matches and refused as stale (a
+// later term) once a write followed it.
 std::uint64_t crash_tables = 0, crash_releases = 0;  // the closes a sweep's runs completed, by kind
+std::uint64_t crash_resumed = 0, crash_stale = 0;  // reopens after a cut with the last closed state
 bool close_crash_run(std::uint64_t seed, std::uint64_t cut) {
 	constexpr GroupId g = 91;
 	jt::Disk disk; disk.random.seed(seed * 7919 + cut);
@@ -815,6 +819,8 @@ bool close_crash_run(std::uint64_t seed, std::uint64_t cut) {
 	const auto at = "seed " + std::to_string(seed) + " cut " + std::to_string(cut);
 	std::vector<std::function<bool()>> calls;  // whether each call the run started completed
 	auto track = [&](auto call) { calls.push_back([call] { return call->done; }); return call; };
+	std::optional<std::string> closed;  // the last closed state a close into the table took
+	Term closed_term = 0;
 	{
 		Loop loop(disk);
 		loop.lone(g);
@@ -836,14 +842,20 @@ bool close_crash_run(std::uint64_t seed, std::uint64_t cut) {
 				auto published = track(loop.start(checkpoint_of(loop, g, acknowledged))); loop.release();
 				if (!published->done || published->error) { alive = false; break; }
 			}
+			auto taken = action == 2 ? loop.driver->closed_state(g) : std::nullopt;
+			const auto term = loop.driver->state(g)->term;
 			if (!ok(track(loop.start(loop.driver->close(g))))) { alive = false; break; }
-			++(loop.host->status(g) == j::GroupStatus::closed ? crash_tables : crash_releases);
-			const auto image = loop.recover(g, error, options({1}));
+			const bool tabled = loop.host->status(g) == j::GroupStatus::closed;
+			++(tabled ? crash_tables : crash_releases);
+			check(action != 2 || disk.dead() || (taken && tabled), "a checkpointed close takes its closed state into the table: " + at + (taken ? "" : " (no closed state)") + (tabled ? "" : " (released)"));
+			if (tabled && taken) { closed = taken; closed_term = term; }
+			const auto image = loop.recover(g, error, options({1}), tabled ? taken : std::nullopt);
 			loop.apply(g);
 			// Without power nothing commits after the recover, so the state shows only before the cut.
 			if (error || disk.dead()) { alive = false; break; }
 			const auto state = recovered(loop, g, image);
 			check(state == attempted, "a recover in the live Host holds every attempted record: " + at + " " + join(state));
+			if (tabled && taken) { check(loop.driver->state(g)->term == term, "a reopen with its closed state resumes the closed term: " + at); }
 		}
 		reached = alive && !disk.dead();
 		if (!reached && !disk.dead()) { check(false, "the run failed before its power cut: " + at); }
@@ -854,8 +866,13 @@ bool close_crash_run(std::uint64_t seed, std::uint64_t cut) {
 	Loop again(disk);
 	if (again.host->status(g) != j::GroupStatus::none) {
 		std::exception_ptr error;
-		const auto image = again.recover(g, error, options({1}));
+		const auto image = again.recover(g, error, options({1}), closed);
 		check(!error, "recovery after the cut: " + at + ": " + what(error));
+		if (closed && !error) {
+			const auto term = again.driver->state(g)->term;
+			check(term >= closed_term, "a reopen after the cut never goes back a term: " + at);
+			++(term == closed_term ? crash_resumed : crash_stale);
+		}
 		again.apply(g);
 		const auto state = recovered(again, g, image);
 		check(prefix(acknowledged, state) && prefix(state, attempted), "recovery keeps every acknowledged record and nothing unattempted: " + at + " recovered " + join(state) + "acknowledged " + join(acknowledged));
@@ -869,8 +886,10 @@ void close_crash() {
 	for (std::uint64_t seed = 1; seed <= seeds; ++seed) {
 		for (std::uint64_t cut = 1; !close_crash_run(seed, cut); ++cut) { ++runs; if (failures) { return; } }
 	}
-	std::printf("close_crash: %u seeds, %u power cuts; %u closes into the table, %u releases\n", unsigned(seeds), unsigned(runs), unsigned(crash_tables), unsigned(crash_releases));
+	std::printf("close_crash: %u seeds, %u power cuts; %u closes into the table, %u releases; after a cut the last closed state resumed its term %u times, %u stale\n",
+		unsigned(seeds), unsigned(runs), unsigned(crash_tables), unsigned(crash_releases), unsigned(crash_resumed), unsigned(crash_stale));
 	check(crash_tables && crash_releases, "the sweep closes rows both ways");
+	check(crash_resumed && crash_stale, "the sweep reopens after a cut both ways");
 }
 
 // Quiescence A1: a lone voter closed at a checkpoint with its closed state reopens on a request

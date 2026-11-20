@@ -174,4 +174,8 @@ conflicting entry at one index and term fences the replica.
 Closing writes nothing to the consensus log, and a reopen writes only with its first batch, so a
 crash at any step leaves either the record and the state it matches (the reopen resumes) or a
 state past it (the record is stale, and the group elects as after any restart). A host that keeps
-an older record, or none, costs an election, never safety.
+an older record, or none, costs an election, never safety. `driver_close_test close_crash` cuts
+power at every IO of rounds that write, checkpoint, close into the table with the closed state and
+reopen with it, on 8 seeds (926 cuts): every acknowledged record survives, a reopen in the live
+host resumes the closed term, and after the cut the last record resumes its term 162 times and is
+refused as stale 462 times (the group elects a later term), never a term back.

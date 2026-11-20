@@ -1089,10 +1089,8 @@ constexpr std::uint64_t round_trip_edge_ns = 256'000'000;
 #else
 constexpr std::uint64_t round_trip_edge_ns = 64'000'000;
 #endif
-// At most one round trip in this many may pass the edge. The executor runs 20-35 ms of fetch work
-// at a time, and a loaded host takes it off the CPU for tens of ms more: of 160 loaded runs at most
-// 2.3% of the round trips passed 64 ms (0.6% passed 256 ms under TSan). A fetch that holds appends
-// back holds most of them.
+// At most one round trip in this many passes the edge: fetch work holds the executor 20-35 ms at a time and a
+// loaded host takes it off the CPU 42-84 ms more, so 2.3% at most passed 64 ms (probes 833fb6, 53e971).
 constexpr std::uint64_t slow_round_trips_share = 8;
 
 // F2: rounds of four 8 MiB fetches at once, both ways between voters one and three, through 1 MiB

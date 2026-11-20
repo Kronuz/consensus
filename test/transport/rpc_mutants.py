@@ -40,9 +40,19 @@ MUTANTS = {
     # group-full: lane frames wait while the groups' data holds the credit (one credit for both)
     "rpc-shared-credit": [(HOST, "rpc::Lane *calls = lane.link->lane == LinkLane::Bulk ? rpc_lane(k, *lane.link) : nullptr;",
                            "rpc::Lane *calls = lane.link->lane == LinkLane::Bulk && stats.uncredited + rpc::chunk_bytes + frame_header <= options_.window ? rpc_lane(k, *lane.link) : nullptr;")],
-    # stream: a body goes as one frame, past chunk and credit
-    "rpc-one-frame": [("\t\treturn std::min<std::uint64_t>(chunk_bytes, o.limit - o.sent);",
-                       "\t\treturn o.total == unknown_total ? chunk_bytes : o.total - o.sent;")],
+    # stream: a body goes in chunks that ignore the peer's credit
+    "rpc-past-credit": [("\t\treturn std::min<std::uint64_t>(chunk_bytes, o.limit - o.sent);",
+                         "\t\treturn chunk_bytes;")],
+    # late-deadline (T7): a deadline found late ends the call, as if the loop had run
+    "late-deadline": [("\t\t\tif (c.deadline <= now && options_.late && !c.extended)", "\t\t\tif (false)")],
+    # hello_test version (review F3): the constructor takes a frame bound below the lane's frame
+    "lane-frame-unchecked": [(HOST, "if (options_.links.rpc_max && options_.links.connection.maximum_frame < rpc::frame_bytes)",
+                              "if (false)")],
+    # rpc_host_test local-throw (review F7): a throw from this end's handler closes the connection
+    "local-throw-closes": [("\t\t} catch (...) {\n\t\t\t++failed_;\n\t\t\tpools_.serving.release(held);",
+                            "\t\t} catch (const ProtocolError &) {\n\t\t\t++failed_;\n\t\t\tpools_.serving.release(held);"),
+                           ("\t\ttry {\n\t\t\tf();\n\t\t\treturn true;\n\t\t} catch (const std::exception &e) {\n\t\t\tfail(h, e.what());\n\t\t} catch (...) {",
+                            "\t\ttry {\n\t\t\tf();\n\t\t\treturn true;\n\t\t} catch (const ProtocolError &e) {\n\t\t\tfail(h, e.what());\n\t\t} catch (const std::bad_alloc &) {")],
     # hello_test leader: the transport reports default limits, not the ones the peer's hello carried
     "hello-limits-ignored": [(HOST, "here.report(route.group, {route.source, limits});",
                               "here.report(route.group, {route.source, kronuz::consensus::Limits{}});")],

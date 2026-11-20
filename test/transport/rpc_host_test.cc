@@ -9,7 +9,10 @@
 //   lane-only   two nodes that share no group: a streamed call dials Bulk alone, completes, and
 //               no group's counter moves
 //   stream      a 32 MiB request streams under the lane's credit while heartbeats on Control keep
-//               every gap under 1,000 ms (control: rpc-one-frame)
+//               every gap under 1,000 ms (control: rpc-past-credit)
+//   local-throw a handler and a body consumer that throw fail their own call handler_failed; the
+//               Bulk connection, a group's frames on it and the next call go on (control:
+//               local-throw-closes)
 //   consensus_transport_rpc_host_test <fixture dir> case
 #include "rpc_hosts.h"
 
@@ -389,11 +392,69 @@ bool stream() {
 	two.stop();
 	return ok;
 }
+// Local code that throws is this end's fault: a handler acting outside its events (total() before
+// its call exists) and a body consumer that throws each fail their call alone.
+bool local_throw() {
+	Host one(1, 2), two(2, 2);
+	Server server;
+	one.open(addresses({&two}));
+	two.open(addresses({&one}));
+	server.install(*two.transport);
+	constexpr rpc::MethodId early = 10, throwing = 11;
+	auto &t2 = *two.transport;
+	t2.handle(early, [&t2](RpcCall c, const rpc::Incoming &) -> std::optional<rpc::Events> {
+		t2.total(c, 8);  // not in the call table yet: throws
+		return rpc::Events{};
+	});
+	t2.handle(throwing, [](RpcCall, const rpc::Incoming &) -> std::optional<rpc::Events> {
+		rpc::Events e;
+		e.body = [](std::string_view, bool) { throw std::runtime_error("consumer broke"); };
+		return e;
+	});
+	const auto g = groups_on(2, two.transport->loop_of_node(1), 1)[0];
+	one.stores({g});
+	two.stores({g});
+	std::atomic<std::uint64_t> delivered{0};
+	two.transport->on_deliver(two.transport->loop_of_group(g), [&](const Received &) {
+		++delivered;
+		return true;
+	});
+	one.start();
+	two.start();
+	const auto at = one.transport->loop_of_group(g);
+	auto group_frame = [&] { one.post(at, [&] { one.transport->send(at, LinkLane::Bulk, FrameKind::data, {g, 1, 2}, 2, std::string(1024, 'g')); }); };
+	group_frame();
+	auto warm = start_call(one, 2, echo, 64 << 10, 10s);
+	const bool warmed = until([&] { return warm->done.load() && delivered == 1; }, 10s) && warm->status.outcome == rpc::Outcome::ok;
+	const auto links = one.total(&HostTransportStats::links) + two.total(&HostTransportStats::links);
+	auto a = start_call(one, 2, early, 64, 10s);
+	auto b = start_call(one, 2, throwing, 1 << 20, 10s);
+	const bool ended = until([&] { return a->done && b->done; }, 10s);
+	group_frame();
+	auto c = start_call(one, 2, echo, 1 << 20, 10s);
+	const bool next = until([&] { return c->done.load() && delivered == 2; }, 10s);
+	std::this_thread::sleep_for(100ms);
+	const auto failed = std::uint32_t(rpc::Code::handler_failed);
+	const auto links_after = one.total(&HostTransportStats::links) + two.total(&HostTransportStats::links);
+	const auto malformed = one.total(&HostTransportStats::malformed) + two.total(&HostTransportStats::malformed);
+	const bool freed = until([&] { return pools_empty(one) && pools_empty(two); }, 2s);
+	const bool ok = warmed && ended && next && a->ends == 1 && a->status.outcome == rpc::Outcome::error && a->status.code == failed &&
+					b->ends == 1 && b->status.outcome == rpc::Outcome::error && b->status.code == failed && b->status.text == "consumer broke" &&
+					c->status.outcome == rpc::Outcome::ok && c->received == 1 << 20 && !c->mismatched && links_after == links &&
+					!malformed && one.ended(rpc::Outcome::connection_aborted) == 0 && freed;
+	std::printf("local-throw: the early handler's call ended %d code %u; the throwing consumer's %d code %u '%s'; the next echo %d with %llu of %u bytes, %llu mismatched; group frames delivered %llu of 2; links %llu then %llu, malformed %llu; pools freed: %s %s\n",
+				int(a->status.outcome), a->status.code, int(b->status.outcome), b->status.code, b->status.text.c_str(), int(c->status.outcome),
+				(unsigned long long)c->received.load(), 1u << 20, (unsigned long long)c->mismatched.load(), (unsigned long long)delivered.load(),
+				(unsigned long long)links, (unsigned long long)links_after, (unsigned long long)malformed, freed ? "yes" : "no", ok ? "ok" : "FAILED");
+	one.stop();
+	two.stop();
+	return ok;
+}
 } // namespace
 
 int main(int argc, char **argv) {
 	if (argc != 3) {
-		std::fprintf(stderr, "usage: %s <fixture dir> calls|group-full|call-full|lane-only|stream\n", argv[0]);
+		std::fprintf(stderr, "usage: %s <fixture dir> calls|group-full|call-full|lane-only|stream|local-throw\n", argv[0]);
 		return 2;
 	}
 	fixture = argv[1];
@@ -410,6 +471,8 @@ int main(int argc, char **argv) {
 		ok = lane_only();
 	else if (which == "stream")
 		ok = stream();
+	else if (which == "local-throw")
+		ok = local_throw();
 	else
 		return 2;
 	std::fflush(stdout);

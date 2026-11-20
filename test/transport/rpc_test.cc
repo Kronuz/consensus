@@ -3,6 +3,7 @@
 // them, and two lanes over pipes on two threads (run under TSan). `seed DIR` writes the fuzz seeds.
 #include "consensus/transport/rpc.h"
 #include "async_pipe.h"
+#include "consensus/transport/deadline.h"
 
 #include <atomic>
 #include <csignal>
@@ -383,6 +384,39 @@ void deadlines() {
 	CHECK(net.zero());
 }
 
+// T7: a call's deadline found past by more than a wheel tick, as after a process stop, gives the
+// call that time again, once, capped at its timeout; one found on time ends the call.
+void late_deadline() {
+	LaneOptions options{.window = 1 << 16};
+	options.late = [](Clock::duration late, Clock::duration timeout) {
+		using ns = std::chrono::nanoseconds;
+		return Clock::duration(ns(kronuz::consensus::transport::late_extension(ns(late).count(), ns(timeout).count())));
+	};
+	Net net(1 << 20, options);
+	auto &stopped = net.open(); // a 10 s deadline
+	net.flow();
+	net.time += 12100ms; // stopped 2.1 s past it
+	net.a->lane.expire();
+	net.flow();
+	CHECK(!stopped.completions && net.a->lane.next_deadline() == net.time + 2100ms);
+	net.time += 2100ms; // once: the extension's own expiry ends it
+	net.a->lane.expire();
+	net.flow();
+	CHECK(stopped.ended_with(Outcome::cancel, Code::deadline_exceeded));
+	auto &long_stop = net.open();
+	net.flow();
+	net.time += 40s; // 30 s past: capped at the 10 s timeout
+	net.a->lane.expire();
+	CHECK(!long_stop.completions && net.a->lane.next_deadline() == net.time + 10s);
+	auto &on_time = net.open();
+	net.flow();
+	net.time += 10s;
+	net.a->lane.expire(); // on time for `on_time`; the long stop's extension also ends
+	net.flow();
+	CHECK(on_time.ended_with(Outcome::cancel, Code::deadline_exceeded) && long_stop.ended_with(Outcome::cancel, Code::deadline_exceeded));
+	CHECK(net.zero());
+}
+
 // D5 refusals: the serving bound, then a pool short of one chunk; a slot frees when its call ends.
 void refusals() {
 	Net net(1 << 20, {.window = 1 << 16, .serving = 2});
@@ -738,6 +772,7 @@ int main(int argc, char **argv) {
 		{"streams", streams},
 		{"ends", ends},
 		{"deadlines", deadlines},
+		{"late-deadline", late_deadline},
 		{"refusals", refusals},
 		{"pools", pools},
 		{"pools-threads", pools_threads},

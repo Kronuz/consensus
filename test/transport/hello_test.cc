@@ -225,10 +225,19 @@ bool version() {
 	HostTransportOptions tight;
 	tight.links.connection.maximum_frame = 1 << 20;  // below a 2 MiB rpc_bytes frame
 	Host three(3, 1);
-	const bool small = refuses<std::invalid_argument>([&] { three.open({{1, {"127.0.0.1", 1}}}, tight); }, "maximum_frame below");
-	const bool ok = refused && !links && !delivered && small;
-	std::printf("version: hellos refused by wire version on host 1: %s; links established %llu; frames delivered %d; a 1 MiB frame for 2 MiB rpc_bytes refused: %s %s\n",
-				refused ? "yes" : "no", (unsigned long long)links, delivered.load(), small ? "yes" : "no", ok ? "ok" : "FAILED");
+	const bool small = refuses<std::invalid_argument>([&] { three.open({{1, {"127.0.0.1", 1}}}, tight); }, "maximum_frame below a frame");
+	// rpc_bytes 16 KiB fits a 32 KiB frame; the lane's 65,584-byte Call does not.
+	HostTransportOptions chunk;
+	chunk.links.limits.command_bytes = 4 << 10;
+	chunk.links.limits.rpc_bytes = 16 << 10;
+	chunk.links.limits.rpc_entries = 16;
+	chunk.links.connection.maximum_frame = 32 << 10;
+	Host four(4, 1);
+	const bool below_chunk = refuses<std::invalid_argument>([&] { four.open({{1, {"127.0.0.1", 1}}}, chunk); }, "below the RPC lane's largest frame");
+	const bool ok = refused && !links && !delivered && small && below_chunk;
+	std::printf("version: hellos refused by wire version on host 1: %s; links established %llu; frames delivered %d; a 1 MiB frame for 2 MiB rpc_bytes refused: %s; a 32 KiB frame below the lane's %zu refused: %s %s\n",
+				refused ? "yes" : "no", (unsigned long long)links, delivered.load(), small ? "yes" : "no", rpc::frame_bytes,
+				below_chunk ? "yes" : "no", ok ? "ok" : "FAILED");
 	return ok;
 }
 } // namespace

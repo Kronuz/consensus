@@ -13,6 +13,12 @@
 // timeout. Everything here runs on the loop that owns the deadline.
 namespace kronuz::consensus::transport {
 
+// The rule itself: the time a deadline `late` ns past its time gets again, capped at its
+// `timeout`; 0 when it fired within a wheel tick. Call deadlines use it too (rpc-lane T7).
+constexpr std::uint64_t late_extension(std::uint64_t late, std::uint64_t timeout) noexcept {
+	return late > wheel::timer_wheel::tick ? std::min(late, timeout) : 0;
+}
+
 class wait_list;
 
 // A deadline on the loop's timer wheel. Its token is requested (cancel_reason::deadline) at
@@ -78,12 +84,13 @@ class late_deadline : wheel::timer_entry {
 			return;  // the wheel is dying, or a wake already ended it
 		const std::uint64_t now = self.loop_.now();
 		const std::uint64_t late = now > self.at_ ? now - self.at_ : 0;
-		if (self.extend_late_ && !self.extended_ && late > wheel::timer_wheel::tick) {
-			self.extended_ = std::min(late, self.timeout_);
-			self.at_ = now + self.extended_;
-			self.loop_.arm(self, self.at_);
-			return;
-		}
+		if (self.extend_late_ && !self.extended_)
+			if (const auto more = late_extension(late, self.timeout_)) {
+				self.extended_ = more;
+				self.at_ = now + more;
+				self.loop_.arm(self, self.at_);
+				return;
+			}
 		self.state_ = outcome::expired;
 		self.source_.request(task::cancel_reason::deadline);
 		self.resume();

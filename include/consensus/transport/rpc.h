@@ -25,6 +25,7 @@ namespace kronuz::consensus::transport::rpc {
 inline constexpr std::size_t header_bytes = 24;
 inline constexpr std::size_t chunk_bytes = 65536;
 inline constexpr std::size_t text_bytes = 1024;
+inline constexpr std::size_t frame_bytes = header_bytes + 24 + chunk_bytes;  // the largest: a Call, a full chunk inline
 inline constexpr std::uint64_t unknown_total = ~std::uint64_t{0};
 
 enum class Kind : std::uint8_t { call = 1, body, credit, cancel, error, drain };
@@ -310,13 +311,16 @@ struct Incoming {
 struct Pools {
 	ByteBudget &serving, &calling, &outgoing;
 };
+using Clock = std::chrono::steady_clock;
 struct LaneOptions {
 	std::size_t window = 4 << 20; // a served request's credit window
 	std::size_t serving = 256;    // served calls live at once
 	std::chrono::milliseconds max_call_deadline = std::chrono::hours(1);
 	unsigned version = 1;
+	// The time a call whose deadline passed `late` ago gets again, once (T7: the transport's
+	// late-fire rule, deadline.h); none: a call ends at its deadline.
+	std::function<Clock::duration(Clock::duration late, Clock::duration timeout)> late;
 };
-using Clock = std::chrono::steady_clock;
 struct CallOptions {
 	Clock::time_point deadline;
 	std::size_t window = 4 << 20;
@@ -330,7 +334,8 @@ struct Outgoing {
 
 // One connection's call table. Not thread-safe: it lives on the connection's loop; `post` runs
 // work there, for pool wakes from other loops. `ready` runs when next() has a frame. A throw from
-// receive() is a protocol violation: the connection closes, then close().
+// receive() is a protocol violation: the connection closes, then close(). A throw from this end's
+// own code (accept, a call's events) fails that call alone, counted in failed().
 class Lane {
   public:
 	using Accept = std::function<std::optional<Events>(const Incoming &)>; // none: unknown_method
@@ -353,6 +358,7 @@ class Lane {
 		c.events = std::make_shared<Events>(std::move(events));
 		c.method = method;
 		c.deadline = options.deadline;
+		c.timeout = options.deadline - now_();
 		c.in = {.pool = &pools_.calling, .window = options.window};
 		c.out.total = total;
 		c.out.limit = c.out.sent = request.size();
@@ -456,13 +462,20 @@ class Lane {
 			if (calls_.count(h))
 				finish(h, {calls_[h].called ? Outcome::connection_aborted : Outcome::not_processed});
 	}
-	// Ends the calls whose deadline has passed; next_deadline() says when to call it again.
+	// Ends the calls whose deadline has passed, each first given the late rule's time once;
+	// next_deadline() says when to call it again.
 	void expire() {
 		const auto now = now_();
 		std::vector<Handle> due;
-		for (auto &[h, c] : calls_)
+		for (auto &[h, c] : calls_) {
+			if (c.deadline <= now && options_.late && !c.extended)
+				if (const auto more = options_.late(now - c.deadline, c.timeout); more > Clock::duration::zero()) {
+					c.deadline = now + more;
+					c.extended = true;
+				}
 			if (c.deadline <= now)
 				due.push_back(h);
+		}
 		for (auto h : due)
 			if (calls_.count(h))
 				stop(h, Code::deadline_exceeded);
@@ -529,8 +542,8 @@ class Lane {
 			in.total = f.total;
 			in.received += n;
 			in.ended = f.end;
-			if (auto keep = c.events; keep->body)
-				keep->body(f.bytes, f.end);
+			if (auto keep = c.events; keep->body && !local(h, [&] { keep->body(f.bytes, f.end); }))
+				return;
 			if (f.end)
 				consume(h, 0); // an end the consumer already took all of finishes the stream
 			return;
@@ -540,13 +553,14 @@ class Lane {
 				throw ProtocolError("rpc: rule 8: credit");
 			c.out.limit = f.limit;
 			if (auto keep = c.events; keep->credit)
-				keep->credit();
+				local(h, [&] { keep->credit(); });
 			return;
 		default: // Cancel at the server, Error at the caller
 			return finish(h, {f.kind == Kind::cancel ? Outcome::cancel : Outcome::error, f.word, std::string(f.bytes)});
 		}
 	}
 	std::uint64_t late() const noexcept { return late_; }
+	std::uint64_t failed() const noexcept { return failed_; }
 	std::size_t live() const noexcept { return calls_.size(); }
 	// What next() would return: a small frame, or else a chunk.
 	bool small_ready() const noexcept { return !small_.empty(); }
@@ -574,6 +588,8 @@ class Lane {
 		bool serving = false, called = false; // called: its Call is queued
 		MethodId method = 0;
 		Clock::time_point deadline;
+		Clock::duration timeout{};      // the deadline's span when set, for the late rule
+		bool extended = false;          // the late rule gave it more time
 		std::shared_ptr<Events> events; // kept alive by each callback while it runs
 		Inbound in;
 		Outbound out;
@@ -651,7 +667,8 @@ class Lane {
 			small_.push_back({encode(f, options_.version), std::move(charge)});
 		} else {
 			const Frame f{.kind = Kind::body, .end = p.end, .call = c.id, .offset = c.out.queued, .total = c.out.total, .bytes = p.bytes};
-			chunks_[c.id].push_back({encode(f, options_.version), std::move(charge)});
+			auto frame = encode(f, options_.version);  // before the queue: a throw leaves no empty one
+			chunks_[c.id].push_back({std::move(frame), std::move(charge)});
 		}
 		c.out.end = p.end;
 		c.out.queued += p.bytes.size();
@@ -685,7 +702,14 @@ class Lane {
 		if (serving_ >= options_.serving || (want && !(held = pools_.serving.try_acquire(std::min(want, chunk_bytes), want))))
 			return small({.kind = Kind::error, .word = std::uint32_t(Code::overloaded), .call = f.call});
 		const Handle h = ++handles_;
-		auto events = accept_ ? accept_({h, f.call, f.word, f.total}) : std::nullopt;
+		std::optional<Events> events;
+		try {
+			events = accept_ ? accept_({h, f.call, f.word, f.total}) : std::nullopt;
+		} catch (...) {
+			++failed_;
+			pools_.serving.release(held);
+			return small({.kind = Kind::error, .word = std::uint32_t(Code::handler_failed), .call = f.call});
+		}
 		if (!events) {
 			pools_.serving.release(held);
 			return small({.kind = Kind::error, .word = std::uint32_t(Code::unknown_method), .call = f.call});
@@ -696,7 +720,8 @@ class Lane {
 		c.method = f.word;
 		c.events = std::make_shared<Events>(std::move(*events));
 		const auto ms = std::min<std::uint64_t>(f.timeout_ms, options_.max_call_deadline.count());
-		c.deadline = now_() + std::chrono::milliseconds(ms);
+		c.timeout = std::chrono::milliseconds(ms);
+		c.deadline = now_() + c.timeout;
 		c.in = {.pool = &pools_.serving, .window = options_.window, .held = held, .base = base, .limit = base + held,
 				.received = base, .total = f.total, .known = true, .ended = f.end};
 		c.out.limit = f.window;
@@ -705,7 +730,25 @@ class Lane {
 		if (want)
 			small({.kind = Kind::credit, .call = c.id, .limit = c.in.limit});
 		if (auto keep = c.events; (base || f.end) && keep->body)
-			keep->body(f.bytes, f.end);
+			local(h, [&] { keep->body(f.bytes, f.end); });
+	}
+	// Runs this end's callback for call `h`: a throw is this end's fault, not the peer's, so it
+	// fails that call alone (Error handler_failed from a server, Cancel cancelled from a caller).
+	template <class F> bool local(Handle h, F f) {
+		try {
+			f();
+			return true;
+		} catch (const std::exception &e) {
+			fail(h, e.what());
+		} catch (...) {
+			fail(h, "unknown exception");
+		}
+		return false;
+	}
+	void fail(Handle h, std::string_view what) {
+		++failed_;
+		if (auto it = calls_.find(h); it != calls_.end())
+			stop(h, it->second.serving ? Code::handler_failed : Code::cancelled, what);
 	}
 	void drained_by_peer(std::uint64_t id) {
 		if (peer_drained_)
@@ -744,12 +787,17 @@ class Lane {
 			chunks_.erase(c.id);
 		if (c.serving)
 			--serving_;
-		if (c.events->done)
-			c.events->done(status);
+		if (c.events->done) {
+			try {
+				c.events->done(status);
+			} catch (...) {
+				++failed_;  // the call has ended; the rest of the table goes on
+			}
+		}
 	}
 
 	const std::uint64_t own_;
-	std::uint64_t next_id_, last_id_ = 0, high_peer_ = 0, late_ = 0, cursor_ = 0;
+	std::uint64_t next_id_, last_id_ = 0, high_peer_ = 0, late_ = 0, failed_ = 0, cursor_ = 0;
 	Pools pools_;
 	LaneOptions options_;
 	Accept accept_;

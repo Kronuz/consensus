@@ -109,12 +109,11 @@ struct Received {
 // The one per-group table of the transport (docs/mechanisms/host-transport.md, Tables): entries
 // dense in a vector, found through an open-addressed index of their slots (linear probing,
 // load 0.5-0.75, backward-shift deletion). An erase moves the last entry into the hole.
-struct Empty {};
 template <class V> class GroupTable {
   public:
 	struct Entry {
 		GroupId id;
-		[[no_unique_address]] V value;
+		V value;
 	};
 	V *find(GroupId id) noexcept {
 		const auto i = position(id);
@@ -270,8 +269,8 @@ class HostTransport {
 	HostTransport(std::vector<HostLoop> loops, std::shared_ptr<asio::ssl::context> tls, const NodePins &pins,
 				  kronuz::consensus::Identity cluster, const std::map<kronuz::consensus::NodeId, PeerAddress> &addresses,
 				  HostTransportOptions options = {})
-		: options_(std::move(options)), loops_(loops.size()), serving_(options_.rpc.serving_bytes),
-		  calling_(options_.rpc.calling_bytes), outgoing_(options_.rpc.outgoing_bytes) {
+		: options_(std::move(options)), serving_(options_.rpc.serving_bytes), calling_(options_.rpc.calling_bytes),
+		  outgoing_(options_.rpc.outgoing_bytes), loops_(loops.size()) {
 		for (auto &[node, address] : addresses)
 			nodes_.push_back(node);
 		if (loops_.empty() || loops_.size() > 4096)
@@ -281,6 +280,8 @@ class HostTransport {
 		kronuz::consensus::validate_limits(options_.links.limits);
 		if (options_.links.connection.maximum_frame < frame_header + control_frame_bound(options_.links.limits))
 			throw std::invalid_argument("host transport: maximum_frame below a frame of this node's rpc_bytes");
+		if (options_.links.rpc_max && options_.links.connection.maximum_frame < rpc::frame_bytes)
+			throw std::invalid_argument("host transport: maximum_frame below the RPC lane's largest frame");
 		for (std::uint32_t k = 0; k != loops_.size(); ++k) {
 			auto &loop = loops_[k];
 			loop.at = loops[k];
@@ -394,7 +395,7 @@ class HostTransport {
 		if (peer.lane)
 			begin(peer, c.id, {method, std::move(options), std::move(request), std::move(events)});
 		else
-			peer.pending.push_back({c.id, method, std::move(options), std::move(request), std::move(events)});
+			peer.pending.push_back({c.id, {method, options, std::move(request), std::move(events)}, options.deadline - rpc::Clock::now()});
 		pump(k, node, LinkLane::Bulk);
 		arm(k, node);
 		return c;
@@ -478,12 +479,12 @@ class HostTransport {
 		kronuz::consensus::NodeId incarnation = 0;
 		Opening open;
 	};
-	// On a group loop, one connection: the stored groups whose peer open matched on it. A batch
-	// of a newer generation empties it: the connection changed.
+	// On a group loop, one connection: the stored groups whose peer open matched on it, each with
+	// the source whose limits were reported last (0: none yet). A batch of a newer generation
+	// empties it: the connection changed.
 	struct Opened {
 		std::uint64_t generation = 0;
-		GroupTable<Empty> groups;
-		GroupTable<kronuz::consensus::NodeId> reported;  // the source whose limits were reported last
+		GroupTable<kronuz::consensus::NodeId> groups;
 	};
 	// One read's message and open frames for one loop, and the connection they came on.
 	struct Batch {
@@ -536,7 +537,14 @@ class HostTransport {
 	struct Pending {
 		std::uint64_t id;
 		Made call;
+		rpc::Clock::duration timeout{};  // its deadline's span, for the late rule
+		bool extended = false;
 	};
+	// T7: deadline.h's rule, for call deadlines.
+	static rpc::Clock::duration late_rule(rpc::Clock::duration late, rpc::Clock::duration timeout) {
+		const auto ns = [](rpc::Clock::duration d) { return std::uint64_t(std::max<std::int64_t>(0, std::chrono::nanoseconds(d).count())); };
+		return std::chrono::duration_cast<rpc::Clock::duration>(std::chrono::nanoseconds(late_extension(ns(late), ns(timeout))));
+	}
 	// The lane to one peer node, on the loop of its connections: the Bulk link's call table, the
 	// calls waiting for it, and each live call's handle there (0 while it waits).
 	struct RpcPeer {
@@ -571,10 +579,8 @@ class HostTransport {
 	}
 	// The group opens again on every connection: a store or a forget.
 	static void unopen(Loop &here, GroupId group) {
-		for (auto &[peer, opened] : here.opened) {
+		for (auto &[peer, opened] : here.opened)
 			opened.groups.erase(group);
-			opened.reported.erase(group);
-		}
 	}
 	// The group loop's queued frames, one post per connection loop.
 	void flush(std::uint32_t k) {
@@ -929,7 +935,6 @@ class HostTransport {
 		if (batch.peer.generation > connection.generation) {
 			connection.generation = batch.peer.generation;
 			connection.groups.clear();
-			connection.reported.clear();
 		}
 		const bool current = batch.peer.generation == connection.generation;
 		std::vector<Owed> owed;  // a run of one group's frames shares a record
@@ -995,10 +1000,10 @@ class HostTransport {
 
 	// A source's node limits, once per connection, before its first admitted frame there.
 	static void report(Loop &here, Opened &connection, const Route &route, const kronuz::consensus::Limits &limits) {
-		auto &last = connection.reported[route.group];
-		if (last == route.source || !here.report)
+		auto *last = connection.groups.find(route.group);  // admitted: open on this connection
+		if (!last || *last == route.source || !here.report)
 			return;
-		last = route.source;
+		*last = route.source;
 		here.report(route.group, {route.source, limits});
 	}
 	// A peer's open on its connection: it opens the group there when the group is stored here and
@@ -1013,12 +1018,12 @@ class HostTransport {
 			++here.stats.mismatched;
 			return false;  // a stale connection's open changes nothing on the current one
 		}
-		connection.groups.erase(group);
 		if (!open || open_fault(stored->open.open, open->second)) {
+			connection.groups.erase(group);
 			++here.stats.mismatched;
 			return false;
 		}
-		(void)connection.groups[group];
+		(void)connection.groups[group];  // an open again keeps the source already reported
 		++here.stats.opens;
 		return true;
 	}
@@ -1073,6 +1078,7 @@ class HostTransport {
 			return fail(peer, rpc::Outcome::protocol_not_supported);
 		auto options = options_.rpc.lane;
 		options.version = link.rpc;
+		options.late = late_rule;
 		const auto node = link.peer;
 		peer.lane = std::make_unique<rpc::Lane>(
 			link.dialed, rpc::Pools{serving_, calling_, outgoing_}, options,
@@ -1099,7 +1105,13 @@ class HostTransport {
 		const RpcCall c{node, ++here.rpc_ids};
 		auto &peer = here.rpc[node];
 		peer.calls[c.id] = in.handle;
-		auto events = serve->second(c, in);
+		std::optional<rpc::Events> events;
+		try {
+			events = serve->second(c, in);
+		} catch (...) {
+			peer.calls.erase(c.id);
+			throw;  // the call table fails the call alone (handler_failed)
+		}
 		if (!events) {
 			peer.calls.erase(c.id);
 			return std::nullopt;
@@ -1169,6 +1181,11 @@ class HostTransport {
 		peer.armed.reset();
 		std::vector<rpc::Events> due;
 		std::erase_if(peer.pending, [&](Pending &p) {
+			if (p.call.options.deadline <= now && !p.extended)
+				if (const auto more = late_rule(now - p.call.options.deadline, p.timeout); more > rpc::Clock::duration::zero()) {
+					p.call.options.deadline = now + more;
+					p.extended = true;
+				}
 			if (p.call.options.deadline > now)
 				return false;
 			due.push_back(std::move(p.call.events));
@@ -1190,8 +1207,8 @@ class HostTransport {
 	}
 
 	HostTransportOptions options_;
+	rpc::ByteBudget serving_, calling_, outgoing_;  // the lane's pools, shared by every loop (D5); outlive every Lane
 	std::vector<Loop> loops_;
-	rpc::ByteBudget serving_, calling_, outgoing_;   // the lane's pools, shared by every loop (D5)
 	std::vector<kronuz::consensus::NodeId> nodes_;  // the nodes with an address
 	std::map<rpc::MethodId, Serve> serves_;          // set before serve(), then only read
 };

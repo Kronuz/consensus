@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <limits>
 #include <map>
+#include <memory>
 #include <deque>
 #include <set>
 #include <stdexcept>
@@ -228,8 +229,8 @@ public:
 		auto found = peers_.find(peer);
 		return snapshot_active(peer, key) && found->second.snapshot->phase == SnapshotPhase::Sending;
 	}
-	bool busy() const noexcept { return pending_.has_value() || install_.has_value(); }
-	bool transferring() const noexcept { return transfer_.has_value(); }
+	bool busy() const noexcept { return pending_.has_value() || install_; }
+	bool transferring() const noexcept { return transfer_ != nullptr; }
 	// The incarnations a leader replicates to (every member, and removed ones until their
 	// removal commits); empty otherwise.
 	std::vector<NodeId> peers() const {
@@ -376,8 +377,9 @@ public:
 		capture_mode_ = true;
 		struct ModeReset { bool& mode; ~ModeReset() { mode = false; } } reset{capture_mode_};
 		auto actions = step(std::move(event));
-		auto capture = std::move(captured_); captured_.reset();
-		if (role_ == Role::Fenced) { capture.reset(); }
+		std::optional<FrozenCheckpoint> capture;
+		if (captured_ && role_ != Role::Fenced) { capture.emplace(std::move(*captured_)); }
+		captured_.reset();
 		return {std::move(actions), std::move(capture)};
 	}
 
@@ -414,6 +416,8 @@ private:
 	};
 	struct PendingRead { RequestId request; Token probe; Term term; Index index; std::set<NodeId> acknowledgements; };
 	struct Transfer { NodeId target; Token token; std::uint64_t until; bool sent = false; };
+	// wire_limits' caps, valid for its key: the membership version and the committed membership's index.
+	struct WireCap { std::pair<std::uint64_t, Index> key; std::size_t command_bytes, rpc_bytes, rpc_entries; };
 	static constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
 	bool is_voter(NodeId incarnation) const { return votes_in(membership(), incarnation); }
 	std::vector<NodeId> voters() const {
@@ -455,8 +459,11 @@ private:
 		// leader asks once per RPC, and the scan is over every member.
 		auto committed_at = configs_.upper_bound(durable_.commit_index);
 		const std::pair<std::uint64_t, Index> key{membership_version_, committed_at == configs_.begin() ? 0 : std::prev(committed_at)->first};
-		if (wire_cache_ && wire_key_ == key) { return *wire_cache_; }
 		Limits out = limits_in_force();
+		if (wire_ && wire_->key == key) {
+			out.command_bytes = wire_->command_bytes; out.rpc_bytes = wire_->rpc_bytes; out.rpc_entries = wire_->rpc_entries;
+			return out;
+		}
 		auto cap = [&](const Limits& node) {
 			out.command_bytes = std::min(out.command_bytes, node.command_bytes);
 			out.rpc_bytes = std::min(out.rpc_bytes, node.rpc_bytes);
@@ -466,7 +473,7 @@ private:
 		for (NodeId member : replicas()) {
 			if (auto found = peer_limits_.find(member); found != peer_limits_.end()) { cap(found->second); }
 		}
-		wire_cache_ = out; wire_key_ = key;
+		wire_ = WireCap{key, out.command_bytes, out.rpc_bytes, out.rpc_entries};
 		return out;
 	}
 	// What one peer's transport takes: its own node's limits and this node's, which encode
@@ -549,7 +556,7 @@ private:
 	void follower(NodeId leader, Actions& deferred) {
 		if (role_ != Role::Follower || leader_ != leader) { deferred.emplace_back(RoleChanged{Role::Follower, hard_.term, leader}); }
 		release_snapshots(SnapshotReleaseReason::LeadershipLost, deferred);
-		role_ = Role::Follower; leader_ = leader; peers_.clear(); grants_.clear(); prevote_.reset(); prevotes_.clear(); answered_.clear(); transfer_.reset();
+		role_ = Role::Follower; leader_ = leader; peers_.clear(); grants_.clear(); prevote_ = 0; prevotes_.clear(); answered_.clear(); transfer_.reset();
 		for (const auto& read : reads_) { deferred.emplace_back(Reject{read.request, RejectReason::NotLeader}); }
 		reads_.clear(); reset_election();
 	}
@@ -663,9 +670,9 @@ private:
 		}
 		}
 		Actions deferred; hard_ = next_hard; follower(request.authenticated_peer, deferred); leader_contact_ = now_;
-		auto id = token(); install_.emplace(PendingInstall{id, request.prepared, request.request, request.boundary, next_hard, std::move(deferred), retain});
+		auto id = token(); install_ = std::make_unique<PendingInstall>(PendingInstall{id, request.prepared, request.request, request.boundary, next_hard, std::move(deferred), retain});
 		install_->membership = request.membership;
-		if (capture_mode_) { captured_ = FrozenCheckpoint(*this, id, state, retain ? entries_.size() - static_cast<std::size_t>(request.boundary.index - base_index_) : 0); }
+		if (capture_mode_) { captured_ = std::make_unique<FrozenCheckpoint>(FrozenCheckpoint(*this, id, state, retain ? entries_.size() - static_cast<std::size_t>(request.boundary.index - base_index_) : 0)); }
 		output.emplace_back(PersistInstall{id, request.prepared, std::move(state)});
 	}
 	void handle(InstallActivated completion, Actions& output) {
@@ -728,7 +735,7 @@ private:
 		auto id = token();
 		Actions deferred; deferred.emplace_back(CheckpointPublished{request.request, request.through});
 		pending_.emplace(Pending{id, durable_, std::move(deferred), false, std::pair{request.through, request.term}});
-		if (capture_mode_) { captured_ = FrozenCheckpoint(*this, id, state, entries_.size() - first); }
+		if (capture_mode_) { captured_ = std::make_unique<FrozenCheckpoint>(FrozenCheckpoint(*this, id, state, entries_.size() - first)); }
 		output.emplace_back(PersistCheckpoint{id, request.capture, std::move(state)});
 	}
 	void handle(Failed failure, Actions& output) {
@@ -833,7 +840,7 @@ private:
 		start_transfer(request.target, output);
 	}
 	void start_transfer(NodeId target, Actions& output) {
-		transfer_ = Transfer{target, token(), deadline(timing_.election_max)};
+		transfer_ = std::make_unique<Transfer>(Transfer{target, token(), deadline(timing_.election_max)});
 		auto& peer = peers_.at(target);
 		if (peer.next <= last_index()) { replicate(target, peer, output, needed_probe(target)); }
 		timeout_now(output);
@@ -985,7 +992,7 @@ private:
 		acted_timeout_ = {source, request.token}; timed_out_ = true;
 	}
 	void receive_message(NodeId source, PreVoteResponse response, StorageBatch&, Actions& output) {
-		if (!prevote_ || response.request_term != *prevote_ || !response.granted || role_ == Role::Leader || !is_voter(source)) { return; }
+		if (!prevote_ || response.request_term != prevote_ || !response.granted || role_ == Role::Leader || !is_voter(source)) { return; }
 		prevotes_.insert(source);  // handle(Receive) campaigns once the quorum is in and nothing persists
 	}
 	void receive_message(NodeId source, VoteResponse response, StorageBatch&, Actions& output) {
@@ -1169,7 +1176,7 @@ private:
 			// node that cannot win never raises the group's term.
 			prevote_ = hard_.term + 1; prevotes_ = {configuration_.local}; reset_election();
 			for (NodeId voter : voters()) {
-				if (voter != configuration_.local) { output.emplace_back(Send{voter, PreVoteRequest{*prevote_, last_index(), log_term(last_index())}}); }
+				if (voter != configuration_.local) { output.emplace_back(Send{voter, PreVoteRequest{prevote_, last_index(), log_term(last_index())}}); }
 			}
 			return;
 		}
@@ -1229,7 +1236,7 @@ private:
 		if (heartbeat) { heartbeat_deadline_ = deadline(timing_.heartbeat); }
 	}
 	void campaign(Actions& output, bool transfer = false) {
-		++hard_.term; hard_.voted_for = configuration_.local; prevote_.reset(); prevotes_.clear();
+		++hard_.term; hard_.voted_for = configuration_.local; prevote_ = 0; prevotes_.clear();
 		role_ = Role::Candidate; leader_ = 0; grants_ = {configuration_.local}; reset_election();
 		Actions deferred; deferred.emplace_back(RoleChanged{role_, hard_.term, 0});
 		for (NodeId voter : voters()) {
@@ -1365,38 +1372,37 @@ private:
 	RetainedStatePolicy retained_;
 	Timing timing_;
 	Flow flow_;
-	Role role_ = Role::Follower;
 	NodeId leader_ = 0;
 	std::size_t log_bytes_ = 0;
 	std::uint64_t now_ = 0, election_delay_, election_deadline_ = 0, heartbeat_deadline_ = 0;
 	Token next_token_ = 0;
 	Index applied_ = 0, delivered_through_ = 0;
 	std::uint64_t epoch_ = 0;
+	Role role_ = Role::Follower;  // beside the flags: one word holds them
 	bool started_ = false, capture_mode_ = false, retiring_ = false;
-	std::optional<FrozenCheckpoint> captured_;
+	bool timed_out_ = false;  // acted on a TimeoutNow; campaigns once durable
+	bool handed_off_ = false;  // a self-removing leader tried its transfer
+	bool term_record_ = false;  // a reopen's first batch carries the hard state
+	std::unique_ptr<FrozenCheckpoint> captured_;  // rare state off the idle object: a checkpoint's capture
 	std::shared_ptr<CaptureOwner> capture_owner_ = std::make_shared<CaptureOwner>(CaptureOwner{this});
 	std::optional<Pending> pending_;
-	std::optional<PendingInstall> install_;
+	std::unique_ptr<PendingInstall> install_;  // rare state off the idle object: an installation
 	std::map<NodeId, Peer> peers_;
 	std::set<NodeId> grants_;
-	std::optional<Term> prevote_;  // the term a pre-vote in progress asks for
+	Term prevote_ = 0;  // the term a pre-vote in progress asks for, above 0; 0 for none
 	std::set<NodeId> prevotes_;
 	std::map<NodeId, std::uint64_t> answered_;  // a leader's last answer from each voter
 	std::uint64_t leader_contact_ = 0;
 	std::vector<PendingRead> reads_;
-	std::optional<Transfer> transfer_;  // a leader's transfer in progress (D6)
+	std::unique_ptr<Transfer> transfer_;  // a leader's transfer in progress (D6), off the idle object
 	std::pair<NodeId, Token> acted_timeout_{};  // the last TimeoutNow this node acted on
-	bool timed_out_ = false;
 	std::uint64_t leadership_start_ = 0;  // when this node last became leader
 	std::uint64_t held_back_ = 0;  // appends sent empty: the peer's next entry is above its limits
 	std::map<NodeId, Limits> peer_limits_;  // members' node limits, as the host reported them
 	std::uint64_t membership_version_ = 0;  // bumped whenever a membership or a report changes
-	mutable std::optional<Limits> wire_cache_;
-	mutable std::pair<std::uint64_t, Index> wire_key_{};
-	bool handed_off_ = false;  // a self-removing leader tried its transfer
+	mutable std::optional<WireCap> wire_;
 	Index witness_bound_ = 0;  // a witness truncates only through this (D9)
 	NodeId resume_ = 0;  // a reopen's leader at close, resumed at Start
-	bool term_record_ = false;  // a reopen's first batch carries the hard state
 };
 
 } // namespace kronuz::consensus

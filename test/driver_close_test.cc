@@ -756,6 +756,46 @@ void closed_bytes() {
 	std::printf("closed_bytes: %u released rows, process heap per row after close: %.1f B\n", unsigned(rows), per(released, released_before));
 }
 
+// The breakpoint test/idle_owners.py stops at, with every row idle (IDLE_BYTES_PAUSE set).
+extern "C" __attribute__((noinline)) void idle_bytes_pause() { asm volatile(""); }
+
+// Quiescence A6, report only: the process heap per row (HeapIO's files left out) of rows opened
+// together, by stage: the Driver's row before create, created (leading, its founding records), a
+// write committed and applied, and idle at a checkpoint covering it. Against Xapiand's 6,984 B
+// for a consensus row and its journal group (Xapiand:d5b84cdf4).
+void idle_bytes() {
+	const char* scale = std::getenv("IDLE_BYTES_ROWS");
+	const GroupId rows = scale ? std::stoull(scale) : 1000;
+	jt::Disk unused; Loop loop(unused, false, std::make_shared<HeapIO>());
+	std::exception_ptr error;
+	loop.lone(1); loop.propose(1, "p"); loop.apply(1);
+	auto warm = loop.start(checkpoint_of(loop, 1, {"p"})); loop.run();
+	check(warm->done && !warm->error && loop.close(1, error) && !error, "one warm round");
+	loop.sink.committed.erase(1); loop.sink.commands.erase(1);
+	const auto base = live_bytes;
+	auto per = [&](std::size_t now) { return (double(now) - double(base)) / double(rows); };
+	for (GroupId g = 2; g < 2 + rows; ++g) { loop.driver->open(g, options({1})); }
+	const auto opened = live_bytes;
+	for (GroupId g = 2; g < 2 + rows; ++g) {
+		if (!loop.settle(loop.driver->create(g, j::Identity{'I', 'B'}), error) || error) { check(false, "create " + std::to_string(g) + ": " + what(error)); return; }
+	}
+	const auto created = live_bytes;
+	for (GroupId g = 2; g < 2 + rows; ++g) { loop.propose(g, "p"); loop.apply(g); }
+	const auto written = live_bytes;
+	for (GroupId g = 2; g < 2 + rows; ++g) {
+		auto published = loop.start(checkpoint_of(loop, g, {"p"})); loop.run();
+		if (!published->done || published->error) { check(false, "checkpoint " + std::to_string(g) + ": " + what(published->error)); return; }
+	}
+	const auto idle = live_bytes;
+	std::size_t at_rest = 0;
+	for (GroupId g = 2; g < 2 + rows; ++g) { at_rest += loop.driver->closed_state(g).has_value(); }
+	check(at_rest == rows, "every idle row can close: " + std::to_string(at_rest));
+	std::printf("idle_bytes: %u rows, process heap per row: %.0f B opened (the Driver's row), %.0f B created, %.0f B written and applied, %.0f B idle at its checkpoint (Xapiand: 6,984 B)\n",
+		unsigned(rows), per(opened), per(created), per(written), per(idle));
+	if (std::getenv("IDLE_BYTES_PAUSE")) { idle_bytes_pause(); }
+	for (GroupId g = 2; g < 2 + rows; ++g) { check(loop.close(g, error) && !error, "close"); }
+}
+
 // A3: power cuts at every IO of a close-then-recover cycle, per seed. Rounds place a record and
 // then fence and close the row, close it with records after its checkpoint, checkpoint and
 // close it into the table, or go on; each close recovers the row in the live Host. After the
@@ -1083,6 +1123,7 @@ void pool_bound() {
 
 const std::map<std::string, void (*)()> cases{
 	{"created_bytes", &created_bytes},
+	{"idle_bytes", &idle_bytes},
 	{"erase_queued", &erase_queued},
 	{"shutdown_idles", &shutdown_idles},
 	{"shutdown_ends", &shutdown_ends},

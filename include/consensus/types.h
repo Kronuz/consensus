@@ -217,7 +217,7 @@ struct TransferLeadership { RequestId request; NodeId target; };
 struct PeerLimits { NodeId incarnation; Limits limits; };
 using Event = std::variant<Start, Tick, Receive, Propose, Read, Persisted, Applied, Failed, LocalCheckpoint, StorageFault, InstallPrepared, InstallActivated, InstallActivationFailed, SnapshotSourceReady, SnapshotTransferFailed, Repair, ChangeMembership, TransferLeadership, PeerLimits>;
 
-enum class Role { Follower, Candidate, Leader, Fenced };
+enum class Role : std::uint8_t { Follower, Candidate, Leader, Fenced };
 enum class RejectReason { Busy, NotLeader, NotReady, LogFull, TooLarge, DuplicateRequest, InvalidCheckpoint, InvalidRepair, LeaderMustTransfer, InvalidMembership, InvalidTarget };
 struct Persist { Token token; StorageBatch batch; };
 struct PersistCheckpoint { Token token; Token capture; RecoveredState state; };

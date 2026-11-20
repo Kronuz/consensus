@@ -30,7 +30,6 @@
 #include <limits>
 #include <map>
 #include <memory>
-#include <deque>
 #include <set>
 #include <stdexcept>
 #include <type_traits>
@@ -421,7 +420,8 @@ private:
 	// peer's last refusal, unanswered by any append or image since, put `next` at or below the
 	// base; only then does an install start, and a `next` there for any other reason probes the base.
 	struct Peer {
-		Index next = 1, matched = 0; std::deque<Flight> flights; std::uint64_t retry_after = 0; std::optional<SnapshotFlight> snapshot{}; std::optional<std::uint64_t> snapshot_retry_clock{}; bool blocked = false;
+		// A few flights (Flow::pipeline): a vector, not a deque's 4 KiB block per idle peer.
+		Index next = 1, matched = 0; std::vector<Flight> flights; std::uint64_t retry_after = 0; std::optional<SnapshotFlight> snapshot{}; std::optional<std::uint64_t> snapshot_retry_clock{}; bool blocked = false;
 		std::optional<Flight> keepalive{}; bool verified = false, lacks_base = false; std::uint64_t window = 0;
 		Index told = 0;  // the commit index an acknowledged append carried
 		// Back to one flight, resuming at `from` (the oldest flight's start: nothing before it is in doubt).
@@ -1211,7 +1211,7 @@ private:
 	// ending there is done; later ones stay in flight.
 	void acknowledge(NodeId source, Peer& peer, Index matched, Actions& output) {
 		peer.matched = std::max(peer.matched, matched);
-		while (!peer.flights.empty() && peer.flights.front().through <= peer.matched) { peer.window -= peer.flights.front().bytes; peer.flights.pop_front(); }
+		while (!peer.flights.empty() && peer.flights.front().through <= peer.matched) { peer.window -= peer.flights.front().bytes; peer.flights.erase(peer.flights.begin()); }
 		peer.next = std::max(peer.next, peer.matched + 1);
 		if (peer.flights.empty() || peer.flights.front().previous <= peer.matched) { peer.verified = true; }
 		if (!peer.blocked) { peer.retry_after = 0; }

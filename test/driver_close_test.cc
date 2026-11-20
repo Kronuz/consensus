@@ -28,6 +28,8 @@
 #include "journal/memory_io.h"
 
 #include <algorithm>
+#include <chrono>
+#include <ctime>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
@@ -118,7 +120,9 @@ struct Sink {
 	std::map<GroupId, std::vector<std::string>> commands;  // each group's committed commands, in order
 	std::function<void(GroupId)> on_fenced;  // a Sink may call the Driver's plain calls
 	std::function<void(GroupId)> on_committed;
-	void operator()(GroupId, Send) {}
+	bool record_sends = false;  // idle_cpu answers them
+	std::vector<std::pair<GroupId, Send>> sent;
+	void operator()(GroupId g, Send n) { if (record_sends) { sent.emplace_back(g, std::move(n)); } }
 	void operator()(GroupId g, Committed c) {
 		if (on_committed) { on_committed(g); }
 		if (c.entries.empty()) { return; }
@@ -223,9 +227,9 @@ struct Loop {
 	std::unique_ptr<Driver<Sink>> driver;
 	task::cancel_source stop, driver_stop;  // the turn driver's run, the Driver's
 	bool turns_done = false, driver_done = false;
-	explicit Loop(jt::Disk& d, bool hold = false, std::shared_ptr<j::IO> storage = {}) : disk(d) {
+	explicit Loop(jt::Disk& d, bool hold = false, std::shared_ptr<j::IO> storage = {}, const j::TurnLogOptions& turns_at = turn_options) : disk(d) {
 		if (!storage) { storage = std::make_shared<jt::MemoryIO>(disk, "host/"); }
-		host = std::make_unique<j::Host>(std::move(storage), host_identity, j::HostOptions{1, turn_options});
+		host = std::make_unique<j::Host>(std::move(storage), host_identity, j::HostOptions{1, turns_at});
 		auto io = hold ? j::completion_ref::of(held) : j::completion_ref::of(inline_io);
 		driver = std::make_unique<Driver<Sink>>(Seams{task::scheduler_ref::of(scheduler), io, *host, 0, 7}, sink);
 		auto ref = task::scheduler_ref::of(scheduler);
@@ -1121,7 +1125,102 @@ void pool_bound() {
 	run({peak, 1}, false);
 }
 
+// Quiescence A4: idle CPU per group, at rest against per-group heartbeats. IDLE_CPU_GROUPS
+// leaders (default 1,000) of three-voter groups on one loop, at the default Timing; their two
+// peers' answers are made here, so the peers' own Drivers are not counted. The manual clock moves
+// 1 ms a step for IDLE_CPU_SECONDS (default 2): a step whose advance fires a timer is a wake.
+// IDLE_CPU_MODE rest or heartbeat runs one mode (default both). Reports only, except that groups
+// at rest arm no timer and wake nothing.
+std::uint64_t thread_cpu_ns() {
+	timespec t{}; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
+	return std::uint64_t(t.tv_sec) * 1'000'000'000 + std::uint64_t(t.tv_nsec);
+}
+std::uint64_t env_or(const char* name, std::uint64_t fallback) {
+	const char* v = std::getenv(name);
+	return v && *v ? std::strtoull(v, nullptr, 10) : fallback;
+}
+void idle_cpu_mode(bool quiesce, std::uint64_t groups, std::uint64_t seconds) {
+	// Segments big enough that setup moves no live record forward: forwarding scans every
+	// group per turn (journal's TurnLog::forward_slice), which would make setup quadratic.
+	jt::Disk unused; Loop loop(unused, false, std::make_shared<HeapIO>(), j::TurnLogOptions{std::uint64_t{256} << 20, 32 << 10, 1, 16, 1 << 20});
+	loop.sink.record_sends = true;
+	// The two peers answer every request at once, as caught-up voters would.
+	std::uint64_t answered = 0;
+	auto answer = [&] {
+		for (;;) {
+			auto sent = std::move(loop.sink.sent); loop.sink.sent.clear();
+			auto committed = std::move(loop.sink.committed); loop.sink.committed.clear();
+			if (sent.empty() && committed.empty()) { return; }
+			for (auto& [g, last] : committed) { loop.driver->applied(g, Applied{last}); }
+			for (auto& [g, send] : sent) {
+				std::optional<Message> reply;
+				if (auto r = std::get_if<PreVoteRequest>(&send.message)) { reply = PreVoteResponse{r->term - 1, r->term, true}; }
+				else if (auto r = std::get_if<VoteRequest>(&send.message)) { reply = VoteResponse{r->term, true}; }
+				else if (auto r = std::get_if<AppendRequest>(&send.message)) {
+					const Index through = r->previous + r->entries.size();
+					reply = AppendResponse{r->term, r->rpc, true, through, through + 1, r->read_probe};
+				}
+				if (reply) { loop.driver->receive(g, Receive{send.peer, std::move(*reply)}); ++answered; }
+			}
+			loop.release();
+		}
+	};
+	GroupOptions o = options({1, 2, 3}, 1);
+	o.timing = Timing{}; o.timing.quiesce = quiesce;
+	const auto made = std::chrono::steady_clock::now();
+	for (GroupId g = 1; g <= groups; ++g) {
+		loop.driver->open(g, o);
+		std::exception_ptr error;
+		if (!loop.settle(loop.driver->create(g, j::Identity{'I', 'C'}), error) || error) { check(false, "create " + std::to_string(g) + ": " + what(error)); return; }
+	}
+	const double created_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - made).count();
+	// Every group campaigns once its election timer fires, and leads once its term entry commits.
+	auto leaders = [&] {
+		std::uint64_t n = 0;
+		for (GroupId g = 1; g <= groups; ++g) { auto st = loop.driver->state(g); n += st && st->role == Role::Leader && st->committed >= 1; }
+		return n;
+	};
+	std::uint64_t leading = 0;
+	for (int n = 1; n <= 4000 && leading != groups; ++n) {
+		loop.scheduler.advance(1'000'000); loop.run(); answer();
+		if (n >= Timing{}.election_max && n % 100 == 0) { leading = leaders(); }
+	}
+	// Then a quiescent group's last round of acknowledgements, a heartbeat group's first beats.
+	for (int n = 1; n <= 1000; ++n) {
+		loop.scheduler.advance(1'000'000); loop.run(); answer();
+		if (n % 50 == 0 && (quiesce ? loop.driver->armed_group_timers() == 0 : n >= 200)) { break; }
+	}
+	const double made_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - made).count();
+	check(leading == groups, std::string(quiesce ? "rest" : "heartbeat") + ": every group leads: " + std::to_string(leading));
+	answered = 0;
+	std::uint64_t wakes = 0, handles = 0;
+	const auto cpu = thread_cpu_ns();
+	for (std::uint64_t step = 0; step < seconds * 1000; ++step) {
+		loop.scheduler.advance(1'000'000);
+		wakes += loop.scheduler.queued() != 0;
+		handles += loop.scheduler.run();
+		answer();
+	}
+	const double spent = double(thread_cpu_ns() - cpu);
+	const auto armed = loop.driver->armed_group_timers();
+	std::printf("idle_cpu %s: %llu groups (created in %.1f s, leading in %.1f s), over %llu s: %.1f wakes/s per host, %.0f handles/s, %.0f answers/s, CPU %.3f s per s (%.1f ns per idle group per s), %zu group timers armed\n",
+				quiesce ? "rest" : "heartbeat", (unsigned long long)groups, created_s, made_s, (unsigned long long)seconds, double(wakes) / double(seconds),
+				double(handles) / double(seconds), double(answered) / double(seconds), spent / 1e9 / double(seconds), spent / double(seconds) / double(groups), armed);
+	if (quiesce) {
+		check(armed == 0, "groups at rest arm no timer: " + std::to_string(armed));
+		check(wakes == 0, "groups at rest wake nothing: " + std::to_string(wakes));
+	}
+}
+void idle_cpu() {
+	const auto groups = env_or("IDLE_CPU_GROUPS", 1000), seconds = env_or("IDLE_CPU_SECONDS", 2);
+	const char* mode = std::getenv("IDLE_CPU_MODE");
+	const std::string m = mode ? mode : "";
+	if (m.empty() || m == "rest") { idle_cpu_mode(true, groups, seconds); }
+	if (m.empty() || m == "heartbeat") { idle_cpu_mode(false, groups, seconds); }
+}
+
 const std::map<std::string, void (*)()> cases{
+	{"idle_cpu", &idle_cpu},
 	{"created_bytes", &created_bytes},
 	{"idle_bytes", &idle_bytes},
 	{"erase_queued", &erase_queued},

@@ -55,10 +55,10 @@ OP_SECONDS = (
 THINK_SECONDS = (
     0.025  # between a client's operations, which bounds the history the checker reads
 )
-# A1: ping's median within 10% of the set round trip past the guest's floor at that delay: the
-# unshaped path's round trip plus two timer wakes (netem holds each packet once per direction), each
-# as late as an hrtimer sleep of the same delay wakes, measured beside it; jitter is the spread of
-# those wakes, at least JITTER_MS.
+# A1: each peer's ping median within 10% of the set round trip past the guest's floor at that delay:
+# the unshaped path's round trip plus two timer wakes (netem holds each packet once per direction),
+# each as late as an hrtimer sleep of the same delay wakes, sampled right after that peer's ping;
+# jitter is the spread of those wakes, at least JITTER_MS.
 RTT_TOLERANCE = 0.10
 JITTER_MS = 0.1
 TIMER_SAMPLES = 30
@@ -491,49 +491,56 @@ class Bench:
         print(f"  round trip unshaped {self.unshaped_ms:.3f} ms", flush=True)
 
     def ping_all(self) -> list[float]:
-        medians = []
-        for peer in range(2, self.nodes + 1):
-            host = self.lab.address(1, peer).rsplit(":", 1)[0]
-            argv = [
-                "ping",
-                "-n",
-                "-c",
-                str(self.plan.pings),
-                "-i",
-                "0.02",
-                "-W",
-                "2",
-                host,
-            ]
-            try:
-                output = self.run(self.lab.command(1, argv))
-            except Exception as error:  # noqa: BLE001 - a ping that loses every reply exits 1
-                output = str(error)
-            rtts = ping_rtts(output)
-            if rtts:
-                medians.append(statistics.median(rtts))
-        return medians
+        return [statistics.median(r) for r in map(self.ping, self.peers()) if r]
+
+    def peers(self) -> range:
+        return range(2, self.nodes + 1)
+
+    def ping(self, peer: int) -> list[float]:
+        """Node 1's round trips to `peer`, in ms."""
+        host = self.lab.address(1, peer).rsplit(":", 1)[0]
+        argv = ["ping", "-n", "-c", str(self.plan.pings), "-i", "0.02", "-W", "2", host]
+        try:
+            output = self.run(self.lab.command(1, argv))
+        except Exception as error:  # noqa: BLE001 - a ping that loses every reply exits 1
+            output = str(error)
+        return ping_rtts(output)
 
     # A1: the network is what netlab set, and only a majority acknowledges.
 
     def check_rtt(self, shape: Shape, row: dict[str, Any]) -> None:
-        medians = self.ping_all()
-        late = self.late(shape.ms) if shape.ms else [0.0]
-        late_ms = statistics.median(late)
-        floor = self.unshaped_ms + 2 * late_ms
-        allowed = RTT_TOLERANCE * shape.rtt_ms + max(
-            JITTER_MS, 2 * (percentile(late, 0.9) - late_ms)
-        )
-        worst = max(
-            (abs(m - shape.rtt_ms - floor) for m in medians), default=float("inf")
-        )
+        """Each peer's ping against its own floor, its timer lateness sampled right after its ping:
+        a loaded host's wakes drift by tenths of a ms within a second."""
+        medians, lates, within, details, peers = [], [], [], [], []
+        for peer in self.peers():
+            rtts = self.ping(peer)
+            late = self.late(shape.ms) if shape.ms else [0.0]
+            late_ms = statistics.median(late)
+            lates += late
+            floor = self.unshaped_ms + 2 * late_ms
+            margin = RTT_TOLERANCE * shape.rtt_ms + max(
+                JITTER_MS, 2 * (percentile(late, 0.9) - late_ms)
+            )
+            if not rtts:
+                within.append(False)
+                details.append(f"{peer}: no reply")
+                continue
+            median = statistics.median(rtts)
+            medians.append(median)
+            within.append(abs(median - shape.rtt_ms - floor) <= margin)
+            peers.append({"peer": peer, "ping_ms": round(median, 3), "late_p50": round(late_ms, 3),
+                          "late_p90": round(percentile(late, 0.9), 3)})  # fmt: skip
+            details.append(
+                f"{peer}: {median:.3f} vs {shape.rtt_ms + floor:.3f}±{margin:.3f}"
+            )
         row["rtt_ms"] = round(statistics.median(medians), 3) if medians else None
-        row["timer_late_ms"] = round(late_ms, 3)
+        row["timer_late_ms"] = round(statistics.median(lates), 3)
+        row["pings"] = peers
         self.check(
             f"{shape.name}: round trip",
-            len(medians) == self.nodes - 1 and worst <= allowed,
-            f"set {shape.rtt_ms:g} ms + floor {floor:.3f} (unshaped {self.unshaped_ms:.3f} + 2 timer wakes {late_ms:.3f}), "
-            f"ping medians {[round(m, 3) for m in medians]} ms, allowed ±{allowed:.3f}",
+            all(within),
+            f"set {shape.rtt_ms:g} ms + unshaped {self.unshaped_ms:.3f} + 2 timer wakes sampled after each peer's ping; "
+            f"peer: ping median vs expected ms: {', '.join(details)}",
         )
 
     def cut(self, side: set[int]) -> None:

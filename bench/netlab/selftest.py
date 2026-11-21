@@ -7,9 +7,12 @@
 The runner records every command netlab issues and answers ping from the shapes netlab set; the
 fake cluster is a small model of a Raft group on the lab's cuts (a majority component elects after
 an election timeout; a leader commits only with a majority) on a simulated clock. The clean model
-passes every check at 3 and 5 nodes, and each mutant fails the check that guards it:
+passes every check at 3 and 5 nodes, through a host stall that makes the guest's timer wake
+STALL_MS later during the 1ms shape's ping to node 2 and its lateness samples, and each mutant
+fails the check that guards it:
 
   rtt-off         ping sees 1.5x the round trip netlab set          -> round trip
+  link-off        ping to one peer sees 1.5x its delay               -> round trip
   late-unmeasured the timer's lateness reads 0 while netem pays it    -> round trip
   minority-ack    a leader cut off with a minority acknowledges      -> majority only, history
   lost-write      each new leader lacks each key's last committed write -> history linearizable
@@ -38,6 +41,10 @@ import bench
 
 LATE_MS = (
     0.3  # the fake guest's timer wakes this late on each netem hold of 10 us or more
+)
+
+STALL_MS = (
+    0.3  # the host stall's extra lateness per wake, as measured in 261121-103053-6192c5
 )
 
 FAULTLAB_REPO = os.environ.get(
@@ -71,14 +78,22 @@ class FakeRunner:
         self.mutant = mutant
         self.commands: list[tuple[list[str], str | None]] = []
         self.lab: Any = None
+        self.stall = 0.0  # extra timer lateness from now to the next ping
+        self.stalled = False
 
     def __call__(self, argv: Sequence[str], stdin: str | None = None) -> str:
         self.commands.append((list(argv), stdin))
         if "ping" in argv:
             target = int(argv[-1].rsplit(".", 1)[1])
             shape = self.lab.shapes[1, target]
-            rtt = 2 * shape.ms * (1.5 if self.mutant == "rtt-off" else 1.0) + 0.05
-            rtt += 2 * LATE_MS if shape.ms >= 0.01 else 0.0
+            off = self.mutant == "rtt-off" or (
+                self.mutant == "link-off" and target == 2
+            )
+            rtt = 2 * shape.ms * (1.5 if off else 1.0) + 0.05
+            stall = shape.ms == 1.0 and target == 2 and not self.stalled
+            self.stalled |= stall
+            self.stall = STALL_MS if stall else 0.0
+            rtt += 2 * (LATE_MS + self.stall) if shape.ms >= 0.01 else 0.0
             return "".join(
                 f"64 bytes from {argv[-1]}: icmp_seq={i} ttl=64 time={rtt + 0.001 * (i % 3):.3f} ms\n"
                 for i in range(5)
@@ -357,7 +372,7 @@ def run(
     plan = bench.Plan.quick()
 
     def late(ms: float) -> list[float]:
-        wake = 0.0 if mutant == "late-unmeasured" else LATE_MS
+        wake = 0.0 if mutant == "late-unmeasured" else LATE_MS + runner.stall
         return [wake + 0.01 * (i % 3) for i in range(9)]
 
     b = bench.Bench(lab, cluster, nodes, plan, out, runner, history, late)
@@ -463,6 +478,7 @@ def main() -> int:
         )
         for mutant, guard in (
             ("rtt-off", "round trip"),
+            ("link-off", "round trip"),
             ("late-unmeasured", "round trip"),
             ("minority-ack", "majority only"),
             ("minority-ack", "history linearizable"),

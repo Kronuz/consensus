@@ -84,8 +84,11 @@ with no role change. The windows end where the load does: the bench caps a load 
 
 | Shape | Before (consensus:8801b99) | After |
 |---|---|---|
-| 1% loss | elections from 2 s, nothing applied in 60 s, no answer in 90 s | 0.44 MB/s, every window commits, no role change |
-| 5% reorder | 1.82 MB/s, p99 2,784 ms, every window commits | 3.15 MB/s, p99 1,253 ms, its 2,048 commits in 42.6 s |
+| 1% loss | elections and stalled windows in both runs: no answer in 90 s; 21 role changes and 63 commits | every window commits, no role change: 0.44 and 0.49 MB/s |
+| 5% reorder | every window commits: 1.82 and 3.62 MB/s, p99 2,784 and 1,694 ms | every window commits: 3.15 and 2.99 MB/s, p99 1,253 and 1,343 ms |
+
+Each cell gives two runs. Under 5% reorder both builds commit steadily; their runs vary more than
+they differ, so two runs do not separate their throughput.
 
 Under reordering the leader's paced appends average 213 to 794 KiB (median 576 KiB, largest 1,152
 KiB) where the unpaced leader sends 2 MiB; nothing shrank them to a stall.

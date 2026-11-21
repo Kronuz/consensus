@@ -124,6 +124,13 @@ struct Host {
 			pins.emplace(node, own, tls->native_handle(), pre_approved_pins());
 		HostTransportOptions options;
 		options.member_of = [](GroupId, NodeId) -> std::optional<Member> { return std::nullopt; };
+		options.open_of = [](GroupId) {  // no group is stored here; the open is required, never sent
+			GroupOpen o;
+			o.cluster.fill('T');
+			o.group.fill('G');
+			o.epoch.fill('E');
+			return o;
+		};
 		options.links.connection.handshake = 2000ms;
 		options.redial = 50ms;
 		std::vector<HostLoop> at;

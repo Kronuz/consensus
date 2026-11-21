@@ -281,6 +281,16 @@ public:
 		return started_ && role_ == Role::Leader && !busy() && !transfer_ && !witness_self() && durable_.commit_index > base_index_ &&
 			log_term(durable_.commit_index) == hard_.term && (configs_.empty() || configs_.rbegin()->first <= durable_.commit_index);
 	}
+	// D3: the removal of a committed replacement's leaving member, which the leader's next
+	// admitted Tick proposes; the Worker plans that Tick as this change (one configuration append).
+	std::optional<Membership> removal() const {
+		const auto& committed = committed_membership();
+		if (!started_ || role_ != Role::Leader || busy() || !committed.leaving || committed != membership() || log_term(durable_.commit_index) != hard_.term) { return std::nullopt; }
+		Membership next = committed;
+		std::erase_if(next.members, [&](const Member& x) { return x.incarnation == committed.leaving; });
+		next.leaving = 0;
+		return next;
+	}
 	// A member's matched index, as the leader knows it (D8).
 	std::optional<Index> progress(NodeId incarnation) const {
 		if (role_ != Role::Leader) { return std::nullopt; }
@@ -1262,12 +1272,13 @@ private:
 		} else { release_snapshot(source, peer, response.result == SnapshotReply::CaughtUp ? SnapshotReleaseReason::CaughtUp : SnapshotReleaseReason::Rejected, output, response.result == SnapshotReply::CaughtUp); }
 	}
 
-	void drive(Actions& output, bool allow_campaign) {
+	// `tick`: an admitted Tick drives, whose admission funds a campaign or a due D3 removal.
+	void drive(Actions& output, bool tick) {
 		if (!started_ || busy() || resting_) { return; }
 		if (role_ != Role::Leader) {
 			// Campaigns require a separately admitted Tick. Slow persistence
 			// must not start another election from its completion callback.
-			if (!allow_campaign || now_ < election_deadline_ || hard_.term == maximum) { return; }
+			if (!tick || now_ < election_deadline_ || hard_.term == maximum) { return; }
 			if (!is_voter(configuration_.local)) { reset_election(); return; }  // learners and joiners never campaign
 			if (quorum() == 1) { campaign(output); return; }
 			// Pre-vote first (Track C, D7): only a quorum of grants starts a campaign, so a
@@ -1312,12 +1323,9 @@ private:
 			}
 			if (!transfer_) { follower(0, output); return; }
 		}
-		if (committed.leaving && committed == membership() && log_term(durable_.commit_index) == hard_.term) {
-			Membership next = committed;
-			std::erase_if(next.members, [&](const Member& x) { return x.incarnation == committed.leaving; });
-			next.leaving = 0;
-			propose_membership(0, next, output);
-			if (busy()) { return; }
+		// Only a Tick proposes it: its admission reserved the append; no other event's did.
+		if (tick) {
+			if (auto next = removal()) { propose_membership(0, *next, output); if (busy()) { return; } }
 		}
 		bool heartbeat = now_ >= heartbeat_deadline_;
 		for (auto& [id, peer] : peers_) {

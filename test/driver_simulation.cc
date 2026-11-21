@@ -790,7 +790,7 @@ void NodeSink::operator()(GroupId g, ActivateInstall) {
 }  // namespace
 
 // Seeds that once failed, each at its failing step count, run beside every range of seeds.
-constexpr std::pair<std::uint64_t, std::uint64_t> regressions[] = {{399, 3000}};
+constexpr std::pair<std::uint64_t, std::uint64_t> regressions[] = {{399, 3000}, {11, 3000}};
 
 // Runs `seeds` seeds of `steps` steps from `first`, then the regression seeds outside that range.
 bool run(std::uint64_t seeds, std::uint64_t steps, std::uint64_t first) {

@@ -25,6 +25,9 @@
 //   order    control first, round robin across ready groups and per-group credit, as values
 //   fetch-alongside-consensus  rounds of four 8 MiB lane fetches both ways through 1 MiB budgets
 //            while the group commits: each fetch exact, each commit within 2 s, the leader's term kept
+//   install  a follower cut off while the leader checkpoints past it installs the leader's image
+//            (three chunks, as transfer frames on Bulk), validated and activated, then applies
+//            entries past its boundary (consensus-driver-install A1)
 // A timing case the host stalled (a 250 ms oversleep) runs again, at most twice. Each step prints
 // as it starts; a case still running after 100 s prints its step, which loops stopped turning
 // and every thread's stack, then exits 3.
@@ -1013,6 +1016,8 @@ bool upload() {
 const j::TurnLogOptions turn_options{16 * 1024, 1024, 1, 4, 4096};
 const j::AdmissionLimits admission{{256u << 20, 8192}, {256 * 1024, 3}, {64u << 20, 4}, 32, 3};
 std::atomic<NodeId> cut{0};  // a node whose frames, both ways, every node refuses
+bool snapshots = false;      // groups install snapshots (the install case)
+constexpr std::size_t image_filler = 150'000;  // an image spans three 64 KiB chunks
 
 struct Node;
 struct GroupSink {
@@ -1020,6 +1025,9 @@ struct GroupSink {
 	std::uint32_t loop = 0;
 	void operator()(GroupId g, Send n);
 	void operator()(GroupId g, Committed n);
+	void operator()(GroupId g, SendTransfer n);
+	void operator()(GroupId g, ValidateImage n);
+	void operator()(GroupId g, ActivateImage n);
 	template <class N> void operator()(GroupId, N &&) {}
 };
 task::task<void> proposing(Driver<GroupSink> *d, GroupId g, std::string command) {
@@ -1045,6 +1053,9 @@ struct Node {
 	std::vector<std::unique_ptr<PerLoop>> per;
 	std::mutex mutex;
 	std::map<GroupId, std::vector<std::string>> applied;
+	std::map<GroupId, Placement> last;  // each group's last applied index and its term
+	std::atomic<int> validations{0}, activations{0};
+	std::atomic<std::uint64_t> transfer_frames{0};
 	std::atomic<std::uint64_t> misplaced{0};  // frames delivered off their group's loop
 	std::atomic<bool> hold_apply{false};  // Committed ranges stay out for application, the last in `held`
 	std::atomic<Index> held{0};
@@ -1073,6 +1084,10 @@ struct Node {
 					return false;
 				if (host.transport->loop_of_group(r.route.group) != k || journal->loop(r.route.group) != k)
 					++misplaced;
+				if (is_transfer(r)) {
+					per[k]->driver->transfer(r.route.group, r.route.source, r.payload);
+					return true;
+				}
 				auto receive = receive_message(r);
 				if (!receive)
 					return false;
@@ -1097,9 +1112,14 @@ struct Node {
 				o.admission = admission;
 				o.scheduling = WorkerLimits{16, 128};
 				o.limits.command_bytes = o.limits.rpc_bytes = 4096;  // a full batch fits the 16 KiB segments' turn room
+				if (snapshots) {
+					o.snapshots = SnapshotLimits{9, 1 << 20, 2};
+					o.limits.log_bytes = 1 << 20;  // a checkpoint's peak, its bundle bound and image, fits the replacement pool
+					o.timing.snapshot_timeout = 3000;  // a transfer whose frame the cut refused starts over within the case
+				}
 				o.timing.quiesce = quiesce;
 				driver->open(g, std::move(o));
-				auto opening = journal->status(g) == j::GroupStatus::stored ? driver->recover(g, [](j::ArtifactReader &) {})
+				auto opening = journal->status(g) == j::GroupStatus::stored ? driver->recover(g, [this, g](j::ArtifactReader &image) { restore(g, image); })
 																			: driver->create(g, j::Identity{'G', char('0' + host.node)});
 				// stored once member_of answers for it (host-transport.md, Identity)
 				task::spawn(task::scheduler_ref::of(host.loops[k]->scheduler), std::move(opening), [this, g, &opened](std::exception_ptr e) {
@@ -1110,6 +1130,42 @@ struct Node {
 			});
 			done.wait();
 		}
+	}
+	// The application's image: its commands, then a filler; restored, validated and activated.
+	static std::string image_of(const std::vector<std::string> &commands) {
+		std::string bytes;
+		for (auto &c : commands)
+			kronuz::journal::put32(bytes, std::uint32_t(c.size())), bytes += c;
+		std::string image;
+		kronuz::journal::put32(image, std::uint32_t(bytes.size()));
+		image += bytes;
+		image.append(image_filler, 'f');
+		return image;
+	}
+	static std::optional<std::vector<std::string>> commands_of(j::ArtifactReader &reader) {
+		std::string bytes(std::size_t(reader.descriptor().length), '\0');
+		for (std::size_t at = 0; at < bytes.size();)
+			at += reader.read_at(at, std::span<char>(bytes.data() + at, std::min<std::size_t>(65536, bytes.size() - at)));
+		std::string_view v(bytes);
+		if (v.size() < 4)
+			return std::nullopt;
+		const auto length = kronuz::journal::get32(v);
+		if (v.size() != length + image_filler)
+			return std::nullopt;
+		v = v.substr(0, length);
+		std::vector<std::string> commands;
+		while (v.size() >= 4) {
+			const auto n = kronuz::journal::get32(v);
+			commands.emplace_back(v.substr(0, n));
+			v.remove_prefix(n);
+		}
+		return commands;
+	}
+	void restore(GroupId g, j::ArtifactReader &image) {
+		auto commands = commands_of(image);
+		assert(commands);
+		std::lock_guard hold(mutex);
+		applied[g] = std::move(*commands);
 	}
 	std::optional<Driver<GroupSink>::GroupState> state(GroupId g) {
 		const auto k = host.transport->loop_of_group(g);
@@ -1155,6 +1211,31 @@ struct Node {
 	}
 };
 void GroupSink::operator()(GroupId g, Send n) { send_message(*node->host.transport, loop, g, node->host.node, n.peer, n); }
+void GroupSink::operator()(GroupId g, SendTransfer n) {
+	++node->transfer_frames;
+	// The transport routes by node; each incarnation here is its node.
+	send_transfer(*node->host.transport, loop, g, node->host.node, n.peer, n.peer, n.frame);
+}
+// The application answers on the loop, from the Sink: the calls only queue.
+void GroupSink::operator()(GroupId g, ValidateImage n) {
+	++node->validations;
+	auto commands = Node::commands_of(n.image);
+	auto &d = node->per[loop]->driver;
+	commands ? d->validated(g, n.token) : d->validation_failed(g, n.token);
+}
+void GroupSink::operator()(GroupId g, ActivateImage n) {
+	++node->activations;
+	auto commands = Node::commands_of(n.image);
+	auto &d = node->per[loop]->driver;
+	if (!commands)
+		return d->activation_failed(g, n.token, "an image that does not decode");
+	{
+		std::lock_guard hold(node->mutex);
+		node->applied[g] = std::move(*commands);
+		node->last[g] = {n.boundary.term, n.boundary.index};
+	}
+	d->activated(g, n.token);
+}
 void GroupSink::operator()(GroupId g, Committed n) {
 	Index last = 0;
 	{
@@ -1163,6 +1244,7 @@ void GroupSink::operator()(GroupId g, Committed n) {
 			if (e.kind == EntryKind::Command)
 				node->applied[g].push_back(e.payload);
 			last = e.index;
+			node->last[g] = {e.term, e.index};
 		}
 	}
 	if (last && node->hold_apply) {
@@ -1287,6 +1369,94 @@ void driver() {
 					(unsigned long long)restarted, s ? (unsigned long long)s->term : 0ull, s ? (unsigned long long)s->committed : 0ull);
 		assert(ok);
 	}
+}
+
+// A checkpoint of what node `n`'s application applied, once its group acknowledged all of it.
+task::task<void> checkpointing(Driver<GroupSink> *d, GroupId g, Placement at, std::string image) {
+	struct Capture {
+		std::string image;
+		std::size_t at = 0;
+		Placement through;
+		CaptureMetadata metadata() const { return {0, through.index, through.term, 0}; }
+		std::size_t read(std::span<char> out) {
+			const auto n = std::min(out.size(), image.size() - at);
+			std::copy_n(image.data() + at, n, out.data());
+			at += n;
+			return n;
+		}
+	};
+	co_await d->checkpoint(g, 1 << 20, Capture{std::move(image), 0, at});
+}
+bool checkpoint(Node &n, GroupId g) {
+	Placement at;
+	std::string image;
+	{
+		std::lock_guard hold(n.mutex);
+		at = n.last[g];
+		image = Node::image_of(n.applied[g]);
+	}
+	if (!until([&] { auto s = n.state(g); return s && s->applied >= at.index; }, 10'000))
+		return false;
+	auto e = n.attempt(g, [g, at, image](Driver<GroupSink> *d) { return checkpointing(d, g, at, image); }, 10s);
+	if (e) {
+		try {
+			std::rethrow_exception(e);
+		} catch (const std::exception &x) {
+			std::printf("install: node %llu's checkpoint at %llu failed: %s\n", (unsigned long long)n.host.node, (unsigned long long)at.index, x.what());
+		}
+	}
+	return !e;
+}
+
+// consensus-driver-install A1 over the host transport: node 3 is cut off while 1 and 2 commit
+// and checkpoint; healed, it installs the leader's image and applies entries past its boundary.
+void install() {
+	snapshots = true;
+	const GroupId g = groups_on(2, 1, 1)[0];
+	Cluster c("install", {g});
+	for (NodeId n = 1; n <= 3; ++n)
+		c.start(n, 2);
+	step("install: the group elects and commits");
+	bool ok = commit_everywhere(c.of({1, 2, 3}), g, "a", 60'000);
+	step("install: node 3 is cut off; 1 and 2 commit and checkpoint");
+	cut = 3;
+	for (int k = 0; ok && k < 12; ++k)
+		ok = commit_everywhere(c.of({1, 2}), g, "b" + std::to_string(k), 30'000);
+	ok = ok && checkpoint(*c.nodes[1], g) && checkpoint(*c.nodes[2], g);
+	const auto behind = c.nodes[3]->state(g)->applied;
+	const auto boundary = c.nodes[c.leader({1, 2}, g)]->state(g)->applied;
+	step("install: the cut heals; node 3 installs");
+	cut = 0;
+	ok = ok && commit_everywhere(c.of({1, 2, 3}), g, "c", 60'000);
+	auto s = c.nodes[3]->state(g);
+	std::vector<std::string> three, leader;
+	{
+		std::lock_guard hold(c.nodes[3]->mutex);
+		three = c.nodes[3]->applied[g];
+	}
+	{
+		auto &l = *c.nodes[c.leader({1, 2, 3}, g)];
+		std::lock_guard hold(l.mutex);
+		leader = l.applied[g];
+	}
+	const auto frames = c.nodes[1]->transfer_frames + c.nodes[2]->transfer_frames + c.nodes[3]->transfer_frames;
+	std::printf("install: node 3 at %llu behind the checkpoint at %llu installed it (%d validations, %d activations, %llu transfer frames) and applied past it: %s (applied %llu, state equal to the leader's: %d)\n",
+				(unsigned long long)behind, (unsigned long long)boundary, c.nodes[3]->validations.load(), c.nodes[3]->activations.load(),
+				(unsigned long long)frames, ok ? "yes" : "NO", s ? (unsigned long long)s->applied : 0ull, int(three == leader));
+	for (NodeId id = 1; id <= 3; ++id) {
+		auto &n = *c.nodes[id];
+		std::uint64_t refused = 0, unopened = 0, dropped = 0, malformed = 0;
+		for (std::uint32_t k = 0; k != n.host.transport->loops(); ++k) {
+			const auto &t = n.host.transport->stats(k);
+			refused += t.refused, unopened += t.unopened, dropped += t.dropped, malformed += t.malformed;
+		}
+		const auto k = n.host.transport->loop_of_group(g);
+		const auto lost = n.host.loops[k]->at([&] { return n.per[k]->driver->dropped(g); });
+		std::printf("install: node %llu: %llu transfer frames sent; the transport refused %llu, unopened %llu, dropped %llu, malformed %llu; the Driver dropped %llu\n",
+					(unsigned long long)id, (unsigned long long)n.transfer_frames.load(), (unsigned long long)refused, (unsigned long long)unopened,
+					(unsigned long long)dropped, (unsigned long long)malformed, (unsigned long long)lost);
+	}
+	assert(ok && behind < boundary && c.nodes[3]->activations == 1 && s && s->applied > boundary && three == leader && frames >= 6);
 }
 
 // Quiescence A2: three nodes of 2 loops, groups at rest arm no timer; the leaders' node stops,
@@ -2646,7 +2816,7 @@ void order() {
 
 int main(int argc, char **argv) {
 	if (argc != 3) {
-		std::fprintf(stderr, "usage: %s <fixture dir> threads|credit|reader|upload|driver|refill|identity|joiner|lagging|leftover|reconnect|backlog|owe-order|receive-bound|relayout|scan|order|fetch-alongside-consensus\n", argv[0]);
+		std::fprintf(stderr, "usage: %s <fixture dir> threads|credit|reader|upload|driver|refill|identity|joiner|lagging|leftover|reconnect|backlog|owe-order|receive-bound|relayout|scan|order|fetch-alongside-consensus|install\n", argv[0]);
 		return 2;
 	}
 #ifndef SO_NOSIGPIPE
@@ -2659,7 +2829,7 @@ int main(int argc, char **argv) {
 	fixture = argv[1];
 	const std::string which = argv[2];
 	// Under ctest's 120 s, and 240 s for the cases that elect and change membership more than once.
-	const bool long_case = which == "joiner" || which == "lagging" || which == "relayout";
+	const bool long_case = which == "joiner" || which == "lagging" || which == "relayout" || which == "install";
 	Watchdog watchdog(long_case ? 220s : 100s);
 	if (which == "threads")
 		threads();
@@ -2697,6 +2867,8 @@ int main(int argc, char **argv) {
 		scan();
 	else if (which == "order")
 		order();
+	else if (which == "install")
+		install();
 	else
 		return 2;
 	std::printf("%s: ok\n", which.c_str());

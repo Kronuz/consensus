@@ -90,7 +90,9 @@ struct NodeSink {
 	void operator()(GroupId, Committed notice);
 	void operator()(GroupId, RoleChanged notice);
 	void operator()(GroupId, Fenced notice);
-	void operator()(GroupId, ActivateInstall) {}
+	void operator()(GroupId, SendTransfer) {}
+	void operator()(GroupId, ValidateImage) {}
+	void operator()(GroupId, ActivateImage) {}
 	void operator()(GroupId, CheckpointPublished) {}
 	void operator()(GroupId, RepairCompleted) {}
 	void operator()(GroupId, SnapshotNeeded) {}

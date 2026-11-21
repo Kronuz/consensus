@@ -31,7 +31,7 @@
 //   waiter_test [case [limit]]   rows-propose, rows-committed, rows-read, rows-propose-pair, close,
 //                                close-read, close-open, close-late, teardown, teardown-close, threads
 #include "consensus/driver.h"
-#include "journal/memory_io.h"
+#include "faultlab/faultfs.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -48,7 +48,7 @@
 
 using namespace kronuz::consensus;
 namespace j = kronuz::journal;
-namespace jt = kronuz::journal::testing;
+namespace fl = kronuz::faultlab;
 
 namespace {
 
@@ -171,7 +171,7 @@ struct Case {
 
 // One run of a case under the explorer's choices.
 struct World {
-	jt::Disk disk;
+	fl::filesystem disk;
 	manual_loop a, b;
 	j::InlineCompletion io;
 	std::unique_ptr<j::Host> host;
@@ -182,7 +182,8 @@ struct World {
 	bool closed_done = false, turns_done = false, driver_done = false;
 
 	World() {
-		host = std::make_unique<j::Host>(std::make_shared<jt::MemoryIO>(disk, "host/"), j::Identity{'W', 'T'}, j::HostOptions{1, turn_options});
+		disk.make_directory("host");
+		host = std::make_unique<j::Host>(std::make_shared<fl::io>(disk, "host"), j::Identity{'W', 'T'}, j::HostOptions{1, turn_options});
 		driver = std::make_unique<Driver<Sink>>(Seams{task::scheduler_ref::of(a), j::completion_ref::of(io), *host, 0, 7}, sink);
 		task::spawn(task::scheduler_ref::of(a), host->driver(0).run(j::completion_ref::of(io), stop.token()), [this](std::exception_ptr) { turns_done = true; });
 		task::spawn(task::scheduler_ref::of(a), driver->run(stop.token()), [this](std::exception_ptr) { driver_done = true; });
@@ -410,7 +411,7 @@ struct thread_loop {
 void threads(int rounds) {
 	for (int round = 0; round < rounds && !failures; ++round) {
 		++runs;
-		jt::Disk disk;
+		fl::filesystem disk;
 		j::InlineCompletion io;
 		Sink sink;
 		auto loop = std::make_unique<thread_loop>();
@@ -420,7 +421,8 @@ void threads(int rounds) {
 		task::cancel_source stop;
 		std::atomic<int> created{0};
 		loop->sync([&] {
-			host = std::make_unique<j::Host>(std::make_shared<jt::MemoryIO>(disk, "host/"), j::Identity{'W', 'T'}, j::HostOptions{1, turn_options});
+			disk.make_directory("host");
+			host = std::make_unique<j::Host>(std::make_shared<fl::io>(disk, "host"), j::Identity{'W', 'T'}, j::HostOptions{1, turn_options});
 			driver = std::make_unique<Driver<Sink>>(Seams{task::scheduler_ref::of(*loop), j::completion_ref::of(io), *host, 0, 7}, sink);
 			task::spawn(task::scheduler_ref::of(*loop), host->driver(0).run(j::completion_ref::of(io), stop.token()), [](std::exception_ptr) {});
 			task::spawn(task::scheduler_ref::of(*loop), driver->run(stop.token()), [](std::exception_ptr) {});

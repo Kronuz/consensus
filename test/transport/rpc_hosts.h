@@ -87,6 +87,7 @@ struct Host {
 				return std::nullopt;
 			return Member{incarnation, incarnation, MemberRole::Voter};
 		};
+		options.open_of = [](GroupId) { return test_open(); };
 		std::vector<HostLoop> at;
 		for (auto &l : loops)
 			at.push_back({l->io.get_executor(), task::scheduler_ref::of(l->scheduler)});
@@ -94,14 +95,17 @@ struct Host {
 		cluster.fill('K');
 		transport = std::make_unique<HostTransport>(at, tls, NodePins(node, pins, tls->native_handle()), cluster, addresses, options);
 	}
-	void stores(const std::vector<GroupId> &groups) {
+	static GroupOpen test_open() {
 		GroupOpen o;
 		o.cluster.fill('T');
 		o.group.fill('G');
 		o.epoch.fill('E');
 		o.profile.fill(0x5A);
+		return o;
+	}
+	void stores(const std::vector<GroupId> &groups) {
 		for (auto g : groups)
-			transport->store(g, node, o);
+			transport->store(g, node);
 	}
 	void start() {
 		transport->serve(acceptor);

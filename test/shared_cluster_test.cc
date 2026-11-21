@@ -30,7 +30,8 @@
 //     cluster heals, in the same order;
 //   - liveness: after healing, every group commits a new command on every node.
 #include "consensus/worker.h"
-#include "journal/memory_io.h"
+#include "faultlab/faultfs.h"
+#include <algorithm>
 #include <cstdlib>
 #include <deque>
 #include <iostream>
@@ -39,7 +40,7 @@
 
 using namespace kronuz::consensus;
 namespace j = kronuz::journal;
-namespace jt = kronuz::journal::testing;
+namespace fl = kronuz::faultlab;
 
 namespace {
 int checks = 0, failures = 0;
@@ -48,6 +49,14 @@ void check(bool value, const std::string& what) {
 	++checks;
 	if (!value) { ++failures; if (failures < 20) { std::cerr << "FAIL: " << what << '\n'; } }
 }
+// The host's directory on `disk`, made on first use.
+std::shared_ptr<j::IO> host_io(fl::filesystem& disk) {
+	const auto names = disk.list();
+	if (std::find(names.begin(), names.end(), "host") == names.end()) { disk.make_directory("host"); }
+	return std::make_shared<fl::io>(disk, "host");
+}
+// A crash keeps any sector-boundary prefix of an unsynced append, as a real device may.
+const fl::crash_policy sector_cut{.size = fl::size_pick::sector};
 constexpr Timing compact{20, 40, 100, 200, 60000};
 constexpr NodeId node_count = 3;
 constexpr std::uint64_t group_count = 3;
@@ -70,7 +79,7 @@ struct Message { std::uint64_t group; NodeId from; kronuz::consensus::Message me
 
 struct Node {
 	NodeId id;
-	jt::Disk disk;
+	fl::filesystem disk;
 	std::unique_ptr<j::Host> host;
 	j::TurnDriver* driver = nullptr;
 	std::map<std::uint64_t, std::unique_ptr<Worker>> workers;
@@ -91,14 +100,14 @@ struct Cluster {
 	bool proposing = true;
 
 	explicit Cluster(std::uint64_t seed) : random(seed) {
-		for (NodeId n = 1; n <= node_count; ++n) { nodes[n - 1].id = n; nodes[n - 1].disk.random.seed(seed * 13 + n); }
+		for (NodeId n = 1; n <= node_count; ++n) { nodes[n - 1].id = n; }
 		for (auto& node : nodes) { open(node); }
 	}
 	Node& at(NodeId id) { return nodes[id - 1]; }
 
 	void open(Node& node) {
 		node.workers.clear(); node.driver = nullptr; node.host.reset(); node.inbox.clear();
-		node.host = std::make_unique<j::Host>(std::make_shared<jt::MemoryIO>(node.disk, "host/"), j::Identity{'N', static_cast<char>(node.id)}, j::HostOptions{1, options});
+		node.host = std::make_unique<j::Host>(host_io(node.disk), j::Identity{'N', static_cast<char>(node.id)}, j::HostOptions{1, options});
 		node.driver = &node.host->driver(0);
 		check(!node.driver->recovered().damaged && node.driver->recovered().lost.empty(), "power loss alone damages no turn log: node " + std::to_string(node.id) + " at " + std::to_string(now));
 		for (std::uint64_t g = 1; g <= group_count; ++g) {
@@ -118,7 +127,7 @@ struct Cluster {
 	void crash(Node& node) {
 		++crashes;
 		node.workers.clear(); node.driver = nullptr; node.host.reset(); node.inbox.clear();
-		node.disk.power_loss();
+		node.disk.crash(random(), sector_cut);
 		node.up = false; node.down_until = now + 200 + random() % 600;
 	}
 	void deliver(std::uint64_t group, NodeId from, const Send& send) {
@@ -145,13 +154,13 @@ struct Cluster {
 				worker.applied({batch->entries.back().index});
 			}
 			published += std::holds_alternative<CheckpointPublished>(action);
-			if (auto fenced = std::get_if<Fenced>(&action); fenced && !node.disk.dead()) { check(false, "node " + std::to_string(node.id) + " group " + std::to_string(g) + " fenced: " + fenced->reason); }
+			if (auto fenced = std::get_if<Fenced>(&action); fenced && !node.disk.powered_off()) { check(false, "node " + std::to_string(node.id) + " group " + std::to_string(g) + " fenced: " + fenced->reason); }
 		}
 	}
 	// One step of one node: deliver a message per group, run each Worker, write a turn.
 	void step(Node& node, bool chaos) {
 		if (!node.up) { if (now >= node.down_until) { open(node); } return; }
-		if (chaos && random() % 400 == 0) { node.disk.cut = node.disk.operations + 1 + random() % 40; }  // power fails soon
+		if (chaos && random() % 400 == 0) { node.disk.power_off_after(random() % 40); }  // power fails soon
 		try {
 			for (std::size_t m = node.inbox.size(); m-- > 0 && !node.inbox.empty();) {
 				auto message = std::move(node.inbox.front()); node.inbox.pop_front();
@@ -190,9 +199,9 @@ struct Cluster {
 				} catch (...) { node.driver->failed(std::current_exception()); throw; }
 				node.driver->completed();
 			}
-		} catch (const jt::PowerLoss&) { crash(node); return; }
+		} catch (const std::exception&) { if (!node.disk.powered_off()) { throw; } crash(node); return; }
 		// A cut that a storage operation turned into an error is still a power loss.
-		if (node.disk.dead()) { crash(node); }
+		if (node.disk.powered_off()) { crash(node); }
 	}
 	void run(unsigned steps, bool chaos) {
 		for (unsigned s = 0; s < steps; ++s) {
@@ -209,7 +218,7 @@ void simulate(std::uint64_t seed, unsigned steps) {
 	try {
 		cluster.run(steps, true);
 		// Heal: no more power cuts; every node comes back and catches up.
-		for (auto& node : cluster.nodes) { node.disk.cut = std::numeric_limits<std::uint64_t>::max(); }
+		for (auto& node : cluster.nodes) { node.disk.power_off_after(std::numeric_limits<std::uint64_t>::max()); }
 		cluster.now += 1000;
 		cluster.run(600, false);
 		std::map<std::uint64_t, Index> before;

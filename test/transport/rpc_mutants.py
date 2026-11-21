@@ -61,6 +61,8 @@ MUTANTS = {
     "close-reenters": [("\t\tif (depth_) {\n\t\t\tclose_wanted_ = true;", "\t\tif (false) {\n\t\t\tclose_wanted_ = true;")],
     # unread-queue (N1): refusals pile up unsent without bound
     "refusals-unbounded": [("\t\t\tif (refusals_ > options_.serving)", "\t\t\tif (false)")],
+    # unread-small (F1): a served call that ends frees its slot with its Error or Credit unsent
+    "small-unbounded": [("\t\tif (Queued *last = c.serving ? unsent(&c) : nullptr) {", "\t\tif (Queued *last = nullptr) {")],
     # overrun (N2): send takes bytes past a known total when they do not end it
     "send-past-total": [("(bytes.size() > o.total - o.sent || end != (o.sent + bytes.size() == o.total))",
                          "end != (o.sent + bytes.size() == o.total)")],

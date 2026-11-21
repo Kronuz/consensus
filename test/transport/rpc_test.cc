@@ -637,6 +637,66 @@ void unread_queue() {
 	CHECK(net.zero());
 }
 
+// F1: a peer that sends Calls and never reads. Each path's small frame (a served Error, a Credit
+// whose call the peer cancels, an Error from expire()) keeps its call's slot until it is taken,
+// so `serving` slots then `serving` + 1 refusals close the peer, with every unsent byte counted;
+// a peer that reads gets each slot back and is never closed.
+void unread_small() {
+	constexpr std::size_t serving = 4;
+	const auto error_bytes = encode({.kind = Kind::error, .word = 256, .call = 1}).size();
+	const auto credit_bytes = encode({.kind = Kind::credit, .call = 1, .limit = 1}).size();
+	for (const std::string path : {"errors", "credits", "deadline"}) {
+		for (const bool reads : {false, true}) {
+			ByteBudget serving_pool(64 << 20), calling(64 << 20), outgoing(64 << 20);
+			std::deque<std::function<void()>> posted;
+			auto now = Clock::time_point{} + 1h;
+			std::optional<Lane> lane;
+			lane.emplace(
+				false, Pools{serving_pool, calling, outgoing}, LaneOptions{.window = 1 << 16, .serving = serving},
+				[&](const Incoming &in) -> std::optional<Events> {
+					const Handle h = in.handle;
+					if (path == "errors") // serve_fetch's missing name: stop(fetch_missing)
+						return Events{.body = [&lane, h](std::string_view, bool end) {
+							if (end)
+								lane->stop(h, Code(256));
+						}};
+					return Events{.body = [](std::string_view, bool) {}};
+				},
+				[&](std::function<void()> f) { posted.push_back(std::move(f)); }, [] {}, [&] { return now; });
+			std::string thrown_at;
+			std::uint64_t calls = 0;
+			for (; calls < 1000 && thrown_at.empty(); ++calls)
+				thrown_at = thrown([&] {
+					const std::uint64_t id = 2 * calls + 1;
+					if (path == "credits") {
+						lane->receive(encode({.kind = Kind::call, .word = 1, .call = id, .timeout_ms = 1000, .window = 1 << 16, .total = 1 << 20, .bytes = "n"}));
+						lane->receive(encode({.kind = Kind::cancel, .word = std::uint32_t(Code::cancelled), .call = id}));
+					} else {
+						lane->receive(encode({.kind = Kind::call, .end = true, .word = 1, .call = id, .timeout_ms = path == "deadline" ? 1u : 1000u,
+											  .window = 1 << 16, .total = 4, .bytes = "name"}));
+						now += 2ms;
+						lane->expire();
+					}
+					if (reads)
+						while (lane->next()) {
+						}
+				});
+			const auto held = path == "credits" ? credit_bytes : error_bytes;
+			std::printf("unread-small %s, %s: %llu Calls, %s; %zu bytes unsent, outgoing %zu, live %zu\n", path.c_str(),
+						reads ? "the peer reads" : "never reads", (unsigned long long)calls, thrown_at.empty() ? "kept" : thrown_at.c_str(),
+						lane->queued(), outgoing.used(), lane->live());
+			if (reads) {
+				CHECK(thrown_at.empty() && calls == 1000 && lane->queued() == 0);
+			} else {
+				CHECK(thrown_at.find("does not read") != std::string::npos && calls == 2 * serving + 1);
+				CHECK(lane->queued() == serving * held + (serving + 1) * error_bytes && outgoing.used() == lane->queued());
+			}
+			lane->close();
+			CHECK(outgoing.used() == 0 && serving_pool.used() == 0 && lane->live() == 0);
+		}
+	}
+}
+
 // A3: the table queues at most `queue_bytes` unsent; a call with more waits for room, holding none
 // of `outgoing` for it.
 void queue_cap() {
@@ -890,6 +950,7 @@ int main(int argc, char **argv) {
 		{"reenter", reenter},
 		{"overrun", overrun},
 		{"unread-queue", unread_queue},
+		{"unread-small", unread_small},
 		{"queue-cap", queue_cap},
 	};
 	int ran = 0;

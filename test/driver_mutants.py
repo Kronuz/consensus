@@ -53,6 +53,17 @@ MUTANTS = {
         "if (b.index < base_index_ || b.index > durable_.commit_index ||",
         "if (b.index > durable_.commit_index ||",
     ),
+    # D3's removal is proposed from any drive, not only an admitted Tick: the Persisted after
+    # the promotion's commit then persists with no reservation (driver_replace_test).
+    "removal-from-any-drive": ("core.h",
+        "\t\tif (tick) {\n\t\t\tif (auto next = removal())",
+        "\t\tif (true) {\n\t\t\tif (auto next = removal())",
+    ),
+    # A leader's Tick is admitted with no reservation though its removal is due (driver_replace_test).
+    "removal-tick-unplanned": ("worker.h",
+        "plan = removal ? plan_event(ChangeMembership{0, std::move(*removal)}, false, limits_, scheduling_.retained) : EventAdmissionPlan{};",
+        "plan = EventAdmissionPlan{}; (void)removal;",
+    ),
     # A witness incarnation may become a learner or voter (R16).
     "witness-becomes-data": ("core.h",
         "\t\t\tif (old && old->role == MemberRole::Witness && x.role != MemberRole::Witness) { reject(RejectReason::InvalidMembership); return; }\n",

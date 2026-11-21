@@ -49,8 +49,9 @@
 //   - no group fences but by a power cut, and no loop spins, stopping or not.
 // After the run the network heals and a new entry commits in every group on every data voter.
 #include "consensus/driver.h"
-#include "journal/memory_io.h"
+#include "faultlab/faultfs.h"
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -60,6 +61,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -67,9 +69,18 @@
 namespace kronuz::consensus::driver_simulation {
 
 namespace j = kronuz::journal;
-namespace jt = kronuz::journal::testing;
+namespace fl = kronuz::faultlab;
 
 namespace {
+
+// The host's directory on `disk`, made on first use.
+std::shared_ptr<j::IO> host_io(fl::filesystem& disk) {
+	const auto names = disk.list();
+	if (std::find(names.begin(), names.end(), "host") == names.end()) { disk.make_directory("host"); }
+	return std::make_shared<fl::io>(disk, "host");
+}
+// A crash keeps any sector-boundary prefix of an unsynced append, as a real device may.
+const fl::crash_policy sector_cut{.size = fl::size_pick::sector};
 
 std::uint64_t failures = 0, current_seed = 0;
 void fail(const std::string& what) {
@@ -216,7 +227,7 @@ struct Replica {
 struct Node {
 	NodeId id = 0;
 	std::uint32_t loop_count = 1;  // what the next boot asks the host for
-	jt::Disk disk;
+	fl::filesystem disk;
 	std::unique_ptr<j::Host> host;
 	NodeSink sink;
 	std::vector<std::unique_ptr<Loop>> loops;
@@ -465,10 +476,10 @@ private:
 
 	void boot(Node& n) {
 		// A restart sometimes asks for another loop count: the host re-partitions its turn logs.
-		if (n.disk.operations) {
+		if (n.disk.mutations()) {
 			if (random_() % 4 == 0) { const auto before = n.loop_count; n.loop_count = 2 + std::uint32_t(random_() % 3); repartitions += before != n.loop_count; }
 		}
-		n.host = std::make_unique<j::Host>(std::make_shared<jt::MemoryIO>(n.disk, "host/"), j::Identity{'N', static_cast<char>('0' + n.id)}, j::HostOptions{n.loop_count, turn_options});
+		n.host = std::make_unique<j::Host>(host_io(n.disk), j::Identity{'N', static_cast<char>('0' + n.id)}, j::HostOptions{n.loop_count, turn_options});
 		++boots_by_loops[n.host->loops()];
 		check_placement(n);
 		for (std::uint32_t index = 0; index < n.host->loops(); ++index) {
@@ -512,7 +523,7 @@ private:
 	// unsynced writes may be lost. A clean shutdown follows DRIVER.md's order: its callers cancel,
 	// it closes every group while the loops run and its IO completes, then it stops the loops.
 	void shut(Node& n, bool power_cut) {
-		if (power_cut) { n.disk.cut = n.disk.operations; n.cutting = true; }
+		if (power_cut) { n.disk.power_off_after(0); n.cutting = true; }
 		else { close_all(n); }
 		for (auto& l : n.loops) { l->stop->request(task::cancel_reason::shutdown); }
 		auto stopped = [&] { for (auto& l : n.loops) { if (!l->turns_done || !l->driver_done) { return false; } } return true; };
@@ -520,7 +531,7 @@ private:
 			for (auto& l : n.loops) {
 				l->run(n.id);
 				for (auto ticket : l->held.tickets()) {
-					if (power_cut) { l->held.fail(ticket, std::make_exception_ptr(jt::PowerLoss{})); } else { l->held.complete(ticket); }
+					if (power_cut) { l->held.fail(ticket, std::make_exception_ptr(std::system_error(EIO, std::generic_category(), "power lost"))); } else { l->held.complete(ticket); }
 					l->run(n.id);
 				}
 			}
@@ -528,7 +539,7 @@ private:
 		if (!stopped()) { fail("node " + std::to_string(n.id) + "'s loops did not stop"); }
 		for (auto& l : n.loops) { l->driver.reset(); }
 		n.host.reset(); n.loops.clear();
-		if (power_cut) { n.disk.power_loss(); }
+		if (power_cut) { n.disk.crash(random_(), sector_cut); }
 		n.up = n.cutting = false;
 	}
 	void close_all(Node& n) {
@@ -850,7 +861,7 @@ void NodeSink::operator()(GroupId g, ActivateImage notice) { sim->on_activate(*n
 }  // namespace
 
 // Seeds that once failed, each at its failing step count, run beside every range of seeds.
-constexpr std::pair<std::uint64_t, std::uint64_t> regressions[] = {{399, 3000}};
+constexpr std::pair<std::uint64_t, std::uint64_t> regressions[] = {{399, 3000}, {11, 3000}};
 
 // Runs `seeds` seeds of `steps` steps from `first`, then the regression seeds outside that range.
 bool run(std::uint64_t seeds, std::uint64_t steps, std::uint64_t first) {

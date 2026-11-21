@@ -27,7 +27,7 @@
 // worker must name that as its fence (worker.h's check).
 //   wave_open_test [groups [wave [cut]]]   (64 groups, all in one wave, by default)
 #include "consensus/driver.h"
-#include "journal/memory_io.h"
+#include "faultlab/faultfs.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -37,7 +37,7 @@
 
 using namespace kronuz::consensus;
 namespace j = kronuz::journal;
-namespace jt = kronuz::journal::testing;
+namespace fl = kronuz::faultlab;
 
 namespace {
 
@@ -109,11 +109,12 @@ int main(int argc, char** argv) {
 	const bool cut = argc > 3 && std::string(argv[3]) == "cut";
 	if (!groups || !wave) { std::fprintf(stderr, "groups and wave must be positive\n"); return 2; }
 
-	jt::Disk disk;
+	fl::filesystem disk;
+	disk.make_directory("host");
 	task::inline_scheduler scheduler;
 	auto ref = task::scheduler_ref::of(scheduler);
 	j::InlineCompletion io;
-	j::Host host(std::make_shared<jt::MemoryIO>(disk, "host/"), host_identity, j::HostOptions{1, turn_options});
+	j::Host host(std::make_shared<fl::io>(disk, "host"), host_identity, j::HostOptions{1, turn_options});
 	Sink sink;
 	Driver<Sink> driver(Seams{ref, j::completion_ref::of(io), host, 0, 7}, sink);
 	task::cancel_source stop;
@@ -178,7 +179,7 @@ int main(int argc, char** argv) {
 	if (cut) {
 		// Power goes out: the next turn fails in the turn driver, outside every worker in it; a
 		// worker whose append comes after finds the turn driver failed and fences itself.
-		disk.cut = disk.operations;
+		disk.power_off_after(0);
 		std::map<GroupId, Row> late;
 		for (const auto& [id, row] : rows) {
 			task::spawn(ref, propose_row(driver, id, "Q|" + std::to_string(id)), [&late, id](std::exception_ptr e) { late[id] = Row{true, e}; });

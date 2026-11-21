@@ -14,6 +14,10 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 
 ## 2026-11-20
 
+### Fixed
+
+- A leader paces each follower's appends to its path ([docs/mechanisms/append-pacing.md](docs/mechanisms/append-pacing.md)). A frame starts at 64 KiB, doubles on a fast answer up to `rpc_bytes`, scales down to what is answered within half the shorter of `rpc_timeout` and `election_min`, and drops back to 64 KiB when a flight times out. Before, a Driver group (built with `Flow{}`) sent appends of up to `rpc_bytes` (2 MiB). Over a path that moves about 0.5 MB/s (TCP under 1% loss at 40 ms round trip), one such append held the connection for about 4 s. The followers then campaigned, the leader's CheckQuorum stepped it down, and each timeout resent the whole batch, so a full window stopped committing (`full_window_stall_test`). No API or wire format changes.
+
 ### Added
 
 - A closed group reopens without an election when its leader is unchanged ([docs/mechanisms/quiescence.md](docs/mechanisms/quiescence.md)). `Core::closed_state()` gives a replica's closed state once it rests at a checkpoint covering applied (hard state, last log index and term, membership and its index, the leader it knew); `encode_closed_state` and `decode_closed_state` carry it as `RFTCLOS1` (192 bytes for a lone voter, 240 for a three-voter member, CRC32C, bound to the journal group, its incarnation and the member incarnation). `Core::reopen(closed)` before `Start` resumes the closed term (leading it, or following its leader) when the record matches the recovered state, and the first batch after it carries the hard state with the first write: a reopened lone voter's first write costs two barriers, as on an open group, instead of five (`simulation_test`, `closing` cases).

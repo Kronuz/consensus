@@ -6,6 +6,12 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#consensus) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-21
+
+### Fixed
+
+- A replacement no longer fences its leader with "persistence lacks preowned reservation" when the core removes the leaving member (D3). The core proposed that removal from whichever event drove it after the promotion committed: a leader's `Tick`, which the Worker admitted with no append reservation, or the `Persisted` after an `AppendResponse` whose one hard-state append the commit had used. Only an admitted `Tick` proposes it now, and the Worker plans a leader's `Tick` as that change (`Core::removal()`: its configuration append and the commit continuation), so the removal follows the promotion's commit by at most a heartbeat. `driver_replace_test` runs the replacement through the Driver (add, promote beside any voting member, the leader or a witness included, remove) over 1000 seeds with delayed, dropped and duplicated messages and leadership transfers.
+
 ## 2026-11-20
 
 ### Added

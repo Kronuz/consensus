@@ -10,7 +10,13 @@ from __future__ import annotations
 
 import json
 import sys
+from itertools import pairwise
 from pathlib import Path
+
+
+def applied_at(samples: list[tuple[float, int]], t: float) -> int:
+    """The highest applied index sampled at or before `t`."""
+    return max((a for when, a in samples if when <= t), default=0)
 
 
 def main(out: Path, label: str = "65536B-32") -> int:
@@ -24,7 +30,7 @@ def main(out: Path, label: str = "65536B-32") -> int:
         )
         roles = lt.get("roles", [])
         print(f"   role changes during the load: {roles}")
-        samples = []
+        samples: list[tuple[float, int]] = []
         for line in (out / "diag-3.jsonl").read_text().splitlines():
             s = json.loads(line)
             if s.get("load") != label:
@@ -39,9 +45,11 @@ def main(out: Path, label: str = "65536B-32") -> int:
         windows = []
         if samples and seconds:
             t0 = samples[0][0]
-            at = lambda t: max((a for when, a in samples if when <= t), default=0)  # noqa: E731
             edges = [t0 + 10 + 5 * i for i in range(int((seconds - 10) // 5) + 1)]
-            windows = [(round(b - t0), at(a), at(b)) for a, b in zip(edges, edges[1:])]
+            windows = [
+                (round(b - t0), applied_at(samples, a), applied_at(samples, b))
+                for a, b in pairwise(edges)
+            ]
         stalled = [w for w in windows if w[2] <= w[1]]
         print(f"   windows (end s, applied at start, at end): {windows}")
         passed = "error" not in lt and not roles and bool(windows) and not stalled

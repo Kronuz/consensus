@@ -270,7 +270,9 @@ asio::awaitable<void> control(asio::io_context &io) {
 		const auto &stats = peers[i]->stats();
 		std::printf("voter %u: %llu wakes, %llu frames\n", i + 1, static_cast<unsigned long long>(wakes[i]),
 					static_cast<unsigned long long>(stats.received));
-		CHECK(stats.received > 0 && stats.reconnects == 0 && stats.rejected == 0);
+		// Four lanes, each authenticated once: no Bulk session was lost and opened again. (A dial
+		// the peer turned away past its handshake bound never opened one.)
+		CHECK(stats.received > 0 && stats.admitted == 4 && ready(*peers[i]) == 4);
 		CHECK(framed[i] == stats.received);
 		CHECK(wakes[i] == stats.received + 2);
 		CHECK(peers[i]->occupancy().retained_inputs == 0);

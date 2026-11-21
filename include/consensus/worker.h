@@ -532,7 +532,7 @@ public:
 				completion_ = Persisted{persist_->token}; persist_.reset(); ++foreground_; return TurnResult::Stored;
 			}
 			if (!output_.empty()) {
-				if (preparation_runnable() || source_) { maintenance(); return fenced() ? TurnResult::Fenced : maintenance_io_ ? TurnResult::IOPending : capture_funding_pressure_ ? TurnResult::Pressure : TurnResult::Maintenance; }
+				if (preparation_runnable() || source_ || installation_waiting()) { maintenance(); return fenced() ? TurnResult::Fenced : maintenance_io_ ? TurnResult::IOPending : capture_funding_pressure_ ? TurnResult::Pressure : TurnResult::Maintenance; }
 				return TurnResult::Blocked;
 			}
 			if (application_) {

@@ -106,6 +106,41 @@ std::shared_ptr<j::IO> host_io(fl::filesystem& disk) {
 // A crash keeps any sector-boundary prefix of an unsynced append, as a real device may.
 const fl::crash_policy sector_cut{.size = fl::size_pick::sector};
 
+// The power cut as the process meets it: a call into the host's directory that fails because the
+// power is off throws PowerCut, which is no std::exception, so no step() catches it and it may end
+// the Driver's loop by a throw. File calls fail with faultfs's EIO.
+struct PowerCut {};
+class CutIO final : public j::IO {
+public:
+	explicit CutIO(fl::filesystem& d) : disk(d), backend(host_io(d)) {}
+	j::FilesystemClass directory_filesystem() const override { return backend->directory_filesystem(); }
+	j::DirectoryTrust directory_trust() const override { return backend->directory_trust(); }
+	std::unique_ptr<j::OwnerLock> acquire_owner(bool create) override { return cut([&] { return backend->acquire_owner(create); }); }
+	std::unique_ptr<j::OwnerLock> acquire_directory_owner() override { return cut([&] { return backend->acquire_directory_owner(); }); }
+	std::unique_ptr<j::File> open_existing(std::string_view n) override { return cut([&] { return backend->open_existing(n); }); }
+	std::unique_ptr<j::File> open_existing_read_only(std::string_view n) override { return cut([&] { return backend->open_existing_read_only(n); }); }
+	std::unique_ptr<j::File> open_reclaim_candidate_read_only(std::string_view n) override { return cut([&] { return backend->open_reclaim_candidate_read_only(n); }); }
+	void open_existing_read_only_into(std::string_view n, j::File& d) override { cut([&] { return backend->open_existing_read_only_into(n, d); }); }
+	bool open_reclaim_candidate_read_only_into(std::string_view n, j::File& d) override { return cut([&] { return backend->open_reclaim_candidate_read_only_into(n, d); }); }
+	std::unique_ptr<j::File> create_exclusive(std::string_view n) override { return cut([&] { return backend->create_exclusive(n); }); }
+	void replace(std::string_view s, std::string_view d) override { cut([&] { return backend->replace(s, d); }); }
+	void link(std::string_view s, std::string_view d) override { cut([&] { return backend->link(s, d); }); }
+	void remove(std::string_view n) override { cut([&] { return backend->remove(n); }); }
+	std::unique_ptr<j::DirectoryCursor> scan_directory() override { return cut([&] { return backend->scan_directory(); }); }
+	std::optional<j::EntryFootprint> entry_footprint(std::string_view n) override { return cut([&] { return backend->entry_footprint(n); }); }
+	std::optional<j::EntryInspection> inspect_entry(std::string_view n) override { return cut([&] { return backend->inspect_entry(n); }); }
+	void order_files_and_directory(std::span<j::File* const> files) override { cut([&] { return backend->order_files_and_directory(files); }); }
+	void sync_directory() override { cut([&] { return backend->sync_directory(); }); }
+protected:
+	std::unique_ptr<j::OwnerLock> lock_owner(const j::OwnerLockOptions& o) override { return cut([&] { return backend->acquire_owner(o); }); }
+private:
+	template <class F> auto cut(F call) const -> decltype(call()) {
+		try { return call(); } catch (const std::system_error&) { if (disk.powered_off()) { throw PowerCut{}; } throw; }
+	}
+	fl::filesystem& disk;
+	std::shared_ptr<j::IO> backend;
+};
+
 constexpr Timing compact{20, 40, 100, 200, 60000};
 const j::TurnLogOptions turn_options{16 * 1024, 1024, 1, 4, 4096};
 const j::AdmissionLimits admission{{256u << 20, 8192}, {256 * 1024, 3}, {64u << 20, 4}, 32, 3};
@@ -772,7 +807,7 @@ bool close_crash_run(std::uint64_t seed, std::uint64_t cut) {
 	std::vector<std::function<bool()>> calls;  // whether each call the run started completed
 	auto track = [&](auto call) { calls.push_back([call] { return call->done; }); return call; };
 	{
-		Loop loop(disk);
+		Loop loop(disk, false, std::make_shared<CutIO>(disk));
 		loop.lone(g);
 		std::exception_ptr error;
 		const auto base = disk.mutations();

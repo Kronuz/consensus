@@ -65,11 +65,18 @@ struct Seams {
 //                      included): it keeps the log, no application state, so the Driver
 //                      acknowledges that range itself
 //   RoleChanged        role, term and leader changes
-//   ActivateInstall    an installed image to activate; answer with activated() or activation_failed()
+//   SendTransfer       a snapshot transfer frame (RFTXFR01) for a peer incarnation (the transport's)
+//   ValidateImage      a received image, durable and CRC-checked: answer validated() or validation_failed()
+//   ActivateImage      an installed image to activate; answer with activated() or activation_failed()
 //   CheckpointPublished, RepairCompleted   only when no caller awaits it (the caller was cancelled)
 //   SnapshotNeeded, SnapshotTransmit, SnapshotReleased   a leader's sender flights
 //   Fenced             the group fenced; every waiter completes with `fenced`
 template <class S> concept sink = /* invocable as above for each notice */;
+
+// The install notices (Install, below). `image` is borrowed for the Sink call only.
+struct SendTransfer { NodeId peer; std::string frame; };
+struct ValidateImage { Token token; LogBoundary boundary; NodeId source; kronuz::journal::ArtifactReader& image; };
+struct ActivateImage { Token token; LogBoundary boundary; kronuz::journal::ArtifactReader& image; };
 
 template <class C> concept capture = requires(C& capture, std::span<char> chunk) {
 	{ capture.metadata() } -> std::convertible_to<CaptureMetadata>;   // through, term, epoch (request ignored)
@@ -94,7 +101,10 @@ public:
 	void receive(GroupId, Receive);
 	void applied(GroupId, Applied);
 	void application_failed(GroupId, Index through, std::string reason);
-	void activated(GroupId, Token token);       // ActivateInstall::token
+	void transfer(GroupId, NodeId source, std::string frame);   // a received RFTXFR01 frame from `source`
+	void validated(GroupId, Token token);       // ValidateImage::token
+	void validation_failed(GroupId, Token token);
+	void activated(GroupId, Token token);       // ActivateImage::token
 	void activation_failed(GroupId, Token token, std::string reason);
 	void peer_limits(GroupId, PeerLimits);
 	std::uint64_t dropped(GroupId) const;       // an open group's inbox overflow; for an id not open (closed, never opened), the Driver-wide count of plain calls dropped on ids not open
@@ -189,7 +199,7 @@ wait for it.
 **The apply index never passes what the application was delivered.** `applied(through)` must name
 the end of the range the Sink delivered last; Core fences any other (`invalid application
 completion`). Otherwise the apply index moves only to the boundary of a checkpoint the application
-restored (`recover`), an image it activated (`ActivateInstall`) or a `repair` it asked for.
+restored (`recover`), an image it activated (`ActivateImage`) or a `repair` it asked for.
 
 The one exception is a witness's range, which the Driver acknowledges itself instead of handing it
 to the Sink. The witness transitions, both ways:
@@ -207,6 +217,86 @@ From its first acknowledged range on, a witness's apply index follows its commit
 application receives no further range. A restart from a checkpoint taken after the removal finds
 this node a witness at neither index, so its later ranges go to the Sink, which restored that
 checkpoint and continues from its boundary.
+
+## Install
+
+A group opened with `GroupOptions::snapshots` installs snapshots: a leader sends its latest
+published checkpoint to a member its log no longer reaches, and the member installs it as its
+own. The Driver owns the group's `SnapshotChannel` (created at the first transfer, freed at
+close); the host carries its frames, and the application validates and activates the image.
+
+```
+ leader's Driver                          host transport (Bulk, data)        follower's Driver
+ Core: SnapshotNeeded ──▶ Sink            (strata pins its checkpoint)
+ source reads checkpoint ── SendTransfer ──▶ send_transfer ═══▶ is_transfer ──▶ transfer()
+   Begin, Chunk x n (64 KiB, window)                                           chunks staged and synced
+ ◀── transfer() ◀══ Accepted, Credit ════════════════════════ SendTransfer ◀── read back, CRC32C-checked
+                                                                               Sink: ValidateImage
+                                                                               ◀── validated(token)
+                                                                               consensus persists the install
+                                                                               Sink: ActivateImage
+                                                                               ◀── activated(token)
+ Core: SnapshotReleased ◀══ Result (Installed) ════════════════ SendTransfer ◀── entries past the boundary
+```
+
+**The image** is the application part of the leader's latest published checkpoint (the bytes its
+`checkpoint` capture wrote, at most `SnapshotLimits::application_bytes`), with the checkpoint's
+boundary. A leader with no published checkpoint at its log's base answers `SnapshotNeeded` with
+a failed flight and asks again later: install needs a checkpoint at the base.
+
+**Frames.** Transfer frames are RFTXFR01 (`snapshot_transfer.h`): Begin (the image's
+descriptor), Accepted, Chunk (offset, up to 64 KiB, final), Credit (cumulative, up to the
+chunk it names), Result (installed, caught up, rejected or failed, with the receiver's term) and
+Cancel. A sender keeps `SnapshotLimits::window` chunks in flight. The Sink's `SendTransfer` is
+one whole frame for the peer incarnation `peer`; the host sends it with
+`transport::send_transfer(transport, loop, group, local, node, frame)`, a data frame on the Bulk
+connection. A received message whose payload `transport::is_transfer` names goes to
+`transfer(group, received.route.source, std::move(received.payload))`; every other one to
+`receive`. A frame is bound to its group's cluster and configuration identities and to its
+source and destination incarnations (the per-frame rule admitted the source); a frame that does
+not decode, or does not follow its transfer's sequence, ends that peer's transfer here, and the
+leader starts it again. Received frames queue per group (`GroupOptions::inbox` of them; more are
+dropped and counted, and the sender's flight times out and starts over).
+
+**Validation.** The follower writes the chunks to a replacement artifact, syncs it, and reads it
+back through its CRC32C. Then the Sink gets `ValidateImage` once per transfer: `token`, the
+image's `boundary`, the `source` incarnation that sent it, and `image`, a reader of the verified
+bytes (`image.read_at(offset, span)`, up to 64 KiB a call; `image.descriptor().length` bytes),
+valid only during the call. Nothing is installed yet: consensus has not persisted anything of
+it. The application checks the image and prepares what it needs to activate it (strata stages
+its pinned files here), on its own time, then answers on the loop:
+
+- `validated(group, token)`: consensus installs it (its bundle published, its boundary its new
+  base), and the Sink then gets `ActivateImage`.
+- `validation_failed(group, token)`: the replacement is discarded and the follower keeps its
+  state; the leader hears a failed transfer and tries again later.
+
+A transfer must finish, validation included, within the leader's `Timing::snapshot_timeout` of
+its start, or the leader cancels it (its `SnapshotReleased`, reason timed out); an answer for a
+transfer that ended, or a token that is not the current one, is dropped and counted. An
+application whose preparation is long keeps what it prepared and resumes it on the next try.
+
+**Activation.** Once the install is durable (consensus's checkpoint is now the image, the log
+below its boundary gone), the Sink gets `ActivateImage`: `token`, `boundary` and `image`, the
+same bytes, valid only during the call. The application makes the image its state (strata
+activates its stage) and answers `activated(group, token)`; the apply index moves to the
+boundary and `Committed` ranges continue past it. `activation_failed(group, token, reason)`
+fences the group. A crash after the install is durable and before `activated` recovers from it:
+`recover`'s Restore reads the same image, so activation is what a restore does, and a host that
+staged something at validation finishes it at recovery when the restored boundary is the
+staged one. A crash before it recovers the old replica: consensus persisted nothing of the image.
+
+**Leader side.** `SnapshotNeeded`, `SnapshotTransmit` and `SnapshotReleased` reach the Sink for
+each flight (an application pins what a follower's validation will fetch at `SnapshotNeeded` and
+releases it at `SnapshotReleased`); the Driver reads the checkpoint and frames it itself.
+
+| Call | Notice it answers | Effect | On a stale token, a closed or fenced group |
+|---|---|---|---|
+| `transfer` | - | the frame joins the group's transfer queue | dropped and counted |
+| `validated` | `ValidateImage` | install proceeds | dropped and counted |
+| `validation_failed` | `ValidateImage` | install discarded, old state kept | dropped and counted |
+| `activated` | `ActivateImage` | apply index at the boundary | dropped and counted |
+| `activation_failed` | `ActivateImage` | the group fences | dropped and counted |
 
 ## The blocking entry
 
@@ -242,4 +332,6 @@ submit nothing; `create`, `recover`, `checkpoint`, `repair` and `close` need no 
 | `PeerLimits{...}` | `peer_limits(group, limits)` |
 | `applied`, `application_failed` | the same plain calls |
 | `reserve_checkpoint`, `attach_capture`, `offer_application_chunk` | `checkpoint(group, cap, capture)` |
-| `snapshot_activated`, `snapshot_activation_failed` | `activated`, `activation_failed` after the Sink's `ActivateInstall` |
+| `SnapshotChannel` over `Peers`: `register_session`, `receive`, `outbound`, `run_one` | the Driver's own channel: `transfer(group, source, frame)` in, the Sink's `SendTransfer` out |
+| `validation_chunk`, `consume_validation`, `validation_succeeded`, `reject_snapshot_validation` | the Sink's `ValidateImage`, then `validated` or `validation_failed` |
+| `snapshot_activated`, `snapshot_activation_failed` | `activated`, `activation_failed` after the Sink's `ActivateImage` |

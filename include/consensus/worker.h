@@ -732,7 +732,11 @@ private:
 		if (maintenance_tick && !std::holds_alternative<Tick>(event)) { throw std::logic_error("maintenance admission requires Tick"); }
 		// Validate even under backpressure; internal events never enter here.
 		auto plan = plan_event(event, core_ && core_->busy(), limits_, scheduling_.retained);
-		if (core_ && core_->role() == Role::Leader && std::holds_alternative<Tick>(event)) { plan.count = 0; }
+		// A leader's Tick campaigns for nothing: it is planned as the D3 removal it proposes, if any.
+		if (core_ && core_->role() == Role::Leader && std::holds_alternative<Tick>(event)) {
+			auto removal = core_->removal();
+			plan = removal ? plan_event(ChangeMembership{0, std::move(*removal)}, false, limits_, scheduling_.retained) : EventAdmissionPlan{};
+		}
 		if (store_.fenced() && !failed_) { fail("storage fenced outside worker"); }
 		if (fenced()) { return SubmitResult::Fenced; }
 		if (!maintenance_tick && hold(event)) { return SubmitResult::Accepted; }

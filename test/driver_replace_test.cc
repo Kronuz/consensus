@@ -25,11 +25,15 @@
 // completed in random order. The leader adds the joiner as a learner, promotes it beside a
 // leaving member (any voting one, the leader included; a witness's place goes to a witness),
 // and the core removes the leaving member by itself. Messages are delayed, reordered, dropped
-// and duplicated; leadership moves now and then. The oracles, per seed:
+// and duplicated; leadership moves now and then; a client write is outstanding throughout.
+// The oracles, per seed:
 //   - no group fences (a Persist the Worker did not fund fences it);
 //   - one leader per term, and every node applies a prefix of one sequence of entries;
 //   - the removal commits: every data member of the final membership applies it, and a
-//     command proposed after it commits there too.
+//     command proposed after it commits there too;
+//   - after settling, every member holds the replacement's membership by value, exactly one
+//     removal (of three configurations) committed, the removed member does not lead, and
+//     every committed client write holds its value on every data member.
 // `driver_replace_test [seeds] [first]`; SIM_REPLACE_TRACE=1 logs each node's notices.
 #include "consensus/driver.h"
 #include "faultlab/faultfs.h"
@@ -68,6 +72,7 @@ void fail(const std::string& what) {
 	if (failures++ < 20) { std::fprintf(stderr, "replace seed %llu: %s\n", (unsigned long long)current_seed, what.c_str()); }
 }
 const bool tracing = std::getenv("SIM_REPLACE_TRACE") != nullptr;
+std::uint64_t writes_committed = 0, elections_mid_removal = 0;
 
 std::shared_ptr<j::IO> host_io(fl::filesystem& disk) {
 	const auto names = disk.list();
@@ -138,13 +143,15 @@ struct World {
 			else if (pick < 750) { auto& n = node(1 + random_() % 4); complete_io(n); }
 			else if (pick < 900) { for (auto& [id, n] : nodes_) { apply(*n); } }
 			else if (pick < 902 && phase_ >= promoted) { transfer(); }
+			write();
 			drive();
 			if (phase_ == done) { break; }
 		}
 		if (failures) { return false; }
 		for (const auto& call : opens_) { if (call->error) { fail("a node's create failed"); } }
 		if (phase_ != done) { report("the replacement did not complete in " + std::to_string(step_bound) + " steps"); return false; }
-		return true;
+		settle_and_check();
+		return !failures;
 	}
 	std::uint64_t leader_changes = 0, transfers = 0, changes = 0;
 	bool leader_left = false;  // the leaving member led when its replacement was proposed
@@ -166,6 +173,7 @@ struct World {
 		n.applying = n.applied.empty() ? 0 : n.applied.back().index;
 	}
 	void on_role(NodeId id, RoleChanged notice) {
+		if (notice.role == Role::Leader && phase_ == promoted) { ++elections_mid_removal; }
 		if (tracing) { std::fprintf(stderr, "[%zu] node %llu role %d term %llu\n", step_, (unsigned long long)id, int(notice.role), (unsigned long long)notice.term); }
 		if (notice.role != Role::Leader) { return; }
 		++leader_changes;
@@ -175,6 +183,66 @@ struct World {
 	void on_fenced(NodeId id, const Fenced& notice) { fail("node " + std::to_string(id) + " fenced: " + notice.reason); }
 
 private:
+	// One outstanding client write on the leader at a time, through the replacement.
+	void write() {
+		if (write_ && !write_->done) { return; }
+		if (write_ && write_->placed) { placed_.push_back({*write_->placed, write_payload_}); }
+		write_.reset();
+		if (phase_ == done) { return; }
+		auto* l = leader(); if (!l) { return; }
+		write_payload_ = "w" + std::to_string(writes_issued_++);
+		start(*l, write_ = std::make_shared<Call>(), l->driver->propose(group, write_payload_));
+		l->run();
+	}
+	// Runs on with no new changes, then checks the final state by value.
+	void settle_and_check() {
+		for (std::size_t k = 0; k < 3000 && !failures; ++k) {
+			advance(1 + random_() % 4);
+			for (int d = 0; d < 4; ++d) { deliver_one(); }
+			complete_io(node(1 + random_() % 4));
+			for (auto& [id, n] : nodes_) { apply(*n); }
+			write();
+		}
+		if (failures) { return; }
+		// The final membership: the founding one without the leaving member, the joiner in its role.
+		std::set<std::pair<NodeId, int>> expected, got;
+		const MemberRole leaving_role = witness_ && leaving_ == 3 ? MemberRole::Witness : MemberRole::Voter;
+		for (NodeId id = 1; id <= 3; ++id) { if (id != leaving_) { expected.insert({id, int(witness_ && id == 3 ? MemberRole::Witness : MemberRole::Voter)}); } }
+		expected.insert({4, int(leaving_role)});
+		for (const auto& x : removal_.members) { got.insert({x.incarnation, int(x.role)}); }
+		if (got != expected || removal_.leaving != 0) { report("the final membership is not the replacement's"); return; }
+		// Every member node holds exactly that membership in force and committed through it.
+		for (const auto& x : removal_.members) {
+			auto s = node(x.incarnation).state();
+			if (!s || !(s->membership == removal_)) { report("member " + std::to_string(x.incarnation) + " holds another membership"); return; }
+		}
+		// The removal committed once: one Configuration entry drops the leaving member.
+		std::size_t configs = 0, removals = 0;
+		for (const auto& [index, e] : sequence_) {
+			if (e.kind != EntryKind::Configuration) { continue; }
+			++configs; auto m = decode_membership(e.payload);
+			removals += !find_member(m, leaving_) && find_member(m, 4) != nullptr;
+		}
+		if (removals != 1) { report("" + std::to_string(removals) + " committed removals"); return; }
+		if (configs != 3) { report("" + std::to_string(configs) + " committed configurations, expected add, promote and remove"); return; }
+		// The removed member leads no term the group follows.
+		if (auto* l = leader(); !l || l->id == leaving_) { report(l ? "the removed member leads" : "no leader after settling"); return; }
+		// Every write whose placement committed holds its payload, on every data member.
+		Index last = 0;
+		for (const auto& [p, payload] : placed_) {
+			auto took = sequence_.find(p.index);
+			if (took == sequence_.end() || took->second.term != p.term) { continue; }
+			if (took->second.payload != payload) { report("write " + payload + " at " + std::to_string(p.index) + " holds " + took->second.payload); return; }
+			++writes_committed; last = std::max(last, p.index);
+		}
+		for (auto* n : data_members()) {
+			if (n->applied.size() < last) { report("node " + std::to_string(n->id) + " did not apply through write index " + std::to_string(last)); return; }
+		}
+	}
+	std::shared_ptr<Call> write_;
+	std::string write_payload_;
+	std::uint64_t writes_issued_ = 0;
+	std::vector<std::pair<Placement, std::string>> placed_;
 	enum Phase { adding, promoting, promoted, removed, done };
 
 	Node& node(NodeId id) { return *nodes_.at(id); }
@@ -376,6 +444,7 @@ int main(int argc, char** argv) {
 		leader_changes += world.leader_changes; transfers += world.transfers; changes += world.changes;
 		witness_left += world.witness_left(); leader_left += world.leader_left;
 	}
+	std::printf("  %llu committed client writes checked, %llu elections between promotion and removal\n", (unsigned long long)writes_committed, (unsigned long long)elections_mid_removal);
 	std::printf("driver replacement: %llu of %llu seeds completed (%llu replaced their leader, %llu a witness), %llu elections, %llu transfers, %llu changes issued: %s\n",
 		(unsigned long long)completed, (unsigned long long)seeds, (unsigned long long)leader_left, (unsigned long long)witness_left, (unsigned long long)leader_changes,
 		(unsigned long long)transfers, (unsigned long long)changes, failures ? "FAIL" : "ok");

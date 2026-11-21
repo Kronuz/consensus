@@ -7,7 +7,8 @@
 advances the applied index, no role changes during the load, and large_throughput answers.
 
 The windows end where the load does: the bench stops sampling when the load answers, which is
-at its seconds or sooner, when it commits its 128 MiB cap (2048 x 64 KiB)."""
+at its seconds or sooner, when it commits its 128 MiB cap (2048 x 64 KiB). A load that answers
+early passes only with the whole cap committed and no failures."""
 
 from __future__ import annotations
 
@@ -59,9 +60,16 @@ def main(out: Path, label: str = "65536B-32") -> int:
         print(
             f"   load ran {ran:.1f} s of {seconds:g}; windows (end s, applied at start, at end): {windows}"
         )
-        passed = "error" not in lt and not roles and bool(windows) and not stalled
+        # A load that answers early must have committed the whole cap, with no failures.
+        cap = (128 << 20) // int(label.split("B-")[0])
+        whole = ran >= seconds - 1 or (
+            lt.get("commits") == cap and not lt.get("failures")
+        )
+        passed = (
+            "error" not in lt and not roles and bool(windows) and not stalled and whole
+        )
         print(
-            f"   {'PASS' if passed else 'FAIL'}: answered={'error' not in lt} role_changes={len(roles)} windows={len(windows)} stalled={len(stalled)}"
+            f"   {'PASS' if passed else 'FAIL'}: answered={'error' not in lt} role_changes={len(roles)} windows={len(windows)} stalled={len(stalled)} whole={whole}"
         )
         ok = ok and passed
     return 0 if ok else 1

@@ -3,7 +3,8 @@
 A leader sizes each Append so its answer comes back within `frame_target()`, half the shorter of
 `Timing::rpc_timeout` and `Timing::election_min` (250 ms at the defaults). Each peer keeps its
 own frame size, `Peer::frame` (`include/consensus/core.h`), under the node's and group's
-`rpc_bytes` and any `Flow::frame_bytes` cap. One entry always goes, whatever its size.
+`rpc_bytes` and any `Flow::frame_bytes` cap. One entry always goes, whatever its size; an entry
+larger than the frame goes alone.
 
 ## The rule
 
@@ -18,6 +19,10 @@ own frame size, `Peer::frame` (`include/consensus/core.h`), under the node's and
 On a fast path the frame reaches `rpc_bytes` in five answers (64 KiB to 2 MiB). On a slow path
 it settles where one append crosses in about the target. With pipeline 1, throughput is then
 roughly `target / (target + round trip)` of the path's rate.
+
+The floor bounds the pacing from below. Under about 256 KB/s a 64 KiB frame already takes longer
+than the target, and under about 128 KB/s it takes longer than `rpc_timeout`, so floor frames are
+resent while they still cross.
 
 ## Why: the full-window stall
 

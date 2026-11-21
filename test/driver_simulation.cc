@@ -327,9 +327,10 @@ struct Simulation {
 				fail("group " + std::to_string(g) + "'s witness member does not acknowledge its committed ranges itself: committed " + std::to_string(s ? s->committed : 0) + ", applied " + std::to_string(s ? s->applied : 0));
 			}
 		}
-		// Repair liveness (F4): on the healed network every repair completes before shutdown.
+		// Repair liveness (F4): on the healed network every repair completes before shutdown. A
+		// repair waits behind an incoming image whose source failed, which ends at snapshot_timeout.
 		auto pending = [&] { std::size_t k = 0; for (const auto& c : calls_) { k += c->kind == Call::repair && !c->completions; } return k; };
-		for (int round = 0; round < 1000 && pending() && !failures; ++round) { quiet_round(); }
+		for (int round = 0; round < 1000 + int(2 * timing.snapshot_timeout / 4) && pending() && !failures; ++round) { quiet_round(); }
 		repairs_pending = pending();
 		if (repairs_pending) { fail(std::to_string(repairs_pending) + " repairs still pending after healing"); }
 		// Shutdown: every call completes.

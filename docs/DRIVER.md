@@ -258,7 +258,9 @@ per-frame rule admitted the source); a frame that does not decode, or does not f
 transfer's sequence, ends that peer's transfer here. Received frames queue per group
 (`GroupOptions::inbox` of them; more are dropped and counted). Nothing retransmits a frame: a
 transfer that lost one (a refused or dropped frame, a connection that ended) stalls until the
-leader's `Timing::snapshot_timeout`, and the leader then starts it over.
+leader's `Timing::snapshot_timeout`, and the leader then starts it over. The follower ends its
+side after its own `snapshot_timeout` without a frame; until then its `repair` and `checkpoint` calls
+wait behind the incoming image.
 
 **Validation.** The follower writes the chunks to a replacement artifact, syncs it, and reads it
 back through its CRC32C. Then the Sink gets `ValidateImage` once per transfer: `token`, the

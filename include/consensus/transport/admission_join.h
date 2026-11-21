@@ -5,12 +5,15 @@
 #include <asio/read.hpp>
 #include <asio/ssl/stream.hpp>
 #include <asio/write.hpp>
+#include <cerrno>
+#include <fcntl.h>
 #include <filesystem>
-#include <fstream>
 #include <journal/codec.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
+#include <system_error>
 #include <task_asio.hh>
+#include <unistd.h>
 
 // Issue on join (D150, docs/mechanisms/admission.md, Joining): a node with no key and no
 // certificate joins with the cluster's join token. It makes its own key, pins the cluster CA by the
@@ -309,19 +312,52 @@ class Issuer {
 struct Joined {
 	kronuz::consensus::NodeId node = 0;
 	std::string key, certificate, ca;
-	// Writes the three files into `directory` (the key readable by its owner only) and returns
-	// the options a Peer context loads them with.
+	// Writes the three files into `directory` and returns the options a Peer context loads them
+	// with. Each is written whole to `<name>.new`, synced and renamed into place; the key is
+	// created readable by its owner only. Throws std::system_error naming the file that failed.
 	reactor::tls::Options save(const std::filesystem::path &directory) const {
 		std::filesystem::create_directories(directory);
 		const auto put = [&](const char *name, const std::string &bytes, bool secret) {
-			const auto path = directory / name;
-			std::filesystem::remove(path);
-			std::ofstream(path, std::ios::binary) << bytes;
-			if (secret)
-				std::filesystem::permissions(path, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
+			const auto path = directory / name, staged = directory / (std::string(name) + ".new");
+			const auto fail = [&](const char *what, int fd = -1) {
+				const int error = errno ? errno : EIO;
+				if (fd >= 0)
+					::close(fd);
+				::unlink(staged.c_str());
+				throw std::system_error(error, std::generic_category(), std::string("join: ") + what + " " + path.string());
+			};
+			errno = 0;
+			::unlink(staged.c_str());  // a failed save's
+			const int fd = ::open(staged.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, secret ? 0600 : 0666);
+			if (fd < 0)
+				fail("create");
+			for (std::size_t done = 0; done != bytes.size();) {
+				errno = 0;
+				const auto n = ::write(fd, bytes.data() + done, bytes.size() - done);
+				if (n < 0 && errno == EINTR)
+					continue;
+				if (n <= 0)
+					fail("write", fd);
+				done += std::size_t(n);
+			}
+			if (::fsync(fd) != 0)
+				fail("sync", fd);
+			if (::close(fd) != 0)
+				fail("close");
+			if (::rename(staged.c_str(), path.c_str()) != 0)
+				fail("rename");
 			return path.string();
 		};
-		return {put("node.pem", certificate, false), put("node.key", key, true), put("ca.pem", ca, false)};
+		reactor::tls::Options files{put("node.pem", certificate, false), put("node.key", key, true), put("ca.pem", ca, false)};
+		const int fd = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);  // the renames, durable
+		if (fd < 0 || ::fsync(fd) != 0) {
+			const int error = errno;
+			if (fd >= 0)
+				::close(fd);
+			throw std::system_error(error, std::generic_category(), "join: sync " + directory.string());
+		}
+		::close(fd);
+		return files;
 	}
 };
 

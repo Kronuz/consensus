@@ -7,9 +7,13 @@
 //   refused  a node never admitted, and one presenting another certificate, refused by name
 //   remove   a node removed and admitted again 8 times while calls flow between two other nodes:
 //            its links close, its dials are refused (removed), and no other call is lost
+//   epoch    TLS completes, the node is removed, then its hellos run: a dial, and an accept moved
+//            to its owner loop, become no link (the removal epoch)
 //   issue    a node with no key or certificate joins with the token (D150): the issuer signs its
 //            key, the CA policy pins it at its first call; a wrong, a missing and another
-//            cluster's token, and a node the hook refuses, are refused by name
+//            cluster's token, a node the hook refuses, and an impostor replaying the CA
+//            certificate, are refused by name
+//   save     a joined node's files: the key created owner-only, a failed write throws naming its file
 //   consensus_transport_admission_nodes_test <fixture dir> case [ca|pins]
 #include "consensus/transport/admission_join.h"
 #include "consensus/transport/host_transport.h"
@@ -20,7 +24,11 @@
 #include <filesystem>
 #include <future>
 #include <mutex>
+#include <csignal>
 #include <openssl/pem.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <thread>
 
 using namespace kronuz::consensus::transport;
@@ -446,18 +454,159 @@ void remove_case() {
 	for (auto *h : {&one, &two, &three})
 		h->stop();
 }
-// Runs `t` on `loop` and waits for its value, or rethrows what it threw.
-template <class T> T run(Loop &loop, task::task<T> t) {
-	std::promise<T> result;
-	asio::post(loop.io, [&] {
-		task::spawn(task::scheduler_ref::of(loop.scheduler), std::move(t), [&](std::exception_ptr e, std::optional<T> v) {
+// A loop the test thread steps, so the epoch case forces its interleavings instead of racing them.
+struct Stepped {
+	asio::io_context io;
+	task::asio_scheduler scheduler{io.get_executor()};
+	task::scheduler_ref ref() { return task::scheduler_ref::of(scheduler); }
+	~Stepped() {
+		io.stop();
+		scheduler.close();
+		scheduler.destroy_roots();
+	}
+};
+// Steps `loops` in turn until `done`, within `limit`.
+template <class P> bool step(std::initializer_list<Stepped *> loops, P done, std::chrono::milliseconds limit = 10000ms) {
+	const auto start = steady::now();
+	while (!done()) {
+		if (steady::now() - start > limit)
+			return false;
+		for (auto *l : loops) {
+			l->io.restart();
+			l->io.run_for(1ms);
+		}
+	}
+	return true;
+}
+template <class T> struct Result {
+	std::optional<T> value;
+	void spawn(Stepped &loop, task::task<T> t) {
+		task::spawn(loop.ref(), std::move(t), [this](std::exception_ptr e, std::optional<T> v) {
+			assert(!e);
+			value = std::move(v);
+		});
+	}
+};
+// One node's Links on a stepped loop, under the policy under test.
+struct Node {
+	NodeId node;
+	std::string name;
+	Stepped &loop;
+	tcp::acceptor acceptor;
+	std::shared_ptr<asio::ssl::context> tls = context(name);
+	std::optional<NodePins> pins;
+	std::unique_ptr<Links> links;
+	std::uint64_t established = 0;
+	Node(NodeId n, std::string certificate, Stepped &l)
+		: node(n), name(std::move(certificate)), loop(l), acceptor(l.io, {asio::ip::address_v4::loopback(), 0}) {
+		const std::map<NodeId, Fingerprint> own{{node, pin_of(name)}};
+		if (by_ca)
+			pins.emplace(node, own, tls->native_handle());
+		else
+			pins.emplace(node, own, tls->native_handle(), pre_approved_pins());
+		links = open(l);
+	}
+	// A Links of this node on `at`, sharing its pins.
+	std::unique_ptr<Links> open(Stepped &at) {
+		Identity cluster{};
+		cluster.fill('K');
+		auto made = std::make_unique<Links>(at.io.get_executor(), at.ref(), tls, *pins, cluster, std::map<NodeId, PeerAddress>{});
+		made->on_established = [this](const Link &) { ++established; };
+		return made;
+	}
+	void admit(const Node &peer) {
+		links->pins().admit(peer.node, by_ca ? std::nullopt : std::optional(pin_of(peer.name)));
+		links->route(peer.node, {"127.0.0.1", peer.acceptor.local_endpoint().port()});
+	}
+};
+// Stops every Links and steps the loops until they drain.
+bool stop_all(std::initializer_list<Links *> links, std::initializer_list<Stepped *> loops) {
+	for (auto *l : links)
+		l->stop();
+	return step(loops, [&] { return std::all_of(links.begin(), links.end(), [](Links *l) { return l->drained(); }); });
+}
+
+// R5: a connection whose TLS passed before remove_node must not become a link once its hellos run.
+void epoch_case() {
+	{
+		// The dial: node 1's TLS to node 3 completes, node 3 is removed, then node 1 offers its hello.
+		Stepped loop;
+		Node one(1, "n1", loop), three(3, "n3", loop);
+		one.admit(three);
+		three.admit(one);
+		task::spawn(loop.ref(), three.links->serve(three.acceptor));
+		Result<std::shared_ptr<Connection>> tls;
+		tls.spawn(loop, one.links->connect(3, LinkLane::Control));
+		check(step({&loop}, [&] { return tls.value.has_value(); }) && *tls.value, "dial: node 1's TLS to node 3 completes");
+		one.links->remove(3);
+		Result<bool> offered;
+		offered.spawn(loop, one.links->offer(3, LinkLane::Control, std::move(*tls.value)));
+		tls.value.reset();
+		check(step({&loop}, [&] { return offered.value.has_value(); }) && !*offered.value && !one.established &&
+				  !one.links->find(3, LinkLane::Control),
+			  "dial: removed before its hellos, it becomes no link");
+		check(step({&loop}, [&] { return !three.links->find(1, LinkLane::Control); }), "dial: node 3's end of it ends");
+		check(stop_all({one.links.get(), three.links.get()}, {&loop}), "dial: drained");
+	}
+	{
+		// The accept: node 1 accepts on loop a and moves node 3's connection to its owner on loop b.
+		// Loop b waits while the move is posted; node 3 is removed; then b reads node 3's hello.
+		Stepped a, b, c;
+		Node one(1, "n1", a), three(3, "n3", c);
+		auto home = one.open(b);
+		one.links->owner = [&](NodeId) { return home.get(); };
+		home->owner = [&](NodeId) { return home.get(); };
+		one.admit(three);
+		three.admit(one);
+		task::spawn(a.ref(), one.links->serve(one.acceptor));
+		Result<bool> dialed;
+		dialed.spawn(c, three.links->dial(1, LinkLane::Control));
+		// An empty owner drains once its moved accept arrives: until then it is not drained.
+		check(step({&a, &c}, [&] { return !home->drained(); }), "accept: node 3 authenticated on loop a, moved to loop b");
+		home->remove(3);
+		check(step({&a, &b, &c}, [&] { return dialed.value.has_value(); }) && !*dialed.value && !one.established &&
+				  !home->find(3, LinkLane::Control) && !one.links->find(3, LinkLane::Control),
+			  "accept: removed before its hellos, it becomes no link");
+		check(!three.links->find(1, LinkLane::Control), "accept: node 3 has no link either");
+		check(stop_all({one.links.get(), home.get(), three.links.get()}, {&a, &b, &c}), "accept: drained");
+	}
+}
+// Starts `t` on `loop`; its future holds its value, or what it threw.
+template <class T> std::future<T> start(Loop &loop, task::task<T> t) {
+	auto result = std::make_shared<std::promise<T>>();
+	auto future = result->get_future();
+	asio::post(loop.io, [&loop, result, t = std::move(t)]() mutable {
+		task::spawn(task::scheduler_ref::of(loop.scheduler), std::move(t), [result](std::exception_ptr e, std::optional<T> v) {
 			if (e)
-				result.set_exception(e);
+				result->set_exception(e);
 			else
-				result.set_value(std::move(*v));
+				result->set_value(std::move(*v));
 		});
 	});
-	return result.get_future().get();
+	return future;
+}
+// Runs `t` on `loop` and waits for its value, or rethrows what it threw.
+template <class T> T run(Loop &loop, task::task<T> t) { return start(loop, std::move(t)).get(); }
+// A host presenting `tls`'s leaf that sends `ca` as an issuer does, then counts what the joiner sends.
+task::task<std::size_t> impostor(tcp::acceptor &listener, std::shared_ptr<asio::ssl::context> tls, X509 *ca, task::scheduler_ref loop) {
+	auto [error, socket] = co_await task::await_asio<void(asio::error_code, tcp::socket)>(
+		[&](auto h) { listener.async_accept(std::move(h)); });
+	if (error || !socket)
+		co_return 0;
+	join_detail::Stream stream(std::move(*socket), *tls);
+	SSL_set_verify(stream.native_handle(), SSL_VERIFY_NONE, nullptr);
+	join_detail::Bounded bound(loop, 3000ms, stream);
+	std::size_t received = 0;
+	try {
+		co_await join_detail::handshake(stream, asio::ssl::stream_base::server);
+		co_await join_detail::write_frame(stream, join_detail::der(ca));
+		char buffer[512];
+		auto [ended, n] = co_await task::await_asio<void(asio::error_code, std::size_t)>(
+			[&](auto h) { stream.async_read_some(asio::buffer(buffer), std::move(h)); });
+		received = ended ? 0 : n;
+	} catch (...) {
+	}
+	co_return received;
 }
 std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> key_of(const std::string &name) {
 	std::unique_ptr<BIO, decltype(&BIO_free)> input(BIO_new_file((fixture / (name + ".key")).c_str(), "r"), BIO_free);
@@ -514,6 +663,26 @@ void issue_case() {
 	check(attempt({pin_of("rogue"), token.secret}, 5) == JoinFault::ca && issuer.refused(JoinFault::token) == 2,
 		  "a token of another CA is refused by the joiner before its secret goes out: ca");
 	check(attempt(token, 1) == JoinFault::node && issuer.refused(JoinFault::node) == 1, "a node the hook refuses: node");
+	{
+		// The CA certificate is public: a host with another CA's leaf (rogue3) replays it.
+		Loop fake;
+		fake.thread = std::thread([&] { fake.io.run(); });
+		tcp::acceptor listener(fake.io, {asio::ip::address_v4::loopback(), 0});
+		auto received = start(fake, impostor(listener, context("rogue3"), ca.get(), task::scheduler_ref::of(fake.scheduler)));
+		std::optional<JoinFault> fault;
+		try {
+			run(joiner, join(joiner.io.get_executor(), task::scheduler_ref::of(joiner.scheduler), listener.local_endpoint(), token, 5));
+		} catch (const JoinRefused &e) {
+			std::printf("  %s\n", e.what());
+			fault = e.fault;
+		} catch (const std::exception &e) {
+			std::printf("  impostor: %s\n", e.what());
+		}
+		const auto bytes = received.get();
+		std::printf("  the impostor received %zu bytes\n", bytes);
+		check(fault == JoinFault::ca && !bytes, "an impostor replaying the CA certificate is refused before the secret goes out: ca");
+		fake.join();
+	}
 	check(!issued, "nothing was issued");
 
 	const auto joined = run(joiner, join(joiner.io.get_executor(), task::scheduler_ref::of(joiner.scheduler), endpoint, token, 5));
@@ -537,17 +706,112 @@ void issue_case() {
 	joiner.join();
 	one.stop();
 }
+
+mode_t mode_of(const std::filesystem::path &path) {
+	struct stat s {};
+	return ::stat(path.c_str(), &s) == 0 ? s.st_mode & 0777 : 07777;
+}
+// Joined::save: the key is its owner's alone from its first byte on disk; a failed write throws.
+void save_case() {
+	const auto dir = fixture / "save";
+	const Joined joined{5, std::string(4096, 'k') + "\n", "certificate\n", "ca\n"};
+	const auto fresh = [&] {
+		std::filesystem::remove_all(dir);
+		std::filesystem::create_directories(dir);
+	};
+	const auto staged = [&] {
+		for (const auto &e : std::filesystem::directory_iterator(dir))
+			if (e.path().extension() == ".new")
+				return true;
+		return false;
+	};
+	::umask(022);
+	fresh();
+	joined.save(dir);
+	std::printf("  modes: node.key %03o, node.pem %03o, ca.pem %03o\n", unsigned(mode_of(dir / "node.key")),
+				unsigned(mode_of(dir / "node.pem")), unsigned(mode_of(dir / "ca.pem")));
+	check(mode_of(dir / "node.key") == 0600 && mode_of(dir / "node.pem") == 0644 && mode_of(dir / "ca.pem") == 0644 && !staged(),
+		  "under umask 022: the key 0600, the certificates 0644, nothing staged left");
+
+	// A child stopped by SIGXFSZ at the key's write: whatever of the key reached the disk.
+	fresh();
+	std::fflush(stdout);
+	const pid_t child = ::fork();
+	if (!child) {
+		::signal(SIGXFSZ, SIG_DFL);
+		const rlimit none{0, 0}, small{1024, 1024};
+		::setrlimit(RLIMIT_CORE, &none);
+		::setrlimit(RLIMIT_FSIZE, &small);
+		try {
+			joined.save(dir);
+		} catch (...) {
+			::_exit(1);
+		}
+		::_exit(0);
+	}
+	int status = 0;
+	::waitpid(child, &status, 0);
+	bool key = false, owner_only = true;
+	for (const auto &e : std::filesystem::directory_iterator(dir))
+		if (e.path().filename().string().starts_with("node.key")) {
+			std::printf("  stopped save left %s %03o\n", e.path().filename().c_str(), unsigned(mode_of(e.path())));
+			key = true;
+			owner_only &= !(mode_of(e.path()) & 077);
+		}
+	check(WIFSIGNALED(status) && WTERMSIG(status) == SIGXFSZ && key, "a save stopped by the file-size limit at its key's write");
+	check(owner_only, "the key's bytes on disk are its owner's alone");
+
+	// The same limit, SIGXFSZ ignored: the key's write fails with EFBIG.
+	fresh();
+	const auto previous = ::signal(SIGXFSZ, SIG_IGN);
+	rlimit limit{};
+	::getrlimit(RLIMIT_FSIZE, &limit);
+	auto small = limit;
+	small.rlim_cur = 1024;
+	::setrlimit(RLIMIT_FSIZE, &small);
+	std::string what;
+	try {
+		joined.save(dir);
+	} catch (const std::system_error &e) {
+		what = e.what();
+	}
+	::setrlimit(RLIMIT_FSIZE, &limit);
+	::signal(SIGXFSZ, previous);
+	std::printf("  a failed write: %s\n", what.empty() ? "returned" : what.c_str());
+	check(what.find("write") != std::string::npos && what.find("node.key") != std::string::npos,
+		  "a failed write throws, naming the key");
+	check(!std::filesystem::exists(dir / "node.key") && !staged(), "and leaves no key behind");
+
+	// A directory it cannot write: the first file's creation fails.
+	if (::geteuid() == 0) {
+		std::printf("  as root, every directory is writable: the unwritable directory is skipped\n");
+		return;
+	}
+	fresh();
+	std::filesystem::permissions(dir, std::filesystem::perms::owner_read | std::filesystem::perms::owner_exec);
+	what.clear();
+	try {
+		joined.save(dir);
+	} catch (const std::system_error &e) {
+		what = e.what();
+	}
+	std::filesystem::permissions(dir, std::filesystem::perms::owner_all);
+	std::printf("  an unwritable directory: %s\n", what.empty() ? "returned" : what.c_str());
+	check(what.find("node.pem") != std::string::npos, "an unwritable directory throws, naming node.pem");
+	std::filesystem::remove_all(dir);
+}
 } // namespace
 
 int main(int argc, char **argv) {
 	if (argc < 3) {
-		std::fprintf(stderr, "usage: %s <fixture dir> policy|join|refused|remove|issue [ca|pins]\n", argv[0]);
+		std::fprintf(stderr, "usage: %s <fixture dir> policy|join|refused|remove|epoch|issue|save [ca|pins]\n", argv[0]);
 		return 2;
 	}
 	fixture = argv[1];
 	const std::string which = argv[2];
 	by_ca = argc < 4 || std::string(argv[3]) == "ca";
-	std::printf("%s (%s)\n", which.c_str(), which == "policy" || which == "issue" ? "cluster CA" : by_ca ? "cluster CA" : "pre-approved pins");
+	const bool one_policy = which == "policy" || which == "issue" || which == "save";
+	std::printf("%s (%s)\n", which.c_str(), one_policy || by_ca ? "cluster CA" : "pre-approved pins");
 	watchdog(120s);
 	if (which == "policy")
 		policy_case();
@@ -557,8 +821,12 @@ int main(int argc, char **argv) {
 		refused_case();
 	else if (which == "remove")
 		remove_case();
+	else if (which == "epoch")
+		epoch_case();
 	else if (which == "issue")
 		issue_case();
+	else if (which == "save")
+		save_case();
 	else
 		return 2;
 	std::printf("%s\n", ok ? "PASS" : "FAIL");

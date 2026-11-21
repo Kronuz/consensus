@@ -105,8 +105,10 @@ cluster's never sees it. The issuer compares the secret in constant time; a wron
 `token`. Its `assign` hook names the node a joiner becomes, or refuses it (`node`); `issued` may
 record the certificate. The certificate names the node under the CA policy's prefix
 (`URI:<prefix><node>`), CA:FALSE, server and client auth, signed with SHA-256 for a year by
-default. `Joined::save(directory)` writes the key (owner-only), the certificate and the CA, and
-returns the options a Peer context loads; the joined node then connects as any node does, and the
+default. `Joined::save(directory)` writes the certificate, the key and the CA, and returns the
+options a Peer context loads: each file is written whole to `<name>.new`, synced and renamed into
+place, the key created 0600 so no other user ever reads its bytes, and a failed create, write,
+sync, close or rename throws `std::system_error` naming the file; the joined node then connects as any node does, and the
 cluster CA policy records its pin at its first connection. Refusals are `JoinRefused` with a
 `JoinFault`, counted at the issuer in `refused(fault)`.
 
@@ -139,12 +141,22 @@ node). The messages of the faults that existed before keep their text.
   and 2, which share a loop with node 3 on node 1: each removal ends node 3's calls both ways at
   once, its dials are refused (`removed`), node 1 does not dial it, it answers once admitted again,
   and no call between 1 and 2 fails. It runs under TSan.
+- `epoch`: the race the removal epoch closes, forced on loops the test steps. Node 1's dial to
+  node 3 finishes TLS, node 3 is removed, then the hellos run; and node 1 accepts node 3 on one
+  loop, moves it to its owner loop, which waits while node 3 is removed, then reads its hello.
+  Neither becomes a link.
 - `issue` (the CA policy alone): the token's round trip; a wrong token and a missing one refused
   (`token`), a token of another CA refused by the joiner before its secret goes out (`ca`), a node
-  the hook refuses (`node`), nothing issued for them; then a node with no key or certificate joins,
-  calls node 1, and node 1 pins its issued certificate at its first join.
+  the hook refuses (`node`), nothing issued for them, and an impostor presenting another CA's leaf
+  that replays the token's CA certificate (`ca`, it receives 0 bytes); then a node with no key or
+  certificate joins, calls node 1, and node 1 pins its issued certificate at its first join.
+- `save`: under umask 022 the key is 0600 and the certificates 0644; a child stopped by
+  `SIGXFSZ` at the key's write left only owner-readable key bytes; a write failing with `EFBIG`
+  throws naming the key and leaves none; an unwritable directory throws naming `node.pem`.
 
 Mutants (`test/transport/admission_mutants.py`): `no-pin-check` (a dial takes any certificate as
 the node it meant) fails `refused_pins`; `no-repin-check` (a first join re-pins a pinned node)
-fails `refused_ca`; `remove-keeps-links` fails `remove_*`; `any-token` (an issuer takes any
-secret) fails `issue`.
+fails `refused_ca`; `remove-keeps-links` fails `remove_*`; `links-no-epoch` (a connection
+authenticated before the removal becomes a link) fails `epoch_*`; `any-token` (an issuer takes any
+secret) and `join-unchained-issuer` (the joiner skips the issuer leaf's chain) fail `issue`;
+`save-chmod-after` (the key written through an ofstream, then chmodded) fails `save`.

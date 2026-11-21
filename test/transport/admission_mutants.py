@@ -25,6 +25,26 @@ mutant_commit.MUTANTS = {
                   "\t\tif (false)"),
     # connection_test peer_gone: a connection's writes raise SIGPIPE on a closed peer
     "send-signals": (T + "connection.h", "data, std::size_t(n), MSG_NOSIGNAL);", "data, std::size_t(n), 0);"),
+    # R5: a connection authenticated before its node's removal still becomes a link (epoch_*)
+    "links-no-epoch": (T + "links.h", "return it != since_.end() && pins_.current(link.peer, it->second);", "return true;"),
+    # A5: the joiner sends its secret to an issuer whose own leaf is another CA's (issue)
+    "join-unchained-issuer": (T + "admission_join.h",
+                              "!chains_to(issuer.get(), SSL_get_peer_cert_chain(stream.native_handle()), ca.get()))", "false)"),
+    # A5: Joined::save writes the key through an ofstream, then chmods it (save); the checked
+    # writer stays, unused
+    "save-chmod-after": [
+        (T + "admission_join.h", "#include <filesystem>\n", "#include <filesystem>\n#include <fstream>\n"),
+        (T + "admission_join.h", "\t\tconst auto put = [&](const char *name, const std::string &bytes, bool secret) {\n",
+         "\t\tconst auto put = [&](const char *name, const std::string &bytes, bool secret) {\n"
+         "\t\t\tconst auto path = directory / name;\n"
+         "\t\t\tstd::filesystem::remove(path);\n"
+         "\t\t\tstd::ofstream(path, std::ios::binary) << bytes;\n"
+         "\t\t\tif (secret)\n"
+         "\t\t\t\tstd::filesystem::permissions(path, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);\n"
+         "\t\t\treturn path.string();\n"
+         "\t\t};\n"
+         "\t\t[[maybe_unused]] const auto checked = [&](const char *name, const std::string &bytes, bool secret) {\n"),
+    ],
     # A2: a removal leaves the node's links up
     "remove-keeps-links": (T + "links.h", "\t\t\t\t\tif (link)\n\t\t\t\t\t\tlink->connection->abort();",
                            "\t\t\t\t\tif (link)\n\t\t\t\t\t\t(void)link;"),

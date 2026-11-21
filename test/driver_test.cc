@@ -25,8 +25,9 @@
 // call's completion and cancellation row (async-drivers D8), close, and the blocking entry
 // (D5), whose cross-thread wake case runs under TSan. `driver_test [case]`; no case runs them all.
 #include "consensus/driver.h"
-#include "journal/memory_io.h"
+#include "faultlab/faultfs.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -42,7 +43,7 @@
 
 using namespace kronuz::consensus;
 namespace j = kronuz::journal;
-namespace jt = kronuz::journal::testing;
+namespace fl = kronuz::faultlab;
 
 namespace {
 
@@ -54,6 +55,13 @@ void check(bool value, const std::string& what) {
 template <class F> bool throws_as(F&& f, const std::function<bool(std::exception_ptr)>& match) {
 	try { f(); } catch (...) { return match(std::current_exception()); }
 	return false;
+}
+
+// The host's directory on `disk`, made on first use.
+std::shared_ptr<j::IO> host_io(fl::filesystem& disk) {
+	const auto names = disk.list();
+	if (std::find(names.begin(), names.end(), "host") == names.end()) { disk.make_directory("host"); }
+	return std::make_shared<fl::io>(disk, "host");
 }
 
 constexpr Timing compact{20, 40, 100, 200, 60000};
@@ -108,7 +116,7 @@ static_assert(sink<Sink>);
 // run() as roots. Turns and the Worker's own IO go through InlineCompletion, or through a
 // HeldCompletion the case completes by hand.
 struct Loop {
-	jt::Disk& disk;
+	fl::filesystem& disk;
 	task::inline_scheduler scheduler;
 	j::InlineCompletion inline_io;
 	j::HeldCompletion held;
@@ -117,8 +125,8 @@ struct Loop {
 	std::unique_ptr<Driver<Sink>> driver;
 	task::cancel_source stop;
 	bool turns_done = false, driver_done = false;
-	explicit Loop(jt::Disk& d, bool hold_turns = false, bool hold_io = false, std::uint64_t seed = 7) : disk(d) {
-		host = std::make_unique<j::Host>(std::make_shared<jt::MemoryIO>(disk, "host/"), host_identity, j::HostOptions{1, turn_options});
+	explicit Loop(fl::filesystem& d, bool hold_turns = false, bool hold_io = false, std::uint64_t seed = 7) : disk(d) {
+		host = std::make_unique<j::Host>(host_io(disk), host_identity, j::HostOptions{1, turn_options});
 		auto io = hold_io ? j::completion_ref::of(held) : j::completion_ref::of(inline_io);
 		auto turns = hold_turns ? j::completion_ref::of(held) : j::completion_ref::of(inline_io);
 		driver = std::make_unique<Driver<Sink>>(Seams{task::scheduler_ref::of(scheduler), io, *host, 0, seed}, sink);
@@ -225,7 +233,7 @@ bool committed_command(const Sink& sink, GroupId g, const std::string& command) 
 // A lone voter's first proposal succeeds with no clock advance, after create and after
 // recover (X5, R9).
 void lone_voter() {
-	jt::Disk disk;
+	fl::filesystem disk;
 	constexpr GroupId g = 11;
 	Placement first;
 	{
@@ -264,7 +272,7 @@ void rows() {
 	constexpr GroupId g = 21;
 	std::cerr << " rows: not admitted\n";
 	{  // a call not yet admitted: unlinked, never submitted
-		jt::Disk disk; Loop loop(disk);
+		fl::filesystem disk; Loop loop(disk);
 		loop.driver->open(g, options({1}));
 		task::cancel_source cancel;
 		auto call = loop.start(loop.driver->propose(g, "never", cancel.token()));
@@ -280,7 +288,7 @@ void rows() {
 	}
 	std::cerr << " rows: staged\n";
 	{  // accepted by Core, staged, then cancelled: the record is still written and commits
-		jt::Disk disk; Loop loop(disk, true);
+		fl::filesystem disk; Loop loop(disk, true);
 		loop.lone(g);
 		task::cancel_source cancel;
 		auto call = loop.start(loop.driver->propose(g, "staged", cancel.token()));
@@ -292,7 +300,7 @@ void rows() {
 	}
 	std::cerr << " rows: committed and read\n";
 	{  // committed: unlinked on cancel; read: unlinked on cancel while awaiting the apply
-		jt::Disk disk; Loop loop(disk);
+		fl::filesystem disk; Loop loop(disk);
 		loop.lone(g);
 		std::exception_ptr error; std::optional<Placement> placed;
 		check(loop.settle(loop.driver->propose(g, "c"), placed, error) && placed, "placed");
@@ -307,7 +315,7 @@ void rows() {
 	}
 	std::cerr << " rows: transfer and repair\n";
 	{  // transfer_leadership on a lone voter is refused by Core; repair completes at RepairCompleted
-		jt::Disk disk; Loop loop(disk);
+		fl::filesystem disk; Loop loop(disk);
 		loop.lone(g);
 		std::exception_ptr error;
 		check(loop.settle(loop.driver->transfer_leadership(g, 2), error) && is<rejected>(error), "a transfer with no target voter is rejected");
@@ -320,7 +328,7 @@ void rows() {
 	}
 	std::cerr << " rows: membership\n";
 	{  // change_membership is a proposal: it completes at ProposalPlaced
-		jt::Disk disk; Loop loop(disk);
+		fl::filesystem disk; Loop loop(disk);
 		loop.lone(g);
 		Membership next; next.members = {{1, 1, MemberRole::Voter}, {2, 2, MemberRole::Learner}}; next.next_incarnation = 3;
 		std::exception_ptr error; std::optional<Placement> placed;
@@ -343,7 +351,7 @@ struct Capture {
 void checkpoints() {
 	constexpr GroupId g = 31;
 	{
-		jt::Disk disk; Loop loop(disk);
+		fl::filesystem disk; Loop loop(disk);
 		loop.lone(g);
 		std::exception_ptr error; std::optional<Placement> placed;
 		check(loop.settle(loop.driver->propose(g, "k"), placed, error) && placed, "placed");
@@ -356,7 +364,7 @@ void checkpoints() {
 		check(loop.sink.published.empty(), "the Sink hears nothing a caller awaited");
 	}
 	{
-		jt::Disk disk; Loop loop(disk, false, true);
+		fl::filesystem disk; Loop loop(disk, false, true);
 		loop.lone(g);
 		std::exception_ptr error; std::optional<Placement> placed;
 		check(loop.settle(loop.driver->propose(g, "k"), placed, error) && placed, "placed");
@@ -377,7 +385,7 @@ void checkpoints() {
 // the same held turn; after recovery every placed record above the last checkpoint commits.
 void checkpoint_keeps_acknowledged() {
 	constexpr GroupId g = 71;
-	jt::Disk disk;
+	fl::filesystem disk;
 	std::vector<std::pair<std::string, Placement>> acknowledged;
 	Index covered = 0;
 	{
@@ -428,7 +436,7 @@ void checkpoint_keeps_acknowledged() {
 // completes when its record is written; late plain calls are dropped and counted.
 void close_rows() {
 	constexpr GroupId g = 41;
-	jt::Disk disk; Loop loop(disk, true);
+	fl::filesystem disk; Loop loop(disk, true);
 	loop.lone(g);
 	auto staged = loop.start(loop.driver->propose(g, "staged"));
 	auto queued = loop.start(loop.driver->propose(g, "queued"));
@@ -466,7 +474,7 @@ void close_rows() {
 // A fenced group completes every waiter with `fenced`; shutdown cancels the rest.
 void fence_and_shutdown() {
 	constexpr GroupId g = 51, h = 52;
-	jt::Disk disk; Loop loop(disk);
+	fl::filesystem disk; Loop loop(disk);
 	loop.lone(g); loop.lone(h);
 	std::exception_ptr error; std::optional<Placement> placed;
 	check(loop.settle(loop.driver->propose(g, "f"), placed, error) && placed, "placed");
@@ -490,7 +498,7 @@ void fence_and_shutdown() {
 // A Sink that throws mid-batch fences the group: nothing after the throw is silently lost.
 void sink_throws() {
 	constexpr GroupId g = 61;
-	jt::Disk disk; Loop loop(disk);
+	fl::filesystem disk; Loop loop(disk);
 	loop.lone(g);
 	loop.sink.throw_committed = true;
 	std::exception_ptr error; std::optional<Placement> placed;
@@ -506,7 +514,7 @@ void sink_throws() {
 // term that truncates the promotion leaves the apply index at what the application received.
 void truncated_promotion() {
 	constexpr GroupId g = 71;
-	jt::Disk disk; Loop loop(disk);
+	fl::filesystem disk; Loop loop(disk);
 	loop.current = g;
 	loop.driver->open(g, options({}, 4));
 	std::exception_ptr error;
@@ -590,7 +598,7 @@ void expect(Loop& loop, GroupId g, Index first, Index through, Index applied, co
 // application's. Judging at a range's first index or at the commit index fails this.
 void witness_promotion() {
 	constexpr GroupId g = 81;
-	jt::Disk disk; Loop loop(disk);
+	fl::filesystem disk; Loop loop(disk);
 	witness_case::promote(loop, g);
 	witness_case::expect(loop, g, 1, 2, 6, "promoted at 4");
 }
@@ -599,7 +607,7 @@ void witness_promotion() {
 // own, so the application, which holds nothing past 2, receives neither.
 void witness_removal() {
 	constexpr GroupId g = 82;
-	jt::Disk disk; Loop loop(disk);
+	fl::filesystem disk; Loop loop(disk);
 	witness_case::promote(loop, g);
 	witness_case::append(loop, g, 5, 6, 6, {witness_case::configuration(7, witness_case::removed), witness_case::command(8)});
 	witness_case::append(loop, g, 6, 8, 9, {witness_case::command(9)});
@@ -612,7 +620,7 @@ void witness_removal() {
 // After a restart from the witness's checkpoint at 6, its removal's range [7..7] is still its own.
 void witness_removal_restart() {
 	constexpr GroupId g = 83;
-	jt::Disk disk;
+	fl::filesystem disk;
 	{
 		Loop loop(disk);
 		witness_case::promote(loop, g);
@@ -639,10 +647,10 @@ void entry_wake_threads() {
 	constexpr int rounds = 20;
 	constexpr std::uint64_t other = 77;
 	constexpr auto budget = std::chrono::milliseconds(50);
-	jt::Disk disk;
+	fl::filesystem disk;
 	task::blocking_scheduler scheduler;
 	j::InlineCompletion io;
-	j::Host host(std::make_shared<jt::MemoryIO>(disk, "host/"), host_identity, j::HostOptions{1, turn_options});
+	j::Host host(host_io(disk), host_identity, j::HostOptions{1, turn_options});
 	Sink sink;
 	Driver<Sink> driver(Seams{task::scheduler_ref::of(scheduler), j::completion_ref::of(io), host, 0, 7}, sink);
 	auto& turns = driver.turns();
@@ -692,7 +700,7 @@ void entry_wake_threads() {
 // changes none of them.
 void leader_gone() {
 	constexpr GroupId first = 91, groups = 8;
-	jt::Disk disk; Loop loop(disk);
+	fl::filesystem disk; Loop loop(disk);
 	auto quiescent = [] { auto o = options({1, 2, 3}, 2); o.timing.quiesce = true; return o; };
 	for (GroupId g = first; g < first + groups; ++g) {
 		loop.current = g;

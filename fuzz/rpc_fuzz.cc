@@ -4,6 +4,9 @@
 // for method 7, driven by records of [op][u16 length][bytes]: op 0 receives a frame, 1 consumes
 // every delivered byte, 2 advances time 40 ms and expires, 3 drains, 4 stops a call. A
 // violation closes the lane. Then: every call ended exactly once and every pool is back to 0.
+// Every pool is below two windows and the queue below two frames, so calls wait for `calling`,
+// `outgoing` and room, and a served request's 4 KiB window is easy to overrun (rule 7.6).
+// Run it with fuzz/rpc_fuzz.sh, whose -max_len covers the lane's largest frame.
 #include "consensus/transport/rpc.h"
 
 #include <cstdint>
@@ -21,7 +24,7 @@ void require(bool value) {
 }
 
 struct Table {
-	ByteBudget serving{1 << 18}, calling{1 << 18}, outgoing{1 << 18};
+	ByteBudget serving{3 << 12}, calling{(1 << 17) + (1 << 15)}, outgoing{128};
 	Clock::time_point time = Clock::time_point{} + std::chrono::hours(1);
 	std::deque<std::function<void()>> posted;
 	std::map<Handle, int> done;          // completions per call
@@ -39,7 +42,7 @@ struct Table {
 	std::deque<Handle> handles;
 	explicit Table(bool dialer) {
 		lane.emplace(
-			dialer, Pools{serving, calling, outgoing}, LaneOptions{.window = 1 << 17, .serving = 4},
+			dialer, Pools{serving, calling, outgoing}, LaneOptions{.window = 1 << 12, .serving = 4, .queue_bytes = 96},
 			[this](const Incoming &in) -> std::optional<Events> {
 				if (in.method != 7)
 					return std::nullopt;
@@ -95,6 +98,8 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t *data, std::size_t size
 			} else if (op == 2) {
 				t.time += std::chrono::milliseconds(40);
 				t.lane->expire();
+				if (auto at = t.lane->next_deadline())
+					require(*at > t.time - std::chrono::hours(2));
 			} else if (op == 3) {
 				t.lane->drain();
 			} else if (!t.handles.empty()) {

@@ -112,6 +112,13 @@ from:
 The measured fit sits between them: about `137 + 37P` at L = 1 and `131 + 41P` at L = 4. Stored
 is 27-33 B under 164, and each peer 11-15 B under 52.
 
+Since transport-group-bytes the open is the host's (`open_of(group)`, host-transport.md,
+Identity), and the last source a connection reported sits beside its id in the group loop's set
+(16 B, not 8). Stored is the id, incarnation and serial, 24 B; per peer, 16 and 16, 32 B. So the
+minimum is `24 + 32P` and the bound `44 + 64P` (24 x 1.5 + 8; 2 x (16 x 1.5 + 8)), and the bench
+also fails a group stored over D108's 64 B. The rows at the new commit are in transport-group-bytes'
+section below.
+
 The per-end and per-host rows below are job 261118-075717-797949 (light, consensus:33f8540, Release
 and no build type, 3 runs each; byte counts do not depend on load).
 
@@ -197,6 +204,17 @@ and a short vector scan on main (profile job 261118-001853-9bb0ba). Before the r
 became a vector of records (consensus:01e2c06, job 261117-205819-0701eb) the data stream cost
 1,575-1,608 ns against main's 644-647 ns: each batch built a credit table and a sender's record
 per credited group, then freed both.
+
+D115 rests on the exclusive job 261118-003330-778798, the same streams alone on the machine: data,
+same 607 and 625 ns on main against 465 and 470 on the branch; control, 277 and 290 ns against
+336 and 333.
+
+The receiver's credit costs frames in the reverse direction. A batch owes one record per run of a
+group's frames, and the sender's round robin makes each run one frame long, so the receiver sends
+about one credit frame per data frame: 0.55-0.90 credit frames per data frame in the hop data
+stream, against 0.43-0.49 on main's per-group map (job 261118-013433-b93ec8), about twice the
+credit bytes (17 B a frame). Both ends' CPU still falls, so the records stay; merging runs per
+batch again would need a per-batch table, the cost the records removed.
 
 Beside it, the bare Asio hop with no TLS and no transport (Detent `run.sh hop_cost`, job
 261117-092732-0475d9, exclusive, Detent:d15d063): 793-851 ns per frame posted alone, 21-22 ns in

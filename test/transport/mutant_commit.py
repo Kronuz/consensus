@@ -15,10 +15,10 @@ import tempfile
 T = "include/consensus/transport/"
 MUTANTS = {
     # deadline.h (A1)
-    "no-extension": (T + "deadline.h", "if (self.extend_late_ && !self.extended_ && late > wheel::timer_wheel::tick) {", "if (false) {"),
-    "uncapped": (T + "deadline.h", "self.extended_ = std::min(late, self.timeout_);", "self.extended_ = late;"),
-    "twice": (T + "deadline.h", "if (self.extend_late_ && !self.extended_ && late > wheel::timer_wheel::tick) {",
-              "if (self.extend_late_ && late > wheel::timer_wheel::tick) {"),
+    "no-extension": (T + "deadline.h", "\t\tif (self.extend_late_ && !self.extended_)\n", "\t\tif (false)\n"),
+    "uncapped": (T + "deadline.h", "return late > wheel::timer_wheel::tick ? std::min(late, timeout) : 0;",
+                 "return late > wheel::timer_wheel::tick ? late : 0;"),
+    "twice": (T + "deadline.h", "\t\tif (self.extend_late_ && !self.extended_)\n", "\t\tif (self.extend_late_)\n"),
     "wake-ignores-extension": (T + "deadline.h", "\t\tif (state_ != outcome::pending)\n\t\t\treturn;\n\t\tstate_ = outcome::woken;",
                                "\t\tif (state_ != outcome::pending || extended_)\n\t\t\treturn;\n\t\tstate_ = outcome::woken;"),
     "entry-left-armed": (T + "deadline.h", "\t\tif (armed())\n\t\t\tloop_.cancel(*this);\n\t\tleave();", "\t\tleave();"),
@@ -56,6 +56,11 @@ MUTANTS = {
     "late-always-extends": (T + "deadline.h", "if (self.extend_late_ && !self.extended_", "if (!self.extended_"),
     "keepalive-extends": (T + "connection.h", "late_deadline idle(loop_, options_.keepalive, false);",
                           "late_deadline idle(loop_, options_.keepalive);"),
+    # consensus-quiescence A2: LeaderGone dropped for one group, and in Core
+    "leader-gone-skips-one": ("include/consensus/driver.h", "g.notices.emplace_back(LeaderGone{node}); mark_ready(g);",
+                              "if (&g != groups_.begin()->second.get()) { g.notices.emplace_back(LeaderGone{node}); mark_ready(g); }"),
+    "node-gone-unreported": (T + "host_transport.h", "if (link.lane == LinkLane::Control && !loops_[k].stopping)", "if (false)"),
+    "leader-gone-ignored": ("include/consensus/core.h", "\t\tfollower(0, output); leader_contact_ = 0;\n", "\t\t(void)output;\n"),
     # links.h (A4's tie-break, A1's lookup)
     "refuse-when-offered": (T + "links.h", "return !offered || peer < pins_.local();", "return !offered;"),
     "accept-when-offered": (T + "links.h", "return !offered || peer < pins_.local();", "return true || offered;"),
@@ -81,7 +86,7 @@ MUTANTS = {
                              "\t\t\tif (true) {\n\t\t\t\tdeliver(k, std::move(moved));"),
     "no-hand-off": (T + "links.h", "Links *home = owner ? owner(peer) : nullptr;", "Links *home = nullptr;"),
     # host_transport.h (transport-groups review F3: credit comes back)
-    "no-credit-on-refuse": (T + "host_transport.h", "\t\t\tif (r.data) {", "\t\t\tif (r.data && taken) {"),
+    "no-credit-on-refuse": (T + "host_transport.h", "\t\t\tif (r.data)\n\t\t\t\towe_for", "\t\t\tif (r.data && taken)\n\t\t\t\towe_for"),
     "no-reset-on-end": (T + "host_transport.h", "\t\t\ta.outstanding = 0;\n\t\t\ta.in = 0;", "\t\t\ta.in = 0;"),
     # host_transport.h (transport-identity A1: the per-frame rule, R7, and the group-open exchange)
     "admit-unstored": (T + "host_transport.h", "\tif (!held)\n\t\treturn Admission::unstored;\n", ""),
@@ -100,20 +105,37 @@ MUTANTS = {
                       "\t\tif (r.size++)\n\t\t\tlane.active.find(r.tail)->next[ring] = id;\n\t\telse\n\t\t\tr.head = id;\n\t\tr.tail = id;",
                       "\t\ta.next[ring] = r.head;\n\t\tr.head = id;\n\t\tif (!r.size++)\n\t\t\tr.tail = id;"),
     "uncredited-kept": (T + "host_transport.h", "\t\t\t\there.stats.uncredited -= credited;\n", ""),
-    "store-keeps-opens": (T + "host_transport.h", "\t\there.stored[group] = {incarnation, {open, ++here.serial}};\n\t\tunopen(here, group);",
-                          "\t\there.stored[group] = {incarnation, {open, ++here.serial}};"),
+    "store-keeps-opens": (T + "host_transport.h", "\t\there.stored[group] = {incarnation, ++here.serial};\n\t\tunopen(here, group);",
+                          "\t\there.stored[group] = {incarnation, ++here.serial};"),
     # transport-feed-scan review F3: the per-connection generation rule on the group loop
     "no-generation-clear": (T + "host_transport.h", "\t\t\tconnection.generation = batch.peer.generation;\n\t\t\tconnection.groups.clear();",
                             "\t\t\tconnection.generation = batch.peer.generation;"),
     "no-current": (T + "host_transport.h", "const bool current = batch.peer.generation == connection.generation;", "const bool current = true;"),
     # transport-feed-scan review G1: owe's merge keeps only the first record's bytes per group
-    "coalesce-drops-credit": (T + "host_transport.h", "\t\t\t\tv[n - 1].bytes += v[i].bytes;\n", "\t\t\t\t(void)0;\n"),
+    "coalesce-drops-credit": (T + "host_transport.h", "\t\t\t\tv[m - 1].bytes += v[i].bytes;\n", "\t\t\t\t(void)0;\n"),
+    # consensus-transport A1, A2: hold (T3), Drain before a lane_idle close (D7, T8), the reader (T5)
+    "hold-ignored": (T + "host_transport.h", "\t\t++loops_[k].rpc[node].holds;\n", "\t\t(void)loops_[k].rpc[node];\n"),
+    "rpc-no-drain": (T + "host_transport.h", "\t\tpeer.lane->drain();\n\t\trpc_ready(k, node);", "\t\tpeer.link->connection->close();"),
+    "lane-via-other-loop": (T + "host_transport.h", "\t\tif (frame.size() >= 4 && frame.substr(0, 4) == \"DTRP\")\n\t\t\treturn rpc_arrived(k, link, frame);",
+                            "\t\tif (frame.size() >= 4 && frame.substr(0, 4) == \"DTRP\") {\n\t\t\tconst auto o = (k + 1) % std::uint32_t(loops_.size());\n"
+                            "\t\t\ton(o, [this, k, node = link.peer, f = std::string(frame)] { on(k, [this, k, node, f] {\n"
+                            "\t\t\t\tif (auto *l = loops_[k].rpc[node].link)\n\t\t\t\t\trpc_arrived(k, *l, f);\n\t\t\t}); });\n\t\t\treturn;\n\t\t}"),
+    # transport-receive-bound: what a connection's frames hold before their group loop takes them
+    "data-unbounded": (T + "host_transport.h", "} else if (held.data && held.data + frame.size() > options_.window) {", "} else if (false) {"),
+    "control-unbounded": (T + "host_transport.h", "if (held.frames >= options_.arriving) {", "if (false) {"),
+    # transport-group-bytes: what a connection owes (Owing) and the feed's order
+    "owing-keeps-prefix": (T + "host_transport.h", "\t\tif (repaid_ * 2 >= records_.size())\n\t\t\tdrop_repaid();\n", ""),
+    "closes-unbounded": (T + "host_transport.h", "if (r.close && closes_ < closes) {", "if (r.close) {"),
+    "owed-before-control": [
+        (T + "host_transport.h", "\t\t\tif (lane.rings[control_ring].size) {\n\t\t\t\tauto [id, a] = pop(lane, control_ring, stats);",
+         "\t\t\tif (!lane.owed.empty()) {\n\t\t\t\tfed += repay(k, lane, stats);\n\t\t\t\tcontinue;\n\t\t\t}\n\t\t\tif (lane.rings[control_ring].size) {\n\t\t\t\tauto [id, a] = pop(lane, control_ring, stats);"),
+    ],
     # security review S1: a read that fails after handing frames over leaves them for the next read
     "read-fails-unflushed": (T + "connection.h",
                              "\t\t\t\tif (on_read)\n\t\t\t\t\ton_read();  // the frames this read handed over, even when it then failed\n\t\t\t\tif (failed)\n\t\t\t\t\tstd::rethrow_exception(failed);",
                              "\t\t\t\tif (failed)\n\t\t\t\t\tstd::rethrow_exception(failed);\n\t\t\t\tif (on_read)\n\t\t\t\t\ton_read();"),
     # security review N2: a zero identity stored
-    "store-zero": (T + "host_transport.h", "if (open.cluster == Identity{} || open.group == Identity{} || open.epoch == Identity{})", "if (false)"),
+    "store-zero": (T + "host_transport.h", "open.cluster == Identity{} || open.group == Identity{} || open.epoch == Identity{})", "false)"),
     # the control: Detent:73e96d6's rule, only a sender that votes in the receiver's membership
     "voters-only": (T + "host_transport.h", "source && source->node != node)",
                     "!source || source->role == kronuz::consensus::MemberRole::Learner || source->node != node)"),

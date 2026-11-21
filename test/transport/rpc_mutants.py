@@ -53,9 +53,21 @@ MUTANTS = {
                             "\t\t} catch (const ProtocolError &) {\n\t\t\t++failed_;\n\t\t\tpools_.serving.release(held);"),
                            ("\t\ttry {\n\t\t\tf();\n\t\t\treturn true;\n\t\t} catch (const std::exception &e) {\n\t\t\tfail(h, e.what());\n\t\t} catch (...) {",
                             "\t\ttry {\n\t\t\tf();\n\t\t\treturn true;\n\t\t} catch (const ProtocolError &e) {\n\t\t\tfail(h, e.what());\n\t\t} catch (const std::bad_alloc &) {")],
+    # queue-cap, rpc_host_test stalled-peer (A3): no per-connection cap on queued frames
+    "rpc-no-queue-cap": [("\t\treturn !(queued_ + reserved_) || queued_ + reserved_ + size <= options_.queue_bytes;",
+                          "\t\treturn true;")],
+    # reenter (N3, under ASan): a close() inside a callback runs at once
+    "close-reenters": [("\t\tif (depth_) {\n\t\t\tclose_wanted_ = true;", "\t\tif (false) {\n\t\t\tclose_wanted_ = true;")],
+    # unread-queue (N1): refusals pile up unsent without bound
+    "refusals-unbounded": [("\t\t\tif (refusals_ > options_.serving)", "\t\t\tif (false)")],
+    # overrun (N2): send takes bytes past a known total when they do not end it
+    "send-past-total": [("(bytes.size() > o.total - o.sent || end != (o.sent + bytes.size() == o.total))",
+                         "end != (o.sent + bytes.size() == o.total)")],
     # hello_test leader: the transport reports default limits, not the ones the peer's hello carried
     "hello-limits-ignored": [(HOST, "here.report(route.group, {route.source, limits});",
                               "here.report(route.group, {route.source, kronuz::consensus::Limits{}});")],
+    # rpc_host_test fetch (Linux, where SO_NOSIGPIPE is missing): the host does not ignore SIGPIPE
+    "sigpipe-default": [("test/transport/rpc_host_test.cc", "\tstd::signal(SIGPIPE, SIG_IGN);", "\t(void)0;")],
 }
 
 

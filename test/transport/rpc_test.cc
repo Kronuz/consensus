@@ -207,6 +207,7 @@ struct Net {
 	bool server_holds = false;
 	std::list<Peer> callers, servers;
 	std::map<Kind, int> from_a, from_b;
+	std::function<void()> ready_a, ready_b; // each table's `ready`, when set
 	std::unique_ptr<Host> a, b;
 	explicit Net(std::size_t pool = 1 << 20, LaneOptions options = {.window = 128 << 10})
 		: a(std::make_unique<Host>(*this, true, pool, options)), b(std::make_unique<Host>(*this, false, pool, options)) {}
@@ -258,7 +259,7 @@ struct Net {
 	}
 };
 Host::Host(Net &net, bool dialer, std::size_t pool, LaneOptions options)
-	: serving(pool), calling(pool), outgoing(pool),
+	: serving(pool), calling(pool), outgoing(std::max(pool, frame_bytes)),
 	  lane(
 		  dialer, {serving, calling, outgoing}, options,
 		  [&net, dialer](const Incoming &in) -> std::optional<Events> {
@@ -269,7 +270,12 @@ Host::Host(Net &net, bool dialer, std::size_t pool, LaneOptions options)
 			  p.hold = net.server_holds;
 			  return events(net.b->lane, p, net.response, true);
 		  },
-		  [&net](std::function<void()> f) { net.posted.push_back(std::move(f)); }, [] {}, [&net] { return net.time; }) {}
+		  [&net](std::function<void()> f) { net.posted.push_back(std::move(f)); },
+		  [&net, dialer] {
+			  if (auto &ready = dialer ? net.ready_a : net.ready_b)
+				  ready();
+		  },
+		  [&net] { return net.time; }) {}
 
 std::vector<Frame> queued(Lane &lane, std::vector<std::string> &keep) {
 	while (auto f = lane.next())
@@ -541,16 +547,112 @@ void split_release() {
 	CHECK(first.ok() && second.ok() && first.got.size() == 256 << 10 && net.zero());
 }
 
-// Mutant `id-at-call`: a call that waits for `outgoing` takes its id after the one that did not.
+// Mutant `id-at-call`: a call that waits for room on the connection takes its id after the one
+// whose Call fit.
 void id_at_call() {
-	Net net;
-	auto &out = net.a->outgoing;
-	Charge blocker(out, out.try_acquire(out.limit(), out.limit()));
-	auto &waits = net.call(pattern(1000, 'w'), 1000);
-	auto &goes = net.call("", 0);
-	blocker = Charge();
+	Net net(1 << 20, {.window = 128 << 10, .queue_bytes = 1100});
+	auto &first = net.call(pattern(100, 'f'), 100);     // 148 bytes queued
+	auto &waits = net.call(pattern(1000, 'w'), 1000);   // 1,048 more: no room
+	auto &goes = net.call("", 0);                       // 48: fits
+	CHECK(net.a->lane.queued() == 196);
 	net.flow();
-	CHECK(waits.ok() && goes.ok() && net.zero());
+	CHECK(first.ok() && waits.ok() && goes.ok() && net.zero());
+}
+
+// N3: a `ready` that closes the table runs the close once the table's own call returns: in
+// called(), while it holds the served call; in stop(), before it ends the call (ASan proves it).
+void reenter() {
+	{
+		Net net;
+		auto &c = net.open(); // a streamed request: its server grants credit inside called()
+		net.ready_b = [&net] { net.b->lane.close(); };
+		net.ab();
+		CHECK(net.servers.size() == 1 && net.servers.back().got == "ping" &&
+			  net.servers.back().ended_with(Outcome::connection_aborted, Code{}) && !net.b->lane.live());
+		net.ready_b = {};
+		net.a->lane.close();
+		net.run();
+		CHECK(c.completions == 1 && net.zero());
+	}
+	{
+		Net net;
+		auto &c = net.open();
+		net.flow();
+		net.ready_a = [&net] { net.a->lane.close(); };
+		net.a->lane.stop(c.h, Code::cancelled);
+		CHECK(c.ended_with(Outcome::cancel, Code::cancelled) && !net.a->lane.live());
+		net.ready_a = {};
+		net.b->lane.close();
+		net.run();
+		CHECK(net.zero());
+	}
+	{
+		Net net; // chunk(): a served end queued with a close inside its `ready`
+		auto &c = net.call("ping", 4);
+		net.ready_b = [&net] { net.b->lane.close(); };
+		net.ab();
+		CHECK(net.servers.back().completions == 1 && !net.b->lane.live());
+		net.ready_b = {};
+		net.a->lane.close();
+		net.run();
+		CHECK(c.completions == 1 && net.zero());
+	}
+}
+
+// N2: bytes past a known total are refused at once, before any state changes; the right end goes.
+void overrun() {
+	Net net;
+	Peer p;
+	p.end_sent = true; // written by hand below
+	p.h = net.a->lane.call(7, {.deadline = net.time + 10s, .window = 128 << 10, .total = 10}, "abcd", events(net.a->lane, p));
+	net.flow();
+	net.a->lane.receive(encode({.kind = Kind::credit, .call = 1, .limit = 1 << 16})); // credit past the total
+	CHECK(net.a->lane.sendable(p.h) >= 7);
+	REJECTS(net.a->lane.send(p.h, std::string(7, 'x'), false), "rpc send");
+	REJECTS(net.a->lane.send(p.h, std::string(7, 'x'), true), "rpc send");
+	net.a->lane.send(p.h, "efghij", true);
+	net.flow();
+	CHECK(p.ok() && net.servers.back().got == "abcdefghij" && net.zero());
+}
+
+// N1: a peer that sends Calls and never reads. Every unsent frame is charged to `outgoing`; served
+// responses wait for room, so their calls keep their slots; past `serving` refusals the table
+// throws, and the connection closes.
+void unread_queue() {
+	Net net(1 << 20, {.window = 1 << 16, .serving = 4, .queue_bytes = 1024});
+	net.response = 100; // a 140-byte end Body each
+	std::string thrown_at;
+	int calls = 0;
+	for (; calls < 64 && thrown_at.empty(); ++calls) {
+		net.call("ping", 4, 4096);
+		thrown_at = thrown([&] { net.ab(); });
+		auto &b = *net.b;
+		CHECK(b.outgoing.used() == b.lane.queued() && b.lane.queued() <= 1024 + 5 * 24);
+	}
+	std::printf("unread-queue: %d calls, %zu bytes unsent at the throw: %s\n", calls, net.b->lane.queued(), thrown_at.c_str());
+	CHECK(thrown_at.find("does not read") != std::string::npos && calls <= 7 + 4 + 5);
+	net.b->lane.close();
+	net.a->lane.close();
+	net.run();
+	CHECK(net.zero());
+}
+
+// A3: the table queues at most `queue_bytes` unsent; a call with more waits for room, holding none
+// of `outgoing` for it.
+void queue_cap() {
+	Net net(16 << 20, {.window = 4 << 20, .queue_bytes = 2 * frame_bytes});
+	std::vector<Peer *> calls;
+	for (char c : {'x', 'y', 'z'})
+		calls.push_back(&net.call(pattern(1 << 20, c), 0, 64 << 10));
+	net.ab();
+	net.ba(); // the servers' credit: each writer queues its whole request
+	std::printf("queue-cap: %zu bytes queued, outgoing %zu\n", net.a->lane.queued(), net.a->outgoing.used());
+	CHECK(net.a->lane.queued() <= 2 * frame_bytes && net.a->outgoing.used() <= 2 * frame_bytes);
+	net.flow();
+	for (auto *p : calls)
+		CHECK(p->ok());
+	std::printf("queue-cap: outgoing high water %zu\n", net.a->outgoing.high_water());
+	CHECK(net.a->outgoing.high_water() <= 3 * frame_bytes && net.zero()); // the cap and the frame being handed over
 }
 
 // The pools' arithmetic, with values.
@@ -785,6 +887,10 @@ int main(int argc, char **argv) {
 		{"split-release", split_release},
 		{"drain-ignored", drain_ignored},
 		{"id-at-call", id_at_call},
+		{"reenter", reenter},
+		{"overrun", overrun},
+		{"unread-queue", unread_queue},
+		{"queue-cap", queue_cap},
 	};
 	int ran = 0;
 	for (auto &[name, run] : cases)

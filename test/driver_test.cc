@@ -34,6 +34,7 @@
 #include <functional>
 #include <iostream>
 #include <map>
+#include <set>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -695,7 +696,91 @@ void entry_wake_threads() {
 	std::cerr << " entry_wake_threads: slowest wake to return " << std::chrono::duration_cast<std::chrono::microseconds>(slowest).count() << " us\n";
 }
 
+// Quiescence A2 (docs/mechanisms/quiescence.md): groups following leader 1 at rest arm no
+// timer. Driver::leader_gone(1), the node-pair detector's report, makes every one of them drop
+// that leader and campaign (a pre-vote) within its election timeout; a report of another node
+// changes none of them.
+void leader_gone() {
+	constexpr GroupId first = 91, groups = 8;
+	fl::filesystem disk; Loop loop(disk);
+	auto quiescent = [] { auto o = options({1, 2, 3}, 2); o.timing.quiesce = true; return o; };
+	for (GroupId g = first; g < first + groups; ++g) {
+		loop.current = g;
+		loop.driver->open(g, quiescent());
+		std::exception_ptr error;
+		check(loop.settle(loop.driver->create(g, j::Identity{'Q', static_cast<char>(g)}), error) && !error, "create");
+		// Leader 1's empty append in term 1: its commit covers this follower's whole log.
+		loop.driver->receive(g, Receive{1, AppendRequest{1, 1, 0, 0, 0, 0, {}}});
+		loop.release();
+	}
+	auto following = [&](NodeId leader) {
+		std::size_t n = 0;
+		for (GroupId g = first; g < first + groups; ++g) { auto s = loop.driver->state(g); n += s && s->role == Role::Follower && s->leader == leader; }
+		return n;
+	};
+	auto prevotes = [&] {
+		std::set<GroupId> campaigning;
+		for (const auto& [g, send] : loop.sink.sent) { if (std::holds_alternative<PreVoteRequest>(send.message)) { campaigning.insert(g); } }
+		return campaigning.size();
+	};
+	check(following(1) == groups, "every group follows leader 1");
+	check(loop.driver->armed_group_timers() == 0, "groups at rest arm no timer: " + std::to_string(loop.driver->armed_group_timers()));
+	for (int n = 0; n < 10; ++n) { loop.scheduler.advance(1'000'000'000); loop.run(); }
+	check(prevotes() == 0 && following(1) == groups, "at rest, ten seconds pass with no campaign");
+	loop.driver->leader_gone(2); loop.release();
+	check(following(1) == groups && loop.driver->armed_group_timers() == 0, "a report of another node changes none");
+	loop.driver->leader_gone(1); loop.release();
+	check(following(0) == groups, "every group drops leader 1: " + std::to_string(following(0)) + " of " + std::to_string(groups));
+	check(loop.driver->armed_group_timers() == groups, "and arms its election timer");
+	loop.scheduler.advance(compact.election_max * 1'000'000); loop.run();
+	check(prevotes() == groups, "each campaigns within its election timeout: " + std::to_string(prevotes()) + " of " + std::to_string(groups));
+}
+
+// Quiescence: a group fenced on a live node tells its other members Gone in its term; a follower
+// at rest hearing Gone from its leader drops it and campaigns within its election timeout, as on
+// LeaderGone, while Gone from another member changes nothing.
+void fence_tells_peers() {
+	constexpr GroupId fenced_group = 101, following = 102;
+	fl::filesystem disk; Loop loop(disk);
+	auto quiescent = [] { auto o = options({1, 2, 3}, 2); o.timing.quiesce = true; return o; };
+	for (GroupId g : {fenced_group, following}) {
+		loop.current = g;
+		loop.driver->open(g, quiescent());
+		std::exception_ptr error;
+		check(loop.settle(loop.driver->create(g, j::Identity{'F', static_cast<char>(g)}), error) && !error, "create");
+	}
+	// Leader 1's entry, committed: the application fails at it and the group fences.
+	loop.driver->receive(fenced_group, Receive{1, AppendRequest{1, 1, 0, 0, 1, 0, {Entry{1, 1, EntryKind::Command, "x"}}}});
+	loop.release();
+	loop.driver->receive(following, Receive{1, AppendRequest{1, 1, 0, 0, 0, 0, {}}});
+	loop.release();
+	auto told = [&](GroupId g) {
+		std::set<NodeId> peers;
+		for (const auto& [id, send] : loop.sink.sent) {
+			if (auto gone = std::get_if<Gone>(&send.message); id == g && gone && gone->term == 1) { peers.insert(send.peer); }
+		}
+		return peers;
+	};
+	check(told(fenced_group).empty(), "no Gone before the fence");
+	loop.driver->application_failed(fenced_group, loop.sink.last_committed(fenced_group), "the application failed");
+	loop.run();
+	check(!loop.sink.fenced.empty() && loop.sink.fenced.back().first == fenced_group, "the group fences");
+	check(told(fenced_group) == std::set<NodeId>{1, 3}, "and tells its other members Gone in its term");
+	auto state = [&] { return loop.driver->state(following); };
+	check(state()->resting && state()->leader == 1 && loop.driver->armed_group_timers() == 0, "the other group follows leader 1 at rest");
+	loop.driver->receive(following, Receive{3, Gone{1}}); loop.release();
+	check(state()->leader == 1 && state()->resting, "Gone from another member changes nothing");
+	loop.driver->receive(following, Receive{1, Gone{1}}); loop.release();
+	check(state()->leader == 0 && !state()->resting && loop.driver->armed_group_timers() == 1, "Gone from its leader drops it and arms the election timer");
+	loop.scheduler.advance(compact.election_max * 1'000'000); loop.run();
+	bool campaigned = false;
+	for (const auto& [g, send] : loop.sink.sent) { campaigned |= g == following && std::holds_alternative<PreVoteRequest>(send.message); }
+	check(campaigned, "and it campaigns within its election timeout");
+}
+
 const std::map<std::string, void (*)()> cases{
+	{"fence_tells_peers", &fence_tells_peers},
+	{"leader_gone", &leader_gone},
 	{"lone_voter", &lone_voter},
 	{"rows", &rows},
 	{"checkpoints", &checkpoints},

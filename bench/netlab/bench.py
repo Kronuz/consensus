@@ -105,6 +105,10 @@ class Plan:
     load_wait: float = (
         30.0  # past a load's own seconds, before its answer is "no answer"
     )
+    large_bytes: int = LARGE  # the large entries' size
+    large_inflight: int = (
+        0  # large entries in flight; 0 is inflight // 8 (2 MiB at 64 KiB)
+    )
     partition_seconds: float = 4.0
     healed_seconds: float = 3.0
     pings: int = 10
@@ -579,8 +583,8 @@ class Bench:
     def load(self, leader: int, size: int, inflight: int) -> dict[str, Any]:
         seconds = self.plan.load_seconds
         # 128 MiB of 64 KiB entries per node, which the guest holds twice
-        cap = 2048 if size == LARGE else 1_000_000
-        label = f"{'large' if size == LARGE else 'small'}-{inflight}"
+        cap = (128 << 20) // size if size > SMALL else 1_000_000
+        label = f"{size}B-{inflight}"
         self.begin_sampling(label, leader)
         try:
             reply = self.call(
@@ -602,7 +606,7 @@ class Bench:
             "failures": reply.get("failures", {}),
         }
 
-    # --diag: each node's applied index and the leader's TCP sockets, every half second of a load.
+    # --diag: each node's status and the leader's TCP sockets, every half second of a load.
 
     def begin_sampling(self, label: str, leader: int) -> None:
         if self.diag is None:
@@ -624,8 +628,12 @@ class Bench:
         if now < self.next_sample and not force:
             return
         self.next_sample = now + 0.5
-        applied = {
-            node: self.replies.get(request, {}).get("applied")
+        status = {  # each node's last status: applied index and the appends it sent and answered
+            node: {
+                k: v
+                for k, v in self.replies.get(request, {}).items()
+                if k not in ("ev", "t", "id", "node")
+            }
             for node, request in self.status.items()
         }
         try:
@@ -638,7 +646,7 @@ class Bench:
                     "t": round(now, 3),
                     "load": label,
                     "leader": leader,
-                    "applied": applied,
+                    "status": status,
                     "ss": sockets,
                 }
             )
@@ -955,9 +963,12 @@ class Bench:
             leader = self.leader()
             row["small_latency"] = self.load(leader, SMALL, 1)
             row["small_throughput"] = self.load(leader, SMALL, self.plan.inflight)
-            row["large_latency"] = self.load(leader, LARGE, 1)
+            large = self.plan.large_bytes
+            row["large_latency"] = self.load(leader, large, 1)
             row["large_throughput"] = self.load(
-                leader, LARGE, max(1, self.plan.inflight // 8)
+                leader,
+                large,
+                self.plan.large_inflight or max(1, self.plan.inflight // 8),
             )
             row["rpc"] = self.rpc(leader)
             times = self.elections(shape)
@@ -1242,6 +1253,8 @@ def main(argv: list[str]) -> int:
     p.add_argument(
         "--load-wait", type=float, help="seconds past a load's own to wait for it"
     )
+    p.add_argument("--large-bytes", type=int, help="the large entries' size")
+    p.add_argument("--large-inflight", type=int, help="large entries in flight")
     p.add_argument(
         "--diag",
         action="store_true",
@@ -1287,6 +1300,10 @@ def main(argv: list[str]) -> int:
     plan = Plan.quick() if args.quick else Plan()
     if args.load_wait is not None:
         plan = dataclasses.replace(plan, load_wait=args.load_wait)
+    if args.large_bytes:
+        plan = dataclasses.replace(plan, large_bytes=args.large_bytes)
+    if args.large_inflight:
+        plan = dataclasses.replace(plan, large_inflight=args.large_inflight)
     bench = Bench(lab, cluster, args.nodes, plan, args.out, netlab.run, history)
     if args.diag:
         bench.diag = args.out / f"diag-{args.nodes}.jsonl"

@@ -31,7 +31,8 @@
 //   load ID SECONDS BYTES INFLIGHT MAX
 //                             closed loop: INFLIGHT proposals of BYTES at once, for SECONDS or MAX
 //                             commits: commits, bytes, and commit latency percentiles
-//   s ID                      status: the last index applied here
+//   s ID                      status: the last index applied, and the appends this node sent and
+//                             answered (entries, bytes, the largest batch; successes and failures)
 //   rpc ID PEER BYTES SECONDS MAX
 //                             RPC-lane echo calls of BYTES to PEER, one at a time: latency percentiles
 //   quit
@@ -176,6 +177,10 @@ struct Node {
 	// The application: each key's latest value, and the last index applied.
 	std::map<std::string, std::string> values;
 	Index applied = 0;
+	// What the Sink saw this node send: append requests with entries, and its answers to appends.
+	std::uint64_t appends = 0, append_entries = 0, append_bytes = 0, largest_entries = 0, largest_bytes = 0;
+	std::uint64_t answered_ok = 0, answered_fail = 0;
+	Index last_fail_hint = 0;
 
 	Node(NodeId n, std::uint32_t N, const std::filesystem::path &dir, std::uint16_t port, const std::map<NodeId, PeerAddress> &peers)
 		: id(n), voters(N), acceptor(io, {asio::ip::address_v4::any(), port}) {
@@ -299,7 +304,26 @@ struct Node {
 	}
 };
 
-void Sink::operator()(GroupId g, Send n) { send_message(*node->transport, 0, g, node->id, n.peer, n); }
+void Sink::operator()(GroupId g, Send n) {
+	if (const auto *request = std::get_if<AppendRequest>(&n.message); request && !request->entries.empty()) {
+		std::uint64_t bytes = 0;
+		for (const auto &e : request->entries)
+			bytes += e.payload.size();
+		++node->appends;
+		node->append_entries += request->entries.size();
+		node->append_bytes += bytes;
+		node->largest_entries = std::max<std::uint64_t>(node->largest_entries, request->entries.size());
+		node->largest_bytes = std::max(node->largest_bytes, bytes);
+	} else if (const auto *response = std::get_if<AppendResponse>(&n.message)) {
+		if (response->success) {
+			++node->answered_ok;
+		} else {
+			++node->answered_fail;
+			node->last_fail_hint = response->next_hint;
+		}
+	}
+	send_message(*node->transport, 0, g, node->id, n.peer, n);
+}
 void Sink::operator()(GroupId g, Committed n) {
 	Index last = 0;
 	for (auto &e : n.entries) {
@@ -466,7 +490,13 @@ void Node::command(const std::string &line) {
 			payload.resize(bytes, '\0');
 		post([this, id, payload] { spawn(write(id, payload)); });
 	} else if (op == "s") {
-		post([this, id] { emit("s", "\"id\":" + id + ",\"applied\":" + std::to_string(applied)); });
+		post([this, id] {
+			std::ostringstream s;
+			s << "\"id\":" << id << ",\"applied\":" << applied << ",\"appends\":" << appends << ",\"append_entries\":" << append_entries
+			  << ",\"append_bytes\":" << append_bytes << ",\"largest_entries\":" << largest_entries << ",\"largest_bytes\":" << largest_bytes
+			  << ",\"answered_ok\":" << answered_ok << ",\"answered_fail\":" << answered_fail << ",\"last_fail_hint\":" << last_fail_hint;
+			emit("s", s.str());
+		});
 	} else if (op == "r") {
 		std::string key;
 		in >> key;

@@ -67,8 +67,9 @@ pinned at faultlab:b64102f, as three `exclusive` campaign jobs: nothing else ran
 - **Floor at a delay.** netem holds each packet on an hrtimer, once per direction, and the guest
   wakes that timer late, so a delayed shape reads above its setting. The floor at a delay `d` is
   the unshaped round trip plus two timer wakes, each as late as a sleep of `d` wakes in the same
-  guest (`timer_late`: 30 sleeps with timer slack 1 ns, their median), measured right after the
-  shape's pings. The jitter allowed is twice the wakes' spread (p90 less median), at least 0.1 ms.
+  guest (`timer_late`: 30 sleeps with timer slack 1 ns, their median), measured right after each
+  peer's ping, so each peer has its own floor: the wakes drift by tenths of a ms within a second
+  (Calibration 5). The jitter allowed is twice the wakes' spread (p90 less median), at least 0.1 ms.
   `bench.py calibrate` checks the model: ping under netem holds of 1 us to 80 ms beside the
   sleep lateness at each (Calibration, below).
 - **Hunt rows** compare with ping's measured round trip plus A1's 10%: a commit at one in flight
@@ -77,8 +78,10 @@ pinned at faultlab:b64102f, as three `exclusive` campaign jobs: nothing else ran
 
 `bench/netlab/selftest.py` runs the same harness without root: faultlab's real `Netlab` over a
 fake runner that records every command and answers ping from the shapes set, and a fake cluster
-that elects only in a majority component, its guest timer waking 0.3 ms late. Five mutants each
-fail their check: ping off by 50% (round trip), a timer lateness measured as 0 (round trip), a
+that elects only in a majority component, its guest timer waking 0.3 ms late, and 0.3 ms later
+still during one peer's ping at 1 ms and the samples after it (a host stall the check must pass).
+Six mutants each fail their check: ping off by 50% (round trip), one peer's link off by 50%
+(round trip), a timer lateness measured as 0 (round trip), a
 cut leader that acknowledges (majority only, history), a new leader that lacks each key's last
 write (history), elections at 4 timeouts (the election bound). It also checks that a failed
 measurement is a table cell, not a crash, and that the cut leader's term is read from its own
@@ -118,6 +121,14 @@ What it shows:
    is 10% of the set round trip (16 ms at 80 ms), and the floor term is 2 ms there.
 4. In the shapes themselves, every ping median is within 1.1 ms of set + floor (below 0.4 ms at the
    1 ms shapes, where the allowance is 0.3 to 0.6 ms) at 3 and 5 nodes.
+5. The lateness drifts within a run. In 261121-103053-6192c5 (5 nodes, 1 ms) node 2's
+   ping median read 3.225 ms and nodes 3 to 5 read 2.51 to 2.64 ms, against set 2 ms + floor 0.601
+   (lateness 0.279 ms, sampled once after all four pings) ± 0.494. The same link at the same delay
+   read 2.69 ms in the partition shape later in that run, beside the others' 2.655 to 2.695 ms, so
+   the shaping was right: node 2's 200 ms of pings saw wakes about 0.3 ms later than the samples
+   0.6 s after them. The same row's events reached the harness up to 27 ms late, a stall of the
+   guest. The floor is now sampled after each peer's ping, and each row keeps every peer's ping
+   median and lateness p50 and p90 (`pings`).
 
 ### Results
 

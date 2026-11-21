@@ -1201,7 +1201,7 @@ private:
 		for (Index index = peer.next; index <= last_index() && batch.size() < rpc_entries; ++index) {
 			const auto& entry = log_entry(index);
 			if (!fits(entry, wire) || entry.payload.size() > wire.rpc_bytes) { break; }
-			if (!batch.empty() && entry.payload.size() > rpc_bytes - bytes) { break; }
+			if (!batch.empty() && (bytes >= rpc_bytes || entry.payload.size() > rpc_bytes - bytes)) { break; }  // a first entry may exceed the frame
 			bytes += entry.payload.size(); batch.push_back(entry);
 		}
 		// An entry above this peer's limits goes by install: until then it hears heartbeats.

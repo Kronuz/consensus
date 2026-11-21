@@ -68,8 +68,9 @@ struct Cluster {
 	std::uint64_t now = 0;
 	RequestId request = 0;
 	std::size_t elections = 0, largest = 0;  // leaders elected since the load began; largest append payload
+	std::size_t size;  // each command's bytes
 
-	explicit Cluster(std::uint64_t bytes_per_ms) : rate(bytes_per_ms) {
+	explicit Cluster(std::uint64_t bytes_per_ms, std::size_t command_bytes = command) : rate(bytes_per_ms), size(command_bytes) {
 		for (NodeId id = 1; id <= 3; ++id) {
 			RecoveredState s; s.configuration = config_of(id);
 			cores[id] = std::make_unique<Core>(config_of(id), std::move(s), limits(), Timing{});
@@ -118,7 +119,7 @@ struct Cluster {
 			auto& core = *cores[l];
 			while (core.last_index() - core.committed() < load && !core.busy()) {
 				const auto last = core.last_index();
-				consume(l, core.step(Propose{++request, std::string(command, 'x')}));
+				consume(l, core.step(Propose{++request, std::string(size, 'x')}));
 				if (core.last_index() == last) { break; }  // refused
 			}
 		}
@@ -180,12 +181,43 @@ void slowed_path() {
 	check(per_s >= 0.6 * 1500 * 1000 / command, "commits at least 60% of the slower path's rate");
 }
 
+// Commands larger than the 64 KiB frame the pacing starts from: an append still takes its first
+// entry whatever its size, and stops there or at rpc_bytes, never past either.
+void large_commands() {
+	const std::size_t limit = Limits{}.rpc_bytes;
+	{
+		constexpr std::size_t size = 100 << 10;
+		Cluster c(600, size);
+		c.run(3000, 0);
+		c.elections = 0; c.largest = 0;
+		const auto before = c.committed();
+		c.run(20000, in_flight);
+		const double per_s = c.committed() > before ? double(c.committed() - before) / 20 : 0;
+		std::printf("slow path, 100 KiB commands: %zu elections, %.1f commits/s (the path carries %.1f), largest append %zu KiB\n",
+			c.elections, per_s, 600.0 * 1000 / size, c.largest >> 10);
+		check(c.largest <= limit, "100 KiB commands: no append past rpc_bytes");
+		check(c.elections == 0, "100 KiB commands: no election on the slow path");
+		check(per_s >= 0.6 * 600 * 1000 / size, "100 KiB commands: commits at least 60% of the path's rate");
+	}
+	{
+		constexpr std::size_t size = 1 << 20;
+		Cluster c(50000, size);
+		c.run(3000, 0);
+		c.elections = 0; c.largest = 0;
+		c.run(2000, 8);
+		std::printf("fast path, 1 MiB commands: %zu elections, largest append %zu KiB\n", c.elections, c.largest >> 10);
+		check(c.largest <= limit, "1 MiB commands: no append past rpc_bytes");
+		check(c.elections == 0, "1 MiB commands: no election on a fast path");
+	}
+}
+
 }  // namespace
 
 int main() {
 	slow_path();
 	fast_path();
 	slowed_path();
+	large_commands();
 	std::printf("full_window_stall_test: %d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }

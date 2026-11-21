@@ -425,6 +425,7 @@ private:
 		Install(Worker& worker, std::uint64_t timeout) : channel(worker, timeout) {}
 		SnapshotChannel channel;
 		std::deque<std::pair<NodeId, std::string>> frames;  // received, not yet taken by the channel
+		std::uint64_t active = 0;  // when the channel last took a frame, in scheduler ns
 		Token validating = 0;                               // the ValidateImage the Sink holds
 		std::optional<std::pair<Token, bool>> answer;       // validated or validation_failed
 	};
@@ -808,6 +809,14 @@ private:
 		at = at > max_ms ? never : at * 1'000'000;
 		const bool waiting = !g.inbox.empty() || !g.notices.empty() || unadmitted(g) || g.retiring || (g.install && !g.install->frames.empty());
 		if (waiting && !g.io && !g.watching) { at = std::min(at, scheduler_.now() + retry_ns); }
+		// An incoming image ends at the channel's receive timeout, which only a step sees: a
+		// resting group wakes for it, and once a timeout later while the image waits on its answer.
+		if (g.install && g.install->channel.incoming_snapshot()) {
+			const auto timeout = g.timing.snapshot_timeout * 1'000'000;
+			auto deadline = g.install->active + timeout;
+			if (deadline <= scheduler_.now()) { deadline = scheduler_.now() + timeout; }
+			at = std::min(at, deadline);
+		}
 		if (at == never) { disarm(g); return; }
 		scheduler_.arm(g, at);
 	}
@@ -1104,6 +1113,7 @@ private:
 			const bool whole = prefix.size() >= 12 && prefix.substr(0, 8) == "RFTXFR01" && [&] { prefix.remove_prefix(8); return kronuz::journal::get32(prefix) == frame.size(); }();
 			if (!whole || !open_session(in, peer)) { in.frames.pop_front(); ++g.dropped; progress = true; continue; }
 			const auto result = in.channel.receive(peer, frame);
+			if (result.consumed || result.result == TransferReceive::Accepted) { in.active = scheduler_.now(); }
 			frame.erase(0, result.consumed);
 			if (frame.empty() || result.result == TransferReceive::Closed) { in.frames.pop_front(); progress = true; }
 			if (result.result == TransferReceive::Closed) { ++g.dropped; continue; }

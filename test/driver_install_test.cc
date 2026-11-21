@@ -31,6 +31,8 @@
 //   crash     node 3's disk loses power at each of its operations from the heal through the install
 //             (`crash STRIDE`: every STRIDE-th): it recovers the old replica or the complete new one,
 //             never an image its application activated that consensus did not persist (A3)
+//   orphan    quiescent: the leader's transfer to node 3 stops after its first chunk and the
+//             leader goes; at rest, node 3 drops the image at its snapshot_timeout, then repairs
 #include "consensus/driver.h"
 #include "journal/memory_io.h"
 
@@ -53,6 +55,7 @@ namespace jt = kronuz::journal::testing;
 namespace {
 
 int checks = 0, failures = 0;
+bool quiesce = false;  // the groups rest (docs/mechanisms/quiescence.md)
 void check(bool value, const std::string& what) {
 	++checks;
 	if (!value) { ++failures; if (failures < 40) { std::cerr << "FAIL: " << what << '\n'; } }
@@ -178,6 +181,7 @@ struct Cluster {
 	std::map<NodeId, Node> nodes;
 	std::deque<Packet> network;
 	std::set<NodeId> isolated;
+	std::function<bool(const Packet&)> drop;  // a packet the network loses
 	std::uint64_t now = 1, transfer_frames = 0, transfer_bytes = 0;
 	Cluster() {
 		for (NodeId id = 1; id <= 3; ++id) { auto& n = nodes[id]; n.id = id; n.boot(*this, now); }
@@ -190,6 +194,7 @@ struct Cluster {
 		o.configuration.cluster[0] = 'I'; o.configuration.configuration[0] = 'N';
 		o.admission = admission; o.limits = limits(); o.timing = timing; o.scheduling = WorkerLimits{16, 128};
 		o.snapshots = SnapshotLimits{format, 1 << 20, 2};
+		o.timing.quiesce = quiesce;
 		return o;
 	}
 	void create(Node& n) {
@@ -228,6 +233,12 @@ struct Cluster {
 		n.run();
 		check(done && !error, "node " + std::to_string(n.id) + " recovers its group");
 	}
+	// Cuts a node off; the others' detector tells their groups it is gone (a resting follower
+	// elects only on that).
+	void isolate(NodeId id) {
+		isolated.insert(id);
+		for (auto& [other, n] : nodes) { if (other != id && n.driver) { n.driver->leader_gone(id); n.run(); } }
+	}
 	bool cut(NodeId from, NodeId to) const { return isolated.count(from) || isolated.count(to); }
 	// One round: the clock moves, the network delivers, the applications answer.
 	void round(std::uint64_t dt = 5) {
@@ -236,7 +247,7 @@ struct Cluster {
 		for (std::size_t k = network.size(); k; --k) {
 			auto p = std::move(network.front()); network.pop_front();
 			auto& to = nodes.at(p.to);
-			if (cut(p.from, p.to) || !to.driver) { continue; }
+			if (cut(p.from, p.to) || !to.driver || (drop && drop(p))) { continue; }
 			if (auto* m = std::get_if<Message>(&p.body)) { to.driver->receive(group, Receive{p.from, std::move(*m)}); }
 			else { to.driver->transfer(group, p.from, std::move(std::get<std::string>(p.body))); }
 			to.run();
@@ -268,6 +279,7 @@ struct Cluster {
 		for (int attempt = 0; attempt < 20 && !placed; ++attempt) {
 			until([&] { return leader() != nullptr; });
 			auto* l = leader();
+			if (!l) { continue; }
 			bool done = false;
 			task::spawn(task::scheduler_ref::of(l->scheduler), l->driver->propose(group, command), [&](std::exception_ptr e, std::optional<Placement> p) { done = true; if (!e) { placed = p; } });
 			l->run();
@@ -291,6 +303,8 @@ struct Cluster {
 			[&](std::exception_ptr e, std::optional<CheckpointPublished>) { done = true; error = e; });
 		n.run();
 		until([&] { return done; });
+		if (error) { try { std::rethrow_exception(error); } catch (const std::exception& e) { std::cerr << "node " << n.id << "'s checkpoint: " << e.what() << '\n'; } }
+		else if (!done) { std::cerr << "node " << n.id << "'s checkpoint did not complete\n"; }
 		return done && !error;
 	}
 	std::optional<Term> term_at(Node& n, Index index) { (void)n; auto it = terms.find(index); return it == terms.end() ? std::nullopt : std::optional<Term>(it->second); }
@@ -443,7 +457,7 @@ void crash() {
 		c.commit("after");
 		span = three.disk.operations - from;
 	}
-	std::uint64_t cuts = 0, old_replica = 0, new_replica = 0;
+	std::uint64_t cuts = 0, old_replica = 0, new_replica = 0, resumed = 0;
 	for (std::uint64_t k = 1; k <= span && !failures; k += stride) {
 		Cluster c;
 		const Index boundary = lag(c);
@@ -454,17 +468,57 @@ void crash() {
 		c.until([&] { return three.disk.dead() || (three.activations > 0 && three.state() && three.state()->applied > boundary); });
 		if (!three.disk.dead()) { continue; }  // the install finished first
 		++cuts;
+		const bool activated = three.active == boundary;
 		c.restart(three, true);
 		auto s = three.state();
 		const Index restored = s ? s->applied : 0;
 		check(restored == before || restored == boundary, "a cut at operation " + std::to_string(k) + " recovers the old replica (" + std::to_string(before) + ") or the new one (" + std::to_string(boundary) + "), not " + std::to_string(restored));
 		old_replica += restored == before; new_replica += restored == boundary;
+		resumed += restored == boundary && !activated;  // durable, not yet activated: recovery activates it
 		c.commit("after");
 		auto* l = c.leader();
 		check(l && three.applied == l->applied, "after the cut at operation " + std::to_string(k) + " node 3's application state equals the leader's");
 	}
 	check(cuts > 0 && old_replica > 0 && new_replica > 0, "cuts land before and after the install is durable");
-	std::cerr << "crash: " << span << " operations, " << cuts << " cuts: " << old_replica << " old replicas, " << new_replica << " new\n";
+	std::cerr << "crash: " << span << " operations, " << cuts << " cuts: " << old_replica << " old replicas, " << new_replica << " new (" << resumed << " activated at recovery)\n";
+}
+
+// R1: a resting follower's orphaned image ends at its snapshot_timeout, with no frame or call to
+// step its group.
+void orphan() {
+	quiesce = true;
+	Cluster c;
+	auto& three = c.nodes.at(3);
+	for (int k = 0; k < 3; ++k) { c.commit("before" + std::to_string(k)); }
+	check(c.checkpoint(three), "node 3 checkpoints before it is cut off");
+	c.isolate(3);
+	for (int k = 0; k < 12; ++k) { c.commit("during" + std::to_string(k)); }
+	auto* l = c.leader();
+	check(l && l->id != 3, "a leader among 1 and 2");
+	if (!l) { return; }
+	const NodeId gone = l->id;
+	check(c.checkpoint(*l), "the leader checkpoints; the other member keeps its log");
+	int sent = 0;
+	c.drop = [&](const Packet& p) { return p.from == gone && p.to == 3 && std::holds_alternative<std::string>(p.body) && ++sent > 2; };
+	c.isolated.clear();
+	check(c.until([&] { return sent > 2; }), "the leader's transfer reaches node 3 through its first chunk");
+	c.isolate(gone);
+	c.until([&] { auto* x = c.leader(); return x != nullptr; });
+	const auto placed = c.commit("after");
+	check(three.applied.size() >= placed.index, "node 3 catches up from the new leader's log");
+	c.isolated.clear();
+	const bool rest = c.until([&] { for (auto& [id, n] : c.nodes) { auto s = n.state(); if (!s || !s->resting) { return false; } } return true; });
+	check(rest, "the group rests on all three");
+	check(three.driver->armed_group_timers() == 1, "resting, node 3 arms its incoming image's receive timeout");
+	const auto from = c.now;
+	check(c.until([&] { return three.driver->armed_group_timers() == 0; }, int(timing.snapshot_timeout / 5) + 200), "node 3 drops the orphaned image and rests with no timer");
+	check(c.now - from <= timing.snapshot_timeout + 50, "within its snapshot_timeout: " + std::to_string(c.now - from) + " ms");
+	const LogBoundary b{three.applied.size(), c.terms[three.applied.size()]};
+	bool repaired = false; std::exception_ptr error;
+	task::spawn(task::scheduler_ref::of(three.scheduler), three.driver->repair(group, b), [&](std::exception_ptr e, std::optional<RepairCompleted>) { repaired = true; error = e; });
+	three.run();
+	check(c.until([&] { return repaired; }, 20) && !error, "node 3 then repairs at once");
+	quiesce = false;
 }
 
 const std::map<std::string, void (*)()> cases{
@@ -473,6 +527,7 @@ const std::map<std::string, void (*)()> cases{
 	{"stale", &stale},
 	{"restart", &restart},
 	{"crash", &crash},
+	{"orphan", &orphan},
 };
 
 }  // namespace

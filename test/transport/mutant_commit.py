@@ -150,6 +150,9 @@ MUTANTS = {
     "activation-wait-maintains": ("include/consensus/worker.h",
                                   "if (installation_waiting()) { if (core_->busy()) { ingest(core_->step(current_time)); } return TurnResult::Blocked; }",
                                   "if (installation_waiting()) { maintenance(); return fenced() ? TurnResult::Fenced : maintenance_io_ ? TurnResult::IOPending : capture_funding_pressure_ ? TurnResult::Pressure : TurnResult::Maintenance; }"),
+    "orphan-no-wake": ("include/consensus/driver.h",
+                       "if (g.install && g.install->channel.incoming_snapshot()) {",
+                       "if (false && g.install && g.install->channel.incoming_snapshot()) {"),
 }
 
 

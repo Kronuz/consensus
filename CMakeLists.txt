@@ -115,7 +115,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	# A Driver group's install (docs/DRIVER.md, Install), a ctest entry per case.
 	add_executable(consensus_driver_install_test test/driver_install_test.cc)
 	target_link_libraries(consensus_driver_install_test PRIVATE consensus::consensus)
-	foreach(c lagging rejected stale restart)
+	foreach(c lagging rejected stale restart orphan)
 		add_test(NAME consensus_driver_install_${c} COMMAND consensus_driver_install_test ${c})
 		set_tests_properties(consensus_driver_install_${c} PROPERTIES TIMEOUT 120)
 	endforeach()

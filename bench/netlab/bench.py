@@ -109,6 +109,7 @@ class Plan:
     large_inflight: int = (
         0  # large entries in flight; 0 is inflight // 8 (2 MiB at 64 KiB)
     )
+    large_seconds: float = 0.0  # the large throughput load's seconds; 0 is load_seconds
     partition_seconds: float = 4.0
     healed_seconds: float = 3.0
     pings: int = 10
@@ -580,8 +581,11 @@ class Bench:
 
     # Numbers.
 
-    def load(self, leader: int, size: int, inflight: int) -> dict[str, Any]:
-        seconds = self.plan.load_seconds
+    def load(
+        self, leader: int, size: int, inflight: int, seconds: float = 0.0
+    ) -> dict[str, Any]:
+        seconds = seconds or self.plan.load_seconds
+        began, seen = self.cluster.now(), len(self.roles)
         # 128 MiB of 64 KiB entries per node, which the guest holds twice
         cap = (128 << 20) // size if size > SMALL else 1_000_000
         label = f"{size}B-{inflight}"
@@ -594,10 +598,20 @@ class Bench:
             )
         finally:
             self.end_sampling()
+        roles = [  # role changes during the load: s after it began, node, role, term
+            [round(when - began, 3), n, role, t]
+            for when, n, role, t, _ in self.roles[seen:]
+        ]
         if not reply:
-            return {"error": f"no answer in {seconds + self.plan.load_wait:g} s"}
+            return {
+                "error": f"no answer in {seconds + self.plan.load_wait:g} s",
+                "seconds": seconds,
+                "roles": roles,
+            }
         commits, took = int(reply["commits"]), float(reply["seconds"]) or 1.0
         return {
+            "seconds": seconds,
+            "roles": roles,
             "commits": commits,
             "per_s": round(commits / took, 1),
             "mb_s": round(int(reply["bytes"]) / took / 1e6, 2),
@@ -969,6 +983,7 @@ class Bench:
                 leader,
                 large,
                 self.plan.large_inflight or max(1, self.plan.inflight // 8),
+                self.plan.large_seconds,
             )
             row["rpc"] = self.rpc(leader)
             times = self.elections(shape)
@@ -1256,6 +1271,9 @@ def main(argv: list[str]) -> int:
     p.add_argument("--large-bytes", type=int, help="the large entries' size")
     p.add_argument("--large-inflight", type=int, help="large entries in flight")
     p.add_argument(
+        "--large-seconds", type=float, help="the large throughput load's seconds"
+    )
+    p.add_argument(
         "--diag",
         action="store_true",
         help="sample each load's progress to diag-N.jsonl",
@@ -1304,6 +1322,8 @@ def main(argv: list[str]) -> int:
         plan = dataclasses.replace(plan, large_bytes=args.large_bytes)
     if args.large_inflight:
         plan = dataclasses.replace(plan, large_inflight=args.large_inflight)
+    if args.large_seconds:
+        plan = dataclasses.replace(plan, large_seconds=args.large_seconds)
     bench = Bench(lab, cluster, args.nodes, plan, args.out, netlab.run, history)
     if args.diag:
         bench.diag = args.out / f"diag-{args.nodes}.jsonl"

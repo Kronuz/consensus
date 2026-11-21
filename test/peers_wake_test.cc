@@ -5,7 +5,8 @@
 //            input retained, and one per Bulk session opened or lost
 //   bulk     a scripted voter on the Bulk lane: a session opening, a fetch served (no wake), a
 //            Begin the channel takes, its Accepted written, a corrupt frame, a peer hanging up,
-//            and a fetch's second deadline closing the lane
+//            a fetch's second deadline closing the lane, and a held Begin refused as the Worker
+//            closes
 //   consensus_transport_peers_wake_test <fixture dir> idle|control|bulk
 #include "consensus/transport/peers.h"
 #include "consensus/transport/profile.h"
@@ -368,6 +369,7 @@ asio::awaitable<void> bulk(asio::io_context &io) {
 									lane.remote.connection, 1, 2, {1, 17, {1, 1}}};
 	co_await voter.put(*lane.session, encode_transfer(TransferKind::Begin, envelope,
 													   encode_snapshot(descriptor, *node->worker().snapshot_policy())));
+	CHECK(co_await reaches(2));
 	auto accepted = co_await lane.session->receive();
 	CHECK(decode_transfer(accepted.bytes()).kind == TransferKind::Accepted);
 	CHECK(co_await reaches(3));
@@ -406,9 +408,27 @@ asio::awaitable<void> bulk(asio::io_context &io) {
 	co_await settle(turn, 200ms);
 	CHECK(wakes == 8 && ready(*peers) == 0);
 
+	// A Begin the channel holds (Busy: the first transfer, canceled with its session, still
+	// waits on the Worker): one wake as its bytes are taken, none while it is retried. The
+	// Worker closing refuses the retry with nothing consumed on the open session: one wake,
+	// none as the lane ends.
+	auto fourth = co_await voter.open(endpoint);
+	CHECK(co_await reaches(9));
+	const TransferEnvelope held{configuration.cluster, configuration.configuration, fourth.local.connection,
+								fourth.remote.connection, 1, 2, {1, 17, {1, 1}}};
+	co_await voter.put(*fourth.session, encode_transfer(TransferKind::Begin, held,
+														 encode_snapshot(descriptor, *node->worker().snapshot_policy())));
+	CHECK(co_await reaches(10));
+	co_await settle(turn, 200ms);
+	CHECK(wakes == 10 && ready(*peers) == 1);
+	node->worker().close();
+	CHECK(co_await reaches(11));
+	co_await settle(turn, 200ms);
+	CHECK(wakes == 11 && ready(*peers) == 0);
+
 	peers->stop();
 	CHECK(co_await until([] {}, [&] { return peers->drained(); }, 5s));
-	CHECK(wakes == 8);
+	CHECK(wakes == 11);
 	std::printf("bulk: %u wakes\n", wakes);
 }
 } // namespace

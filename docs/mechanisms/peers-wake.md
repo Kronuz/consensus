@@ -18,7 +18,7 @@ again, so no owner turn runs between the event and its call:
 |---|---|
 | A Control frame decoded; its reader retains the input | `admit()` |
 | A Bulk frame the snapshot channel took bytes from, or whose held frame it ran | the channel's and the Worker's `run_one`, `pump()` for any reply |
-| A Bulk frame the channel refused, closing its open session (corrupt or unbound frame, fenced Worker) | the channel's and the Worker's `run_one` |
+| A Bulk frame the channel refused, closing its open session (corrupt or unbound frame, a closing or fenced Worker, also on the retry of a held frame) | the channel's and the Worker's `run_one` |
 | A snapshot frame written and consumed from the channel | the channel's `run_one`: its next chunk or control frame |
 | A Bulk session opened (registered with the channel) | the channel's `run_one`: a transfer waiting for that peer |
 | An open Bulk session lost: the peer hung up, a frame deadline or a read failed, a fetch's second deadline closed the lane | the channel's and the Worker's `run_one` |
@@ -63,8 +63,8 @@ every wake it consumed.
   A voter stopping costs each other voter one call (its lost Bulk session) and itself none.
 - `bulk`: a scripted voter on the Bulk lane checks each row of the table in turn (session opened,
   fetch served with no call, a Begin taken with the transfer already the channel's, its
-  Accepted written, a corrupt frame, a hang-up, a fetch's second deadline) and the exact count
-  after each.
+  Accepted written, a corrupt frame, a hang-up, a fetch's second deadline, a Begin held busy and
+  then refused with nothing consumed as the Worker closes) and the exact count after each.
 
 `test/peers_wake_mutants.py` writes a mutant per row that drops its call; the plain test fails
 at each.

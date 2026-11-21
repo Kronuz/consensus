@@ -184,7 +184,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	endif()
 
 	# The tests that build a journal run it on faultfs.
-	foreach(t simulation shared_worker shared_cluster wave_open waiter blocking_entry driver)
+	foreach(t simulation shared_worker shared_cluster wave_open waiter blocking_entry driver driver_close worker)
 		target_link_libraries(consensus_${t}_test PRIVATE faultlab::faultlab)
 	endforeach()
 

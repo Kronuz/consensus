@@ -25,7 +25,7 @@
 // group back to the host (closed into its table or released), and the id recovers again in the
 // same live Host. `driver_close_test [case]`; no case runs them all.
 #include "consensus/driver.h"
-#include "journal/memory_io.h"
+#include "faultlab/faultfs.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -41,7 +41,7 @@
 
 using namespace kronuz::consensus;
 namespace j = kronuz::journal;
-namespace jt = kronuz::journal::testing;
+namespace fl = kronuz::faultlab;
 
 // Live heap bytes, counted at the allocation and the sized free, each block carrying its size.
 // A block allocated in an Uncounted scope (a test disk's own) carries a mark and never counts.
@@ -96,6 +96,15 @@ void check(bool value, const std::string& what) {
 	++checks;
 	if (!value) { ++failures; if (failures < 40) { std::cerr << "FAIL: " << what << '\n'; } }
 }
+
+// The host's directory on `disk`, made on first use.
+std::shared_ptr<j::IO> host_io(fl::filesystem& disk) {
+	const auto names = disk.list();
+	if (std::find(names.begin(), names.end(), "host") == names.end()) { disk.make_directory("host"); }
+	return std::make_shared<fl::io>(disk, "host");
+}
+// A crash keeps any sector-boundary prefix of an unsynced append, as a real device may.
+const fl::crash_policy sector_cut{.size = fl::size_pick::sector};
 
 constexpr Timing compact{20, 40, 100, 200, 60000};
 const j::TurnLogOptions turn_options{16 * 1024, 1024, 1, 4, 4096};
@@ -213,7 +222,7 @@ protected:
 // One host and one loop on an inline_scheduler; the Worker's IO and the turns go through
 // InlineCompletion, or through a HeldCompletion the case completes by hand.
 struct Loop {
-	jt::Disk& disk;
+	fl::filesystem& disk;
 	task::inline_scheduler scheduler;
 	j::InlineCompletion inline_io;
 	j::HeldCompletion held;
@@ -222,8 +231,8 @@ struct Loop {
 	std::unique_ptr<Driver<Sink>> driver;
 	task::cancel_source stop, driver_stop;  // the turn driver's run, the Driver's
 	bool turns_done = false, driver_done = false;
-	explicit Loop(jt::Disk& d, bool hold = false, std::shared_ptr<j::IO> storage = {}) : disk(d) {
-		if (!storage) { storage = std::make_shared<jt::MemoryIO>(disk, "host/"); }
+	explicit Loop(fl::filesystem& d, bool hold = false, std::shared_ptr<j::IO> storage = {}) : disk(d) {
+		if (!storage) { storage = host_io(disk); }
 		host = std::make_unique<j::Host>(std::move(storage), host_identity, j::HostOptions{1, turn_options});
 		auto io = hold ? j::completion_ref::of(held) : j::completion_ref::of(inline_io);
 		driver = std::make_unique<Driver<Sink>>(Seams{task::scheduler_ref::of(scheduler), io, *host, 0, 7}, sink);
@@ -336,7 +345,7 @@ template <class E> bool is(std::exception_ptr error) {
 // A1: a group fenced by its application, in a live process, closes; the id opens again.
 void fenced_row() {
 	constexpr GroupId g = 11;
-	jt::Disk disk; Loop loop(disk);
+	fl::filesystem disk; Loop loop(disk);
 	loop.lone(g);
 	auto read = loop.start(loop.driver->read(g));
 	loop.driver->application_failed(g, 1, "the application failed");
@@ -357,7 +366,7 @@ void fenced_row() {
 // A1: a group fenced by its application with a proposal's IO in flight: close still ends.
 void fenced_in_flight() {
 	constexpr GroupId g = 12;
-	jt::Disk disk; Loop loop(disk, true);
+	fl::filesystem disk; Loop loop(disk, true);
 	loop.lone(g);
 	auto proposal = loop.start(loop.driver->propose(g, "staged"));
 	check(!proposal->done && loop.held.held() > 0, "the proposal's record waits in a held turn");
@@ -373,7 +382,7 @@ void fenced_in_flight() {
 // A2: open succeeded and the caller then failed: no create, no records.
 void half_opened_row() {
 	constexpr GroupId g = 21;
-	jt::Disk disk; Loop loop(disk);
+	fl::filesystem disk; Loop loop(disk);
 	loop.driver->open(g, options({1}));
 	check(loop.driver->groups() == 1, "the row is held");
 	std::exception_ptr error;
@@ -387,7 +396,7 @@ void half_opened_row() {
 // A2: a create that failed (the group cancelled before it ran) leaves a row that closes.
 void failed_create() {
 	constexpr GroupId g = 22;
-	jt::Disk disk; Loop loop(disk);
+	fl::filesystem disk; Loop loop(disk);
 	loop.driver->open(g, options({1}));
 	task::cancel_source cancel; cancel.request();
 	std::exception_ptr error;
@@ -397,7 +406,7 @@ void failed_create() {
 
 // An id the Driver never held: close completes at once.
 void unknown_row() {
-	jt::Disk disk; Loop loop(disk);
+	fl::filesystem disk; Loop loop(disk);
 	std::exception_ptr error;
 	check(loop.close(31, error) && !error && loop.driver->groups() == 0, "close of an unknown id completes: " + what(error));
 	loop.lone(32);
@@ -413,7 +422,7 @@ void unknown_row() {
 // A4: a close with a call waiting and IO in flight completes it and then the row, once the IO lands.
 void close_in_flight() {
 	constexpr GroupId g = 41;
-	jt::Disk disk; Loop loop(disk, true);
+	fl::filesystem disk; Loop loop(disk, true);
 	loop.lone(g);
 	auto staged = loop.start(loop.driver->propose(g, "staged"));
 	auto read = loop.start(loop.driver->read(g));
@@ -431,7 +440,7 @@ void close_in_flight() {
 // Fenced callback calls applied(), which marks the group ready while it closes in that step.
 void erase_queued() {
 	constexpr GroupId g = 51, h = 52;
-	jt::Disk disk; Loop loop(disk);
+	fl::filesystem disk; Loop loop(disk);
 	loop.lone(g); loop.lone(h);
 	std::size_t calls = 0;
 	loop.sink.on_fenced = [&](GroupId id) { ++calls; loop.driver->applied(id, Applied{1}); };
@@ -465,7 +474,7 @@ struct Capture {
 // driver still writes what is staged.
 void shutdown_idles() {
 	constexpr GroupId g = 61, h = 62;
-	jt::Disk disk; Loop loop(disk, true);
+	fl::filesystem disk; Loop loop(disk, true);
 	loop.lone(h);
 	auto placed = loop.start(loop.driver->propose(h, "k"));
 	loop.release();
@@ -496,7 +505,7 @@ void shutdown_idles() {
 // barrier, which no turn driver will write: it ends once the IO lands, and the record stays staged.
 void shutdown_ends() {
 	constexpr GroupId g = 71, h = 72;
-	jt::Disk disk; Loop loop(disk, true);
+	fl::filesystem disk; Loop loop(disk, true);
 	loop.lone(h);
 	auto placed = loop.start(loop.driver->propose(h, "k"));
 	loop.release();
@@ -540,7 +549,7 @@ void sweep_ranges(Loop& loop, GroupId first, std::size_t rows) {
 // A3: 10,000 rows opened and closed leave the Driver's heap where it was.
 void bytes() {
 	constexpr GroupId rows = 10'000;
-	jt::Disk disk; Loop loop(disk);
+	fl::filesystem disk; Loop loop(disk);
 	std::exception_ptr error;
 	// One warm round, so one-time allocations do not count.
 	loop.driver->open(1, options({1}));
@@ -564,21 +573,12 @@ void bytes() {
 }
 
 // Heap the simulated disk itself holds: not the process's (a real host's files are on disk).
-std::size_t disk_bytes(const jt::Disk& disk) {
-	std::size_t bytes = 0;
-	for (const auto& [id, inode] : disk.inodes) {
-		bytes += inode.durable.capacity() + sizeof(inode);
-		for (const auto& [sector, data] : inode.pending) { bytes += data.capacity() + sizeof(data); }
-	}
-	for (const auto& [name, inode] : disk.names) { bytes += name.capacity() + 48; }
-	for (const auto& [name, inode] : disk.durable_names) { bytes += name.capacity() + 48; }
-	return bytes;
-}
+std::size_t disk_bytes(const fl::filesystem& disk) { return disk.used(); }
 
 // Report only: created rows (the rows Xapiand counts) opened, closed and left, with the share the
 // journal keeps per structure. `proposals` more records are written per row before the close.
 void created_pass(GroupId rows, int proposals) {
-	jt::Disk disk; Loop loop(disk);
+	fl::filesystem disk; Loop loop(disk);
 	std::exception_ptr error;
 	loop.lone(1); check(loop.close(1, error) && !error, "warm close");
 	const auto base = live_bytes, base_disk = disk_bytes(disk);
@@ -636,7 +636,7 @@ std::vector<std::string> recovered(Loop& loop, GroupId g, const std::string& ima
 // every acknowledged record and nothing unattempted.
 void reopen_rows() {
 	constexpr GroupId g = 81;
-	jt::Disk disk; Loop loop(disk, true);
+	fl::filesystem disk; Loop loop(disk, true);
 	auto& turns = loop.host->driver(0);
 	std::vector<std::string> acknowledged, attempted;
 	std::exception_ptr error;
@@ -702,7 +702,7 @@ void reopen_rows() {
 void closed_bytes() {
 	const char* scale = std::getenv("CLOSE_BYTES_ROWS");  // another count, for timing
 	const GroupId rows = scale ? std::stoull(scale) : 10'000;
-	jt::Disk unused; Loop loop(unused, false, std::make_shared<HeapIO>());
+	fl::filesystem unused; Loop loop(unused, false, std::make_shared<HeapIO>());
 	std::exception_ptr error;
 	auto process = [] { return live_bytes; };
 	auto open = [&](GroupId g, bool covered) {
@@ -763,10 +763,11 @@ void closed_bytes() {
 std::uint64_t crash_tables = 0, crash_releases = 0;  // the closes a sweep's runs completed, by kind
 bool close_crash_run(std::uint64_t seed, std::uint64_t cut) {
 	constexpr GroupId g = 91;
-	jt::Disk disk; disk.random.seed(seed * 7919 + cut);
+	fl::filesystem disk;
 	std::vector<std::string> acknowledged, attempted;
 	std::mt19937_64 random(seed);
 	bool reached = false;
+	std::function<bool()> dead = [] { return false; };  // the cut-th operation has run
 	const auto at = "seed " + std::to_string(seed) + " cut " + std::to_string(cut);
 	std::vector<std::function<bool()>> calls;  // whether each call the run started completed
 	auto track = [&](auto call) { calls.push_back([call] { return call->done; }); return call; };
@@ -774,7 +775,9 @@ bool close_crash_run(std::uint64_t seed, std::uint64_t cut) {
 		Loop loop(disk);
 		loop.lone(g);
 		std::exception_ptr error;
-		disk.cut = disk.operations + cut;
+		const auto base = disk.mutations();
+		dead = [&disk, base, cut] { return disk.mutations() - base >= cut; };
+		disk.power_off_after(cut - 1);
 		auto ok = [&](std::shared_ptr<Loop::Started<bool>> call) { loop.release(); return call->done && !call->error; };
 		bool alive = true;
 		for (unsigned round = 0; round < 6 && alive; ++round) {
@@ -796,16 +799,16 @@ bool close_crash_run(std::uint64_t seed, std::uint64_t cut) {
 			const auto image = loop.recover(g, error, options({1}));
 			loop.apply(g);
 			// Without power nothing commits after the recover, so the state shows only before the cut.
-			if (error || disk.dead()) { alive = false; break; }
+			if (error || dead()) { alive = false; break; }
 			const auto state = recovered(loop, g, image);
 			check(state == attempted, "a recover in the live Host holds every attempted record: " + at + " " + join(state));
 		}
-		reached = alive && !disk.dead();
-		if (!reached && !disk.dead()) { check(false, "the run failed before its power cut: " + at); }
+		reached = alive && !dead();
+		if (!reached && !dead()) { check(false, "the run failed before its power cut: " + at); }
 	}
 	// The cut may end the Driver's loop by a throw: its callers still complete, none suspended.
 	check(std::all_of(calls.begin(), calls.end(), [](const auto& done) { return done(); }), "every call completes once the loop ends: " + at);
-	disk.power_loss();
+	disk.crash(seed * 7919 + cut, sector_cut);
 	Loop again(disk);
 	if (again.host->status(g) != j::GroupStatus::none) {
 		std::exception_ptr error;
@@ -828,31 +831,6 @@ void close_crash() {
 	check(crash_tables && crash_releases, "the sweep closes rows both ways");
 }
 
-// A MemoryIO whose directory sync fails once, the n-th after `fail_sync` is armed.
-class FlakyIO final : public j::IO {
-public:
-	explicit FlakyIO(jt::Disk& disk) : backend(disk, "host/") {}
-	jt::MemoryIO backend;
-	int fail_sync = 0, failed_syncs = 0;
-	std::unique_ptr<j::OwnerLock> acquire_owner(bool create) override { return backend.acquire_owner(create); }
-	std::unique_ptr<j::File> open_existing(std::string_view n) override { return backend.open_existing(n); }
-	std::unique_ptr<j::File> open_existing_read_only(std::string_view n) override { return backend.open_existing_read_only(n); }
-	std::unique_ptr<j::File> open_reclaim_candidate_read_only(std::string_view n) override { return backend.open_reclaim_candidate_read_only(n); }
-	void open_existing_read_only_into(std::string_view n, j::File& d) override { backend.open_existing_read_only_into(n, d); }
-	bool open_reclaim_candidate_read_only_into(std::string_view n, j::File& d) override { return backend.open_reclaim_candidate_read_only_into(n, d); }
-	std::unique_ptr<j::File> create_exclusive(std::string_view n) override { return backend.create_exclusive(n); }
-	void replace(std::string_view s, std::string_view d) override { backend.replace(s, d); }
-	void remove(std::string_view n) override { backend.remove(n); }
-	std::unique_ptr<j::DirectoryCursor> scan_directory() override { return backend.scan_directory(); }
-	std::optional<j::EntryFootprint> entry_footprint(std::string_view n) override { return backend.entry_footprint(n); }
-	void sync_directory() override {
-		if (fail_sync && --fail_sync == 0) { ++failed_syncs; throw std::runtime_error("injected directory sync failure"); }
-		backend.sync_directory();
-	}
-protected:
-	std::unique_ptr<j::OwnerLock> lock_owner(const j::OwnerLockOptions&) override { return std::make_unique<j::OwnerLock>(); }
-};
-
 // F2: a close whose table commit fails after the shard file was replaced (its directory sync
 // throws) fences the Store, which releases the group. The table may hold the group closed, so
 // recover and create refuse the id in this live Host with close_in_doubt (the host's mark).
@@ -862,11 +840,10 @@ protected:
 // failed close is lost.
 void failed_close() {
 	constexpr GroupId g = 71;
-	jt::Disk disk; disk.random.seed(1);
+	fl::filesystem disk;
 	std::vector<std::string> acknowledged, attempted;
 	{
-		auto io = std::make_shared<FlakyIO>(disk);
-		Loop loop(disk, false, io);
+		Loop loop(disk);
 		std::exception_ptr error;
 		loop.lone(g);
 		attempted.push_back("a");
@@ -875,9 +852,8 @@ void failed_close() {
 		auto published = loop.start(checkpoint_of(loop, g, acknowledged));
 		loop.release();
 		check(published->done && !published->error, "the checkpoint publishes: " + what(published->error));
-		io->fail_sync = 1;
+		disk.add_fault({fl::op::sync_directory});  // the next directory sync fails: the table commit's
 		check(loop.close(g, error) && !error, "close completes when its table commit fails: " + what(error));
-		check(io->failed_syncs == 1, "the table commit's directory sync failed");
 		check(loop.driver->groups() == 0, "the row is erased");
 		check(loop.host->driver(0).parked(g), "the fenced Store released the group: parked");
 		loop.recover(g, error, options({1}));
@@ -893,10 +869,10 @@ void failed_close() {
 			check(loop.settle(loop.driver->create(g, j::Identity{'F', 'C'}), error) && is<close_in_doubt>(error), "a live create of the id refuses with close_in_doubt: " + what(error));
 			check(loop.close(g, error) && !error && loop.driver->groups() == 0, "the refused row closes: " + what(error));
 		}
-		io->backend.sync_directory();  // any later directory sync: another group's create, a segment
+		fl::io(disk, "host").sync_directory();  // any later directory sync: another group's create, a segment
 		loop.release();
 	}
-	disk.power_loss();
+	disk.crash(1, sector_cut);
 	Loop again(disk);
 	check(again.host->status(g) == j::GroupStatus::closed, "the restarted host holds the group closed, as its file does");
 	std::exception_ptr error;
@@ -912,11 +888,10 @@ void failed_close() {
 // restart.
 void second_driver() {
 	constexpr GroupId g = 71;
-	jt::Disk disk; disk.random.seed(1);
+	fl::filesystem disk;
 	std::vector<std::string> acknowledged, attempted;
 	{
-		auto io = std::make_shared<FlakyIO>(disk);
-		Loop loop(disk, false, io);
+		Loop loop(disk);
 		std::exception_ptr error;
 		loop.lone(g);
 		attempted.push_back("a");
@@ -924,8 +899,8 @@ void second_driver() {
 		loop.apply(g);
 		auto published = loop.start(checkpoint_of(loop, g, acknowledged));
 		loop.release();
-		io->fail_sync = 1;
-		check(loop.close(g, error) && !error && io->failed_syncs == 1, "the close's table commit fails: " + what(error));
+		disk.add_fault({fl::op::sync_directory});  // the next directory sync fails: the table commit's
+		check(loop.close(g, error) && !error, "the close's table commit fails: " + what(error));
 		loop.driver_stop.request(task::cancel_reason::shutdown);
 		loop.release();
 		check(loop.driver_done && loop.driver->groups() == 0, "the first Driver's run ends, no row left");
@@ -943,10 +918,10 @@ void second_driver() {
 			loop.apply(g);
 		}
 		check(loop.close(g, error), "the row closes: " + what(error));
-		io->backend.sync_directory();
+		fl::io(disk, "host").sync_directory();
 		loop.release();
 	}
-	disk.power_loss();
+	disk.crash(1, sector_cut);
 	Loop again(disk);
 	std::exception_ptr error;
 	const auto image = again.recover(g, error, options({1}));
@@ -960,8 +935,8 @@ void second_driver() {
 // catches) reaches the entry's caller, not as the work's task::cancelled.
 void entry_throw() {
 	constexpr GroupId g = 111;
-	jt::Disk disk; task::blocking_scheduler scheduler; j::InlineCompletion io; Sink sink;
-	j::Host host(std::make_shared<jt::MemoryIO>(disk, "host/"), host_identity, j::HostOptions{1, turn_options});
+	fl::filesystem disk; task::blocking_scheduler scheduler; j::InlineCompletion io; Sink sink;
+	j::Host host(host_io(disk), host_identity, j::HostOptions{1, turn_options});
 	Driver<Sink> driver(Seams{task::scheduler_ref::of(scheduler), j::completion_ref::of(io), host, 0, 7}, sink);
 	kronuz::consensus::run(driver, scheduler, [](Driver<Sink>& d, GroupId id) -> task::task<void> { d.open(id, options({1})); co_await d.create(id, j::Identity{'E', 'T'}); }(driver, g));
 	driver.applied(g, Applied{sink.committed[g]});  // the next Committed is delivered once this one is applied
@@ -979,7 +954,7 @@ void pool_bound() {
 	const std::uint64_t peak = 2 * j::detail::artifact_header_size + checkpoint_detail::maximum_size(limits()) + cap;
 	auto run = [&](j::StorageResources pool, bool fits) {
 		constexpr GroupId g = 101;
-		jt::Disk disk; Loop loop(disk);
+		fl::filesystem disk; Loop loop(disk);
 		auto o = options({1}); o.admission.replacement_pool = pool;
 		loop.driver->open(g, std::move(o));
 		std::exception_ptr error;

@@ -27,7 +27,7 @@
 #include <fstream>
 #include <sys/resource.h>
 #include "completion/posix.h"
-#include "journal/memory_io.h"
+#include "faultlab/faultfs.h"
 #include <iostream>
 #include <map>
 #include <ctime>
@@ -2364,14 +2364,14 @@ void worker_rejoin_by_install() {
 // empty segment of the host's turn log (the operating limits, follower batching included).
 void batch_turn_room() {
 	namespace j = kronuz::journal;
-	namespace jt = kronuz::journal::testing;
+	namespace fl = kronuz::faultlab;
 	const j::TurnLogOptions turns{16 * 1024, 1024, 1, 4, 4096};
 	const j::AdmissionLimits quota{{4u << 20, 4096}, {64 * 1024, 3}, {256 * 1024, 4}, 16, 3};
 	const auto room = j::turn_log_detail::turn_room(turns.segment_bytes, turns.block_bytes);
 	// The largest rpc_bytes whose batch of 8 entries still fits the room.
 	const std::size_t fits = room - j::turn_log_detail::record_cost(0) - storage_batch_size(true, true, 8);
 	auto attempt = [&](std::size_t rpc_bytes, WorkerLimits scheduling = {16, 128}) -> std::string {
-		jt::Disk disk; j::Host host(std::make_shared<jt::MemoryIO>(disk, "host/"), {'T', 'R', 'M'}, j::HostOptions{1, turns});
+		fl::filesystem disk; disk.make_directory("host"); j::Host host(std::make_shared<fl::io>(disk, "host"), {'T', 'R', 'M'}, j::HostOptions{1, turns});
 		Limits l; l.command_bytes = 1024; l.rpc_bytes = rpc_bytes; l.log_bytes = 1u << 20; l.log_entries = 64; l.control_entries = 4; l.rpc_entries = 8;
 		try { Worker worker(host, 1, configuration(), quota, l, compact, scheduling); return {}; }
 		catch (const std::invalid_argument& error) { return error.what(); }

@@ -23,6 +23,8 @@
 //   relayout a host restarted with another L serves every group from its new loop
 //   scan     the groups a feed visits per frame stay constant at 100, 1,000 and 10,000 groups
 //   order    control first, round robin across ready groups and per-group credit, as values
+//   fetch-alongside-consensus  rounds of four 8 MiB lane fetches both ways through 1 MiB budgets
+//            while the group commits: each fetch exact, each commit within 2 s, the leader's term kept
 // A timing case the host stalled (a 250 ms oversleep) runs again, at most twice. Each step prints
 // as it starts; a case still running after 100 s prints its step, which loops stopped turning
 // and every thread's stack, then exits 3.
@@ -137,6 +139,8 @@ struct Host {
 	tcp::acceptor acceptor;
 	std::unique_ptr<HostTransport> transport;
 	bool running = false, quiet = false;
+	std::mutex opens_mutex;
+	std::map<GroupId, GroupOpen> opens;  // the host's opens, which open_of reads
 	Host(NodeId n, std::uint32_t L, std::uint16_t port = 0) : node(n), loops(make(L)), acceptor(loops[0]->io, {asio::ip::address_v4::loopback(), port}) {
 		std::lock_guard hold(hosts_mutex);
 		hosts.push_back(this);
@@ -160,6 +164,10 @@ struct Host {
 					return std::nullopt;
 				return Member{incarnation, incarnation, MemberRole::Voter};
 			};
+		options.open_of = [this](GroupId g) {
+			std::lock_guard hold(opens_mutex);
+			return opens.at(g);
+		};
 		std::vector<HostLoop> at;
 		for (auto &l : loops)
 			at.push_back({l->io.get_executor(), task::scheduler_ref::of(l->scheduler)});
@@ -167,10 +175,18 @@ struct Host {
 		cluster.fill('K');
 		transport = std::make_unique<HostTransport>(at, tls, NodePins(node, pins, tls->native_handle()), cluster, addresses, options);
 	}
+	// On the group's loop: the host's open of `g` becomes `open`, and it stores g as `incarnation`.
+	void store(GroupId g, NodeId incarnation, const GroupOpen &open) {
+		{
+			std::lock_guard hold(opens_mutex);
+			opens[g] = open;
+		}
+		transport->store(g, incarnation);
+	}
 	// Before start(): stores each group as incarnation `node`, with `open`.
 	void stores(const std::vector<GroupId> &groups, const GroupOpen &open = test_open()) {
 		for (auto g : groups)
-			transport->store(g, node, open);
+			store(g, node, open);
 	}
 	static GroupOpen test_open() {
 		GroupOpen o;
@@ -1030,11 +1046,12 @@ struct Node {
 	std::mutex mutex;
 	std::map<GroupId, std::vector<std::string>> applied;
 	std::atomic<std::uint64_t> misplaced{0};  // frames delivered off their group's loop
+	std::atomic<bool> hold_apply{false};  // Committed ranges stay out for application, the last in `held`
+	std::atomic<Index> held{0};
 	// Each group is founded by `voters`; with none, this node is a joiner (D5).
 	Node(NodeId id, std::uint32_t L, std::uint16_t port, std::shared_ptr<j::IO> io, const std::vector<GroupId> &groups,
-		 const std::map<NodeId, PeerAddress> &peers, std::vector<NodeId> voters = {1, 2, 3})
+		 const std::map<NodeId, PeerAddress> &peers, std::vector<NodeId> voters = {1, 2, 3}, HostTransportOptions options = {}, bool quiesce = false)
 		: host(id, L, port) {
-		HostTransportOptions options;
 		options.member_of = [this](GroupId g, NodeId incarnation) -> std::optional<Member> {
 			auto s = per[host.transport->loop_of_group(g)]->driver->state(g);
 			const Member *m = s ? find_member(s->membership, incarnation) : nullptr;
@@ -1050,6 +1067,7 @@ struct Node {
 			p->driver = std::make_unique<Driver<GroupSink>>(Seams{ref, j::completion_ref::of(p->io), *journal, k, id * 31 + k}, p->sink);
 			task::spawn(ref, journal->driver(k).run(j::completion_ref::of(p->io), p->stop.token()), [q = p.get()](std::exception_ptr) { q->turns_done = true; });
 			task::spawn(ref, p->driver->run(p->stop.token()), [q = p.get()](std::exception_ptr) { q->driver_done = true; });
+			host.transport->on_node_gone(k, [this, k](NodeId gone) { per[k]->driver->leader_gone(gone); });
 			host.transport->on_deliver(k, [this, k](const Received &r) {
 				if (const NodeId c = cut; c && (host.node == c || r.node == c))
 					return false;
@@ -1079,13 +1097,14 @@ struct Node {
 				o.admission = admission;
 				o.scheduling = WorkerLimits{16, 128};
 				o.limits.command_bytes = o.limits.rpc_bytes = 4096;  // a full batch fits the 16 KiB segments' turn room
+				o.timing.quiesce = quiesce;
 				driver->open(g, std::move(o));
 				auto opening = journal->status(g) == j::GroupStatus::stored ? driver->recover(g, [](j::ArtifactReader &) {})
 																			: driver->create(g, j::Identity{'G', char('0' + host.node)});
 				// stored once member_of answers for it (host-transport.md, Identity)
 				task::spawn(task::scheduler_ref::of(host.loops[k]->scheduler), std::move(opening), [this, g, &opened](std::exception_ptr e) {
 					assert(!e && "create or recover");
-					host.transport->store(g, host.node, Host::test_open());
+					host.store(g, host.node, Host::test_open());
 					opened.set_value();
 				});
 			});
@@ -1146,6 +1165,10 @@ void GroupSink::operator()(GroupId g, Committed n) {
 			last = e.index;
 		}
 	}
+	if (last && node->hold_apply) {
+		node->held = last;  // out for application until the test fails it
+		return;
+	}
 	if (last)
 		node->host.post(loop, [n = node, k = loop, g, last] {
 			if (auto &d = n->per[k]->driver)
@@ -1187,6 +1210,7 @@ struct Cluster {
 	std::vector<GroupId> groups;
 	std::uint16_t ports[5] = {};
 	std::unique_ptr<Node> nodes[5];
+	std::function<HostTransportOptions(NodeId)> options_of = [](NodeId) { return HostTransportOptions{}; };
 	Cluster(const std::string &name, std::vector<GroupId> ids)
 		: root(std::filesystem::current_path() / ("groups-" + name)), groups(std::move(ids)) {
 		std::filesystem::remove_all(root);
@@ -1204,13 +1228,14 @@ struct Cluster {
 	}
 	std::filesystem::path directory(NodeId n) const { return root / ("node" + std::to_string(n)); }
 	// Starts node `n` with L loops, or restarts it on its journal.
-	void start(NodeId n, std::uint32_t L, std::vector<NodeId> voters = {1, 2, 3}) {
+	void start(NodeId n, std::uint32_t L, std::vector<NodeId> voters = {1, 2, 3}, bool quiesce = false) {
 		nodes[n].reset();
 		std::map<NodeId, PeerAddress> peers;
 		for (NodeId m = 1; m <= 4; ++m)
 			if (m != n)
 				peers[m] = {"127.0.0.1", ports[m]};
-		nodes[n] = std::make_unique<Node>(n, L, ports[n], std::make_shared<j::PosixIO>(directory(n)), groups, peers, std::move(voters));
+		nodes[n] = std::make_unique<Node>(n, L, ports[n], std::make_shared<j::PosixIO>(directory(n)), groups, peers, std::move(voters),
+										  options_of(n), quiesce);
 	}
 	std::vector<Node *> of(std::initializer_list<NodeId> ids) {
 		std::vector<Node *> r;
@@ -1262,6 +1287,144 @@ void driver() {
 					(unsigned long long)restarted, s ? (unsigned long long)s->term : 0ull, s ? (unsigned long long)s->committed : 0ull);
 		assert(ok);
 	}
+}
+
+// Quiescence A2: three nodes of 2 loops, groups at rest arm no timer; the leaders' node stops,
+// and the transport's node-pair detector (its Control connection's end) raises LeaderGone at
+// every group following a leader there, which elect within their timeout and commit again.
+void quiescent() {
+	const std::vector<GroupId> groups{groups_on(2, 0, 1)[0], groups_on(2, 1, 1)[0]};
+	Cluster c("quiescent", groups);
+	for (NodeId n = 1; n <= 3; ++n)
+		c.start(n, 2, {1, 2, 3}, true);
+	auto all = c.of({1, 2, 3});
+	for (auto g : groups) {
+		step("quiescent: group " + std::to_string(g) + " elects and commits");
+		const bool ok = commit_everywhere(all, g, "before-" + std::to_string(g), 30'000);
+		std::printf("quiescent: group %llu committed on all three nodes: %s\n", (unsigned long long)g, ok ? "yes" : "NO");
+		assert(ok);
+	}
+	// Both groups led from one node, so its stop leaves every group leaderless.
+	step("quiescent: both groups led from one node");
+	NodeId gone = c.leader({1, 2, 3}, groups[0]);
+	for (int tries = 0; c.leader({1, 2, 3}, groups[1]) != gone && tries < 20; ++tries) {
+		const NodeId from = c.leader({1, 2, 3}, groups[1]);
+		if (from)
+			c.nodes[from]->call(groups[1], [g = groups[1], gone](Driver<GroupSink> *d) { return transferring(d, g, gone); }, 5s);
+		std::this_thread::sleep_for(100ms);
+	}
+	assert(gone && c.leader({1, 2, 3}, groups[1]) == gone);
+	step("quiescent: every replica rests");
+	const bool rested = until([&] {
+		for (NodeId n = 1; n <= 3; ++n)
+			for (auto g : groups)
+				if (auto s = c.nodes[n]->state(g); !s || !s->resting)
+					return false;
+		return true;
+	}, 10'000);
+	std::printf("quiescent: every replica of both groups at rest: %s\n", rested ? "yes" : "NO");
+	assert(rested);
+	std::map<GroupId, Term> terms;
+	for (auto g : groups)
+		terms[g] = c.nodes[gone]->state(g)->term;
+	// At rest nothing elects: a follower's election timer does not run.
+	std::this_thread::sleep_for(3s);
+	for (auto g : groups)
+		for (NodeId n = 1; n <= 3; ++n) {
+			auto s = c.nodes[n]->state(g);
+			assert(s && s->term == terms[g] && s->resting && "nothing moves at rest past an election timeout");
+		}
+	step("quiescent: node " + std::to_string(gone) + " stops");
+	std::vector<NodeId> rest;
+	for (NodeId n = 1; n <= 3; ++n)
+		if (n != gone)
+			rest.push_back(n);
+	const auto stopped = steady::now();
+	c.nodes[gone].reset();
+	for (auto g : groups) {
+		const bool elected = until([&] {
+			for (auto n : rest)
+				if (auto s = c.nodes[n]->state(g); s && s->role == Role::Leader && s->term > terms[g])
+					return true;
+			return false;
+		}, 10'000);
+		std::printf("quiescent: group %llu elected a new leader %llu ms after node %llu stopped: %s\n", (unsigned long long)g,
+					(unsigned long long)ms_since(stopped), (unsigned long long)gone, elected ? "yes" : "NO");
+		assert(elected);
+		// Election timeout (2 s here) and a round, plus the stop itself and this poll.
+		assert(ms_since(stopped) < 5'000 && "within the election timeout");
+	}
+	std::uint64_t reported = 0;
+	for (auto n : rest)
+		for (std::uint32_t k = 0; k != 2; ++k)
+			reported += c.nodes[n]->host.transport->stats(k).gone;
+	std::printf("quiescent: node-gone reports on the other two hosts' loops: %llu\n", (unsigned long long)reported);
+	auto two = c.of({rest[0], rest[1]});
+	for (auto g : groups) {
+		step("quiescent: group " + std::to_string(g) + " commits on the other two");
+		const bool ok = commit_everywhere(two, g, "after-" + std::to_string(g), 30'000);
+		std::printf("quiescent: group %llu committed on the other two: %s\n", (unsigned long long)g, ok ? "yes" : "NO");
+		assert(ok);
+	}
+}
+
+// Quiescence: the leader's group fences at rest while its node stays up, so no node-pair report
+// fires; its Driver sends Gone, and the followers elect within their timeout.
+void quiescent_fence() {
+	const GroupId g = groups_on(2, 0, 1)[0];
+	Cluster c("quiescent-fence", {g});
+	for (NodeId n = 1; n <= 3; ++n)
+		c.start(n, 2, {1, 2, 3}, true);
+	step("quiescent fence: the group elects, commits and rests");
+	const bool ok = commit_everywhere(c.of({1, 2, 3}), g, "before", 30'000);
+	assert(ok);
+	const bool rested = until([&] {
+		for (NodeId n = 1; n <= 3; ++n)
+			if (auto s = c.nodes[n]->state(g); !s || !s->resting)
+				return false;
+		return true;
+	}, 10'000);
+	std::printf("quiescent fence: every replica at rest: %s\n", rested ? "yes" : "NO");
+	assert(rested);
+	const NodeId leader = c.leader({1, 2, 3}, g);
+	const auto at = c.nodes[leader]->state(g);
+	assert(leader && at);
+	// The leader's application holds a command out, the followers apply it and rest, then the
+	// leader's application fails at it: its group fences.
+	step("quiescent fence: node " + std::to_string(leader) + "'s application holds a command, the followers rest");
+	auto &node = *c.nodes[leader];
+	const auto k = node.host.transport->loop_of_group(g);
+	node.hold_apply = true;
+	node.host.post(k, [&node, k, g] { task::spawn(task::scheduler_ref::of(node.host.loops[k]->scheduler), proposing(node.per[k]->driver.get(), g, "held"), [](std::exception_ptr) {}); });
+	const bool held = until([&] {
+		if (!node.held)
+			return false;
+		for (NodeId n = 1; n <= 3; ++n)
+			if (n != leader)
+				if (auto s = c.nodes[n]->state(g); !c.nodes[n]->has(g, "held") || !s || !s->resting)
+					return false;
+		return true;
+	}, 10'000);
+	std::printf("quiescent fence: the followers applied the held command and rest: %s\n", held ? "yes" : "NO");
+	assert(held);
+	step("quiescent fence: the leader's group fences on node " + std::to_string(leader));
+	const auto fenced = steady::now();
+	node.host.post(k, [&node, k, g, through = Index(node.held)] { node.per[k]->driver->application_failed(g, through, "the test fails the application"); });
+	const bool elected = until([&] {
+		for (NodeId n = 1; n <= 3; ++n)
+			if (auto s = n == leader ? std::nullopt : c.nodes[n]->state(g); s && s->role == Role::Leader && s->term > at->term)
+				return true;
+		return false;
+	}, 10'000);
+	std::uint64_t reported = 0;
+	for (NodeId n = 1; n <= 3; ++n)
+		for (std::uint32_t l = 0; l != 2; ++l)
+			reported += c.nodes[n]->host.transport->stats(l).gone;
+	std::printf("quiescent fence: a follower elected %llu ms after the fence: %s; node-gone reports %llu\n", (unsigned long long)ms_since(fenced),
+				elected ? "yes" : "NO", (unsigned long long)reported);
+	assert(elected && "Gone elects without a node-pair report");
+	assert(reported == 0 && "the leader's node stayed up");
+	assert(ms_since(fenced) < 5'000 && "within the election timeout");
 }
 
 Membership with_learner(Membership m, NodeId incarnation) {
@@ -1514,14 +1677,14 @@ void identity() {
 	assert(total(two, &HostTransportStats::mismatched) >= 4 && total(two, &HostTransportStats::unstored) >= 20);
 
 	step("identity: host 2 stores the late group; host 1 opens it again");
-	two.loops[two.transport->loop_of_group(late)]->at([&] { two.transport->store(late, 2, Host::test_open()); });
+	two.loops[two.transport->loop_of_group(late)]->at([&] { two.store(late, 2, Host::test_open()); });
 	const bool late_opened = until([&] { return send(late, 1, 2, "late"), received(late, "late") > 0; }, 20'000);
 	std::printf("identity: once host 2 stored it, the late group's frames arrive: %s\n", late_opened ? "yes" : "NO");
 	assert(late_opened);
 
 	step("identity: host 1 stores ok again under another epoch");
 	const auto epoch2 = differing([](GroupOpen &o) { o.epoch.fill('Y'); });
-	one.loops[one.transport->loop_of_group(ok)]->at([&] { one.transport->store(ok, 1, epoch2); });
+	one.loops[one.transport->loop_of_group(ok)]->at([&] { one.store(ok, 1, epoch2); });
 	const auto mismatched = total(two, &HostTransportStats::mismatched);
 	for (int i = 0; i != 20; ++i) {
 		send(ok, 1, 2, "epoch2");
@@ -1533,12 +1696,12 @@ void identity() {
 				(unsigned long long)received(ok, "epoch2"));
 	assert(reopened && !received(ok, "epoch2"));
 	step("identity: host 2 stores ok under the same epoch");
-	two.loops[two.transport->loop_of_group(ok)]->at([&] { two.transport->store(ok, 2, epoch2); });
+	two.loops[two.transport->loop_of_group(ok)]->at([&] { two.store(ok, 2, epoch2); });
 	const bool agreed = until([&] { return send(ok, 1, 2, "agreed"), received(ok, "agreed") > 0; }, 20'000);
 	std::printf("identity: once both store the new epoch, frames arrive: %s\n", agreed ? "yes" : "NO");
 	assert(agreed);
 	step("identity: host 2 stores ok again under a third epoch");
-	two.loops[two.transport->loop_of_group(ok)]->at([&] { two.transport->store(ok, 2, differing([](GroupOpen &o) { o.epoch.fill('Z'); })); });
+	two.loops[two.transport->loop_of_group(ok)]->at([&] { two.store(ok, 2, differing([](GroupOpen &o) { o.epoch.fill('Z'); })); });
 	const auto restored = total(two, &HostTransportStats::mismatched);
 	for (int i = 0; i != 20; ++i) {
 		send(ok, 1, 2, "epoch3");
@@ -1658,7 +1821,8 @@ struct RawPeer {
 	std::unique_ptr<Links> links;
 	std::atomic<const Link *> link{nullptr};
 	std::atomic<int> ended{0};
-	std::atomic<std::uint64_t> closed{0}, credits{0}, credited{0}, big{0};
+	std::atomic<std::uint64_t> closed{0}, credits{0}, credited{0}, big{0}, controls{0};
+	std::atomic<std::uint64_t> credits_at_control{~0ull};  // credit frames read before the first control frame
 	std::map<GroupId, std::uint64_t> credit;  // on the loop
 	RawPeer(NodeId node, NodeId to, std::uint16_t port, LinkOptions options = {}) {
 		auto tls = context(names[node]);
@@ -1686,6 +1850,8 @@ struct RawPeer {
 				++credits;
 			}
 			big += f.size() > 1 << 20;
+			if (!f.empty() && f[0] == char(FrameKind::control) && !controls++)
+				credits_at_control = credits.load();
 		};
 		loop.start();
 	}
@@ -2037,6 +2203,239 @@ void backlog() {
 	assert(one.credits < N * R && one.closed == 0 && "the owed records merged");
 }
 
+// owe-order: control frames leave before what a connection owes (feed-scan review N2). As in
+// backlog, the gate holds host 2's sends behind 24 MiB while node 1's data frames make host 2 owe
+// 2,000 groups' credit; then host 2 queues 10 control frames for node 1. Once the gate opens,
+// node 1 reads every control frame before any credit.
+void owe_order() {
+	constexpr std::size_t N = 2000, B = 6;
+	HostTransportOptions options;
+	options.links.connection.dead_after = 60s;
+	Host two(2, 1);
+	two.open({}, options);
+	std::vector<GroupId> groups, bulk;
+	for (std::size_t i = 0; i != N; ++i)
+		groups.push_back(10'001 + i);
+	for (std::size_t i = 0; i != B; ++i)
+		bulk.push_back(90'001 + i);
+	const GroupId beat = 80'001;
+	two.stores(groups);
+	two.stores(bulk);
+	two.stores({beat});
+	std::atomic<std::uint64_t> delivered{0};
+	two.transport->on_deliver(0, [&](const Received &r) {
+		delivered += r.route.source == 1;
+		return true;
+	});
+	two.start();
+	const auto &stats = two.transport->stats(0);
+	Gate gate(two.port());
+	RawPeer one(1, 2, gate.port(), options.links);
+	step("owe-order: node 1 opens 2,000 groups on host 2");
+	const bool up = one.dial(2);
+	assert(up);
+	std::vector<std::string> opens;
+	for (auto g : groups)
+		opens.push_back(encode_open(g, Host::test_open()));
+	one.send(opens);
+	const bool opened = until([&] { return stats.opens >= N; }, 10'000);
+	step("owe-order: the gate holds host 2's sends behind 24 MiB; node 1 sends a data frame to each group");
+	gate.hold(true);
+	const auto sent_before = stats.sent.load();
+	two.post(0, [&] {
+		for (auto g : bulk)
+			two.transport->send(0, LinkLane::Control, FrameKind::data, {g, 2, 1}, 1, std::string((4 << 20) - 1024, 'B'));
+	});
+	const bool backed = until([&] { return stats.sent > sent_before; }, 10'000);
+	std::vector<std::string> frames;
+	for (auto g : groups)
+		frames.push_back(RawPeer::frame(g, 1, 2, "d", FrameKind::data));
+	one.send(frames);
+	const bool arrived = until([&] { return delivered == N && stats.owed >= N; }, 10'000);
+	step("owe-order: host 2 queues 10 control frames for node 1; the gate opens");
+	two.post(0, [&] {
+		for (int i = 0; i != 10; ++i)
+			two.transport->send(0, LinkLane::Control, FrameKind::control, {beat, 2, 1}, 1, "beat");
+	});
+	std::this_thread::sleep_for(100ms);
+	gate.hold(false);
+	const bool read = until([&] { return one.controls >= 10 && one.credited >= N * (frame_header + 1); }, 20'000);
+	std::printf("owe-order: up %s, opened %s, backed %s, host 2 owed %llu records; node 1 read %llu control frames and %llu credit frames, "
+				"%llu of them before the first control frame\n",
+				up ? "yes" : "NO", opened ? "yes" : "NO", backed ? "yes" : "NO", (unsigned long long)N, (unsigned long long)one.controls.load(),
+				(unsigned long long)one.credits.load(), (unsigned long long)one.credits_at_control.load());
+	assert(opened && backed && arrived && read);
+	assert(one.credits_at_control == 0 && "control frames go before credit");
+}
+
+// fetch-alongside-consensus (D102, Peers' F2 on the lane's fetch): three nodes of 2 loops, a
+// group's Drivers over the transport; rounds of four 8 MiB fetches (method 1), both ways between
+// nodes, through 1 MiB lane budgets, while a command commits every 50 ms. Every fetch arrives
+// exact, every commit lands on all three within 2 s, and the leader keeps its term.
+std::string pattern(std::size_t n, unsigned seed) {
+	std::string s(n, '\0');
+	for (std::size_t i = 0; i != n; ++i)
+		s[i] = char((i * 2654435761u + seed * 40503u) >> 13);
+	return s;
+}
+void fetch_alongside() {
+	constexpr std::size_t size = 8 << 20, budget = 1 << 20;
+	const GroupId g = groups_on(2, 0, 1)[0];
+	Cluster c("fetch-alongside", {g});
+	c.options_of = [](NodeId n) {
+		HostTransportOptions o;
+		o.rpc.outgoing_bytes = o.rpc.calling_bytes = o.rpc.serving_bytes = budget;
+		o.rpc.fetch_bytes = 2 * size;
+		o.rpc.reader = [n](std::string_view name) -> std::optional<std::string> {
+			if (name != "history/table")
+				return std::nullopt;
+			return pattern(size, unsigned(n));
+		};
+		return o;
+	};
+	for (NodeId n = 1; n <= 3; ++n)
+		c.start(n, 2);
+	auto all = c.of({1, 2, 3});
+	step("fetch-alongside: the group elects and commits");
+	assert(commit_everywhere(all, g, "before", 30'000));
+	const NodeId leader = c.leader({1, 2, 3}, g);
+	assert(leader);
+	const Term term = c.nodes[leader]->state(g)->term;
+
+	struct Fetched {
+		std::atomic<bool> done{false};
+		std::error_code error;
+		std::optional<std::string> bytes;
+	};
+	auto fetch = [&](NodeId from, NodeId peer) {
+		auto got = std::make_shared<Fetched>();
+		auto &h = c.nodes[from]->host;
+		h.loops[h.transport->loop_of_node(peer)]->at([&] {
+			h.transport->fetch(peer, "history/table", [got](std::error_code e, std::optional<std::string> b) {
+				got->error = e;
+				got->bytes = std::move(b);
+				got->done = true;
+			});
+			return 0;
+		});
+		return got;
+	};
+	std::uint64_t quiet = 0;
+	for (int i = 0; i != 4; ++i) {
+		const auto begun = steady::now();
+		assert(commit_everywhere(all, g, "quiet " + std::to_string(i), 2'000));
+		quiet = std::max(quiet, ms_since(begun));
+		std::this_thread::sleep_for(50ms);
+	}
+	const std::vector<std::pair<NodeId, NodeId>> pairs{{1, 2}, {1, 3}, {3, 2}, {2, 3}};
+	constexpr unsigned rounds = 4;
+	unsigned round = 0, exact = 0, commits = 0;
+	std::uint64_t slowest = 0;
+	bool committed = true;
+	std::vector<std::shared_ptr<Fetched>> fetches;
+	step("fetch-alongside: " + std::to_string(rounds) + " rounds of four 8 MiB fetches beside commits");
+	const auto start = steady::now();
+	while (ms_since(start) < 60'000) {
+		if (std::all_of(fetches.begin(), fetches.end(), [](auto &f) { return f->done.load(); })) {
+			for (std::size_t i = 0; i != fetches.size(); ++i)
+				exact += !fetches[i]->error && fetches[i]->bytes && *fetches[i]->bytes == pattern(size, unsigned(pairs[i].second));
+			fetches.clear();
+			if (round == rounds)
+				break;
+			++round;
+			for (auto [from, peer] : pairs)
+				fetches.push_back(fetch(from, peer));
+		}
+		const auto begun = steady::now();
+		committed &= commit_everywhere(all, g, "command " + std::to_string(++commits), 2'000);
+		slowest = std::max(slowest, ms_since(begun));
+		std::this_thread::sleep_for(50ms);
+	}
+	const auto elapsed = ms_since(start);
+	auto s = c.nodes[leader]->state(g);
+	const bool kept = s && s->role == Role::Leader && s->term == term;
+	std::printf("fetch-alongside: %u rounds of %zu x 8 MiB fetched through 1 MiB lane budgets in %llu ms, %u of %u exact; %u commits "
+				"beside them, each on all three within 2 s: %s (slowest %llu ms; 4 quiet ones before, slowest %llu ms); node %llu leads in "
+				"term %llu throughout: %s\n",
+				round, pairs.size(), (unsigned long long)elapsed, exact, rounds * unsigned(pairs.size()), commits, committed ? "yes" : "NO",
+				(unsigned long long)slowest, (unsigned long long)quiet, (unsigned long long)leader, (unsigned long long)term, kept ? "yes" : "NO");
+	assert(round == rounds && exact == rounds * pairs.size() && committed && kept);
+}
+
+// receive-bound: what a connection's frames for one group may hold on the receiver before its
+// group loop takes them (transport-groups review N2). Host 2 has 2 loops; g sits on the loop
+// that does not read node 1's connection, and that loop is held. Node 1 sends g 8 data frames
+// of 16,000 B against a 64 KiB window: the receiver ends the connection at the fifth (`overrun`)
+// and delivers at most 4 once the loop goes on. On a new connection node 1 sends g 1,000 control
+// frames: at most 256 are held and delivered, the rest refused (`flooded`), and the connection
+// stays up and delivers g's next frame.
+void receive_bound() {
+	constexpr std::uint32_t L = 2;
+	HostTransportOptions options;
+	options.window = 64 << 10;
+	Host two(2, L);
+	two.open({}, options);
+	const auto reader = two.transport->loop_of_node(1), held = 1 - reader;
+	const GroupId g = groups_on(L, held, 1)[0];
+	two.stores({g});
+	std::atomic<std::uint64_t> data{0}, control{0};
+	for (std::uint32_t k = 0; k != L; ++k)
+		two.transport->on_deliver(k, [&](const Received &r) {
+			(r.data ? data : control) += r.route.group == g;
+			return true;
+		});
+	two.start();
+	std::atomic<bool> hold{false};
+	auto stall = [&] {
+		hold = true;
+		two.post(held, [&] {
+			while (hold)
+				std::this_thread::sleep_for(1ms);
+		});
+	};
+	const auto open = encode_open(g, Host::test_open());
+	RawPeer one(1, 2, two.port());
+
+	step("receive-bound: node 1 sends 8 frames of 16,000 B past g's 64 KiB window while g's loop is held");
+	const bool up = one.dial(2);
+	assert(up);
+	one.send(open);
+	const bool opened = until([&] { return total(two, &HostTransportStats::opens) >= 1; }, 10'000);
+	stall();
+	std::vector<std::string> frames;
+	for (int i = 0; i != 8; ++i)
+		frames.push_back(RawPeer::frame(g, 1, 2, std::string(16'000, 'd'), FrameKind::data));
+	one.send(frames);
+	const bool ended = until([&] { return one.ended >= 1; }, 10'000);
+	hold = false;
+	std::this_thread::sleep_for(300ms);
+	std::printf("receive-bound: opened %s; the connection ended: %s (overrun %llu); delivered %llu of 8 data frames\n", opened ? "yes" : "NO",
+				ended ? "yes" : "NO", (unsigned long long)total(two, &HostTransportStats::overrun), (unsigned long long)data.load());
+	assert(opened && ended && total(two, &HostTransportStats::overrun) == 1 && data <= 4);
+
+	step("receive-bound: on a new connection node 1 sends g 1,000 control frames while g's loop is held");
+	const bool again = one.dial(2);
+	assert(again);
+	one.send(open);
+	const bool reopened = until([&] { return total(two, &HostTransportStats::opens) >= 2; }, 10'000);
+	stall();
+	frames.clear();
+	for (int i = 0; i != 1000; ++i)
+		frames.push_back(RawPeer::frame(g, 1, 2, "c"));
+	one.send(frames);
+	const bool refused = until([&] { return total(two, &HostTransportStats::flooded) >= 1000 - options.arriving; }, 10'000);
+	hold = false;
+	const bool taken = until([&] { return control >= options.arriving; }, 10'000);
+	std::this_thread::sleep_for(100ms);
+	const auto delivered = control.load();
+	one.send(RawPeer::frame(g, 1, 2, "next"));
+	const bool next = until([&] { return control == options.arriving + 1; }, 10'000);
+	std::printf("receive-bound: reopened %s; flooded %llu, delivered %llu of 1,000, then the next frame: %s; the connection ended %d time(s)\n",
+				reopened ? "yes" : "NO", (unsigned long long)total(two, &HostTransportStats::flooded), (unsigned long long)delivered,
+				next ? "yes" : "NO", one.ended.load());
+	assert(reopened && refused && taken && delivered == options.arriving && next && one.ended == 1);
+}
+
 // scan: the feed's work per frame. Host 1 stores N groups and sends a control and a data frame
 // per group to host 2, for N = 100, 1,000 and 10,000, every group on one loop: the groups both
 // hosts' feeds visit per frame they send stay under 2 at each N (a scan per frame grows with N).
@@ -2247,7 +2646,7 @@ void order() {
 
 int main(int argc, char **argv) {
 	if (argc != 3) {
-		std::fprintf(stderr, "usage: %s <fixture dir> threads|credit|reader|upload|driver|refill|identity|joiner|lagging|leftover|reconnect|backlog|relayout|scan|order\n", argv[0]);
+		std::fprintf(stderr, "usage: %s <fixture dir> threads|credit|reader|upload|driver|refill|identity|joiner|lagging|leftover|reconnect|backlog|owe-order|receive-bound|relayout|scan|order|fetch-alongside-consensus\n", argv[0]);
 		return 2;
 	}
 #ifndef SO_NOSIGPIPE
@@ -2271,7 +2670,7 @@ int main(int argc, char **argv) {
 	else if (which == "upload")
 		timed("upload", upload);
 	else if (which == "driver")
-		driver();
+		driver(), quiescent(), quiescent_fence();
 	else if (which == "refill")
 		refill();
 	else if (which == "identity")
@@ -2282,6 +2681,12 @@ int main(int argc, char **argv) {
 		reconnect();
 	else if (which == "backlog")
 		backlog();
+	else if (which == "owe-order")
+		owe_order();
+	else if (which == "receive-bound")
+		receive_bound();
+	else if (which == "fetch-alongside-consensus")
+		fetch_alongside();
 	else if (which == "joiner")
 		joiner();
 	else if (which == "lagging")

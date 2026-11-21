@@ -46,6 +46,10 @@ endif()
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	enable_testing()
 	file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/.scratch")  # the tests' state
+	# faultlab's faultfs, the crash model the journal tests run on; test-only. It reuses the
+	# completion target declared above.
+	FetchContent_Declare(faultlab GIT_REPOSITORY https://github.com/Kronuz/faultlab.git GIT_TAG a3b71d1b9bdcfa3664dbce8725f14c07bb14845f)
+	FetchContent_MakeAvailable(faultlab)
 	foreach(t consensus checkpoint_encoder retained_log retirement simulation membership pipeline retained_state)
 		add_executable(consensus_${t}_test test/${t}_test.cc)
 		target_link_libraries(consensus_${t}_test PRIVATE consensus::consensus)
@@ -55,6 +59,10 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	# Sanitized and beside the shared-journal tests on two CPUs, the simulation needs more.
 	set_tests_properties(consensus_simulation PROPERTIES TIMEOUT 300)
 	target_sources(consensus_simulation_test PRIVATE test/driver_simulation.cc)  # the same oracles through the Driver
+	# A full rpc_bytes window over slow in-order links (docs/mechanisms/append-pacing.md).
+	add_executable(consensus_full_window_stall_test test/full_window_stall_test.cc)
+	target_link_libraries(consensus_full_window_stall_test PRIVATE consensus::consensus)
+	add_test(NAME consensus_full_window_stall COMMAND consensus_full_window_stall_test)
 	# T1: stores written at b7073bb recover unchanged.
 	add_executable(consensus_compat_test test/compat_test.cc)
 	target_link_libraries(consensus_compat_test PRIVATE consensus::consensus)
@@ -135,6 +143,10 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	add_executable(consensus_fuzz_rpc_replay fuzz/rpc_fuzz.cc fuzz/replay.cc)
 	target_link_libraries(consensus_fuzz_rpc_replay PRIVATE consensus::consensus)
 	add_test(NAME consensus_fuzz_rpc_replay COMMAND consensus_fuzz_rpc_replay "${CMAKE_CURRENT_SOURCE_DIR}/fuzz/corpus/rpc")
+	# The multicast seed datagram (fuzz/seeds_fuzz.cc): its corpus replays as a test.
+	add_executable(consensus_fuzz_seeds_replay fuzz/seeds_fuzz.cc fuzz/replay.cc)
+	target_link_libraries(consensus_fuzz_seeds_replay PRIVATE consensus::consensus)
+	add_test(NAME consensus_fuzz_seeds_replay COMMAND consensus_fuzz_seeds_replay "${CMAKE_CURRENT_SOURCE_DIR}/fuzz/seeds_corpus")
 	option(CONSENSUS_FUZZ "Build the libFuzzer targets (Clang)" OFF)
 	if(CONSENSUS_FUZZ)
 		add_executable(consensus_fuzz_decoders fuzz/fuzz_decoders.cc)
@@ -145,6 +157,10 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 		target_link_libraries(consensus_fuzz_rpc PRIVATE consensus::consensus)
 		target_compile_options(consensus_fuzz_rpc PRIVATE -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all)
 		target_link_options(consensus_fuzz_rpc PRIVATE -fsanitize=fuzzer,address,undefined)
+		add_executable(consensus_fuzz_seeds fuzz/seeds_fuzz.cc)
+		target_link_libraries(consensus_fuzz_seeds PRIVATE consensus::consensus)
+		target_compile_options(consensus_fuzz_seeds PRIVATE -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all)
+		target_link_options(consensus_fuzz_seeds PRIVATE -fsanitize=fuzzer,address,undefined)
 	endif()
 	add_test(NAME consensus_worker_terminal COMMAND consensus_worker_test --terminal-regressions)
 	set_tests_properties(consensus_worker_terminal PROPERTIES TIMEOUT 30)
@@ -171,6 +187,11 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 		target_link_libraries(consensus_worker_completion_bench PRIVATE consensus::consensus completion::asio reactor::reactor)
 	endif()
 
+	# The tests that build a journal run it on faultfs.
+	foreach(t simulation shared_worker shared_cluster wave_open waiter blocking_entry driver driver_close worker)
+		target_link_libraries(consensus_${t}_test PRIVATE faultlab::faultlab)
+	endforeach()
+
 	# Transport tests; they check with assert, so NDEBUG stays off.
 	# The fixture's certificates come from the openssl beside the linked library: macOS's
 	# /usr/bin/openssl is LibreSSL, whose certificates OpenSSL 3 rejects.
@@ -189,6 +210,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 		add_test(NAME consensus_transport_${t} COMMAND consensus_transport_${t}_test)
 		set_tests_properties(consensus_transport_${t} PROPERTIES TIMEOUT 30)
 	endforeach()
+	target_link_libraries(consensus_transport_peers_test PRIVATE faultlab::faultlab)  # its Nodes' journal runs on faultfs
 	set_tests_properties(consensus_transport_peers PROPERTIES TIMEOUT 50)  # under TSan a run takes up to 25 s
 	# A scenario that throws with its voters running reports the failure instead of hanging.
 	add_test(NAME consensus_transport_peers_throwing COMMAND consensus_transport_peers_test throwing)
@@ -209,7 +231,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	add_executable(consensus_transport_groups_test test/transport/groups_test.cc)
 	target_link_libraries(consensus_transport_groups_test PRIVATE consensus::transport)
 	target_compile_options(consensus_transport_groups_test PRIVATE -UNDEBUG)
-	foreach(c threads credit reader upload driver refill identity joiner lagging leftover reconnect backlog relayout scan order)
+	foreach(c threads credit reader upload driver refill identity joiner lagging leftover reconnect backlog owe-order receive-bound relayout scan order fetch-alongside-consensus)
 		add_test(NAME consensus_transport_groups_${c} COMMAND consensus_transport_groups_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture ${c})
 		set_tests_properties(consensus_transport_groups_${c} PROPERTIES FIXTURES_REQUIRED consensus_tls TIMEOUT 120)
 	endforeach()
@@ -224,10 +246,13 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	add_executable(consensus_transport_rpc_host_test test/transport/rpc_host_test.cc)
 	target_link_libraries(consensus_transport_rpc_host_test PRIVATE consensus::transport)
 	target_compile_options(consensus_transport_rpc_host_test PRIVATE -UNDEBUG)
-	foreach(c calls group-full call-full lane-only stream local-throw)
+	foreach(c calls group-full call-full lane-only stream local-throw stalled-peer hold idle-race shutdown fetch reader stop-drain)
 		add_test(NAME consensus_transport_rpc_host_${c} COMMAND consensus_transport_rpc_host_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture ${c})
 		set_tests_properties(consensus_transport_rpc_host_${c} PROPERTIES FIXTURES_REQUIRED consensus_tls TIMEOUT 150)
 	endforeach()
+	# Latency bounds a runner that stops the process can break (D100): `ctest -LE timing` skips them; CI runs them.
+	set_tests_properties(consensus_transport_rpc_host_group-full consensus_transport_rpc_host_call-full
+		consensus_transport_rpc_host_stream consensus_transport_rpc_host_reader PROPERTIES LABELS timing)
 	# The node hello's limits and wire versions (docs/mechanisms/hello.md).
 	add_executable(consensus_transport_hello_test test/transport/hello_test.cc)
 	target_link_libraries(consensus_transport_hello_test PRIVATE consensus::transport)
@@ -237,6 +262,16 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 		set_tests_properties(consensus_transport_hello_${c} PROPERTIES FIXTURES_REQUIRED consensus_tls TIMEOUT 120)
 	endforeach()
 	set_tests_properties(consensus_transport_rpc PROPERTIES TIMEOUT 120)
+	# Multicast seeds (docs/mechanisms/seeds.md), one ctest entry per case. A host whose loopback
+	# cannot carry multicast skips the cases that need it (exit 77) and says why; where CI or
+	# CONSENSUS_SEEDS_REQUIRE is set, that fails instead.
+	add_executable(consensus_transport_seeds_test test/transport/seeds_test.cc)
+	target_link_libraries(consensus_transport_seeds_test PRIVATE consensus::transport)
+	target_compile_options(consensus_transport_seeds_test PRIVATE -UNDEBUG)
+	foreach(c codec drops processes unavailable forged forged_rotating rate recovers receive_errors throws require)
+		add_test(NAME consensus_transport_seeds_${c} COMMAND consensus_transport_seeds_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture ${c})
+		set_tests_properties(consensus_transport_seeds_${c} PROPERTIES FIXTURES_REQUIRED consensus_tls TIMEOUT 60 SKIP_RETURN_CODE 77)
+	endforeach()
 	# The host transport's idle cost per group, connection end and host, and its hop's CPU
 	# (docs/perf/transport-idle-cost.md); ctest checks the counts on every platform.
 	add_executable(consensus_transport_idle bench/transport_idle.cc)

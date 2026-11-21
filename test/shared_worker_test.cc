@@ -26,14 +26,15 @@
 // group's artifacts: each command a group delivered as Committed comes back, in order,
 // from its checkpoint image and its replayed suffix, and the groups carry on.
 #include "consensus/worker.h"
-#include "journal/memory_io.h"
+#include "faultlab/faultfs.h"
+#include <algorithm>
 #include <iostream>
 #include <map>
 #include <random>
 
 using namespace kronuz::consensus;
 namespace j = kronuz::journal;
-namespace jt = kronuz::journal::testing;
+namespace fl = kronuz::faultlab;
 
 namespace {
 int checks = 0, failures = 0;
@@ -42,6 +43,14 @@ void check(bool value, const std::string& what) {
 	++checks;
 	if (!value) { ++failures; if (failures < 20) { std::cerr << "FAIL: " << what << '\n'; } }
 }
+// The host's directory on `disk`, made on first use.
+std::shared_ptr<j::IO> host_io(fl::filesystem& disk) {
+	const auto names = disk.list();
+	if (std::find(names.begin(), names.end(), "host") == names.end()) { disk.make_directory("host"); }
+	return std::make_shared<fl::io>(disk, "host");
+}
+// A crash keeps any sector-boundary prefix of an unsynced append, as a real device may.
+const fl::crash_policy sector_cut{.size = fl::size_pick::sector};
 constexpr Timing compact{20, 40, 100, 200, 60000};
 constexpr std::uint64_t group_count = 4;
 const j::Identity log_identity{'T', 'U', 'R', 'N', 'S'};
@@ -89,13 +98,13 @@ struct Group {
 };
 
 struct Node {
-	jt::Disk& disk;
+	fl::filesystem& disk;
 	std::unique_ptr<j::Host> host;
 	j::TurnDriver* driver = nullptr;
 	std::map<std::uint64_t, Group> groups;
 	std::uint64_t now = 100;
 	RequestId next_request = 1;
-	explicit Node(jt::Disk& d) : disk(d) {}
+	explicit Node(fl::filesystem& d) : disk(d) {}
 	~Node() { close(); }
 	// The process ends: the Workers, then the host and its lock.
 	void close() {
@@ -105,7 +114,7 @@ struct Node {
 
 	void open() {
 		close();
-		host = std::make_unique<j::Host>(std::make_shared<jt::MemoryIO>(disk, "host/"), log_identity, j::HostOptions{1, options});
+		host = std::make_unique<j::Host>(host_io(disk), log_identity, j::HostOptions{1, options});
 		driver = &host->driver(0);
 		for (std::uint64_t g = 1; g <= group_count; ++g) {
 			auto& group = groups[g];
@@ -187,17 +196,17 @@ struct Node {
 };
 
 std::uint64_t run(std::uint64_t seed, std::uint64_t cut, unsigned rounds) {
-	jt::Disk disk; disk.random.seed(seed * 31 + cut);
+	fl::filesystem disk;
 	std::mt19937_64 random(seed);
 	Node node(disk);
 	try {
-		disk.cut = cut;
+		disk.power_off_after(cut - 1);
 		node.open();
 		for (unsigned r = 0; r < rounds; ++r) { node.round(random); }
-	} catch (const jt::PowerLoss&) {}
-	const auto operations = disk.operations;
+	} catch (const std::exception& error) { check(disk.powered_off(), "only the power cut fails the run, which threw " + std::string(error.what()) + ": seed " + std::to_string(seed) + " cut " + std::to_string(cut)); }
+	const auto operations = disk.mutations();
 	node.close();
-	disk.power_loss();
+	disk.crash(seed * 31 + cut, sector_cut);
 	const auto at = "seed " + std::to_string(seed) + " cut " + std::to_string(cut);
 	try {
 		Node again(disk); again.now = node.now; again.next_request = node.next_request;

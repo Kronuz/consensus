@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ctypes
+import dataclasses
 import json
 import os
 import random
@@ -53,10 +55,13 @@ OP_SECONDS = (
 THINK_SECONDS = (
     0.025  # between a client's operations, which bounds the history the checker reads
 )
-# A1: ping's median within 10% of the set round trip, past the unshaped path's own round trip (the
-# floor), which is also the jitter allowed, at least JITTER_MS.
+# A1: ping's median within 10% of the set round trip past the guest's floor at that delay: the
+# unshaped path's round trip plus two timer wakes (netem holds each packet once per direction), each
+# as late as an hrtimer sleep of the same delay wakes, measured beside it; jitter is the spread of
+# those wakes, at least JITTER_MS.
 RTT_TOLERANCE = 0.10
 JITTER_MS = 0.1
+TIMER_SAMPLES = 30
 
 
 @dataclass(frozen=True)
@@ -97,6 +102,9 @@ class Plan:
     rpc_seconds: float = 1.5
     rpc_max: int = 400
     elections: int = 4
+    load_wait: float = (
+        30.0  # past a load's own seconds, before its answer is "no answer"
+    )
     partition_seconds: float = 4.0
     healed_seconds: float = 3.0
     pings: int = 10
@@ -151,7 +159,13 @@ class Processes:
     """The real cluster: node.cc processes, each in its namespace, its journal under `root`."""
 
     def __init__(
-        self, lab: Lab, binary: Path, fixture: Path, root: Path, nodes: int
+        self,
+        lab: Lab,
+        binary: Path,
+        fixture: Path,
+        root: Path,
+        nodes: int,
+        options: Sequence[str] = (),
     ) -> None:
         self.lab, self.binary, self.fixture, self.root, self.nodes = (
             lab,
@@ -160,6 +174,7 @@ class Processes:
             root,
             nodes,
         )
+        self.options = list(options)  # node.cc's leading options, as --rpc-timeout MS
         self.procs: dict[int, subprocess.Popen[bytes]] = {}
         self.buffers: dict[int, bytes] = {}
         self.selector = selectors.DefaultSelector()
@@ -180,6 +195,7 @@ class Processes:
         ]
         argv = [
             str(self.binary),
+            *self.options,
             str(self.fixture),
             str(directory),
             str(node),
@@ -264,6 +280,19 @@ def percentile(values: Sequence[float], q: float) -> float:
     return ordered[int(q * (len(ordered) - 1))]
 
 
+def timer_late(ms: float, samples: int = TIMER_SAMPLES) -> list[float]:
+    """How late, in ms, a sleep of `ms` wakes in this kernel, with the timer slack netem's own
+    hrtimer has (1 ns): each sample is one hold's lateness."""
+    with contextlib.suppress(OSError, AttributeError):
+        ctypes.CDLL(None, use_errno=True).prctl(29, 1, 0, 0, 0)  # PR_SET_TIMERSLACK
+    late = []
+    for _ in range(samples):
+        start = time.perf_counter_ns()
+        time.sleep(ms / 1000)
+        late.append((time.perf_counter_ns() - start) / 1e6 - ms)
+    return late
+
+
 def ping_rtts(output: str) -> list[float]:
     """Each reply's round trip in ms from ping's output."""
     return [float(m) for m in re.findall(r"time[=<]([0-9.]+) ?ms", output)]
@@ -299,6 +328,7 @@ class Bench:
         out: Path,
         run: Callable[[Sequence[str]], str],
         history: Any,
+        late: Callable[[float], list[float]] = timer_late,
     ) -> None:
         self.lab, self.cluster, self.nodes, self.plan, self.out = (
             lab,
@@ -308,12 +338,16 @@ class Bench:
             out,
         )
         self.run = run  # runs a command, returns its output (netlab's runner)
+        self.late = late  # a timer's lateness samples at a delay (timer_late)
+        self.diag: Path | None = None  # where a load's progress samples go, when set
+        self.sampling: tuple[str, int, Any] | None = None  # label, leader, open file
+        self.next_sample = 0.0
+        self.status: dict[int, str] = {}  # node: the request id of its last status call
         self.history = history  # faultlab.history
         self.checks: list[Check] = []
         self.role: dict[int, tuple[str, int, float]] = {}  # node: (role, term, t)
         self.replies: dict[str, Event] = {}  # by request id
         self.ids = 0
-        self.floor_ms = 0.0
         self.recorder: Any = None
         self.clients: list[Client] = []
         self.ops: dict[
@@ -356,6 +390,8 @@ class Bench:
             for node, event in self.cluster.poll(min(left, 0.02)):
                 self.dispatch(node, event)
             self.tick()
+            if self.sampling is not None:
+                self.sample()
 
     def dispatch(self, node: int, event: Event) -> None:
         kind = event.get("ev")
@@ -411,6 +447,7 @@ class Bench:
 
     def start(self) -> int:
         self.role.clear()
+        self.roles.clear()  # this cluster's role changes only
         for node in range(1, self.nodes + 1):
             self.cluster.start(node, fresh=True)
         led = self.pump(30, lambda: self.leader() != 0)
@@ -442,19 +479,11 @@ class Bench:
         self.lab.reorder(shape.reorder)
 
     def measure_floor(self) -> None:
-        """The round trip of a packet netem holds for 1 us each way: the path's own cost and the
-        guest's timer latency on each hold, which every delayed shape pays beside its delay."""
+        """The unshaped path's round trip, which every shape pays beside its delay."""
         self.shape(SHAPES[0])
         samples = self.ping_all()
         self.unshaped_ms = statistics.median(samples) if samples else 0.0
-        self.shape(Shape("held", ms=0.001))
-        samples = self.ping_all()
-        self.floor_ms = statistics.median(samples) if samples else 0.0
-        self.shape(SHAPES[0])
-        print(
-            f"  round trip unshaped {self.unshaped_ms:.3f} ms, held 1 us each way {self.floor_ms:.3f} ms",
-            flush=True,
-        )
+        print(f"  round trip unshaped {self.unshaped_ms:.3f} ms", flush=True)
 
     def ping_all(self) -> list[float]:
         medians = []
@@ -484,16 +513,22 @@ class Bench:
 
     def check_rtt(self, shape: Shape, row: dict[str, Any]) -> None:
         medians = self.ping_all()
-        expected = shape.rtt_ms
-        allowed = RTT_TOLERANCE * expected + max(self.floor_ms, JITTER_MS)
+        late = self.late(shape.ms) if shape.ms else [0.0]
+        late_ms = statistics.median(late)
+        floor = self.unshaped_ms + 2 * late_ms
+        allowed = RTT_TOLERANCE * shape.rtt_ms + max(
+            JITTER_MS, 2 * (percentile(late, 0.9) - late_ms)
+        )
         worst = max(
-            (abs(m - expected - self.floor_ms) for m in medians), default=float("inf")
+            (abs(m - shape.rtt_ms - floor) for m in medians), default=float("inf")
         )
         row["rtt_ms"] = round(statistics.median(medians), 3) if medians else None
+        row["timer_late_ms"] = round(late_ms, 3)
         self.check(
             f"{shape.name}: round trip",
             len(medians) == self.nodes - 1 and worst <= allowed,
-            f"set {expected:g} ms + floor {self.floor_ms:.3f}, ping medians {[round(m, 3) for m in medians]} ms, allowed ±{allowed:.3f}",
+            f"set {shape.rtt_ms:g} ms + floor {floor:.3f} (unshaped {self.unshaped_ms:.3f} + 2 timer wakes {late_ms:.3f}), "
+            f"ping medians {[round(m, 3) for m in medians]} ms, allowed ±{allowed:.3f}",
         )
 
     def cut(self, side: set[int]) -> None:
@@ -545,11 +580,18 @@ class Bench:
         seconds = self.plan.load_seconds
         # 128 MiB of 64 KiB entries per node, which the guest holds twice
         cap = 2048 if size == LARGE else 1_000_000
-        reply = self.call(
-            leader, f"load {seconds} {size} {inflight} {cap}", seconds + 30
-        )
+        label = f"{'large' if size == LARGE else 'small'}-{inflight}"
+        self.begin_sampling(label, leader)
+        try:
+            reply = self.call(
+                leader,
+                f"load {seconds} {size} {inflight} {cap}",
+                seconds + self.plan.load_wait,
+            )
+        finally:
+            self.end_sampling()
         if not reply:
-            return {"error": "no answer"}
+            return {"error": f"no answer in {seconds + self.plan.load_wait:g} s"}
         commits, took = int(reply["commits"]), float(reply["seconds"]) or 1.0
         return {
             "commits": commits,
@@ -559,6 +601,54 @@ class Bench:
             "p99_ms": reply["p99"] / 1000,
             "failures": reply.get("failures", {}),
         }
+
+    # --diag: each node's applied index and the leader's TCP sockets, every half second of a load.
+
+    def begin_sampling(self, label: str, leader: int) -> None:
+        if self.diag is None:
+            return
+        self.status.clear()
+        self.next_sample = 0.0
+        self.sampling = (label, leader, self.diag.open("a"))
+
+    def end_sampling(self) -> None:
+        if self.sampling is not None:
+            self.sample(force=True)
+            self.sampling[2].close()
+            self.sampling = None
+
+    def sample(self, force: bool = False) -> None:
+        assert self.sampling is not None
+        label, leader, out = self.sampling
+        now = self.cluster.now()
+        if now < self.next_sample and not force:
+            return
+        self.next_sample = now + 0.5
+        applied = {
+            node: self.replies.get(request, {}).get("applied")
+            for node, request in self.status.items()
+        }
+        try:
+            sockets = self.run(self.lab.command(leader, ["ss", "-tinH"]))
+        except Exception as error:  # noqa: BLE001 - a sample is best effort
+            sockets = str(error)
+        out.write(
+            json.dumps(
+                {
+                    "t": round(now, 3),
+                    "load": label,
+                    "leader": leader,
+                    "applied": applied,
+                    "ss": sockets,
+                }
+            )
+            + "\n"
+        )
+        out.flush()
+        for node in range(1, self.nodes + 1):
+            if self.cluster.alive(node):
+                self.status[node] = self.next_id()
+                self.cluster.send(node, f"s {self.status[node]}")
 
     def rpc(self, leader: int) -> dict[str, Any]:
         """One call opens the lane's Bulk link (its dial, TLS and hellos): its latency is the cold
@@ -937,7 +1027,6 @@ def measure(bench: Bench, shapes: Sequence[Shape]) -> dict[str, Any]:
     failed = [c for c in bench.checks if not c.ok]
     return {
         "nodes": bench.nodes,
-        "floor_rtt_ms": bench.floor_ms,
         "unshaped_rtt_ms": bench.unshaped_ms,
         "plan": bench.plan.__dict__,
         "rows": rows,
@@ -951,6 +1040,23 @@ def measure(bench: Bench, shapes: Sequence[Shape]) -> dict[str, Any]:
 
 def _ms(value: Any) -> str:
     return "-" if value is None else f"{float(value):.2f}"
+
+
+def _cell(measured: dict[str, Any], text: Callable[[dict[str, Any]], str]) -> str:
+    """A measurement's cell, or its error: a row that failed is reported, never dropped."""
+    if "error" in measured:
+        return f"error: {measured['error']}"
+    return text(measured)
+
+
+def _latency(m: dict[str, Any]) -> str:
+    return f"{_ms(m.get('p50_ms'))} / {_ms(m.get('p99_ms'))}"
+
+
+def _ratio(row: dict[str, Any], base: dict[str, Any], name: str, key: str) -> str:
+    """row's `name.key` over loopback's, or "-" when either side has no number."""
+    a, b = row.get(name, {}).get(key), base.get(name, {}).get(key)
+    return "-" if a is None or b is None else f"{a / max(b, 1e-9):.2f}x"
 
 
 def table(results: Sequence[dict[str, Any]], jobs: dict[int, str]) -> str:
@@ -971,7 +1077,11 @@ def table(results: Sequence[dict[str, Any]], jobs: dict[int, str]) -> str:
                     f"| {p['operations']} ops, {p['acknowledged_writes']} acked writes, {p['violations']} violations | {jobs.get(row['nodes'], '-')} |"
                 )
                 continue
-            if "small_latency" not in row:
+            if "small_latency" not in row:  # no leader at start: its checks say why
+                lines.append(
+                    f"| {row['nodes']} | {row['shape']} | {row['set_rtt_ms']:g} / {_ms(row.get('rtt_ms'))} "
+                    f"| error: not measured | - | - | - | - | - | - | {jobs.get(row['nodes'], '-')} |"
+                )
                 continue
             sl, ll, st, lt, rpc = (
                 row["small_latency"],
@@ -983,15 +1093,24 @@ def table(results: Sequence[dict[str, Any]], jobs: dict[int, str]) -> str:
             el = row.get("elections_ms") or []
             versus = "-"
             if base is not None and base is not row and "small_latency" in base:
+                p50, b50 = sl.get("p50_ms"), base["small_latency"].get("p50_ms")
                 versus = (
-                    f"p50 +{sl['p50_ms'] - base['small_latency']['p50_ms']:.2f} ms; "
-                    f"{st['per_s'] / max(base['small_throughput']['per_s'], 1e-9):.2f}x commits/s; "
-                    f"{lt['mb_s'] / max(base['large_throughput']['mb_s'], 1e-9):.2f}x MB/s"
+                    f"p50 {'-' if p50 is None or b50 is None else f'+{p50 - b50:.2f} ms'}; "
+                    f"{_ratio(row, base, 'small_throughput', 'per_s')} commits/s; "
+                    f"{_ratio(row, base, 'large_throughput', 'mb_s')} MB/s"
                 )
+
+            cells = (
+                _cell(sl, _latency),
+                _cell(ll, _latency),
+                _cell(st, lambda m: f"{m['per_s']:,.0f}"),
+                _cell(lt, lambda m: f"{m['mb_s']:.1f}"),
+                _cell(rpc, lambda m: f"{_latency(m)} (cold {_ms(m.get('cold_ms'))})"),
+            )
             lines.append(
-                f"| {row['nodes']} | {row['shape']} | {row['set_rtt_ms']:g} / {_ms(row.get('rtt_ms'))} "
-                f"| {_ms(sl.get('p50_ms'))} / {_ms(sl.get('p99_ms'))} | {_ms(ll.get('p50_ms'))} / {_ms(ll.get('p99_ms'))} "
-                f"| {st.get('per_s', 0):,.0f} | {lt.get('mb_s', 0):.1f} | {_ms(rpc.get('p50_ms'))} / {_ms(rpc.get('p99_ms'))} (cold {_ms(rpc.get('cold_ms'))}) "
+                f"| {row['nodes']} | {row['shape']} | {row['set_rtt_ms']:g} / {_ms(row.get('rtt_ms'))} | "
+                + " | ".join(cells)
+                + " "
                 f"| {f'{statistics.median(el):.0f}, {max(el):.0f}' if el else '-'} | {versus} | {jobs.get(row['nodes'], '-')} |"
             )
     return head + "\n".join(lines) + "\n"
@@ -1020,6 +1139,8 @@ def hunts(results: Sequence[dict[str, Any]]) -> list[str]:
             )  # A1's own margin
             where = f"{result['nodes']} nodes, {row['shape']}"
             for name in ("small_latency", "large_latency"):
+                if "p50_ms" not in row[name] or "p99_ms" not in base[name]:
+                    continue
                 limit = rtt + base[name]["p99_ms"]
                 if row[name]["p50_ms"] > limit:
                     found.append(
@@ -1030,7 +1151,7 @@ def hunts(results: Sequence[dict[str, Any]]) -> list[str]:
                     found.append(
                         f"{where}: {name} p99 {row[name]['p99_ms']:.2f} ms > 2 RTT + loopback p99 = {limit:.2f} ms"
                     )
-            limit = rtt + base["rpc"]["p99_ms"]
+            limit = rtt + base["rpc"].get("p99_ms", 0)
             if row["rpc"].get("p99_ms", 0) > limit:
                 found.append(
                     f"{result['nodes']} nodes, {row['shape']}: RPC p99 {row['rpc']['p99_ms']:.2f} ms > RTT + loopback p99 = {limit:.2f} ms"
@@ -1041,6 +1162,46 @@ def hunts(results: Sequence[dict[str, Any]]) -> list[str]:
                         f"{result['nodes']} nodes, {row['shape']}: election {t:.0f} ms > 3 timeouts"
                     )
     return found
+
+
+CALIBRATION_MS = (0.001, 0.01, 0.1, 0.5, 1, 2, 5, 20, 80)
+
+
+def calibrate(
+    lab: Lab, run: Callable[[Sequence[str]], str], pings: int = 40
+) -> list[dict[str, Any]]:
+    """ping between two namespaces with netem holding each packet `ms` each way, beside a sleep of
+    `ms`'s lateness: whether the round trip past the delay is the unshaped path plus two such wakes."""
+    lab.open({1: PORT, 2: PORT})
+    rows = []
+    try:
+        host = lab.address(1, 2).rsplit(":", 1)[0]
+        for ms in CALIBRATION_MS:
+            lab.delay(ms)
+            argv = ["ping", "-n", "-c", str(pings), "-i", "0.02", "-W", "2", host]
+            rtts = ping_rtts(run(lab.command(1, argv)))
+            late = timer_late(ms)
+            rows.append(
+                {
+                    "ms": ms,
+                    "ping_p50": round(statistics.median(rtts), 3),
+                    "ping_p10": round(percentile(rtts, 0.1), 3),
+                    "ping_p90": round(percentile(rtts, 0.9), 3),
+                    "excess": round(statistics.median(rtts) - 2 * ms, 3),
+                    "late_p50": round(statistics.median(late), 3),
+                    "late_p90": round(percentile(late, 0.9), 3),
+                }
+            )
+            print(json.dumps(rows[-1]), flush=True)
+        lab.delay(0)
+        rtts = ping_rtts(
+            run(lab.command(1, ["ping", "-n", "-c", str(pings), "-i", "0.02", host]))
+        )
+        rows.append({"ms": 0, "ping_p50": round(statistics.median(rtts), 3)})
+        print(json.dumps(rows[-1]), flush=True)
+    finally:
+        lab.teardown()
+    return rows
 
 
 def load_faultlab(directory: Path) -> tuple[Any, Any]:
@@ -1077,6 +1238,20 @@ def main(argv: list[str]) -> int:
     p.add_argument("--data", type=Path, default=Path("/dev/shm/netlab-consensus"))
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--rpc-timeout", type=int, help="the nodes' Timing::rpc_timeout, ms")
+    p.add_argument(
+        "--load-wait", type=float, help="seconds past a load's own to wait for it"
+    )
+    p.add_argument(
+        "--diag",
+        action="store_true",
+        help="sample each load's progress to diag-N.jsonl",
+    )
+    p = sub.add_parser(
+        "calibrate", help="netem holds against timer lateness (Linux, root)"
+    )
+    p.add_argument("--faultlab", type=Path, required=True)
+    p.add_argument("--out", type=Path, required=True)
     p = sub.add_parser("table", help="the markdown table and hunt rows of result files")
     p.add_argument("results", nargs="+", type=Path)
     p.add_argument(
@@ -1097,22 +1272,25 @@ def main(argv: list[str]) -> int:
     if (reason := netlab.unavailable()) is not None:
         print(f"bench.py: {reason}", file=sys.stderr)
         return 2
+    args.out.mkdir(parents=True, exist_ok=True)
+    if args.command == "calibrate":
+        rows = calibrate(netlab.Netlab(prefix="nlc"), netlab.run)
+        (args.out / "calibrate.json").write_text(json.dumps(rows, indent=1) + "\n")
+        return 0
     chosen = [s for s in SHAPES if s.name in args.shapes.split(",")]
     random.seed(args.seed)
-    args.out.mkdir(parents=True, exist_ok=True)
     shutil.rmtree(args.data, ignore_errors=True)
     lab = netlab.Netlab(prefix="nlc")
     certs = fixture(args.data / "fixture", netlab.run)
-    cluster = Processes(lab, args.node, certs, args.data, args.nodes)
-    bench = Bench(
-        lab,
-        cluster,
-        args.nodes,
-        Plan.quick() if args.quick else Plan(),
-        args.out,
-        netlab.run,
-        history,
-    )
+    options = ["--rpc-timeout", str(args.rpc_timeout)] if args.rpc_timeout else []
+    cluster = Processes(lab, args.node, certs, args.data, args.nodes, options)
+    plan = Plan.quick() if args.quick else Plan()
+    if args.load_wait is not None:
+        plan = dataclasses.replace(plan, load_wait=args.load_wait)
+    bench = Bench(lab, cluster, args.nodes, plan, args.out, netlab.run, history)
+    if args.diag:
+        bench.diag = args.out / f"diag-{args.nodes}.jsonl"
+        bench.diag.unlink(missing_ok=True)
     result = measure(bench, chosen)
     (args.out / f"result-{args.nodes}.json").write_text(
         json.dumps(result, indent=1) + "\n"

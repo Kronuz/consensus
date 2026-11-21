@@ -4,7 +4,8 @@
 #
 # bench/netlab's VM side, from a consensus checkout's root, inside a campaign job:
 #   vm.sh build                                   node.cc built in a guest, cached by its sources' trees
-#   vm.sh run --nodes N [--quick] [--shapes A,B]  bench.py in a guest, every node a netlab namespace
+#   vm.sh run --nodes N [bench.py run options]    bench.py in a guest, every node a netlab namespace
+#   vm.sh calibrate                               bench.py calibrate: netem holds against timer lateness
 # One guest of Xapiand's VM tier (tools/vm/cluster.sh up --nodes 1) holds the whole cluster: netlab's
 # veths and netem shape the links in its kernel, and the nodes share one CLOCK_MONOTONIC. The guest
 # is parked on every exit (our trap, and the guardian when this shell dies). Results go to $JOB_OUT.
@@ -16,9 +17,7 @@ args=()
 while [ $# -gt 0 ]; do
 	case $1 in
 		--nodes) nodes=$2; shift 2 ;;
-		--quick) args+=(--quick); shift ;;
-		--shapes) args+=(--shapes "$2"); shift 2 ;;
-		*) echo "vm.sh: unknown option $1" >&2; exit 2 ;;
+		*) args+=("$1"); shift ;;
 	esac
 done
 XAPIAND=${XAPIAND:-$HOME/code/Kronuz/Xapiand}
@@ -36,7 +35,9 @@ if [ "$what" = build ] && [ -x "$bin" ]; then
 	echo "vm.sh: $bin is built (sources $key)"
 	exit 0
 fi
-if [ "$what" = run ] && [ ! -x "$bin" ]; then
+if [ "$what" = calibrate ]; then
+	bin=
+elif [ "$what" = run ] && [ ! -x "$bin" ]; then
 	echo "vm.sh: no $bin: run vm.sh build first" >&2
 	exit 2
 fi
@@ -79,5 +80,14 @@ case $what in
 		echo "vm.sh: $nodes nodes, exit $status, results in $out, $(($(date +%s) - started)) s"
 		exit $status
 		;;
-	*) echo "vm.sh: build or run" >&2; exit 2 ;;
+	calibrate)
+		mkdir -p "$out"
+		tar -C bench/netlab -cf - bench.py | guest 'rm -rf ~/nlc && mkdir -p ~/nlc && tar -xf - -C ~/nlc'
+		tar -C "$faultlab" -cf - python/faultlab | guest 'mkdir -p ~/nlc/faultlab && tar -xf - -C ~/nlc/faultlab'
+		status=0
+		guest 'sudo python3 -I ~/nlc/bench.py calibrate --faultlab ~/nlc/faultlab --out ~/nlc/out' || status=$?
+		guest 'sudo tar -C ~/nlc/out -cf - .' | tar -xf - -C "$out" || true
+		exit $status
+		;;
+	*) echo "vm.sh: build, run or calibrate" >&2; exit 2 ;;
 esac

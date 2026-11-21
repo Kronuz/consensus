@@ -10,6 +10,7 @@ an election timeout; a leader commits only with a majority) on a simulated clock
 passes every check at 3 and 5 nodes, and each mutant fails the check that guards it:
 
   rtt-off         ping sees 1.5x the round trip netlab set          -> round trip
+  late-unmeasured the timer's lateness reads 0 while netem pays it    -> round trip
   minority-ack    a leader cut off with a minority acknowledges      -> majority only, history
   lost-write      each new leader lacks each key's last committed write -> history linearizable
   slow-election   elections take 4 timeouts                          -> elects after the cut
@@ -34,6 +35,10 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import bench
+
+LATE_MS = (
+    0.3  # the fake guest's timer wakes this late on each netem hold of 10 us or more
+)
 
 FAULTLAB_REPO = os.environ.get(
     "FAULTLAB_REPO", "https://github.com/Kronuz/faultlab.git"
@@ -73,6 +78,7 @@ class FakeRunner:
             target = int(argv[-1].rsplit(".", 1)[1])
             shape = self.lab.shapes[1, target]
             rtt = 2 * shape.ms * (1.5 if self.mutant == "rtt-off" else 1.0) + 0.05
+            rtt += 2 * LATE_MS if shape.ms >= 0.01 else 0.0
             return "".join(
                 f"64 bytes from {argv[-1]}: icmp_seq={i} ttl=64 time={rtt + 0.001 * (i % 3):.3f} ms\n"
                 for i in range(5)
@@ -247,6 +253,7 @@ class FakeCluster:
             self.kill(node)
         self.leader_of.clear()
         self.lost_leader_at = 0.0
+        self.term = 0  # fresh journals: the next shape's terms start over
         self.state.clear()  # the next shape starts a fresh cluster
         self.history.clear()
 
@@ -348,7 +355,12 @@ def run(
     runner.lab = lab
     cluster = FakeCluster(lab, nodes, mutant)
     plan = bench.Plan.quick()
-    b = bench.Bench(lab, cluster, nodes, plan, out, runner, history)
+
+    def late(ms: float) -> list[float]:
+        wake = 0.0 if mutant == "late-unmeasured" else LATE_MS
+        return [wake + 0.01 * (i % 3) for i in range(9)]
+
+    b = bench.Bench(lab, cluster, nodes, plan, out, runner, history, late)
     return bench.measure(b, bench.SHAPES), runner
 
 
@@ -403,6 +415,10 @@ def main() -> int:
                 f"{nodes} nodes: the partition's history has acknowledged writes and faults",
                 part["acknowledged_writes"] > 0 and part["violations"] == 0,
             )
+            expect(
+                f"{nodes} nodes: the cut leader's term is its own cluster's ({part['terms']})",
+                part["terms"]["isolated_leader"] == part["terms"]["before"],
+            )
             logged = (out / part["history"]).read_text()
             expect(
                 f"{nodes} nodes: the event log holds netlab's isolate and heal",
@@ -415,6 +431,26 @@ def main() -> int:
             and rows.count("\n| 5 |") == len(bench.SHAPES),
         )
         expect("no hunt rows for the clean model", not bench.hunts(results))
+        failing = [dict(r) for r in results[:1]]
+        failing[0]["rows"] = [dict(r) for r in results[0]["rows"]]
+        failing[0]["rows"][1] = dict(
+            failing[0]["rows"][1], large_throughput={"error": "no answer in 32 s"}
+        )
+        failing[0]["rows"][2] = {
+            k: v
+            for k, v in failing[0]["rows"][2].items()
+            if k == "shape" or k == "nodes" or k == "set_rtt_ms"
+        }
+        try:
+            text = bench.table(failing, {})
+            bench.hunts(failing)
+        except Exception as error:  # noqa: BLE001 - the check is that nothing raises
+            text = repr(error)
+        expect(
+            "an errored measurement and an unmeasured row are table cells, not a crash",
+            "| error: no answer in 32 s |" in text
+            and "| error: not measured |" in text,
+        )
         slow = [dict(r) for r in results[:1]]
         slow[0]["rows"] = [dict(r) for r in results[0]["rows"]]
         slow[0]["rows"][2] = dict(
@@ -427,6 +463,7 @@ def main() -> int:
         )
         for mutant, guard in (
             ("rtt-off", "round trip"),
+            ("late-unmeasured", "round trip"),
             ("minority-ack", "majority only"),
             ("minority-ack", "history linearizable"),
             ("lost-write", "history linearizable"),

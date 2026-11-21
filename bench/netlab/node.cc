@@ -24,17 +24,18 @@
 // DIR and the host transport (mutual TLS with the test fixture's certificates), one voter of a
 // fixed group of VOTERS. It takes commands on stdin and writes one JSON line per event on stdout,
 // each stamped with CLOCK_MONOTONIC microseconds ("t"), so the harness compares nodes' clocks.
-//   consensus_netlab_node FIXTURE DIR ID VOTERS PORT J=HOST:PORT...
+//   consensus_netlab_node [--rpc-timeout MS] FIXTURE DIR ID VOTERS PORT J=HOST:PORT...
 // Commands:
 //   w ID KEY VALUE BYTES      propose "KEY=VALUE" padded to BYTES, answered once committed here
 //   r ID KEY                  a linearizable read (Driver::read) of KEY's value
 //   load ID SECONDS BYTES INFLIGHT MAX
 //                             closed loop: INFLIGHT proposals of BYTES at once, for SECONDS or MAX
 //                             commits: commits, bytes, and commit latency percentiles
+//   s ID                      status: the last index applied here
 //   rpc ID PEER BYTES SECONDS MAX
 //                             RPC-lane echo calls of BYTES to PEER, one at a time: latency percentiles
 //   quit
-// Events: ready, role (each RoleChanged), w, r, load, rpc. A refused call answers ok 0 with its
+// Events: ready, role (each RoleChanged), w, r, s, load, rpc. A refused call answers ok 0 with its
 // reason; "superseded" and "rejected" are definite failures, anything else is unknown.
 #include "consensus/driver.h"
 #include "consensus/transport/host_transport.h"
@@ -60,6 +61,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -72,6 +74,7 @@ namespace j = kronuz::journal;
 
 namespace {
 std::filesystem::path fixture;
+std::uint64_t rpc_timeout_ms = Timing{}.rpc_timeout;
 const char *names[] = {"", "one", "two", "three", "four", "five"};
 constexpr GroupId group = 1;
 constexpr rpc::MethodId echo = 7;
@@ -219,6 +222,7 @@ struct Node {
 			o.configuration.configuration[0] = 'G';
 			o.admission = admission;
 			o.limits.log_bytes = 768u << 20;  // no checkpoints: a run's whole log stays retained
+			o.timing.rpc_timeout = rpc_timeout_ms;
 			driver->open(group, std::move(o));
 			auto opening = journal->status(group) == j::GroupStatus::stored ? driver->recover(group, [](j::ArtifactReader &) {})
 																			 : driver->create(group, j::Identity{'G', char('0' + id)});
@@ -461,6 +465,8 @@ void Node::command(const std::string &line) {
 		if (payload.size() < bytes)
 			payload.resize(bytes, '\0');
 		post([this, id, payload] { spawn(write(id, payload)); });
+	} else if (op == "s") {
+		post([this, id] { emit("s", "\"id\":" + id + ",\"applied\":" + std::to_string(applied)); });
 	} else if (op == "r") {
 		std::string key;
 		in >> key;
@@ -485,8 +491,14 @@ void Node::command(const std::string &line) {
 } // namespace
 
 int main(int argc, char **argv) {
+	if (argc > 2 && std::string_view(argv[1]) == "--rpc-timeout") {
+		rpc_timeout_ms = std::stoull(argv[2]);
+		argv[2] = argv[0];
+		argc -= 2;
+		argv += 2;
+	}
 	if (argc < 6) {
-		std::fprintf(stderr, "usage: %s FIXTURE DIR ID VOTERS PORT J=HOST:PORT...\n", argv[0]);
+		std::fprintf(stderr, "usage: %s [--rpc-timeout MS] FIXTURE DIR ID VOTERS PORT J=HOST:PORT...\n", argv[0]);
 		return 2;
 	}
 	std::signal(SIGPIPE, SIG_IGN);

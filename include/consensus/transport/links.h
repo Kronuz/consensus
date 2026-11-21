@@ -20,7 +20,8 @@ struct LinkOptions {
 	std::chrono::milliseconds resolve_deadline{1000}, stagger{250};
 	PeerResolver resolver = system_resolver;  // on a thread that may outlive Links: capture only what it owns
 	// Incoming connections before authentication: at most `handshakes`, and `handshakes_per_source`
-	// from one address (a node dials each lane once at a time); a newcomer replaces the oldest.
+	// from one address (a node dials each lane once at a time); a newcomer replaces the oldest,
+	// and one from an unknown address never replaces one from a peer's (N9).
 	std::size_t handshakes = 4, handshakes_per_source = 2;
 	std::uint32_t rpc_min = 1, rpc_max = 1;
 	std::uint32_t wire_min = wire_version, wire_max = wire_version;
@@ -313,6 +314,7 @@ class Links {
 	struct Handshake {
 		asio::ip::address source;
 		std::shared_ptr<Connection> connection;
+		bool peer = false;  // from an address a route names
 	};
 	struct Task {
 		Links &links;
@@ -368,21 +370,42 @@ class Links {
 		if (connection)
 			std::erase(live_, connection);
 	}
-	// Makes room for an incoming connection before it authenticates: when its source, or the
-	// pool, is full, the oldest of it ends at once (host-connection.md, Before authentication).
-	void admit(const asio::ip::address &source, std::shared_ptr<Connection> connection) {
+	// Makes room for an incoming connection before it authenticates: when its source is full,
+	// its oldest ends at once; when the pool is, its oldest from an unknown address, else, for a
+	// newcomer from a peer's address, its oldest, else the newcomer (host-connection.md, Before
+	// authentication).
+	void admit(asio::ip::address source, std::shared_ptr<Connection> connection) {
+		if (source.is_v6() && source.to_v6().is_v4_mapped())
+			source = asio::ip::make_address_v4(asio::ip::v4_mapped, source.to_v6());
+		const bool peer = routed(source);
 		const auto from = [&](const Handshake &h) { return h.source == source; };
 		auto drop = handshaking_.end();
 		if (std::size_t(std::count_if(handshaking_.begin(), handshaking_.end(), from)) >= options_.handshakes_per_source)
 			drop = std::find_if(handshaking_.begin(), handshaking_.end(), from);
-		else if (handshaking_.size() >= options_.handshakes)
-			drop = handshaking_.begin();
+		else if (handshaking_.size() >= options_.handshakes) {
+			drop = std::find_if(handshaking_.begin(), handshaking_.end(), [](const Handshake &h) { return !h.peer; });
+			if (drop == handshaking_.end() && peer)
+				drop = handshaking_.begin();
+		}
+		if (drop == handshaking_.end() && handshaking_.size() >= options_.handshakes) {
+			++stats_.evicted;
+			connection->abort();
+			return;
+		}
 		if (drop != handshaking_.end()) {
 			++stats_.evicted;
 			drop->connection->abort();
 			handshaking_.erase(drop);
 		}
-		handshaking_.push_back({source, std::move(connection)});
+		handshaking_.push_back({source, std::move(connection), peer});
+	}
+	// Whether a route names `source`: a literal address, or a name's cached answer.
+	bool routed(const asio::ip::address &source) const {
+		for (auto &[node, route] : state_->routes)
+			for (auto &e : route.endpoints)
+				if (e.address() == source)
+					return true;
+		return false;
 	}
 	void authenticated(const std::shared_ptr<Connection> &connection) {
 		std::erase_if(handshaking_, [&](const Handshake &h) { return h.connection == connection; });

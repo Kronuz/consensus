@@ -76,9 +76,13 @@ posts it to the waiting lane's loop.
   frame always fits an empty queue. A peer that stops reading therefore holds at most its
   connection's queue, plus the frame being handed over, of the host's pool, and calls to every
   other peer go on.
-- **A peer that never reads** (N1): a served response waits for room like any stream, so its
-  call keeps its slot and `serving` bounds them; a `Call` refused past that is answered `Error`,
-  and more than `serving` refusals unsent close the connection (`ProtocolError`).
+- **A peer that never reads** (N1, F1): a served response waits for room like any stream, so its
+  call keeps its slot and `serving` bounds them. A served call that ends with a small frame
+  unsent (its `Error`, from `stop()` or `expire()`, or a `Credit` before the peer's `Cancel`)
+  keeps its slot the same way until `next()` takes that frame. A `Call` refused past `serving`
+  is answered `Error`, and more than `serving` refusals unsent close the connection
+  (`ProtocolError`). A peer's own grants bound its Credits, so a table holds at most a few
+  small frames per slot, `serving` + 1 refusals, and a Cancel per call it sent.
 - `next()` returns small frames first, in order, then chunks round-robin by call.
 
 ## Drain
@@ -154,7 +158,9 @@ groups' snapshot frames:
 threads, and two lanes over pipes on two loops (run under TSan). `reenter` closes the table from
 `ready` inside `called()`, `stop()` and a served end (ASan; control `close-reenters`), `overrun`
 sends past a known total (`send-past-total`), `unread-queue` feeds a table that is never read
-until it throws, every unsent byte charged (`refusals-unbounded`), and `queue-cap` streams three
+until it throws, every unsent byte charged (`refusals-unbounded`), `unread-small` sends a peer
+that never reads served `Error`s, cancelled calls' `Credit`s and `expire()`'s `Error`s until it
+throws at `2 * serving + 1` Calls, each unsent byte counted (`small-unbounded`), and `queue-cap` streams three
 1 MiB requests into a two-frame queue (`rpc-no-queue-cap`). Each of the model's eight
 mutants (`test/transport/rpc_mutants.py`) fails the case of its name, and so does `late-deadline`
 (T7: a 2.1 s stop past a 10 s deadline gives 2.1 s once, a 30 s one gives 10 s). `fuzz/rpc_fuzz.cc` drives
@@ -177,7 +183,10 @@ so calls wait for `calling`, `outgoing` and room (N4); its corpus `fuzz/corpus/r
 | `shutdown` | `drain()` with a 4 MiB echo streaming: it completes whole, a later call ends `not_processed`, the lanes close, no call ends `connection_aborted` | |
 | `fetch` | host 2 uploads 4 groups' 1 MiB data frames to host 1 on Bulk while host 1 fetches 16 MiB on the same connection: it arrives exact in about 1.1 s beside 131 MiB of uploads, heartbeats on Control keep a 210 ms longest gap; a missing name gives nullopt, a throwing reader `io_error`, 48 MiB against a 32 MiB `fetch_bytes` `message_size`, and past 4 awaiting `resource_unavailable_try_again` | |
 | `reader` | host 2's loop that does not read node 1's connection is held; 10 echoes on that connection complete, the slowest in under 200 ms (T5) | `lane-via-other-loop` |
+| `stop-drain` | host 2 runs in a child process that raises SIGSTOP in its reader; host 1's fetch ends `timed_out`, and after SIGCONT the late reply arrives, is dropped (rule 9) on the same connection, and the next fetch is exact on it (F18) | `forget-is-violation` (never drain), `fetch-deadline-io-error` |
 | `local-throw` | a handler acting outside its events and a body consumer that throw each end their call `handler_failed`; the link count, `malformed` 0, a group's frames on Bulk and the next 1 MiB echo show the connection went on | `local-throw-closes` (a local throw closes the connection) |
+
+`group-full`, `call-full`, `stream` and `reader` assert latency bounds a runner that stops the process can break (D100): they carry the ctest label `timing`, which `ctest -LE timing` skips; CI runs them.
 
 `hello_test version` refuses a 32 KiB `maximum_frame` below the lane's 65,584-byte frame
 (control `lane-frame-unchecked`).

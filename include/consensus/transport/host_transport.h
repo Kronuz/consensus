@@ -611,7 +611,9 @@ class HostTransport {
 				if (status.code == std::uint32_t(fetch_missing))
 					return later({}, std::nullopt);
 				return later(std::make_error_code(errc::io_error), std::nullopt);
-			case rpc::Outcome::cancel:
+			case rpc::Outcome::cancel:  // this end's stop: past fetch_bytes, or the deadline after the Call left
+				if (status.code == std::uint32_t(rpc::Code::deadline_exceeded))
+					return later(std::make_error_code(errc::timed_out), std::nullopt);
 				return later(std::make_error_code(state->over ? errc::message_size : errc::io_error), std::nullopt);
 			case rpc::Outcome::timed_out:
 				return later(std::make_error_code(errc::timed_out), std::nullopt);

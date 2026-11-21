@@ -33,6 +33,12 @@ MUTANTS = {
     # connection.h (security review S1, N2)
     "fail-closes-fd": (T + "connection.h", "\t\t\t::shutdown(socket_.native_handle(), SHUT_RDWR);\n\t\t\tsocket_.cancel(ignored);",
                        "\t\t\tsocket_.close(ignored);"),
+    # links.h (transport-admission N9): an unknown address evicts a peer's pending handshake
+    "no-peer-priority": (T + "links.h", "const bool peer = routed(source);", "const bool peer = false;"),
+    # connection_test fd_reuse_reader (round 2 N13): frames read with the one that ended it still reach the handler
+    "deliver-after-end": (T + "connection.h", "while (end_ == ConnectionEnd::open && in_.size() - at >= 4) {", "while (in_.size() - at >= 4) {"),
+    # connection_test dead_extends (round 3 N14): the dead-peer wait does not take the late rule
+    "dead-no-extend": (T + "connection.h", "late_deadline dead(loop_, options_.dead_after);", "late_deadline dead(loop_, options_.dead_after, false);"),
     "ssl-after-end": (T + "connection.h", "if (end_ != ConnectionEnd::open)\n\t\t\tthrow", "if (false)\n\t\t\tthrow"),
     # one stuck deadline for all of a flush's waits, not one per wait
     "stuck-spans-flush": [

@@ -1,12 +1,15 @@
 // Links over loopback with the TLS fixture: a dial and its frames, simultaneous dials settled
 // to one connection before any frame (T6), a draining link that does not count, a name's lookup
 // through the late deadline, two hosts on two loops (run under TSan), a given-up dial released,
-// and a flood of idle connections that cannot lock a real dialer out (security review S2, N1).
+// and a flood of idle connections that cannot lock a real dialer out (security review S2, N1),
+// nor, from an address no route names, evict a peer's handshake (round 2, N9).
 //   consensus_transport_links_test <fixture dir> [case]
 #include "consensus/transport/links.h"
 #include <asio/io_context.hpp>
 #include <asio/post.hpp>
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <cassert>
 #include <csignal>
 #include <cstdio>
@@ -80,8 +83,10 @@ struct Host {
 	std::unique_ptr<Links> links;
 	std::atomic<std::size_t> frames{0};
 	std::vector<std::string> received;
+	std::optional<tcp::acceptor> v6;  // a second listener, on ::1
 	Host(NodeId n, Loop &l) : node(n), loop(l), acceptor(l.io, tcp::endpoint(asio::ip::address_v4::loopback(), 0)) {}
 	std::uint16_t port() const { return acceptor.local_endpoint().port(); }
+	std::uint16_t port6() const { return v6->local_endpoint().port(); }
 	void open(const std::map<NodeId, PeerAddress> &addresses, LinkOptions options = {}) {
 		auto tls = context(names[node]);
 		std::map<NodeId, Fingerprint> pins{{1, pin_of("one")}, {2, pin_of("two")}};
@@ -92,9 +97,17 @@ struct Host {
 				received.emplace_back(f);
 		};
 		task::spawn(loop.ref(), links->serve(acceptor));
+		if (v6)
+			task::spawn(loop.ref(), links->serve(*v6));
 	}
 	void stop() {
-		loop.call([&] { links->stop(); });
+		loop.call([&] {
+			asio::error_code ignored;
+			acceptor.close(ignored);  // Links closes only the last acceptor it serves
+			if (v6)
+				v6->close(ignored);
+			links->stop();
+		});
 		assert(loop.until([&] { return links->drained(); }));
 	}
 };
@@ -376,13 +389,123 @@ void flood() {
 	}
 }
 
+// N9: node 1 is configured at ::1 and dials from it; 127.0.0.1 is an address no route names, and
+// its per-source cap is lifted so one address fills the pool of 4. A pending handshake from ::1
+// (a socket that never starts TLS) outlives 16 unknown arrivals; then, while a thread opens
+// connections from 127.0.0.1 as fast as it can, node 1's dials of both lanes link.
+bool open_socket(tcp::socket &s) {
+	char c;
+	const auto n = ::recv(s.native_handle(), &c, 1, MSG_DONTWAIT | MSG_PEEK);
+	return n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
+}
+void churn() {
+	Loop loop;
+	Host one(1, loop), two(2, loop);
+	one.v6.emplace(loop.io, tcp::endpoint(asio::ip::address_v6::loopback(), 0));
+	two.v6.emplace(loop.io, tcp::endpoint(asio::ip::address_v6::loopback(), 0));
+	LinkOptions options;
+	options.handshakes_per_source = options.handshakes + 1;
+	one.open({{2, {"::1", two.port6()}}});
+	two.open({{1, {"::1", one.port6()}}}, options);
+	tcp::socket pending(loop.io);
+	pending.connect(tcp::endpoint(asio::ip::address_v6::loopback(), two.port6()));
+	loop.until([] { return false; }, 200ms);  // node 2 accepts it first: the pool's oldest
+	std::vector<tcp::socket> idle;
+	for (int i = 0; i != 16; ++i) {
+		idle.emplace_back(loop.io);
+		idle.back().connect(tcp::endpoint(asio::ip::address_v4::loopback(), two.port()));
+	}
+	const bool settled = loop.until([&] { return two.links->stats().evicted == 16 - 3; }, 5s);
+	loop.until([] { return false; }, 100ms);
+	const bool kept = open_socket(pending);
+	std::printf("churn: 16 connections from 127.0.0.1, %llu evicted; the pending one from ::1 %s\n",
+				(unsigned long long)two.links->stats().evicted, kept ? "kept" : "EVICTED");
+	assert(settled && kept);
+	idle.clear();
+	pending.close();
+
+	std::atomic<bool> stop{false};
+	std::atomic<std::uint64_t> opened{0};
+	std::thread flood([&] {
+		asio::io_context io;
+		while (!stop) {
+			tcp::socket s(io);
+			asio::error_code error;
+			s.connect(tcp::endpoint(asio::ip::address_v4::loopback(), two.port()), error);
+			opened += !error;
+		}
+	});
+	const auto begun = std::chrono::steady_clock::now();
+	Result<bool> control, bulk;
+	control.spawn(loop, one.links->dial(2, LinkLane::Control));
+	bulk.spawn(loop, one.links->dial(2, LinkLane::Bulk));
+	loop.until([&] { return control.value.has_value() && bulk.value.has_value(); }, 15s);
+	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begun).count();
+	stop = true;
+	flood.join();
+	const bool linked = control.value && *control.value && bulk.value && *bulk.value;
+	std::printf("churn: %llu connections from 127.0.0.1 in %lld ms (%llu/s); node 1's dials from ::1 %s\n", (unsigned long long)opened,
+				(long long)ms, (unsigned long long)(ms ? opened * 1000 / std::uint64_t(ms) : 0), linked ? "linked" : "FAILED");
+	assert(linked);
+	one.stop();
+	two.stop();
+}
+
+// N5 (transport-connection review): a lookup's thread outlives its Links. The resolver blocks on
+// a gate until Links, its hosts and their io_context are destroyed; released, its answer finds
+// nothing to deliver to (run under ASan: no use after free).
+void resolver_outlives() {
+	struct Gate {
+		std::mutex mutex;
+		std::condition_variable cv;
+		bool open = false, entered = false, returned = false;
+	};
+	auto gate = std::make_shared<Gate>();
+	{
+		Loop loop;
+		Host one(1, loop), two(2, loop);
+		LinkOptions options;
+		options.resolve_deadline = 100ms;
+		options.resolver = [gate](const std::string &) {
+			std::unique_lock hold(gate->mutex);
+			gate->entered = true;
+			gate->cv.notify_all();
+			gate->cv.wait(hold, [&] { return gate->open; });
+			gate->returned = true;
+			gate->cv.notify_all();
+			return std::vector<asio::ip::address>{asio::ip::address_v4::loopback()};
+		};
+		one.open({{2, {"gate.test", two.port()}}}, options);
+		two.open(to(one));
+		Result<bool> dialed;
+		dialed.spawn(loop, one.links->dial(2, LinkLane::Control));
+		assert(loop.until([&] { return dialed.value.has_value(); }));
+		std::unique_lock hold(gate->mutex);
+		assert(gate->entered && !*dialed.value);
+		hold.unlock();
+		one.stop();
+		two.stop();
+		one.links.reset();
+		two.links.reset();
+	}
+	std::unique_lock hold(gate->mutex);
+	gate->open = true;
+	gate->cv.notify_all();
+	const bool returned = gate->cv.wait_for(hold, 5s, [&] { return gate->returned; });
+	hold.unlock();
+	std::this_thread::sleep_for(200ms);  // the answer's delivery runs after the resolver returns
+	std::printf("resolver_outlives: the lookup's thread returned %s after Links and its loop were gone\n", returned ? "and ended" : "NEVER");
+	assert(returned);
+}
+
 struct Case {
 	const char *name;
 	void (*run)();
 };
 constexpr Case cases[] = {{"dial", dial},	  {"simultaneous", simultaneous},	  {"draining", draining},
 						  {"lookup", lookup}, {"threads", threads}, {"abandoned_dial", abandoned_dial},
-						  {"flood", flood}};
+						  {"flood", flood}, {"churn", churn},
+						  {"resolver_outlives", resolver_outlives}};
 } // namespace
 
 int main(int argc, char **argv) {

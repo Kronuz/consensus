@@ -23,6 +23,8 @@
 //   relayout a host restarted with another L serves every group from its new loop
 //   scan     the groups a feed visits per frame stay constant at 100, 1,000 and 10,000 groups
 //   order    control first, round robin across ready groups and per-group credit, as values
+//   fetch-alongside-consensus  rounds of four 8 MiB lane fetches both ways through 1 MiB budgets
+//            while the group commits: each fetch exact, each commit within 2 s, the leader's term kept
 //   install  a follower cut off while the leader checkpoints past it installs the leader's image
 //            (three chunks, as transfer frames on Bulk), validated and activated, then applies
 //            entries past its boundary (consensus-driver-install A1)
@@ -1059,9 +1061,8 @@ struct Node {
 	std::atomic<Index> held{0};
 	// Each group is founded by `voters`; with none, this node is a joiner (D5).
 	Node(NodeId id, std::uint32_t L, std::uint16_t port, std::shared_ptr<j::IO> io, const std::vector<GroupId> &groups,
-		 const std::map<NodeId, PeerAddress> &peers, std::vector<NodeId> voters = {1, 2, 3}, bool quiesce = false)
+		 const std::map<NodeId, PeerAddress> &peers, std::vector<NodeId> voters = {1, 2, 3}, HostTransportOptions options = {}, bool quiesce = false)
 		: host(id, L, port) {
-		HostTransportOptions options;
 		options.member_of = [this](GroupId g, NodeId incarnation) -> std::optional<Member> {
 			auto s = per[host.transport->loop_of_group(g)]->driver->state(g);
 			const Member *m = s ? find_member(s->membership, incarnation) : nullptr;
@@ -1291,6 +1292,7 @@ struct Cluster {
 	std::vector<GroupId> groups;
 	std::uint16_t ports[5] = {};
 	std::unique_ptr<Node> nodes[5];
+	std::function<HostTransportOptions(NodeId)> options_of = [](NodeId) { return HostTransportOptions{}; };
 	Cluster(const std::string &name, std::vector<GroupId> ids)
 		: root(std::filesystem::current_path() / ("groups-" + name)), groups(std::move(ids)) {
 		std::filesystem::remove_all(root);
@@ -1314,7 +1316,8 @@ struct Cluster {
 		for (NodeId m = 1; m <= 4; ++m)
 			if (m != n)
 				peers[m] = {"127.0.0.1", ports[m]};
-		nodes[n] = std::make_unique<Node>(n, L, ports[n], std::make_shared<j::PosixIO>(directory(n)), groups, peers, std::move(voters), quiesce);
+		nodes[n] = std::make_unique<Node>(n, L, ports[n], std::make_shared<j::PosixIO>(directory(n)), groups, peers, std::move(voters),
+										  options_of(n), quiesce);
 	}
 	std::vector<Node *> of(std::initializer_list<NodeId> ids) {
 		std::vector<Node *> r;
@@ -2435,6 +2438,100 @@ void owe_order() {
 	assert(one.credits_at_control == 0 && "control frames go before credit");
 }
 
+// fetch-alongside-consensus (D102, Peers' F2 on the lane's fetch): three nodes of 2 loops, a
+// group's Drivers over the transport; rounds of four 8 MiB fetches (method 1), both ways between
+// nodes, through 1 MiB lane budgets, while a command commits every 50 ms. Every fetch arrives
+// exact, every commit lands on all three within 2 s, and the leader keeps its term.
+std::string pattern(std::size_t n, unsigned seed) {
+	std::string s(n, '\0');
+	for (std::size_t i = 0; i != n; ++i)
+		s[i] = char((i * 2654435761u + seed * 40503u) >> 13);
+	return s;
+}
+void fetch_alongside() {
+	constexpr std::size_t size = 8 << 20, budget = 1 << 20;
+	const GroupId g = groups_on(2, 0, 1)[0];
+	Cluster c("fetch-alongside", {g});
+	c.options_of = [](NodeId n) {
+		HostTransportOptions o;
+		o.rpc.outgoing_bytes = o.rpc.calling_bytes = o.rpc.serving_bytes = budget;
+		o.rpc.fetch_bytes = 2 * size;
+		o.rpc.reader = [n](std::string_view name) -> std::optional<std::string> {
+			if (name != "history/table")
+				return std::nullopt;
+			return pattern(size, unsigned(n));
+		};
+		return o;
+	};
+	for (NodeId n = 1; n <= 3; ++n)
+		c.start(n, 2);
+	auto all = c.of({1, 2, 3});
+	step("fetch-alongside: the group elects and commits");
+	assert(commit_everywhere(all, g, "before", 30'000));
+	const NodeId leader = c.leader({1, 2, 3}, g);
+	assert(leader);
+	const Term term = c.nodes[leader]->state(g)->term;
+
+	struct Fetched {
+		std::atomic<bool> done{false};
+		std::error_code error;
+		std::optional<std::string> bytes;
+	};
+	auto fetch = [&](NodeId from, NodeId peer) {
+		auto got = std::make_shared<Fetched>();
+		auto &h = c.nodes[from]->host;
+		h.loops[h.transport->loop_of_node(peer)]->at([&] {
+			h.transport->fetch(peer, "history/table", [got](std::error_code e, std::optional<std::string> b) {
+				got->error = e;
+				got->bytes = std::move(b);
+				got->done = true;
+			});
+			return 0;
+		});
+		return got;
+	};
+	std::uint64_t quiet = 0;
+	for (int i = 0; i != 4; ++i) {
+		const auto begun = steady::now();
+		assert(commit_everywhere(all, g, "quiet " + std::to_string(i), 2'000));
+		quiet = std::max(quiet, ms_since(begun));
+		std::this_thread::sleep_for(50ms);
+	}
+	const std::vector<std::pair<NodeId, NodeId>> pairs{{1, 2}, {1, 3}, {3, 2}, {2, 3}};
+	constexpr unsigned rounds = 4;
+	unsigned round = 0, exact = 0, commits = 0;
+	std::uint64_t slowest = 0;
+	bool committed = true;
+	std::vector<std::shared_ptr<Fetched>> fetches;
+	step("fetch-alongside: " + std::to_string(rounds) + " rounds of four 8 MiB fetches beside commits");
+	const auto start = steady::now();
+	while (ms_since(start) < 60'000) {
+		if (std::all_of(fetches.begin(), fetches.end(), [](auto &f) { return f->done.load(); })) {
+			for (std::size_t i = 0; i != fetches.size(); ++i)
+				exact += !fetches[i]->error && fetches[i]->bytes && *fetches[i]->bytes == pattern(size, unsigned(pairs[i].second));
+			fetches.clear();
+			if (round == rounds)
+				break;
+			++round;
+			for (auto [from, peer] : pairs)
+				fetches.push_back(fetch(from, peer));
+		}
+		const auto begun = steady::now();
+		committed &= commit_everywhere(all, g, "command " + std::to_string(++commits), 2'000);
+		slowest = std::max(slowest, ms_since(begun));
+		std::this_thread::sleep_for(50ms);
+	}
+	const auto elapsed = ms_since(start);
+	auto s = c.nodes[leader]->state(g);
+	const bool kept = s && s->role == Role::Leader && s->term == term;
+	std::printf("fetch-alongside: %u rounds of %zu x 8 MiB fetched through 1 MiB lane budgets in %llu ms, %u of %u exact; %u commits "
+				"beside them, each on all three within 2 s: %s (slowest %llu ms; 4 quiet ones before, slowest %llu ms); node %llu leads in "
+				"term %llu throughout: %s\n",
+				round, pairs.size(), (unsigned long long)elapsed, exact, rounds * unsigned(pairs.size()), commits, committed ? "yes" : "NO",
+				(unsigned long long)slowest, (unsigned long long)quiet, (unsigned long long)leader, (unsigned long long)term, kept ? "yes" : "NO");
+	assert(round == rounds && exact == rounds * pairs.size() && committed && kept);
+}
+
 // receive-bound: what a connection's frames for one group may hold on the receiver before its
 // group loop takes them (transport-groups review N2). Host 2 has 2 loops; g sits on the loop
 // that does not read node 1's connection, and that loop is held. Node 1 sends g 8 data frames
@@ -2719,7 +2816,7 @@ void order() {
 
 int main(int argc, char **argv) {
 	if (argc != 3) {
-		std::fprintf(stderr, "usage: %s <fixture dir> threads|credit|reader|upload|driver|refill|identity|joiner|lagging|leftover|reconnect|backlog|owe-order|receive-bound|relayout|scan|order\n", argv[0]);
+		std::fprintf(stderr, "usage: %s <fixture dir> threads|credit|reader|upload|driver|refill|identity|joiner|lagging|leftover|reconnect|backlog|owe-order|receive-bound|relayout|scan|order|fetch-alongside-consensus|install\n", argv[0]);
 		return 2;
 	}
 #ifndef SO_NOSIGPIPE
@@ -2758,6 +2855,8 @@ int main(int argc, char **argv) {
 		owe_order();
 	else if (which == "receive-bound")
 		receive_bound();
+	else if (which == "fetch-alongside-consensus")
+		fetch_alongside();
 	else if (which == "joiner")
 		joiner();
 	else if (which == "lagging")

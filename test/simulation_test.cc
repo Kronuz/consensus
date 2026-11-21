@@ -1344,6 +1344,12 @@ void gone() {
 	const NodeId a = leader % 3 + 1, b = 6 - leader - a;
 	g.act(a, g.replicas.at(a).core->step(Receive{b, Gone{term}}));
 	expect(g.replicas.at(a).core->leader() == leader && g.replicas.at(a).core->resting(), "Gone from a follower changes nothing");
+	// A Gone never raises a term: one a term ahead, from a follower, leaves the leader leading.
+	for (NodeId id : {leader, a}) { g.act(id, g.replicas.at(id).core->step(Receive{b, Gone{term + 1}})); }
+	g.settle();
+	for (auto& [id, r] : g.replicas) {
+		expect(r.core->term() == term && r.core->leader() == leader, "a higher-term Gone deposes no one");
+	}
 	(void)g.replicas.at(leader).core->step(StorageFault{"quiescence: the leader's storage fails"});
 	expect(g.replicas.at(leader).core->role() == Role::Fenced, "the leader fences, its node up");
 	for (NodeId id : {a, b}) { g.act(id, g.replicas.at(id).core->step(Receive{leader, Gone{term}})); }
@@ -1355,6 +1361,15 @@ void gone() {
 	}
 	expect(elected && g.replicas.at(elected).core->term() > term, "Gone from the leader elects a new leader in a later term");
 	expect(g.now() - from <= 2 * g.election_max(), "within the election timeout and a round: " + std::to_string(g.now() - from));
+	// A stale Gone from the old leader changes nothing under the new one.
+	g.settle();
+	const Term now_term = g.replicas.at(elected).core->term();
+	for (NodeId id : {a, b}) { g.act(id, g.replicas.at(id).core->step(Receive{leader, Gone{term}})); }
+	g.settle();
+	for (NodeId id : {a, b}) {
+		const auto& r = *g.replicas.at(id).core;
+		expect(r.term() == now_term && r.leader() == elected, "a stale Gone deposes no one");
+	}
 }
 
 bool run() {

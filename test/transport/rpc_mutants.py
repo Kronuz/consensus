@@ -17,7 +17,8 @@ import tempfile
 PATH = "include/consensus/transport/rpc.h"
 HOST = "include/consensus/transport/host_transport.h"
 MUTANTS = {
-    # frames for a call no longer live close the lane (DTFT0001's rule)
+    # frames for a call no longer live close the lane (DTFT0001's rule); also the never-drain
+    # mutant of rpc_host_test stop-drain (F18)
     "forget-is-violation": [("\t\t\t++late_; // rule 9: a retired id\n\t\t\treturn;",
                              "\t\t\tthrow ProtocolError(\"late\");")],
     # the first window is what was asked, not what the pool holds
@@ -60,12 +61,16 @@ MUTANTS = {
     "close-reenters": [("\t\tif (depth_) {\n\t\t\tclose_wanted_ = true;", "\t\tif (false) {\n\t\t\tclose_wanted_ = true;")],
     # unread-queue (N1): refusals pile up unsent without bound
     "refusals-unbounded": [("\t\t\tif (refusals_ > options_.serving)", "\t\t\tif (false)")],
+    # unread-small (F1): a served call that ends frees its slot with its Error or Credit unsent
+    "small-unbounded": [("\t\tif (Queued *last = c.serving ? unsent(&c) : nullptr) {", "\t\tif (Queued *last = nullptr) {")],
     # overrun (N2): send takes bytes past a known total when they do not end it
     "send-past-total": [("(bytes.size() > o.total - o.sent || end != (o.sent + bytes.size() == o.total))",
                          "end != (o.sent + bytes.size() == o.total)")],
     # hello_test leader: the transport reports default limits, not the ones the peer's hello carried
     "hello-limits-ignored": [(HOST, "here.report(route.group, {route.source, limits});",
                               "here.report(route.group, {route.source, kronuz::consensus::Limits{}});")],
+    # rpc_host_test stop-drain: a fetch whose deadline passed after its Call left ends io_error
+    "fetch-deadline-io-error": [(HOST, "\t\t\t\tif (status.code == std::uint32_t(rpc::Code::deadline_exceeded))\n\t\t\t\t\treturn later(std::make_error_code(errc::timed_out), std::nullopt);\n", "")],
     # rpc_host_test fetch (Linux, where SO_NOSIGPIPE is missing): the host does not ignore SIGPIPE
     "sigpipe-default": [("test/transport/rpc_host_test.cc", "\tstd::signal(SIGPIPE, SIG_IGN);", "\t(void)0;")],
 }

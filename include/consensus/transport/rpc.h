@@ -452,7 +452,7 @@ class Lane {
 			throw std::invalid_argument("rpc stop code");
 		text = text.substr(0, text_bytes);
 		if (c.called)
-			small({.kind = c.serving ? Kind::error : Kind::cancel, .word = word, .call = c.id, .bytes = text});
+			small({.kind = c.serving ? Kind::error : Kind::cancel, .word = word, .call = c.id, .bytes = text}, &c);
 		const auto outcome = c.serving ? Outcome::error
 			: c.called || code != Code::deadline_exceeded ? Outcome::cancel
 														  : Outcome::timed_out;
@@ -480,6 +480,8 @@ class Lane {
 			return;
 		closed_ = true;
 		small_.clear();
+		small_taken_ = small_queued_;
+		serving_ -= std::exchange(slots_, 0);
 		chunks_.clear();
 		roomless_.clear();
 		queued_ = refusals_ = 0;
@@ -521,9 +523,15 @@ class Lane {
 		Busy busy(*this);
 		std::optional<Outgoing> out;
 		if (!small_.empty()) {
-			refusals_ -= small_.front().refusal;
-			out = std::move(small_.front().out);
+			auto &front = small_.front();
+			refusals_ -= front.refusal;
+			if (front.slot) {
+				--serving_;
+				--slots_;
+			}
+			out = std::move(front.out);
 			small_.pop_front();
+			++small_taken_;
 		} else if (!chunks_.empty()) {
 			auto it = chunks_.upper_bound(cursor_);
 			if (it == chunks_.end())
@@ -639,11 +647,13 @@ class Lane {
 		ByteBudget *ticket_pool = nullptr;
 		std::size_t reserved = 0; // the connection's room its outgoing wait holds
 		bool roomless = false;    // waits for room on the connection
+		std::uint64_t small = 0;  // its last small frame's sequence number (unsent while > small_taken_)
 	};
-	// A queued frame; a refusal answers a Call the table never took.
+	// A queued frame; a refusal answers a Call the table never took; `slot`: an ended served
+	// call's serving slot, which returns when next() takes it.
 	struct Queued {
 		Outgoing out;
-		bool refusal = false;
+		bool refusal = false, slot = false;
 	};
 	// Holds the table for a callback's duration: a close() inside runs when the outermost returns.
 	struct Busy {
@@ -774,7 +784,7 @@ class Lane {
 		in.held = held;
 		if (from + held > in.limit) {
 			in.limit = from + held;
-			small({.kind = Kind::credit, .call = c.id, .limit = in.limit});
+			small({.kind = Kind::credit, .call = c.id, .limit = in.limit}, &c);
 		}
 	}
 	void called(const Frame &f) {
@@ -788,7 +798,7 @@ class Lane {
 		const std::size_t want = std::min<std::uint64_t>(options_.window, need);
 		std::size_t held = 0;
 		if (serving_ >= options_.serving || (want && !(held = pools_.serving.try_acquire(std::min(want, chunk_bytes), want))))
-			return small({.kind = Kind::error, .word = std::uint32_t(Code::overloaded), .call = f.call}, true);
+			return small({.kind = Kind::error, .word = std::uint32_t(Code::overloaded), .call = f.call}, nullptr, true);
 		const Handle h = ++handles_;
 		std::optional<Events> events;
 		try {
@@ -796,11 +806,11 @@ class Lane {
 		} catch (...) {
 			++failed_;
 			pools_.serving.release(held);
-			return small({.kind = Kind::error, .word = std::uint32_t(Code::handler_failed), .call = f.call}, true);
+			return small({.kind = Kind::error, .word = std::uint32_t(Code::handler_failed), .call = f.call}, nullptr, true);
 		}
 		if (!events) {
 			pools_.serving.release(held);
-			return small({.kind = Kind::error, .word = std::uint32_t(Code::unknown_method), .call = f.call}, true);
+			return small({.kind = Kind::error, .word = std::uint32_t(Code::unknown_method), .call = f.call}, nullptr, true);
 		}
 		auto &c = calls_[h];
 		c.id = f.call;
@@ -816,7 +826,7 @@ class Lane {
 		index_[c.id] = h;
 		++serving_;
 		if (want)
-			small({.kind = Kind::credit, .call = c.id, .limit = c.in.limit});
+			small({.kind = Kind::credit, .call = c.id, .limit = c.in.limit}, &c);
 		if (auto keep = c.events; (base || f.end) && keep->body)
 			local(h, [&] { keep->body(f.bytes, f.end); });
 	}
@@ -857,15 +867,25 @@ class Lane {
 				finish(h, {Outcome::not_processed});
 	}
 	// A small frame answers or tells the peer, so it never waits: it takes rpc_outgoing_bytes at
-	// once, and a peer that never reads past `serving` refusals is closed (receive).
-	void small(const Frame &f, bool refusal = false) {
+	// once. Each is bounded (N1, F1): a served call that ends keeps its slot until its last small
+	// frame is taken, and a peer that never reads past `serving` refusals is closed (receive).
+	void small(const Frame &f, Call *c = nullptr, bool refusal = false) {
 		auto bytes = encode(f, options_.version);
 		pools_.outgoing.charge(bytes.size());
 		const auto n = bytes.size();
 		small_.push_back({{std::move(bytes), Charge(pools_.outgoing, n)}, refusal});
 		queued_ += n;
 		refusals_ += refusal;
+		const auto seq = ++small_queued_;
+		if (c)
+			c->small = seq;
 		ready_();
+	}
+	// The call's last small frame while it is unsent.
+	Queued *unsent(const Call *c) {
+		if (!c || c->small <= small_taken_)
+			return nullptr;
+		return &small_[c->small - small_taken_ - 1];
 	}
 	// A call ends here exactly once: its bytes return, its id retires, `done` runs last.
 	void finish(Handle h, Status status) {
@@ -887,8 +907,12 @@ class Lane {
 			chunks_.erase(q);
 			room();
 		}
-		if (c.serving)
+		if (Queued *last = c.serving ? unsent(&c) : nullptr) {
+			last->slot = true; // the slot returns when next() takes it
+			++slots_;
+		} else if (c.serving) {
 			--serving_;
+		}
 		if (c.events->done) {
 			try {
 				c.events->done(status);
@@ -907,7 +931,8 @@ class Lane {
 	std::function<void()> ready_;
 	std::function<Clock::time_point()> now_;
 	Handle handles_ = 0;
-	std::size_t serving_ = 0;
+	std::size_t serving_ = 0, slots_ = 0; // served calls live or ending; ended ones whose last small frame is unsent
+	std::uint64_t small_queued_ = 0, small_taken_ = 0; // small frames queued and taken, ever
 	bool closed_ = false, drain_sent_ = false, peer_drained_ = false;
 	std::map<Handle, Call> calls_;
 	std::unordered_map<std::uint64_t, Handle> index_;

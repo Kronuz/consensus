@@ -987,6 +987,11 @@ private:
 			bool grant = request->term > hard_.term && !heard_from_leader() && log_up_to_date(request->last_index, request->last_term);
 			output.emplace_back(Send{receive.authenticated_peer, PreVoteResponse{hard_.term, request->term, grant}}); return;
 		}
+		// Gone ends its sender's leadership in its own term only, as LeaderGone; it never raises a term.
+		if (auto gone = std::get_if<Gone>(&receive.message)) {
+			if (role_ == Role::Follower && leader_ == receive.authenticated_peer && gone->term == hard_.term) { leader_lost(output); }
+			return;
+		}
 		// The leader-contact guard: a voter that heard from a current leader within
 		// election_min ignores a vote request unless it comes from a leadership transfer.
 		if (auto request = std::get_if<VoteRequest>(&receive.message); request && !request->transfer && heard_from_leader()) { return; }
@@ -1061,10 +1066,7 @@ private:
 			!self || self->role != MemberRole::Voter || acted_timeout_ == std::pair{source, request.token}) { return; }
 		acted_timeout_ = {source, request.token}; timed_out_ = true;
 	}
-	// The leader's replica stopped (its Driver reports its fence): as LeaderGone, per group.
-	void receive_message(NodeId source, Gone gone, StorageBatch&, Actions& output) {
-		if (role_ == Role::Follower && leader_ == source && gone.term == hard_.term) { leader_lost(output); }
-	}
+	void receive_message(NodeId, Gone, StorageBatch&, Actions&) {}  // handled in handle(Receive)
 	void receive_message(NodeId source, PreVoteResponse response, StorageBatch&, Actions& output) {
 		if (!prevote_ || response.request_term != prevote_ || !response.granted || role_ == Role::Leader || !is_voter(source)) { return; }
 		prevotes_.insert(source);  // handle(Receive) campaigns once the quorum is in and nothing persists

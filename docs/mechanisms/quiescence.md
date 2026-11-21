@@ -41,7 +41,8 @@ each group's heartbeats and election timers.
 - **`Gone{term}`** is the per-group report of a replica that stopped while its node stays up,
   which no node-pair detector sees. When a group fences, its Driver sends `Gone` in the group's
   term to every other member, and a follower of that replica in that term handles it as
-  `LeaderGone`; from anyone else it changes nothing. The fenced Core sends nothing itself: the
+  `LeaderGone`; from anyone else or in another term it changes nothing, and it never raises a
+  term. The fenced Core sends nothing itself: the
   Driver reads its term and membership (`driver_test fence_tells_peers`; `groups_test driver`:
   a leader's group fenced at rest on a live node, a follower elects within the timeout with no
   node-gone report).

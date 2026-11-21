@@ -78,7 +78,9 @@ struct Sink {
 		for (const auto& e : n.entries) { if (e.kind == EntryKind::Command) { commands[g].push_back(e.payload); } }
 	}
 	void operator()(GroupId, RoleChanged) {}
-	void operator()(GroupId, ActivateInstall) {}
+	void operator()(GroupId, SendTransfer) {}
+	void operator()(GroupId, ValidateImage) {}
+	void operator()(GroupId, ActivateImage) {}
 	void operator()(GroupId, CheckpointPublished) {}
 	void operator()(GroupId, RepairCompleted) {}
 	void operator()(GroupId g, Fenced n) { fenced.emplace(g, std::move(n.reason)); }

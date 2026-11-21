@@ -75,7 +75,7 @@ struct Sink {
 	std::vector<std::pair<GroupId, Send>> sent;
 	std::vector<std::pair<GroupId, Committed>> committed;
 	std::vector<std::pair<GroupId, RoleChanged>> roles;
-	std::vector<std::pair<GroupId, ActivateInstall>> activations;
+	std::vector<std::pair<GroupId, LogBoundary>> activations;
 	std::vector<std::pair<GroupId, CheckpointPublished>> published;
 	std::vector<std::pair<GroupId, RepairCompleted>> repaired;
 	std::vector<std::pair<GroupId, Fenced>> fenced;
@@ -87,7 +87,9 @@ struct Sink {
 		committed.emplace_back(g, std::move(n));
 	}
 	void operator()(GroupId g, RoleChanged n) { roles.emplace_back(g, n); }
-	void operator()(GroupId g, ActivateInstall n) { activations.emplace_back(g, n); }
+	void operator()(GroupId, SendTransfer) {}
+	void operator()(GroupId, ValidateImage) {}
+	void operator()(GroupId g, ActivateImage n) { activations.emplace_back(g, n.boundary); }
 	void operator()(GroupId g, CheckpointPublished n) { published.emplace_back(g, n); }
 	void operator()(GroupId g, RepairCompleted n) { repaired.emplace_back(g, n); }
 	void operator()(GroupId g, Fenced n) { fenced.emplace_back(g, std::move(n)); }

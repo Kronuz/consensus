@@ -37,7 +37,10 @@ Every frame on a host connection starts with its kind:
 Integers are little-endian. Any other kind, or a credit, open or closed frame of another
 length, ends the connection. `send_message` puts a Driver's `Send` on Control: an append that
 carries entries is data, every other message (votes, pre-votes, heartbeats, responses,
-`TimeoutNow`) is control. Bulk carries the same kinds for snapshot chunks (rpc-lane-on-bulk).
+`TimeoutNow`) is control. Bulk carries the same kinds for a group's snapshot transfer frames:
+`send_transfer` puts a Driver's `SendTransfer` there as a data frame, within the group's credit,
+and `is_transfer` names a received one by its RFTXFR01 magic (a Raft message starts `DTC2`), which
+the host hands to `Driver::transfer` (DRIVER.md, Install).
 
 ## Receive: a batch per loop, posted once per read
 
@@ -203,6 +206,7 @@ encode and decode. `consensus_transport_groups_test <fixture> <case>`, each a ct
 | `order` | one turn queues data and control frames for three groups; the receiver gets control first, round robin (a0 b0 c0 a1 b1 a2 b2), then data round robin (a0 b0 a1); with a 100-byte window and group a's loop stalled, all of b's frames arrive and exactly one of a's crosses, then a's arrive in order | `ring-at-front`, `bulk-ahead-of-control`, `no-credit` |
 | `reconnect` | node 1 over raw Links opens g on host 2 and its frame arrives; after that connection ends, g's frame on the next one without the open is refused (1 `unopened`) and closed back, and arrives once node 1 opens g there | `no-generation-clear`; `no-current` survives (a stale batch never reaches a group loop: see Identity) |
 | `backlog` | node 1 over raw Links, through a gate that leaves host 2's bytes unread, opens 6,000 groups on host 2; with the gate held, host 2 sends it 24 MiB and node 1 sends 3 data frames to each group: host 2 owes 18,000 records with its queue full, so they merge per group; once all have arrived the gate opens and each group's credit comes back whole as values, in fewer credit frames than data frames | `coalesce-drops-credit` |
+| `install` | three nodes of 2 loops with on-disk journals: node 3 is cut off while 1 and 2 commit and checkpoint; healed, it installs the leader's image (three chunks, as transfer frames on Bulk), validated and activated, and applies an entry past the boundary with its application state equal to the leader's | `no-transfer-out` (consensus-driver-install) |
 | `relayout` | three nodes of 2 loops with on-disk journals commit four groups; node 1 restarts with 3 loops, its journal re-partitions, two groups move loop, and all four commit on all three with node 1's frames on each group's new loop | |
 
 A timing case that the host stalled 250 ms or more runs again, at most twice. Each step prints

@@ -29,7 +29,10 @@
 // power with IO in flight, recover, and sometimes reopen with another loop count, which
 // re-partitions the host. Callers propose, await commits, read, transfer leadership, cancel,
 // checkpoint their application's image (restored on recovery), and repair at and below the
-// commit cursor (Track C, D10), below their latest checkpoint too. The oracles, per group:
+// commit cursor (Track C, D10), below their latest checkpoint too. A checkpoint often passes a
+// lagging or restarted member, which then installs the leader's image (docs/DRIVER.md, Install):
+// its transfer frames ride the same faulty network, and its application validates the image
+// (refusing some) and activates it. The oracles, per group:
 //   - one leader per term (RoleChanged);
 //   - every node applies a prefix of one sequence of entries;
 //   - each call completes once, per its D8 row: propose's Placement holds its command once
@@ -40,6 +43,9 @@
 //   - a witness member votes but never applies: its Sink never receives a Committed range;
 //   - a repair completes only at or above the node's latest checkpoint, and the application
 //     replays from its boundary; once the network heals every repair completes (none pending);
+//   - an image to validate or activate is the committed sequence through its boundary, and
+//     only an image the application validated activates, after which its ranges continue at
+//     the boundary;
 //   - no group fences but by a power cut, and no loop spins, stopping or not.
 // After the run the network heals and a new entry commits in every group on every data voter.
 #include "consensus/driver.h"
@@ -55,6 +61,7 @@
 #include <set>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace kronuz::consensus::driver_simulation {
@@ -86,6 +93,7 @@ const j::TurnLogOptions turn_options{16 * 1024, 1024, 1, 4, 4096};
 const j::AdmissionLimits admission{{8u << 20, 4096}, {64 * 1024, 3}, {4u << 20, 4}, 16, 3};
 constexpr std::uint64_t application_cap = 64 * 1024;
 constexpr Timing timing{20, 40, 100, 200, 60000};
+constexpr std::uint32_t image_format = 5;
 
 Limits limits() {
 	Limits l;
@@ -198,7 +206,11 @@ struct Replica {
 	std::optional<Index> repairing; // a repair's boundary, until it completes or is refused
 	bool replayed = false;          // a range from the boundary came while repairing
 	std::uint64_t committed_notices = 0, epoch = 0;
-	Index base = 0;                 // the latest checkpoint's boundary: published, or restored
+	Index base = 0;                 // the latest checkpoint's boundary: published, restored or installed
+	struct Validating { Token token; Index boundary; bool valid; };
+	std::optional<Validating> validating;  // a ValidateImage, until the application answers
+	std::vector<Entry> validated;          // the image it validated last
+	std::optional<Token> activating;       // an ActivateImage, until the application answers
 };
 
 struct Node {
@@ -217,7 +229,8 @@ struct Node {
 	void run() { for (auto& l : loops) { l->run(id); } }
 };
 
-struct Envelope { NodeId from, to; GroupId group; Message message; std::uint64_t at; };
+// A Raft message, or a snapshot transfer frame.
+struct Envelope { NodeId from, to; GroupId group; std::variant<Message, std::string> body; std::uint64_t at; };
 
 struct Simulation {
 	Simulation(std::uint64_t seed) : random_(seed) {
@@ -266,9 +279,9 @@ struct Simulation {
 		for (auto& [id, n] : nodes_) { if (!n.up) { boot(n); } }
 		std::map<GroupId, std::shared_ptr<Call>> last;
 		auto healed = [&](GroupId g) { auto& c = last[g]; return c && c->placed && healed_everywhere(g, *c->placed); };
-		// A leader that compacted past a peer's known match asks for an install the simulation
-		// never sends, and probes again at its base after snapshot_timeout: healing outlasts that
-		// twice on the slowest node's clock (a quiet round is 5 ms, 4 ms at a 0.8 rate).
+		// A member behind the leader's checkpoint installs it; a transfer the network broke or the
+		// application refused starts over after snapshot_timeout: healing outlasts that twice on
+		// the slowest node's clock (a quiet round is 5 ms, 4 ms at a 0.8 rate).
 		const int rounds = 4000 + int(2 * timing.snapshot_timeout / 4);
 		for (int round = 0; round < rounds && !failures; ++round) {
 			trace_step = 1'000'000 + std::uint64_t(round);
@@ -331,11 +344,52 @@ struct Simulation {
 	std::uint64_t checkpoints = 0, restored = 0, repairs = 0, repairs_below_base = 0, repaired = 0, refused = 0, repairs_cancelled = 0, repairs_pending = 0;
 	std::uint64_t repair_wait_total = 0, repair_wait_max = 0;  // simulated ms from issue to a completed repair
 	std::uint64_t boots_by_loops[5] = {};
-	std::map<GroupId, std::uint64_t> snapshots_needed;  // the simulation sends no installs
+	std::map<GroupId, std::uint64_t> snapshots_needed;
+	std::uint64_t transfer_frames = 0, validations = 0, refusals = 0, activations = 0, installs = 0;
 
 	void on_send(Node& n, GroupId g, Send notice) {
 		network_.push_back({n.id, notice.peer, g, std::move(notice.message), now_ + random_() % 6});
-		if (random_() % 50 == 0) { network_.push_back({n.id, notice.peer, g, network_.back().message, now_ + random_() % 30}); }  // duplicated
+		if (random_() % 50 == 0) { network_.push_back({n.id, notice.peer, g, network_.back().body, now_ + random_() % 30}); }  // duplicated
+	}
+	void on_transfer(Node& n, GroupId g, SendTransfer notice) {
+		++transfer_frames;
+		network_.push_back({n.id, notice.peer, g, std::move(notice.frame), now_ + random_() % 6});
+		if (random_() % 50 == 0) { network_.push_back({n.id, notice.peer, g, network_.back().body, now_ + random_() % 30}); }  // duplicated
+	}
+	// The image to validate is the committed sequence through its boundary; the application
+	// answers later (apply()), refusing one in eight.
+	void on_validate(Node& n, GroupId g, ValidateImage notice) {
+		++validations;
+		if (witness(n.id, g)) { fail("a witness member was asked to validate an image"); }
+		auto image = read_image(notice.image);
+		if (image.size() != notice.boundary.index) { fail("a validated image does not end at its boundary"); }
+		check_image(n, g, image, "validated");
+		auto& r = n.replicas[g];
+		r.validating = {notice.token, notice.boundary.index, random_() % 8 != 0};
+		r.validated = image;
+	}
+	// Only the image the application validated activates; its state becomes the image.
+	void on_activate(Node& n, GroupId g, ActivateImage notice) {
+		++activations;
+		if (witness(n.id, g)) { fail("a witness member was asked to activate an image"); }
+		auto image = read_image(notice.image);
+		auto& r = n.replicas[g];
+		if (image.size() != notice.boundary.index || image.size() != r.validated.size() || encode_image(image) != encode_image(r.validated)) { fail("node " + std::to_string(n.id) + " activates an image it did not validate in group " + std::to_string(g)); }
+		check_image(n, g, image, "activated");
+		if (r.applying) { fail("an image activates while the application holds a range"); }
+		r.applied = std::move(image); r.base = notice.boundary.index; r.activating = notice.token;
+	}
+	std::vector<Entry> read_image(j::ArtifactReader& reader) {
+		std::string bytes(static_cast<std::size_t>(reader.descriptor().length), '\0');
+		for (std::size_t at = 0; at < bytes.size();) { at += reader.read_at(at, std::span<char>(bytes.data() + at, std::min<std::size_t>(65536, bytes.size() - at))); }
+		return decode_image(bytes);
+	}
+	void check_image(Node& n, GroupId g, const std::vector<Entry>& image, const char* what) {
+		auto& sequence = sequences_[g];
+		for (const auto& e : image) {
+			auto it = sequence.find(e.index);
+			if (it == sequence.end() || it->second.term != e.term || it->second.payload != e.payload) { fail("node " + std::to_string(n.id) + " " + what + " group " + std::to_string(g) + "'s image unlike the committed sequence at " + std::to_string(e.index)); return; }
+		}
 	}
 	void on_committed(Node& n, GroupId g, Committed notice) {
 		auto& r = n.replicas[g];
@@ -444,6 +498,7 @@ private:
 			o.configuration.cluster[0] = 'D'; o.configuration.configuration[0] = 'S';
 			if (witnessed_.count(g)) { o.founding = Membership{{{1, 1, MemberRole::Voter}, {2, 2, MemberRole::Voter}, {3, 3, MemberRole::Witness}}, 4, 0}; }
 			o.admission = admission; o.limits = limits(); o.timing = timing; o.scheduling = WorkerLimits{16, 128};
+			o.snapshots = SnapshotLimits{image_format, application_cap, 1 + std::uint32_t(random_() % 3)};
 			auto& d = n.driver(g);
 			d.open(g, std::move(o));
 			auto call = track(n, g, Call::open);
@@ -524,7 +579,8 @@ private:
 		auto& to = nodes_.at(e.to);
 		if (!to.up || isolated_.count(e.from) || isolated_.count(e.to)) { return; }
 		auto& l = to.loop_of(e.group);
-		l.driver->receive(e.group, Receive{e.from, e.message});
+		if (auto* m = std::get_if<Message>(&e.body)) { l.driver->receive(e.group, Receive{e.from, *m}); }
+		else { l.driver->transfer(e.group, e.from, std::get<std::string>(e.body)); }
 		l.run(to.id);
 	}
 	void deliver_one() {
@@ -546,8 +602,18 @@ private:
 	}
 	void apply(Node& n, GroupId g) {
 		auto& r = n.replicas[g];
-		if (!r.applying) { return; }
 		auto& l = n.loop_of(g);
+		if (r.validating) {
+			auto v = *std::exchange(r.validating, std::nullopt);
+			trace("node %llu group %llu %s the image at %llu", (unsigned long long)n.id, (unsigned long long)g, v.valid ? "validates" : "refuses", (unsigned long long)v.boundary);
+			if (v.valid) { l.driver->validated(g, v.token); } else { ++refusals; l.driver->validation_failed(g, v.token); }
+			l.run(n.id);
+		}
+		if (r.activating) {
+			l.driver->activated(g, *std::exchange(r.activating, std::nullopt)); ++installs;
+			l.run(n.id);
+		}
+		if (!r.applying) { return; }
 		trace("node %llu group %llu applied(%llu)", (unsigned long long)n.id, (unsigned long long)g, (unsigned long long)*r.applying);
 		l.driver->applied(g, Applied{*r.applying});
 		r.applying.reset();
@@ -629,16 +695,18 @@ private:
 			if (it == sequence.end() || it->second.term != e.term || it->second.payload != e.payload) { fail("node " + std::to_string(n.id) + " restored group " + std::to_string(g) + "'s index " + std::to_string(e.index) + " unlike the committed sequence"); break; }
 		}
 	}
-	// A checkpoint of what the application applied, through an index every member's log
-	// holds, so no member needs a snapshot install (the simulation sends none).
+	// A checkpoint of what the application applied: half the time through an index every
+	// member's log holds, otherwise past the data members that lag, which then install it. A
+	// witness keeps the log and no application state, so it never lags a checkpoint.
 	void checkpoint(Node& n, GroupId g) {
 		if (!n.up || witness(n.id, g)) { return; }
 		auto& r = n.replicas[g];
 		if (r.applying || r.repairing || r.applied.empty()) { return; }
 		Index floor = r.applied.size();
+		const bool past = random_() % 2;
 		for (auto& [id, m] : nodes_) {
 			if (witness(id, g)) { auto s = state(m, g); if (!s) { return; } floor = std::min<Index>(floor, s->committed); }
-			else { floor = std::min<Index>(floor, m.replicas[g].applied.size()); }
+			else if (!past) { floor = std::min<Index>(floor, m.replicas[g].applied.size()); }
 		}
 		if (floor != r.applied.size() || floor <= r.base) { return; }
 		++checkpoints;
@@ -774,11 +842,9 @@ void NodeSink::operator()(GroupId g, SnapshotNeeded notice) {
 	++sim->snapshots_needed[g];
 	trace("node %llu group %llu SnapshotNeeded for peer %llu", (unsigned long long)node->id, (unsigned long long)g, (unsigned long long)notice.peer);
 }
-void NodeSink::operator()(GroupId, SendTransfer) { fail("a transfer frame without snapshots"); }
-void NodeSink::operator()(GroupId, ValidateImage) { fail("a validation without snapshots"); }
-void NodeSink::operator()(GroupId g, ActivateImage) {
-	if (sim->witness(node->id, g)) { fail("a witness member was asked to activate an image"); }
-}
+void NodeSink::operator()(GroupId g, SendTransfer notice) { sim->on_transfer(*node, g, std::move(notice)); }
+void NodeSink::operator()(GroupId g, ValidateImage notice) { sim->on_validate(*node, g, notice); }
+void NodeSink::operator()(GroupId g, ActivateImage notice) { sim->on_activate(*node, g, notice); }
 
 }  // namespace
 
@@ -789,6 +855,7 @@ constexpr std::pair<std::uint64_t, std::uint64_t> regressions[] = {{399, 3000}};
 bool run(std::uint64_t seeds, std::uint64_t steps, std::uint64_t first) {
 	std::uint64_t proposals = 0, placed = 0, commits = 0, superseded_count = 0, reads = 0, cancelled = 0, crashes = 0, transfers = 0, elections = 0, repartitions = 0;
 	std::uint64_t checkpoints = 0, restored = 0, repairs = 0, below = 0, repaired = 0, refused = 0, repairs_cancelled = 0, pending = 0, wait_total = 0, wait_max = 0, boots[5] = {};
+	std::uint64_t needed = 0, frames = 0, validations = 0, refusals = 0, activations = 0, installs = 0;
 	auto one = [&](std::uint64_t seed, std::uint64_t length) {
 		current_seed = seed;
 		Simulation sim(seed);
@@ -799,6 +866,8 @@ bool run(std::uint64_t seeds, std::uint64_t steps, std::uint64_t first) {
 		checkpoints += sim.checkpoints; restored += sim.restored; repairs += sim.repairs; below += sim.repairs_below_base; repaired += sim.repaired; refused += sim.refused;
 		repairs_cancelled += sim.repairs_cancelled; pending += sim.repairs_pending; wait_total += sim.repair_wait_total; wait_max = std::max(wait_max, sim.repair_wait_max);
 		for (int l = 0; l < 5; ++l) { boots[l] += sim.boots_by_loops[l]; }
+		for (auto [g, k] : sim.snapshots_needed) { needed += k; }
+		frames += sim.transfer_frames; validations += sim.validations; refusals += sim.refusals; activations += sim.activations; installs += sim.installs;
 	};
 	for (std::uint64_t seed = first; seed < first + seeds && !failures; ++seed) { one(seed, steps); }
 	std::uint64_t replayed = 0;
@@ -813,6 +882,8 @@ bool run(std::uint64_t seeds, std::uint64_t steps, std::uint64_t first) {
 	std::printf("  %llu checkpoints (%llu images restored), %llu repairs requested (%llu below the checkpoint): %llu completed, %llu refused, %llu cancelled, %llu pending at a seed's end; completed after %.1f ms on average, %llu ms at the longest\n",
 		(unsigned long long)checkpoints, (unsigned long long)restored, (unsigned long long)repairs, (unsigned long long)below, (unsigned long long)repaired, (unsigned long long)refused,
 		(unsigned long long)repairs_cancelled, (unsigned long long)pending, repaired ? double(wait_total) / double(repaired) : 0.0, (unsigned long long)wait_max);
+	std::printf("  %llu SnapshotNeeded, %llu transfer frames, %llu images validated (%llu refused), %llu activated, %llu installs acknowledged\n",
+		(unsigned long long)needed, (unsigned long long)frames, (unsigned long long)validations, (unsigned long long)refusals, (unsigned long long)activations, (unsigned long long)installs);
 	return failures == 0;
 }
 

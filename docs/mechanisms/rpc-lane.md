@@ -36,7 +36,10 @@ receiver's parity or 0 or was never allocated (rule 10). A frame for a retired i
 `late()` and dropped (rule 9). On a throw the connection closes and calls `close()`. A throw from
 this end's own code (the accept callback, a call's `body`, `credit` or `done`) is not the peer's:
 it is counted in `failed()` and fails that call alone, `Error handler_failed` from a server and
-`Cancel cancelled` from a caller, with the exception's text.
+`Cancel cancelled` from a caller, with the exception's text. A callback may call into the table:
+a `close()` from one (a `ready` whose write failed at once, say) runs when the table's outermost
+call returns, never while it holds a call (N3). No callback may destroy the table. `send` refuses
+bytes past a call's known total at once, before anything changes (N2).
 
 A call ends once at each end, and its `done` runs once: `ok` when the response is consumed to its
 end (the caller) or queued to its end (the server); `error` or `cancel` with the frame's code;
@@ -63,8 +66,23 @@ posts it to the waiting lane's loop.
   holding and takes up to a window back in one step, its own bytes first. The holding never
   drops below what the peer may still send, so no other call can strand the stream; it grows
   beyond its own bytes only while nobody waits.
-- A chunk, and a `Call`'s inline bytes, charge `rpc_outgoing_bytes` before they queue; the charge
-  returns when the frame's write completes. Headers and the small frames are not charged.
+- Every queued frame is charged to `rpc_outgoing_bytes`, header included, until `next()` hands
+  it over and its write completes. A `Call` or `Body` waits for the charge, first in first out;
+  the small frames (`Credit`, `Cancel`, `Error`, `Drain`) answer the peer and take it at once,
+  past the limit if they must (`ByteBudget::charge`), so nobody else takes until they go.
+- **A per-connection queue** (A3; Xapiand:a3b4b4903 R2): a table queues at most
+  `LaneOptions::queue_bytes` unsent (4 frames, 262,336 bytes), small frames included. A `Call` or
+  `Body` that does not fit waits for room, in order, before it asks `rpc_outgoing_bytes`; one
+  frame always fits an empty queue. A peer that stops reading therefore holds at most its
+  connection's queue, plus the frame being handed over, of the host's pool, and calls to every
+  other peer go on.
+- **A peer that never reads** (N1, F1): a served response waits for room like any stream, so its
+  call keeps its slot and `serving` bounds them. A served call that ends with a small frame
+  unsent (its `Error`, from `stop()` or `expire()`, or a `Credit` before the peer's `Cancel`)
+  keeps its slot the same way until `next()` takes that frame. A `Call` refused past `serving`
+  is answered `Error`, and more than `serving` refusals unsent close the connection
+  (`ProtocolError`). A peer's own grants bound its Credits, so a table holds at most a few
+  small frames per slot, `serving` + 1 refusals, and a Cancel per call it sent.
 - `next()` returns small frames first, in order, then chunks round-robin by call.
 
 ## Drain
@@ -91,10 +109,11 @@ groups' snapshot frames:
   serve)` registers a method before `serve()`; the handler gets the `RpcCall` it answers on and
   acts from the call's events.
 - **Receive.** A frame starting `DTRP` goes to the link's call table at once, from the
-  connection's buffer (T5). One that breaks a rule, or arrives on Control or with the lane off,
+  connection's buffer, on the connection's loop (T5): it never waits on another loop or a shared
+  budget. One that breaks a rule, or arrives on Control or with the lane off,
   closes the connection (`malformed`), and its calls end `connection_aborted`.
-- **Send.** A feed hands over, in order: credit owed to groups, the lane's small frames (FIFO),
-  groups' control frames, then lane chunks and groups' data frames in turn while both wait. Lane
+- **Send.** A feed hands over, in order: the lane's small frames (FIFO), groups' control frames,
+  credit owed to groups, then lane chunks and groups' data frames in turn while both wait. Lane
   frames sit outside every group's credit: a group whose window is full holds none of them, and a
   call whose credit is full holds no group frame. A chunk's `rpc_outgoing_bytes` charge returns
   when the connection takes it, and the connection takes a feed only once its queue is out.
@@ -108,16 +127,46 @@ groups' snapshot frames:
   each outcome. Lane frames never move `HostTransportStats`, so a lane-only pair leaves every
   group counter at 0.
 
-Not built here: `lane_idle` and `Drain` on an idle or shutting-down link (the host transport
-keeps connections up until `stop()`, which aborts them), and `hold(node)`.
+- **Fetch is method 1 (D8).** `fetch(node, name, done)` on `loop_of_node(node)` is a call of
+  method 1 whose request is the name, with `fetch_deadline` (30 s); `done` runs on that loop,
+  never within the call. With `RpcOptions::reader` set, the host serves method 1: the reader's
+  bytes under the call's credit with `total` the file's size, `Error` 256 (`fetch_missing`) for a
+  name it holds none of, `handler_failed` when the reader throws and `message_size` past its
+  `fetch_bytes`. The fetcher maps them to bytes, nullopt and `io_error`; it cancels a reply past
+  its own `fetch_bytes` (`message_size`) once the bytes it holds would exceed it; past `fetches`
+  (4) awaiting the node a fetch ends `resource_unavailable_try_again`, as does one a drain refused
+  (`not_processed`); `timed_out`, `connection_aborted` and `not_connected` pass through. Its reply
+  shares the lane's pools and Bulk's alternation with groups' data frames, so heartbeats on Control
+  keep their gaps (`fetch`). `Peers` and `DTFT0001` stay until worker-pump-removal deletes them.
+- **Holds and lane_idle (T3, D7).** `hold(node)` dials Bulk to `node` and keeps it, sharing a
+  group or not, until as many `release(node)`; a failed dial is tried again every `redial`. A
+  Bulk connection that has carried no group frame either way, with no hold, no call and nothing
+  waiting, drains after `RpcOptions::idle` (60 s). One that carried a group frame stays until
+  `stop()`, as Control does.
+- **Drain and the graceful close (D4, T8).** Draining sends the lane's `Drain`; once the table is
+  drained (no call live at this end), the feed closes the connection gracefully: the frames queued,
+  then `close_notify`. A call the peer started past the Drain ends `not_processed` there, and a
+  call this host makes on a lane either end drained waits for the next connection, so a call
+  racing a close ends `ok` or `not_processed`, never `connection_aborted`. A drain whose calls are
+  still live at `drain_deadline` (5 s) aborts the connection. `drain()` drains every lane for a
+  shutdown before `stop()`: new calls end `not_processed`, and `lanes_drained(loop)` says when the
+  loop's lanes are closed. `LaneStats::drains` and `retired` count them.
 
 ## Evidence
 
 `test/transport/rpc_test.cc` has a case per rule with values, a call's life, the pools under
-threads, and two lanes over pipes on two loops (run under TSan). Each of the model's eight
+threads, and two lanes over pipes on two loops (run under TSan). `reenter` closes the table from
+`ready` inside `called()`, `stop()` and a served end (ASan; control `close-reenters`), `overrun`
+sends past a known total (`send-past-total`), `unread-queue` feeds a table that is never read
+until it throws, every unsent byte charged (`refusals-unbounded`), `unread-small` sends a peer
+that never reads served `Error`s, cancelled calls' `Credit`s and `expire()`'s `Error`s until it
+throws at `2 * serving + 1` Calls, each unsent byte counted (`small-unbounded`), and `queue-cap` streams three
+1 MiB requests into a two-frame queue (`rpc-no-queue-cap`). Each of the model's eight
 mutants (`test/transport/rpc_mutants.py`) fails the case of its name, and so does `late-deadline`
 (T7: a 2.1 s stop past a 10 s deadline gives 2.1 s once, a 30 s one gives 10 s). `fuzz/rpc_fuzz.cc` drives
-the decoder and a call table; its corpus `fuzz/corpus/rpc` replays as `consensus_fuzz_rpc_replay`.
+the decoder and a call table whose pools are below two windows and whose queue is below two frames,
+so calls wait for `calling`, `outgoing` and room (N4); its corpus `fuzz/corpus/rpc` (with `seed-past-credit`, a served request's Body past its 4 KiB window, rule 7.6) replays as
+`consensus_fuzz_rpc_replay`, and `fuzz/rpc_fuzz.sh` fuzzes it at `-max_len=65600`.
 
 `test/transport/rpc_host_test.cc`, two hosts over loopback TLS, one ctest entry per case:
 
@@ -128,7 +177,16 @@ the decoder and a call table; its corpus `fuzz/corpus/rpc` replays as `consensus
 | `call-full` | a call whose server never reads holds its 4 MiB credit and pool; heartbeats on Control keep every gap under 1,000 ms | |
 | `lane-only` | no shared group: the call dials Bulk alone, its bytes exact, one link per end, every group counter 0 | |
 | `stream` | a 32 MiB request under the lane's credit, heartbeats' gaps under 1,000 ms, the serving pool's and the sender's queued bytes' (`rpc_outgoing_bytes`) high water within one window | `rpc-past-credit` (chunks that ignore the peer's credit) |
+| `stalled-peer` | four calls hold 16 MiB of host 2's credit when host 2 stops reading for 4 s; host 1's 2 MiB `rpc_outgoing_bytes` holds at most that connection's queue, so a 1 MiB echo to host 3 completes before host 2 resumes | `rpc-no-queue-cap` |
+| `hold` | `hold(2)` on a lane-only pair with a 300 ms lane_idle: Bulk comes up and stays 1 s; `release(2)` drains it about 300 ms later (1 Drain, closed gracefully) | `hold-ignored` |
+| `idle-race` | host 1's 300 ms lane_idle drains while host 2's loop is held 600 ms, in which it starts 5 calls on the old connection: all 5 end `not_processed`, none `connection_aborted`, and the next call dials again and completes | `rpc-no-drain` |
+| `shutdown` | `drain()` with a 4 MiB echo streaming: it completes whole, a later call ends `not_processed`, the lanes close, no call ends `connection_aborted` | |
+| `fetch` | host 2 uploads 4 groups' 1 MiB data frames to host 1 on Bulk while host 1 fetches 16 MiB on the same connection: it arrives exact in about 1.1 s beside 131 MiB of uploads, heartbeats on Control keep a 210 ms longest gap; a missing name gives nullopt, a throwing reader `io_error`, 48 MiB against a 32 MiB `fetch_bytes` `message_size`, and past 4 awaiting `resource_unavailable_try_again` | |
+| `reader` | host 2's loop that does not read node 1's connection is held; 10 echoes on that connection complete, the slowest in under 200 ms (T5) | `lane-via-other-loop` |
+| `stop-drain` | host 2 runs in a child process that raises SIGSTOP in its reader; host 1's fetch ends `timed_out`, and after SIGCONT the late reply arrives, is dropped (rule 9) on the same connection, and the next fetch is exact on it (F18) | `forget-is-violation` (never drain), `fetch-deadline-io-error` |
 | `local-throw` | a handler acting outside its events and a body consumer that throw each end their call `handler_failed`; the link count, `malformed` 0, a group's frames on Bulk and the next 1 MiB echo show the connection went on | `local-throw-closes` (a local throw closes the connection) |
+
+`group-full`, `call-full`, `stream` and `reader` assert latency bounds a runner that stops the process can break (D100): they carry the ctest label `timing`, which `ctest -LE timing` skips; CI runs them.
 
 `hello_test version` refuses a 32 KiB `maximum_frame` below the lane's 65,584-byte frame
 (control `lane-frame-unchecked`).

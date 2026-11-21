@@ -138,7 +138,7 @@ public:
 		if (voting != voters || founding.leaving) { throw std::invalid_argument("founding membership does not match the voters"); }
 		// A group's limits stay within its node's (R16).
 		if (founding.limits && !within(*founding.limits, limits_)) { throw std::invalid_argument("founding limits above the node's"); }
-		founding_ = std::move(founding);
+		founding_ = std::make_unique<Membership>(std::move(founding));
 	}
 	void create(kronuz::journal::Identity identity) {
 		unopened();
@@ -202,9 +202,19 @@ public:
 	std::size_t retired_log_entries() const noexcept { return core_ ? core_->retired_log_entries() : 0; }
 	bool owns_io_operation(const std::shared_ptr<kronuz::journal::IOOperation>& operation) const noexcept { return operation && (operation == io_job_ || operation == maintenance_io_); }
 	NodeId leader() const noexcept { return core_ ? core_->leader() : 0; }
+	NodeId leader_node() const { return core_ ? core_->leader_node() : 0; }
+	bool resting() const noexcept { return core_ && core_->resting(); }
 	bool transferring() const noexcept { return core_ && core_->transferring(); }
 	Index last_index() const noexcept { return core_ ? core_->last_index() : 0; }
 	std::optional<Term> term_at(Index index) const { return core_ ? core_->term_at(index) : std::nullopt; }
+	// The closed state, when this replica can close now (Core::closed_state): open, not fenced.
+	std::optional<ClosedState> closed_state() const { return core_ && !closing_ && !fenced() ? core_->closed_state() : std::nullopt; }
+	// After create or recover, before Start: resumes the closed term when `closed` matches the
+	// recovered state (Core::reopen); false for a stale one.
+	bool reopen(const ClosedState& closed) {
+		if (!core_) { throw std::logic_error("reopen before create or recover"); }
+		return core_->reopen(closed);
+	}
 	// When the Core next needs a Tick (Core::next_deadline), as Tick::now; the maximum for none.
 	std::uint64_t next_deadline() const {
 		return core_ && !closing_ && !fenced() ? core_->next_deadline() : std::numeric_limits<std::uint64_t>::max();
@@ -391,12 +401,16 @@ public:
 	}
 	CancelResult reject_snapshot_validation(const SnapshotId& id) { return cancel_snapshot(id, SnapshotReason::InvalidApplication); }
 	CancelResult cancel_snapshot(const SnapshotId& id) { return cancel_snapshot(id, SnapshotReason::Canceled); }
-	const SnapshotResult* pending_snapshot_result() const noexcept { return snapshot_result_ ? &*snapshot_result_ : nullptr; }
+	const SnapshotResult* pending_snapshot_result() const noexcept { return snapshot_result_.get(); }
 	std::uint32_t snapshot_window() const noexcept { return snapshot_limits_ ? snapshot_limits_->window : 1; }
 	std::optional<SnapshotPolicy> snapshot_policy() const { return snapshot_limits_ ? std::optional<SnapshotPolicy>{{configuration_.cluster, configuration_.configuration, snapshot_limits_->application_format, snapshot_limits_->application_bytes}} : std::nullopt; }
 	const FixedConfiguration& configuration() const noexcept { return configuration_; }
 	const Limits& limits() const noexcept { return limits_; }
-	std::optional<SnapshotResult> take_snapshot_result() { auto result = std::move(snapshot_result_); snapshot_result_.reset(); return result; }
+	std::optional<SnapshotResult> take_snapshot_result() {
+		std::optional<SnapshotResult> result;
+		if (snapshot_result_) { result.emplace(std::move(*snapshot_result_)); snapshot_result_.reset(); }
+		return result;
+	}
 	SubmitResult request_install(const SnapshotId& id) {
 		if (closing_) { return SubmitResult::Busy; }
 		if (fenced()) { return SubmitResult::Fenced; }
@@ -667,11 +681,12 @@ private:
 	}
 	enum class MaintenanceKind { Reclaim, BeginApplication, Application, SealApplication, OpenVerification, Readback, BeginBundle, Bundle, SealBundle, Publish, SourceOpen, SourceVerify, SourceRead };
 
-	std::string initial_record() const { return configuration_.voters.empty() ? encode_join(configuration_) : encode_initialization(configuration_, founding_); }
+	std::optional<Membership> founding() const { return founding_ ? std::optional<Membership>(*founding_) : std::nullopt; }
+	std::string initial_record() const { return configuration_.voters.empty() ? encode_join(configuration_) : encode_initialization(configuration_, founding()); }
 	RecoveredState initial_state() const {
 		RecoveredState state{configuration_, {}, 0, 0, {}, 0};
 		if (configuration_.voters.empty()) { state.membership = Membership{}; }
-		else if (founding_ && encode_initialization(configuration_, founding_) != encode_initialization(configuration_)) { state.membership = founding_; }
+		else if (founding_ && encode_initialization(configuration_, founding()) != encode_initialization(configuration_)) { state.membership = *founding_; }
 		return state;
 	}
 	// The group's largest record, an operating-limit batch or the founding record, must fit one
@@ -812,7 +827,7 @@ private:
 			if (snapshot_result_) { throw std::logic_error("snapshot result slot occupied"); }
 			auto context = incoming->context; SnapshotId id(checkpoint_owner_, checkpoint_->token);
 			store_.cancel_replacement(checkpoint_->replacement); checkpoint_.reset(); cutover_debt_ = false;
-			snapshot_result_.emplace(SnapshotResult{id, std::move(context), reason});
+			snapshot_result_ = std::make_unique<SnapshotResult>(SnapshotResult{id, std::move(context), reason});
 		} else { store_.cancel_replacement(checkpoint_->replacement); checkpoint_.reset(); cutover_debt_ = false; }
 	}
 
@@ -1161,7 +1176,7 @@ private:
 		SnapshotId id(checkpoint_owner_, prepared);
 		if (reason != SnapshotReason::Installed) { store_.cancel_replacement(checkpoint_->replacement); }
 		checkpoint_.reset(); cutover_debt_ = false; release_pack();
-		snapshot_result_.emplace(SnapshotResult{id, std::move(context), reason, rejection, core_->durable_hard_state().term});
+		snapshot_result_ = std::make_unique<SnapshotResult>(SnapshotResult{id, std::move(context), reason, rejection, core_->durable_hard_state().term});
 	}
 
 	void fail(std::string reason) {
@@ -1175,7 +1190,7 @@ private:
 		persist_.reset(); completion_.reset(); application_.reset(); activation_completion_.reset(); checkpoint_.reset(); source_.reset(); published_.reset(); pending_publication_.reset(); release_pack(); terminal_ = Fenced{std::move(reason)};
 	}
 	FixedConfiguration configuration_;
-	std::optional<Membership> founding_;
+	std::unique_ptr<Membership> founding_;  // before create: the founding roles, off the idle object
 	Limits limits_;
 	Timing timing_;
 	WorkerLimits scheduling_;
@@ -1206,7 +1221,7 @@ private:
 	std::unique_ptr<Checkpoint> checkpoint_;
 	Token next_checkpoint_ = 0;
 	Token next_validation_ = 0;
-	std::optional<SnapshotResult> snapshot_result_;
+	std::unique_ptr<SnapshotResult> snapshot_result_;  // rare state off the idle object
 	Actions output_;
 	Index delivered_ = 0;
 	std::optional<Publication> published_, pending_publication_;

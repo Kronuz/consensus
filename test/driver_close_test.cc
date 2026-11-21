@@ -28,12 +28,15 @@
 #include "faultlab/faultfs.h"
 
 #include <algorithm>
+#include <chrono>
+#include <ctime>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <iostream>
 #include <map>
 #include <new>
+#include <optional>
 #include <random>
 #include <span>
 #include <string>
@@ -161,7 +164,9 @@ struct Sink {
 	std::map<GroupId, std::vector<std::string>> commands;  // each group's committed commands, in order
 	std::function<void(GroupId)> on_fenced;  // a Sink may call the Driver's plain calls
 	std::function<void(GroupId)> on_committed;
-	void operator()(GroupId, Send) {}
+	bool record_sends = false;  // idle_cpu answers them
+	std::vector<std::pair<GroupId, Send>> sent;
+	void operator()(GroupId g, Send n) { if (record_sends) { sent.emplace_back(g, std::move(n)); } }
 	void operator()(GroupId g, Committed c) {
 		if (on_committed) { on_committed(g); }
 		if (c.entries.empty()) { return; }
@@ -266,9 +271,9 @@ struct Loop {
 	std::unique_ptr<Driver<Sink>> driver;
 	task::cancel_source stop, driver_stop;  // the turn driver's run, the Driver's
 	bool turns_done = false, driver_done = false;
-	explicit Loop(fl::filesystem& d, bool hold = false, std::shared_ptr<j::IO> storage = {}) : disk(d) {
+	explicit Loop(fl::filesystem& d, bool hold = false, std::shared_ptr<j::IO> storage = {}, const j::TurnLogOptions& turns_at = turn_options) : disk(d) {
 		if (!storage) { storage = host_io(disk); }
-		host = std::make_unique<j::Host>(std::move(storage), host_identity, j::HostOptions{1, turn_options});
+		host = std::make_unique<j::Host>(std::move(storage), host_identity, j::HostOptions{1, turns_at});
 		auto io = hold ? j::completion_ref::of(held) : j::completion_ref::of(inline_io);
 		driver = std::make_unique<Driver<Sink>>(Seams{task::scheduler_ref::of(scheduler), io, *host, 0, 7}, sink);
 		auto ref = task::scheduler_ref::of(scheduler);
@@ -350,7 +355,7 @@ struct Loop {
 	}
 	// Recovers g in this live Host: the application image its checkpoint restores (empty
 	// without one); its commands after the image reach the Sink as they commit.
-	std::string recover(GroupId g, std::exception_ptr& error, GroupOptions o) {
+	std::string recover(GroupId g, std::exception_ptr& error, GroupOptions o, std::optional<std::string> closed = std::nullopt) {
 		std::string image;
 		driver->open(g, std::move(o));
 		sink.commands.erase(g); sink.committed.erase(g);
@@ -358,7 +363,7 @@ struct Loop {
 			image.assign(static_cast<std::size_t>(reader.descriptor().length), '\0');
 			for (std::size_t at = 0; at < image.size();) { at += reader.read_at(at, std::span<char>(image.data() + at, image.size() - at)); }
 		};
-		if (!settle(driver->recover(g, restore), error)) { check(false, "recover completes"); }
+		if (!settle(driver->recover(g, restore, std::move(closed)), error)) { check(false, "recover completes"); }
 		release();
 		return image;
 	}
@@ -790,12 +795,56 @@ void closed_bytes() {
 	std::printf("closed_bytes: %u released rows, process heap per row after close: %.1f B\n", unsigned(rows), per(released, released_before));
 }
 
+// The breakpoint test/idle_owners.py stops at, with every row idle (IDLE_BYTES_PAUSE set).
+extern "C" __attribute__((noinline)) void idle_bytes_pause() { asm volatile(""); }
+
+// Quiescence A6, report only: the process heap per row (HeapIO's files left out) of rows opened
+// together, by stage: the Driver's row before create, created (leading, its founding records), a
+// write committed and applied, and idle at a checkpoint covering it. Against Xapiand's 6,984 B
+// for a consensus row and its journal group (Xapiand:d5b84cdf4).
+void idle_bytes() {
+	const char* scale = std::getenv("IDLE_BYTES_ROWS");
+	const GroupId rows = scale ? std::stoull(scale) : 1000;
+	fl::filesystem unused; Loop loop(unused, false, std::make_shared<HeapIO>());
+	std::exception_ptr error;
+	loop.lone(1); loop.propose(1, "p"); loop.apply(1);
+	auto warm = loop.start(checkpoint_of(loop, 1, {"p"})); loop.run();
+	check(warm->done && !warm->error && loop.close(1, error) && !error, "one warm round");
+	loop.sink.committed.erase(1); loop.sink.commands.erase(1);
+	const auto base = live_bytes;
+	auto per = [&](std::size_t now) { return (double(now) - double(base)) / double(rows); };
+	for (GroupId g = 2; g < 2 + rows; ++g) { loop.driver->open(g, options({1})); }
+	const auto opened = live_bytes;
+	for (GroupId g = 2; g < 2 + rows; ++g) {
+		if (!loop.settle(loop.driver->create(g, j::Identity{'I', 'B'}), error) || error) { check(false, "create " + std::to_string(g) + ": " + what(error)); return; }
+	}
+	const auto created = live_bytes;
+	for (GroupId g = 2; g < 2 + rows; ++g) { loop.propose(g, "p"); loop.apply(g); }
+	const auto written = live_bytes;
+	for (GroupId g = 2; g < 2 + rows; ++g) {
+		auto published = loop.start(checkpoint_of(loop, g, {"p"})); loop.run();
+		if (!published->done || published->error) { check(false, "checkpoint " + std::to_string(g) + ": " + what(published->error)); return; }
+	}
+	const auto idle = live_bytes;
+	std::size_t at_rest = 0;
+	for (GroupId g = 2; g < 2 + rows; ++g) { at_rest += loop.driver->closed_state(g).has_value(); }
+	check(at_rest == rows, "every idle row can close: " + std::to_string(at_rest));
+	std::printf("idle_bytes: %u rows, process heap per row: %.0f B opened (the Driver's row), %.0f B created, %.0f B written and applied, %.0f B idle at its checkpoint (Xapiand: 6,984 B)\n",
+		unsigned(rows), per(opened), per(created), per(written), per(idle));
+	if (std::getenv("IDLE_BYTES_PAUSE")) { idle_bytes_pause(); }
+	for (GroupId g = 2; g < 2 + rows; ++g) { check(loop.close(g, error) && !error, "close"); }
+}
+
 // A3: power cuts at every IO of a close-then-recover cycle, per seed. Rounds place a record and
 // then fence and close the row, close it with records after its checkpoint, checkpoint and
 // close it into the table, or go on; each close recovers the row in the live Host. After the
 // cut, a new Host recovers every acknowledged record and nothing unattempted: none lost, none
-// that a table close dropped replayed again.
+// that a table close dropped replayed again. Quiescence A5: a close into the table takes the
+// closed state and the recover reopens with it, resuming the closed term; after the cut the last
+// closed state reopens again, resuming its term when it still matches and refused as stale (a
+// later term) once a write followed it.
 std::uint64_t crash_tables = 0, crash_releases = 0;  // the closes a sweep's runs completed, by kind
+std::uint64_t crash_resumed = 0, crash_stale = 0;  // reopens after a cut with the last closed state
 bool close_crash_run(std::uint64_t seed, std::uint64_t cut) {
 	constexpr GroupId g = 91;
 	fl::filesystem disk;
@@ -806,6 +855,8 @@ bool close_crash_run(std::uint64_t seed, std::uint64_t cut) {
 	const auto at = "seed " + std::to_string(seed) + " cut " + std::to_string(cut);
 	std::vector<std::function<bool()>> calls;  // whether each call the run started completed
 	auto track = [&](auto call) { calls.push_back([call] { return call->done; }); return call; };
+	std::optional<std::string> closed;  // the last closed state a close into the table took
+	Term closed_term = 0;
 	{
 		Loop loop(disk, false, std::make_shared<CutIO>(disk));
 		loop.lone(g);
@@ -829,14 +880,20 @@ bool close_crash_run(std::uint64_t seed, std::uint64_t cut) {
 				auto published = track(loop.start(checkpoint_of(loop, g, acknowledged))); loop.release();
 				if (!published->done || published->error) { alive = false; break; }
 			}
+			auto taken = action == 2 ? loop.driver->closed_state(g) : std::nullopt;
+			const auto term = loop.driver->state(g)->term;
 			if (!ok(track(loop.start(loop.driver->close(g))))) { alive = false; break; }
-			++(loop.host->status(g) == j::GroupStatus::closed ? crash_tables : crash_releases);
-			const auto image = loop.recover(g, error, options({1}));
+			const bool tabled = loop.host->status(g) == j::GroupStatus::closed;
+			++(tabled ? crash_tables : crash_releases);
+			check(action != 2 || dead() || (taken && tabled), "a checkpointed close takes its closed state into the table: " + at + (taken ? "" : " (no closed state)") + (tabled ? "" : " (released)"));
+			if (tabled && taken) { closed = taken; closed_term = term; }
+			const auto image = loop.recover(g, error, options({1}), tabled ? taken : std::nullopt);
 			loop.apply(g);
 			// Without power nothing commits after the recover, so the state shows only before the cut.
 			if (error || dead()) { alive = false; break; }
 			const auto state = recovered(loop, g, image);
 			check(state == attempted, "a recover in the live Host holds every attempted record: " + at + " " + join(state));
+			if (tabled && taken) { check(loop.driver->state(g)->term == term, "a reopen with its closed state resumes the closed term: " + at); }
 		}
 		reached = alive && !dead();
 		if (!reached && !dead()) { check(false, "the run failed before its power cut: " + at); }
@@ -847,8 +904,13 @@ bool close_crash_run(std::uint64_t seed, std::uint64_t cut) {
 	Loop again(disk);
 	if (again.host->status(g) != j::GroupStatus::none) {
 		std::exception_ptr error;
-		const auto image = again.recover(g, error, options({1}));
+		const auto image = again.recover(g, error, options({1}), closed);
 		check(!error, "recovery after the cut: " + at + ": " + what(error));
+		if (closed && !error) {
+			const auto term = again.driver->state(g)->term;
+			check(term >= closed_term, "a reopen after the cut never goes back a term: " + at);
+			++(term == closed_term ? crash_resumed : crash_stale);
+		}
 		again.apply(g);
 		const auto state = recovered(again, g, image);
 		check(prefix(acknowledged, state) && prefix(state, attempted), "recovery keeps every acknowledged record and nothing unattempted: " + at + " recovered " + join(state) + "acknowledged " + join(acknowledged));
@@ -862,8 +924,91 @@ void close_crash() {
 	for (std::uint64_t seed = 1; seed <= seeds; ++seed) {
 		for (std::uint64_t cut = 1; !close_crash_run(seed, cut); ++cut) { ++runs; if (failures) { return; } }
 	}
-	std::printf("close_crash: %u seeds, %u power cuts; %u closes into the table, %u releases\n", unsigned(seeds), unsigned(runs), unsigned(crash_tables), unsigned(crash_releases));
+	std::printf("close_crash: %u seeds, %u power cuts; %u closes into the table, %u releases; after a cut the last closed state resumed its term %u times, %u stale\n",
+		unsigned(seeds), unsigned(runs), unsigned(crash_tables), unsigned(crash_releases), unsigned(crash_resumed), unsigned(crash_stale));
 	check(crash_tables && crash_releases, "the sweep closes rows both ways");
+	check(crash_resumed && crash_stale, "the sweep reopens after a cut both ways");
+}
+
+// Quiescence A1: a lone voter closed at a checkpoint with its closed state reopens on a request
+// leading in its term, and the request costs an open group's two barriers: the journal's
+// re-staged checkpoint record and the entry with the term record in one turn, then the commit
+// index. Reopened without the record it costs five (ballot, no-op, commit, entry, commit).
+// Damaged bytes fail the recover with Corruption.
+void reopen_barriers() {
+	constexpr GroupId g = 121;
+	fl::filesystem disk; Loop loop(disk);
+	auto& log = loop.host->driver(0).log();
+	auto barriers = [&] { return log.stats().barriers; };
+	std::vector<std::string> applied;
+	std::exception_ptr error;
+	// A write placed and committed: the turn barriers it took.
+	auto write = [&](const std::string& c) {
+		const auto before = barriers();
+		auto placed = loop.propose(g, c);
+		loop.apply(g); applied.push_back(c);
+		check(placed && loop.sink.committed[g] >= placed->index, c + " commits");
+		return barriers() - before;
+	};
+	// Checkpoints at the applied position, takes the closed state, and closes into the table.
+	auto close = [&](const std::string& how) {
+		check(!loop.driver->closed_state(g), how + ": no closed state before a checkpoint covers applied");
+		auto published = loop.start(checkpoint_of(loop, g, applied));
+		loop.release();
+		check(published->done && !published->error, how + ": the checkpoint publishes: " + what(published->error));
+		auto closed = loop.driver->closed_state(g);
+		check(closed && closed->size() == 192, how + ": a lone voter's closed state is 192 bytes");
+		check(loop.close(g, error) && !error && loop.host->status(g) == j::GroupStatus::closed, how + ": closes into the host's table: " + what(error));
+		return closed.value_or(std::string{});
+	};
+	// The closed group reopens on a request: recover and the write issued together. The barriers
+	// from the recover to the write's commit.
+	auto reopen_on = [&](std::optional<std::string> closed, const std::string& c) {
+		const auto before = barriers();
+		loop.driver->open(g, options({1}));
+		loop.sink.commands.erase(g); loop.sink.committed.erase(g);
+		std::string image;
+		auto restore = [&image](j::ArtifactReader& reader) {
+			image.assign(static_cast<std::size_t>(reader.descriptor().length), '\0');
+			for (std::size_t at = 0; at < image.size();) { at += reader.read_at(at, std::span<char>(image.data() + at, image.size() - at)); }
+		};
+		auto ref = task::scheduler_ref::of(loop.scheduler);
+		bool recovered = false, placed = false;
+		std::exception_ptr recover_error, place_error;
+		task::spawn(ref, loop.driver->recover(g, restore, std::move(closed)), [&](std::exception_ptr e) { recovered = true; recover_error = e; });
+		task::spawn(ref, loop.driver->propose(g, c), [&](std::exception_ptr e, std::optional<Placement>) { placed = true; place_error = e; });
+		loop.release(); loop.apply(g);
+		check(recovered && !recover_error && split(image) == applied, c + ": recovers: " + what(recover_error));
+		check(placed && !place_error, c + ": the request is placed: " + what(place_error));
+		applied.push_back(c);
+		return barriers() - before;
+	};
+	loop.lone(g);
+	write("a");
+	const auto open = write("b");
+	check(open == 2, "a write to an open lone voter costs two barriers, not " + std::to_string(open));
+	const auto term = loop.driver->state(g)->term;
+	auto closed = close("first close");
+	auto damaged = closed; damaged[100] ^= 1;
+	loop.recover(g, error, options({1}), damaged);
+	check(is<j::Corruption>(error), "a damaged closed state fails the recover with Corruption: " + what(error));
+	check(loop.close(g, error) && !error && loop.driver->groups() == 0, "the refused row closes: " + what(error));
+	auto cost = reopen_on(closed, "c");
+	check(cost == open, "a request reopening with its closed state costs an open group's " + std::to_string(open) + " barriers, not " + std::to_string(cost));
+	auto state = loop.driver->state(g);
+	check(state && state->role == Role::Leader && state->term == term, "the reopened lone voter leads in its closed term, no election");
+	check(write("d") == open, "and the next write costs the same");
+	// Recovered first, written after: the journal's re-staged checkpoint record takes its own turn.
+	closed = close("second close");
+	auto before = barriers();
+	loop.recover(g, error, options({1}), closed);
+	check(!error && barriers() - before == 1, "a reopen alone writes only the journal's checkpoint record: " + std::to_string(barriers() - before));
+	check(write("e") == open && loop.driver->state(g)->term == term, "then a write costs an open group's barriers, in the same term");
+	// Without the record: an election before the write.
+	close("third close");
+	cost = reopen_on(std::nullopt, "f");
+	check(cost == 5, "a request reopening without the record costs five barriers, not " + std::to_string(cost));
+	check(loop.driver->state(g)->term > term, "and a new term");
 }
 
 // F2: a close whose table commit fails after the shard file was replaced (its directory sync
@@ -1009,8 +1154,104 @@ void pool_bound() {
 	run({peak, 1}, false);
 }
 
+// Quiescence A4: idle CPU per group, at rest against per-group heartbeats. IDLE_CPU_GROUPS
+// leaders (default 1,000) of three-voter groups on one loop, at the default Timing; their two
+// peers' answers are made here, so the peers' own Drivers are not counted. The manual clock moves
+// 1 ms a step for IDLE_CPU_SECONDS (default 2): a step whose advance fires a timer is a wake.
+// IDLE_CPU_MODE rest or heartbeat runs one mode (default both). Reports only, except that groups
+// at rest arm no timer and wake nothing.
+std::uint64_t thread_cpu_ns() {
+	timespec t{}; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
+	return std::uint64_t(t.tv_sec) * 1'000'000'000 + std::uint64_t(t.tv_nsec);
+}
+std::uint64_t env_or(const char* name, std::uint64_t fallback) {
+	const char* v = std::getenv(name);
+	return v && *v ? std::strtoull(v, nullptr, 10) : fallback;
+}
+void idle_cpu_mode(bool quiesce, std::uint64_t groups, std::uint64_t seconds) {
+	// Segments big enough that setup moves no live record forward: forwarding scans every
+	// group per turn (journal's TurnLog::forward_slice), which would make setup quadratic.
+	fl::filesystem unused; Loop loop(unused, false, std::make_shared<HeapIO>(), j::TurnLogOptions{std::uint64_t{256} << 20, 32 << 10, 1, 16, 1 << 20});
+	loop.sink.record_sends = true;
+	// The two peers answer every request at once, as caught-up voters would.
+	std::uint64_t answered = 0;
+	auto answer = [&] {
+		for (;;) {
+			auto sent = std::move(loop.sink.sent); loop.sink.sent.clear();
+			auto committed = std::move(loop.sink.committed); loop.sink.committed.clear();
+			if (sent.empty() && committed.empty()) { return; }
+			for (auto& [g, last] : committed) { loop.driver->applied(g, Applied{last}); }
+			for (auto& [g, send] : sent) {
+				std::optional<Message> reply;
+				if (auto r = std::get_if<PreVoteRequest>(&send.message)) { reply = PreVoteResponse{r->term - 1, r->term, true}; }
+				else if (auto r = std::get_if<VoteRequest>(&send.message)) { reply = VoteResponse{r->term, true}; }
+				else if (auto r = std::get_if<AppendRequest>(&send.message)) {
+					const Index through = r->previous + r->entries.size();
+					reply = AppendResponse{r->term, r->rpc, true, through, through + 1, r->read_probe};
+				}
+				if (reply) { loop.driver->receive(g, Receive{send.peer, std::move(*reply)}); ++answered; }
+			}
+			loop.release();
+		}
+	};
+	GroupOptions o = options({1, 2, 3}, 1);
+	o.timing = Timing{}; o.timing.quiesce = quiesce;
+	const auto made = std::chrono::steady_clock::now();
+	for (GroupId g = 1; g <= groups; ++g) {
+		loop.driver->open(g, o);
+		std::exception_ptr error;
+		if (!loop.settle(loop.driver->create(g, j::Identity{'I', 'C'}), error) || error) { check(false, "create " + std::to_string(g) + ": " + what(error)); return; }
+	}
+	const double created_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - made).count();
+	// Every group campaigns once its election timer fires, and leads once its term entry commits.
+	auto leaders = [&] {
+		std::uint64_t n = 0;
+		for (GroupId g = 1; g <= groups; ++g) { auto st = loop.driver->state(g); n += st && st->role == Role::Leader && st->committed >= 1; }
+		return n;
+	};
+	std::uint64_t leading = 0;
+	for (int n = 1; n <= 4000 && leading != groups; ++n) {
+		loop.scheduler.advance(1'000'000); loop.run(); answer();
+		if (n >= Timing{}.election_max && n % 100 == 0) { leading = leaders(); }
+	}
+	// Then a quiescent group's last round of acknowledgements, a heartbeat group's first beats.
+	for (int n = 1; n <= 1000; ++n) {
+		loop.scheduler.advance(1'000'000); loop.run(); answer();
+		if (n % 50 == 0 && (quiesce ? loop.driver->armed_group_timers() == 0 : n >= 200)) { break; }
+	}
+	const double made_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - made).count();
+	check(leading == groups, std::string(quiesce ? "rest" : "heartbeat") + ": every group leads: " + std::to_string(leading));
+	answered = 0;
+	std::uint64_t wakes = 0, handles = 0;
+	const auto cpu = thread_cpu_ns();
+	for (std::uint64_t step = 0; step < seconds * 1000; ++step) {
+		loop.scheduler.advance(1'000'000);
+		wakes += loop.scheduler.queued() != 0;
+		handles += loop.scheduler.run();
+		answer();
+	}
+	const double spent = double(thread_cpu_ns() - cpu);
+	const auto armed = loop.driver->armed_group_timers();
+	std::printf("idle_cpu %s: %llu groups (created in %.1f s, leading in %.1f s), over %llu s: %.1f wakes/s per host, %.0f handles/s, %.0f answers/s, CPU %.3f s per s (%.1f ns per idle group per s), %zu group timers armed\n",
+				quiesce ? "rest" : "heartbeat", (unsigned long long)groups, created_s, made_s, (unsigned long long)seconds, double(wakes) / double(seconds),
+				double(handles) / double(seconds), double(answered) / double(seconds), spent / 1e9 / double(seconds), spent / double(seconds) / double(groups), armed);
+	if (quiesce) {
+		check(armed == 0, "groups at rest arm no timer: " + std::to_string(armed));
+		check(wakes == 0, "groups at rest wake nothing: " + std::to_string(wakes));
+	}
+}
+void idle_cpu() {
+	const auto groups = env_or("IDLE_CPU_GROUPS", 1000), seconds = env_or("IDLE_CPU_SECONDS", 2);
+	const char* mode = std::getenv("IDLE_CPU_MODE");
+	const std::string m = mode ? mode : "";
+	if (m.empty() || m == "rest") { idle_cpu_mode(true, groups, seconds); }
+	if (m.empty() || m == "heartbeat") { idle_cpu_mode(false, groups, seconds); }
+}
+
 const std::map<std::string, void (*)()> cases{
+	{"idle_cpu", &idle_cpu},
 	{"created_bytes", &created_bytes},
+	{"idle_bytes", &idle_bytes},
 	{"erase_queued", &erase_queued},
 	{"shutdown_idles", &shutdown_idles},
 	{"shutdown_ends", &shutdown_ends},
@@ -1024,6 +1265,7 @@ const std::map<std::string, void (*)()> cases{
 	{"reopen_rows", &reopen_rows},
 	{"closed_bytes", &closed_bytes},
 	{"close_crash", &close_crash},
+	{"reopen_barriers", &reopen_barriers},
 	{"pool_bound", &pool_bound},
 	{"failed_close", &failed_close},
 	{"second_driver", &second_driver},

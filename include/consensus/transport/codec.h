@@ -46,6 +46,8 @@ inline std::string encode(const kronuz::consensus::Message &message,
 				number(7);
 			else if constexpr (std::is_same_v<T, TimeoutNow>)
 				number(8);
+			else if constexpr (std::is_same_v<T, Gone>)
+				number(9);
 			else
 				static_assert(!sizeof(T), "missing control wire tag");
 			number(value.term);
@@ -153,6 +155,9 @@ inline kronuz::consensus::Message decode(std::string_view bytes, kronuz::consens
 		result = TimeoutNow{term, index, get64(bytes)};
 		break;
 	}
+	case 9:
+		result = Gone{term};
+		break;
 	case 2:
 		result = VoteResponse{term, boolean()};
 		break;

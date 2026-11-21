@@ -29,13 +29,91 @@
 #include <algorithm>
 #include <limits>
 #include <map>
-#include <deque>
+#include <memory>
 #include <set>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
 
 namespace kronuz::consensus {
+
+// A replica's consensus position at close (docs/mechanisms/quiescence.md): its hard state,
+// the end of its log, the membership in force and the index it is in force from, and the
+// leader it knew in its term. A matching one reopens the group with no election.
+struct ClosedState {
+	HardState hard;
+	LogBoundary last{0, 0};
+	Membership membership;
+	Index membership_index = 0;
+	NodeId leader = 0;
+	bool operator==(const ClosedState&) const = default;
+};
+// What binds a closed state to one replica of one group: a replaced replica (a new group
+// incarnation in the journal's table, a new member incarnation) never takes another's.
+struct ClosedIdentity {
+	Identity cluster{}, configuration{};
+	std::uint64_t group = 0, incarnation = 0;
+	NodeId local = 0;
+	bool operator==(const ClosedIdentity&) const = default;
+};
+
+namespace closed_detail {
+inline constexpr std::string_view magic{"RFTCLOS1", 8};
+inline constexpr std::size_t fixed_bytes = 132;  // every field but the membership's bytes
+// The record's rules; names the first one broken, null when none is.
+inline const char* invalid(const ClosedState& s, NodeId local) {
+	const auto& h = s.hard;
+	if ((h.term == 0 && h.voted_for) || (h.voted_for && *h.voted_for == 0)) { return "closed state ballot"; }
+	if (h.commit_index > s.last.index || s.last.term > h.term || (s.last.index == 0) != (s.last.term == 0)) { return "closed state log"; }
+	if (s.membership_index > s.last.index) { return "closed state membership index"; }
+	if (s.leader && s.leader == local && h.voted_for != local) { return "closed state leader without its ballot"; }
+	return nullptr;
+}
+} // namespace closed_detail
+
+// RFTCLOS1: the closed state's bytes, CRC32C at the end. Throws std::invalid_argument for a
+// state the record's rules refuse.
+inline std::string encode_closed_state(const ClosedState& state, const ClosedIdentity& id) {
+	using kronuz::journal::put32;
+	using kronuz::journal::put64;
+	if (auto why = closed_detail::invalid(state, id.local)) { throw std::invalid_argument(why); }
+	validate_membership(state.membership, ceilings);
+	auto membership = encode_membership(state.membership);
+	std::string bytes(closed_detail::magic);
+	put32(bytes, static_cast<std::uint32_t>(closed_detail::fixed_bytes + membership.size()));
+	bytes.append(id.cluster.data(), id.cluster.size()); bytes.append(id.configuration.data(), id.configuration.size());
+	for (auto v : {id.group, id.incarnation, id.local, state.hard.term, state.hard.voted_for.value_or(0), state.hard.commit_index,
+			 state.last.index, state.last.term, state.leader, state.membership_index}) { put64(bytes, v); }
+	put32(bytes, static_cast<std::uint32_t>(membership.size())); bytes += membership;
+	put32(bytes, kronuz::journal::crc32c(bytes));
+	return bytes;
+}
+// Throws kronuz::journal::Corruption for damaged bytes, another replica's record, or a state
+// the record's rules refuse.
+inline ClosedState decode_closed_state(std::string_view bytes, const ClosedIdentity& expected) {
+	using kronuz::journal::Corruption;
+	using kronuz::journal::get32;
+	using kronuz::journal::get64;
+	if (bytes.size() < closed_detail::fixed_bytes || bytes.substr(0, 8) != closed_detail::magic) { throw Corruption("closed state magic"); }
+	auto body = bytes.substr(0, bytes.size() - 4), tail = bytes.substr(bytes.size() - 4);
+	if (get32(tail) != kronuz::journal::crc32c(body)) { throw Corruption("closed state checksum"); }
+	body.remove_prefix(8);
+	if (get32(body) != bytes.size()) { throw Corruption("closed state length"); }
+	ClosedIdentity id;
+	std::copy_n(body.begin(), 16, id.cluster.begin()); std::copy_n(body.begin() + 16, 16, id.configuration.begin()); body.remove_prefix(32);
+	id.group = get64(body); id.incarnation = get64(body); id.local = get64(body);
+	if (id != expected) { throw Corruption("closed state of another replica"); }
+	ClosedState s;
+	s.hard.term = get64(body);
+	if (auto vote = get64(body)) { s.hard.voted_for = vote; }
+	s.hard.commit_index = get64(body);
+	s.last.index = get64(body); s.last.term = get64(body);
+	s.leader = get64(body); s.membership_index = get64(body);
+	if (get32(body) != body.size()) { throw Corruption("closed state membership length"); }
+	s.membership = decode_membership(body);
+	if (auto why = closed_detail::invalid(s, id.local)) { throw Corruption(why); }
+	return s;
+}
 
 // One owning executor. No I/O, clock reads, entropy, or application callbacks.
 // Persist changes are staged internally; all dependent actions are deferred.
@@ -150,8 +228,8 @@ public:
 		auto found = peers_.find(peer);
 		return snapshot_active(peer, key) && found->second.snapshot->phase == SnapshotPhase::Sending;
 	}
-	bool busy() const noexcept { return pending_.has_value() || install_.has_value(); }
-	bool transferring() const noexcept { return transfer_.has_value(); }
+	bool busy() const noexcept { return pending_.has_value() || install_; }
+	bool transferring() const noexcept { return transfer_ != nullptr; }
 	// The incarnations a leader replicates to (every member, and removed ones until their
 	// removal commits); empty otherwise.
 	std::vector<NodeId> peers() const {
@@ -223,6 +301,26 @@ public:
 
 	// The leader this node knows of in its term; 0 for none.
 	NodeId leader() const noexcept { return leader_; }
+	// The closed state, when this replica can close now: started, not fenced or retiring,
+	// nothing persisting or out for application, applied at the commit index and a checkpoint
+	// there (docs/mechanisms/quiescence.md). Rest is not required: closing an awake group is
+	// safe, and its reopen may cost an election.
+	std::optional<ClosedState> closed_state() const {
+		if (!started_ || retiring_ || role_ == Role::Fenced || busy() || delivered_through_ || applied_ != durable_.commit_index ||
+			base_index_ != applied_ || membership().members.empty()) { return std::nullopt; }
+		return ClosedState{durable_, {last_index(), log_term(last_index())}, membership(), membership_index(), leader_};
+	}
+	// Before Start: resumes the closed term when `closed` matches the recovered state exactly
+	// (hard state, last index and term, membership and its index); false, changing nothing,
+	// for a stale one. The first storage batch then carries the hard state (the term record).
+	bool reopen(const ClosedState& closed) {
+		if (started_) { throw std::logic_error("reopen after start"); }
+		if (auto why = closed_detail::invalid(closed, configuration_.local)) { throw std::invalid_argument(why); }
+		if (closed.hard != durable_ || closed.last != LogBoundary{last_index(), log_term(last_index())} ||
+			closed.membership != membership() || closed.membership_index != membership_index()) { return false; }
+		resume_ = closed.leader; term_record_ = true;
+		return true;
+	}
 	// The term of the entry at `index`, while the retained log or its base holds it.
 	std::optional<Term> term_at(Index index) const {
 		if (index < base_index_ || index > last_index() || (index == 0 && base_index_ == 0)) { return std::nullopt; }
@@ -234,7 +332,7 @@ public:
 	// misses no timer; an earlier Tick is harmless. A due leader heartbeat or election may be
 	// now or past; every other deadline counts only while ahead of the clock.
 	std::uint64_t next_deadline() const {
-		if (!started_ || retiring_ || role_ == Role::Fenced || busy()) { return maximum; }
+		if (!started_ || retiring_ || role_ == Role::Fenced || busy() || resting_) { return maximum; }
 		if (role_ != Role::Leader) { return is_voter(configuration_.local) && hard_.term != maximum ? election_deadline_ : maximum; }
 		auto at = peers_.empty() ? maximum : heartbeat_deadline_;  // a leader with nobody to heartbeat sleeps
 		auto later = [&](std::uint64_t base, std::uint64_t delay) {
@@ -289,8 +387,9 @@ public:
 		capture_mode_ = true;
 		struct ModeReset { bool& mode; ~ModeReset() { mode = false; } } reset{capture_mode_};
 		auto actions = step(std::move(event));
-		auto capture = std::move(captured_); captured_.reset();
-		if (role_ == Role::Fenced) { capture.reset(); }
+		std::optional<FrozenCheckpoint> capture;
+		if (captured_ && role_ != Role::Fenced) { capture.emplace(std::move(*captured_)); }
+		captured_.reset();
 		return {std::move(actions), std::move(capture)};
 	}
 
@@ -299,9 +398,21 @@ public:
 		retire_log();
 		Actions output;
 		if (role_ == Role::Fenced) { return output; }
-		try { std::visit([&](auto&& value) { handle(std::move(value), output); }, std::move(event)); }
+		try {
+			if (resting_ && wakes(event)) { wake(output); }
+			std::visit([&](auto&& value) { handle(std::move(value), output); }, std::move(event));
+			if (!resting_ && leader_at_rest()) { resting_ = true; }
+		}
 		catch (const std::exception& error) { fence(error.what(), output); }
 		return output;
+	}
+	// Quiescence (docs/mechanisms/quiescence.md): at rest, with no timer armed.
+	bool resting() const noexcept { return resting_; }
+	// The node (Member::node) of the leader this node knows of; 0 for none.
+	NodeId leader_node() const {
+		if (!leader_) { return 0; }
+		auto member = find_member(membership(), leader_);
+		return member ? member->node : leader_;
 	}
 
 private:
@@ -311,7 +422,7 @@ private:
 		Actions deferred; bool retain_suffix, published = false;
 		std::optional<Membership> membership{};
 	};
-	struct Flight { Token rpc; Index previous, through; Token read_probe; std::uint64_t sent; bool keepalive = false; std::uint64_t bytes = 0; };
+	struct Flight { Token rpc; Index previous, through; Token read_probe; std::uint64_t sent; bool keepalive = false; std::uint64_t bytes = 0; Index commit = 0; };
 	enum class SnapshotPhase { AwaitSource, Sending };
 	struct SnapshotFlight { SnapshotKey key; SnapshotPhase phase; std::uint64_t started; };
 	// Up to `pipeline` Append RPCs and `window_bytes` in flight (D15), oldest first, `next`
@@ -320,13 +431,18 @@ private:
 	// peer's last refusal, unanswered by any append or image since, put `next` at or below the
 	// base; only then does an install start, and a `next` there for any other reason probes the base.
 	struct Peer {
-		Index next = 1, matched = 0; std::deque<Flight> flights; std::uint64_t retry_after = 0; std::optional<SnapshotFlight> snapshot{}; std::optional<std::uint64_t> snapshot_retry_clock{}; bool blocked = false;
+		// A few flights (Flow::pipeline): a vector, not a deque's 4 KiB block per idle peer.
+		Index next = 1, matched = 0; std::vector<Flight> flights; std::uint64_t retry_after = 0; std::optional<SnapshotFlight> snapshot{}; std::optional<std::uint64_t> snapshot_retry_clock{}; bool blocked = false;
 		std::optional<Flight> keepalive{}; bool verified = false, lacks_base = false; std::uint64_t window = 0;
+		Index told = 0;  // the commit index an acknowledged append carried
 		// Back to one flight, resuming at `from` (the oldest flight's start: nothing before it is in doubt).
 		void reset_flights(Index from) { flights.clear(); window = 0; verified = false; next = std::max(matched + 1, from); }
 	};
 	struct PendingRead { RequestId request; Token probe; Term term; Index index; std::set<NodeId> acknowledgements; };
 	struct Transfer { NodeId target; Token token; std::uint64_t until; bool sent = false; };
+	// wire_limits' caps, valid for its key: the membership version (from 1) and the committed
+	// membership's index; a zero key holds none.
+	struct WireCap { std::pair<std::uint64_t, Index> key{}; std::size_t command_bytes = 0, rpc_bytes = 0, rpc_entries = 0; };
 	static constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
 	bool is_voter(NodeId incarnation) const { return votes_in(membership(), incarnation); }
 	std::vector<NodeId> voters() const {
@@ -368,8 +484,11 @@ private:
 		// leader asks once per RPC, and the scan is over every member.
 		auto committed_at = configs_.upper_bound(durable_.commit_index);
 		const std::pair<std::uint64_t, Index> key{membership_version_, committed_at == configs_.begin() ? 0 : std::prev(committed_at)->first};
-		if (wire_cache_ && wire_key_ == key) { return *wire_cache_; }
 		Limits out = limits_in_force();
+		if (wire_.key == key) {
+			out.command_bytes = wire_.command_bytes; out.rpc_bytes = wire_.rpc_bytes; out.rpc_entries = wire_.rpc_entries;
+			return out;
+		}
 		auto cap = [&](const Limits& node) {
 			out.command_bytes = std::min(out.command_bytes, node.command_bytes);
 			out.rpc_bytes = std::min(out.rpc_bytes, node.rpc_bytes);
@@ -379,7 +498,7 @@ private:
 		for (NodeId member : replicas()) {
 			if (auto found = peer_limits_.find(member); found != peer_limits_.end()) { cap(found->second); }
 		}
-		wire_cache_ = out; wire_key_ = key;
+		wire_ = WireCap{key, out.command_bytes, out.rpc_bytes, out.rpc_entries};
 		return out;
 	}
 	// What one peer's transport takes: its own node's limits and this node's, which encode
@@ -400,6 +519,56 @@ private:
 		return out;
 	}
 	// A report that fails validation is ignored: a zero limit would empty every RPC.
+	// Quiescence: what ends a rest. A leader's: a frame, a request, a report, or Wake; a
+	// follower's: Wake (its leader's frames decide its rest; LeaderGone or its leader's Gone ends it).
+	bool wakes(const Event& event) const {
+		if (std::holds_alternative<Wake>(event)) { return true; }
+		// A follower wakes on another member's (pre-)vote: its leader, if it still leads, hears
+		// that member too and heartbeats; a leader that stepped down unheard (removed) does not.
+		if (auto receive = std::get_if<Receive>(&event); receive && role_ == Role::Follower && receive->authenticated_peer != leader_ &&
+			(std::holds_alternative<PreVoteRequest>(receive->message) || std::holds_alternative<VoteRequest>(receive->message))) {
+			return true;
+		}
+		return role_ == Role::Leader && (std::holds_alternative<Receive>(event) || std::holds_alternative<Propose>(event) || std::holds_alternative<Read>(event) ||
+			std::holds_alternative<ChangeMembership>(event) || std::holds_alternative<TransferLeadership>(event) || std::holds_alternative<PeerLimits>(event) ||
+			std::holds_alternative<Repair>(event));
+	}
+	// Ends a rest: a leader heartbeats at once, rests again only once every replica acknowledges
+	// that round, and starts CheckQuorum's window afresh; a follower's election timer runs from
+	// now, and it re-acknowledges its durable log to its leader, which wakes on it if it still
+	// leads (a pending persistence answers it on its own).
+	void wake(Actions& output) {
+		resting_ = false;
+		if (role_ == Role::Leader) {
+			for (auto& [id, at] : answered_) { at = now_; }
+			for (auto& [id, peer] : peers_) { peer.told = 0; }
+			heartbeat_deadline_ = now_;
+		} else {
+			leader_contact_ = now_; reset_election();
+			if (leader_ && !busy()) { output.emplace_back(Send{leader_, AppendResponse{hard_.term, token(), true, last_index(), last_index() + 1, 0}}); }
+		}
+	}
+	// A leader at rest has nothing to send: every replica acknowledged its whole log and its
+	// commit index, its term's entry is committed, the membership in force is committed and
+	// settled, and no read, transfer or snapshot is in progress.
+	bool leader_at_rest() const {
+		if (!timing_.quiesce || !started_ || role_ != Role::Leader || busy() || !reads_.empty() || transfer_ || peers_.empty() || witness_self()) { return false; }
+		if (durable_.commit_index != last_index() || log_term(last_index()) != hard_.term) { return false; }
+		const auto& committed = committed_membership();
+		if (committed != membership() || committed.leaving || !votes_in(committed, configuration_.local) || peers_.size() != replicas().size()) { return false; }
+		for (const auto& [id, peer] : peers_) {
+				if (!peer.flights.empty() || peer.snapshot || peer.keepalive || peer.blocked || peer.matched != last_index() || peer.told != durable_.commit_index) { return false; }
+		}
+		return true;
+	}
+	void handle(Wake, Actions&) {}  // step() woke it
+	// The node-pair detector: a follower whose leader is on `node` drops it and elects within its
+	// election timeout, as on a missed heartbeat.
+	void handle(LeaderGone gone, Actions& output) {
+		if (!started_ || role_ != Role::Follower || gone.node == 0 || leader_node() != gone.node) { return; }
+		leader_lost(output);
+	}
+	void leader_lost(Actions& output) { follower(0, output); leader_contact_ = 0; }
 	void handle(PeerLimits report, Actions&) {
 		if (!report.incarnation || report.incarnation == configuration_.local) { return; }
 		try { validate_limits(report.limits); } catch (const std::invalid_argument&) { return; }
@@ -462,12 +631,13 @@ private:
 	void follower(NodeId leader, Actions& deferred) {
 		if (role_ != Role::Follower || leader_ != leader) { deferred.emplace_back(RoleChanged{Role::Follower, hard_.term, leader}); }
 		release_snapshots(SnapshotReleaseReason::LeadershipLost, deferred);
-		role_ = Role::Follower; leader_ = leader; peers_.clear(); grants_.clear(); prevote_.reset(); prevotes_.clear(); answered_.clear(); transfer_.reset();
+		role_ = Role::Follower; leader_ = leader; peers_.clear(); grants_.clear(); prevote_ = 0; prevotes_.clear(); answered_.clear(); transfer_.reset(); resting_ = false;
 		for (const auto& read : reads_) { deferred.emplace_back(Reject{read.request, RejectReason::NotLeader}); }
 		reads_.clear(); reset_election();
 	}
 	void persist(StorageBatch batch, Actions deferred, Actions& output, bool elected = false) {
 		if (busy()) { throw std::logic_error("overlapping persistence"); }
+		if (std::exchange(term_record_, false) && !batch.hard) { batch.hard = hard_; }
 		auto id = token();
 		pending_.emplace(Pending{id, hard_, std::move(deferred), elected, std::nullopt});
 		output.emplace_back(Persist{id, std::move(batch)});
@@ -475,9 +645,12 @@ private:
 	void handle(Start, Actions& output) {
 		if (started_) { return; }
 		started_ = true; reset_election();
+		// A reopen resumes its closed term: as its leader, or following the leader it knew.
+		if (resume_ == configuration_.local) { lead(); output.emplace_back(RoleChanged{role_, hard_.term, leader_}); }
+		else if (resume_) { follower(resume_, output); leader_contact_ = now_; }
 		// X5: the only voter, with no witness, needs nobody's vote: its election is due at once,
 		// so the next Tick campaigns at the same clock and its admission funds the ballot.
-		if (lone_voter()) { election_deadline_ = now_; }
+		else if (lone_voter()) { election_deadline_ = now_; }
 		deliver(output);
 	}
 	bool lone_voter() const {
@@ -572,9 +745,9 @@ private:
 		}
 		}
 		Actions deferred; hard_ = next_hard; follower(request.authenticated_peer, deferred); leader_contact_ = now_;
-		auto id = token(); install_.emplace(PendingInstall{id, request.prepared, request.request, request.boundary, next_hard, std::move(deferred), retain});
+		auto id = token(); install_ = std::make_unique<PendingInstall>(PendingInstall{id, request.prepared, request.request, request.boundary, next_hard, std::move(deferred), retain});
 		install_->membership = request.membership;
-		if (capture_mode_) { captured_ = FrozenCheckpoint(*this, id, state, retain ? entries_.size() - static_cast<std::size_t>(request.boundary.index - base_index_) : 0); }
+		if (capture_mode_) { captured_ = std::make_unique<FrozenCheckpoint>(FrozenCheckpoint(*this, id, state, retain ? entries_.size() - static_cast<std::size_t>(request.boundary.index - base_index_) : 0)); }
 		output.emplace_back(PersistInstall{id, request.prepared, std::move(state)});
 	}
 	void handle(InstallActivated completion, Actions& output) {
@@ -637,7 +810,7 @@ private:
 		auto id = token();
 		Actions deferred; deferred.emplace_back(CheckpointPublished{request.request, request.through});
 		pending_.emplace(Pending{id, durable_, std::move(deferred), false, std::pair{request.through, request.term}});
-		if (capture_mode_) { captured_ = FrozenCheckpoint(*this, id, state, entries_.size() - first); }
+		if (capture_mode_) { captured_ = std::make_unique<FrozenCheckpoint>(FrozenCheckpoint(*this, id, state, entries_.size() - first)); }
 		output.emplace_back(PersistCheckpoint{id, request.capture, std::move(state)});
 	}
 	void handle(Failed failure, Actions& output) {
@@ -742,7 +915,7 @@ private:
 		start_transfer(request.target, output);
 	}
 	void start_transfer(NodeId target, Actions& output) {
-		transfer_ = Transfer{target, token(), deadline(timing_.election_max)};
+		transfer_ = std::make_unique<Transfer>(Transfer{target, token(), deadline(timing_.election_max)});
 		auto& peer = peers_.at(target);
 		if (peer.next <= last_index()) { replicate(target, peer, output, needed_probe(target)); }
 		timeout_now(output);
@@ -824,6 +997,11 @@ private:
 			bool grant = request->term > hard_.term && !heard_from_leader() && log_up_to_date(request->last_index, request->last_term);
 			output.emplace_back(Send{receive.authenticated_peer, PreVoteResponse{hard_.term, request->term, grant}}); return;
 		}
+		// Gone ends its sender's leadership in its own term only, as LeaderGone; it never raises a term.
+		if (auto gone = std::get_if<Gone>(&receive.message)) {
+			if (role_ == Role::Follower && leader_ == receive.authenticated_peer && gone->term == hard_.term) { leader_lost(output); }
+			return;
+		}
 		// The leader-contact guard: a voter that heard from a current leader within
 		// election_min ignores a vote request unless it comes from a leadership transfer.
 		if (auto request = std::get_if<VoteRequest>(&receive.message); request && !request->transfer && heard_from_leader()) { return; }
@@ -854,12 +1032,17 @@ private:
 	bool valid(const PreVoteRequest& request) const { return valid(VoteRequest{request.term, request.last_index, request.last_term}); }
 	bool valid(const PreVoteResponse& response) const { return response.request_term > 0; }
 	bool valid(const TimeoutNow& request) const { return request.term > 0 && request.token > 0 && request.last_index < maximum; }
+	bool valid(const Gone& gone) const { return gone.term > 0; }
 	bool log_up_to_date(Index index, Term term) const {
 		return term > log_term(last_index()) || (term == log_term(last_index()) && index >= last_index());
 	}
 	// A leader is a current leader too: it refuses pre-votes and ignores untransferred votes,
 	// so a rejoining node cannot depose it (D7); CheckQuorum removes a leader cut off.
-	bool heard_from_leader() const { return role_ == Role::Leader || (role_ == Role::Follower && leader_ != 0 && now_ - leader_contact_ < timing_.election_min); }
+	// A follower at rest wakes on another member's (pre-)vote, and the wake holds its leader
+	// current (wake()); its leader's own campaign does not wake it, so it is answered.
+	bool heard_from_leader() const {
+		return role_ == Role::Leader || (role_ == Role::Follower && leader_ != 0 && now_ - leader_contact_ < timing_.election_min);
+	}
 	bool valid(const VoteResponse&) const { return true; }
 	bool valid(const SnapshotResponse& response) const { return valid_snapshot_response(response); }
 	bool valid(const AppendResponse& response) const {
@@ -893,8 +1076,9 @@ private:
 			!self || self->role != MemberRole::Voter || acted_timeout_ == std::pair{source, request.token}) { return; }
 		acted_timeout_ = {source, request.token}; timed_out_ = true;
 	}
+	void receive_message(NodeId, Gone, StorageBatch&, Actions&) {}  // handled in handle(Receive)
 	void receive_message(NodeId source, PreVoteResponse response, StorageBatch&, Actions& output) {
-		if (!prevote_ || response.request_term != *prevote_ || !response.granted || role_ == Role::Leader || !is_voter(source)) { return; }
+		if (!prevote_ || response.request_term != prevote_ || !response.granted || role_ == Role::Leader || !is_voter(source)) { return; }
 		prevotes_.insert(source);  // handle(Receive) campaigns once the quorum is in and nothing persists
 	}
 	void receive_message(NodeId source, VoteResponse response, StorageBatch&, Actions& output) {
@@ -971,6 +1155,11 @@ private:
 		// committed; a later leader may report less, and the bound follows it down.
 		witness_bound_ = std::min({request.data_matched, verified, request.commit});
 		hard_.commit_index = std::max(hard_.commit_index, std::min(request.commit, verified));
+		// Quiescence: the leader's commit covers this whole log, so its next frame may be long off;
+		// never under a leader whose removal is in force or pending, which steps down unheard.
+		const auto& committed = committed_membership();
+		resting_ = timing_.quiesce && request.commit >= verified && verified == last_index() && committed == membership() &&
+			votes_in(committed, source) && committed.leaving != source;
 		output.emplace_back(Send{source, AppendResponse{hard_.term, request.rpc, true, verified, verified + 1, request.read_probe}});
 	}
 	// Adds a log mutation to a step's batch: a later one starts within or right after the
@@ -1007,6 +1196,7 @@ private:
 			return;
 		} else if (response.success) {
 			if (response.matched != at->through) { return; }
+			peer.told = std::max(peer.told, at->commit);
 			acknowledge_read(source, response.read_probe);
 			acknowledge(source, peer, response.matched, output);
 		} else {
@@ -1040,7 +1230,7 @@ private:
 	// ending there is done; later ones stay in flight.
 	void acknowledge(NodeId source, Peer& peer, Index matched, Actions& output) {
 		peer.matched = std::max(peer.matched, matched);
-		while (!peer.flights.empty() && peer.flights.front().through <= peer.matched) { peer.window -= peer.flights.front().bytes; peer.flights.pop_front(); }
+		while (!peer.flights.empty() && peer.flights.front().through <= peer.matched) { peer.window -= peer.flights.front().bytes; peer.flights.erase(peer.flights.begin()); }
 		peer.next = std::max(peer.next, peer.matched + 1);
 		if (peer.flights.empty() || peer.flights.front().previous <= peer.matched) { peer.verified = true; }
 		if (!peer.blocked) { peer.retry_after = 0; }
@@ -1068,7 +1258,7 @@ private:
 
 	// `tick`: an admitted Tick drives, whose admission funds a campaign or a due D3 removal.
 	void drive(Actions& output, bool tick) {
-		if (!started_ || busy()) { return; }
+		if (!started_ || busy() || resting_) { return; }
 		if (role_ != Role::Leader) {
 			// Campaigns require a separately admitted Tick. Slow persistence
 			// must not start another election from its completion callback.
@@ -1079,7 +1269,7 @@ private:
 			// node that cannot win never raises the group's term.
 			prevote_ = hard_.term + 1; prevotes_ = {configuration_.local}; reset_election();
 			for (NodeId voter : voters()) {
-				if (voter != configuration_.local) { output.emplace_back(Send{voter, PreVoteRequest{*prevote_, last_index(), log_term(last_index())}}); }
+				if (voter != configuration_.local) { output.emplace_back(Send{voter, PreVoteRequest{prevote_, last_index(), log_term(last_index())}}); }
 			}
 			return;
 		}
@@ -1136,8 +1326,8 @@ private:
 		if (heartbeat) { heartbeat_deadline_ = deadline(timing_.heartbeat); }
 	}
 	void campaign(Actions& output, bool transfer = false) {
-		++hard_.term; hard_.voted_for = configuration_.local; prevote_.reset(); prevotes_.clear();
-		role_ = Role::Candidate; leader_ = 0; grants_ = {configuration_.local}; reset_election();
+		++hard_.term; hard_.voted_for = configuration_.local; prevote_ = 0; prevotes_.clear();
+		role_ = Role::Candidate; leader_ = 0; grants_ = {configuration_.local}; resting_ = false; reset_election();
 		Actions deferred; deferred.emplace_back(RoleChanged{role_, hard_.term, 0});
 		for (NodeId voter : voters()) {
 			if (voter != configuration_.local) { deferred.emplace_back(Send{voter, VoteRequest{hard_.term, last_index(), log_term(last_index()), transfer}}); }
@@ -1149,17 +1339,25 @@ private:
 		if (last_index() >= maximum - 1 || entries_.charged_entries() >= std::min(limits_in_force().log_entries, retained_.log_entries)) {
 			follower(0, output); return; // Control reserve exhausted: fail closed.
 		}
+		lead();
+		Entry noop{last_index() + 1, hard_.term, EntryKind::NoOp, {}}; entries_.push_back(noop);
+		Actions deferred; deferred.emplace_back(RoleChanged{role_, hard_.term, leader_});
+		persist(StorageBatch{std::nullopt, LogMutation{noop.index, {noop}}}, std::move(deferred), output);
+	}
+	// Leads this term from now: every replica from the next index, CheckQuorum's window afresh,
+	// a heartbeat due at once.
+	void lead() {
 		role_ = Role::Leader; leader_ = configuration_.local; peers_.clear(); grants_.clear(); answered_.clear(); transfer_.reset();
-		leadership_start_ = now_; handed_off_ = false;
+		leadership_start_ = now_; handed_off_ = false; resting_ = false;
 		for (NodeId replica : replicas()) {
 			peers_.emplace(replica, Peer{last_index() + 1, 0, {}});
 			if (is_voter(replica)) { answered_[replica] = now_; }
 		}
-		Entry noop{last_index() + 1, hard_.term, EntryKind::NoOp, {}}; entries_.push_back(noop);
-		Actions deferred; deferred.emplace_back(RoleChanged{role_, hard_.term, leader_});
-		persist(StorageBatch{std::nullopt, LogMutation{noop.index, {noop}}}, std::move(deferred), output);
 		heartbeat_deadline_ = now_;
 	}
+	// The index the membership in force is known from: its Configuration entry while the
+	// retained log holds it, else the base index.
+	Index membership_index() const noexcept { return configs_.empty() ? base_index_ : configs_.rbegin()->first; }
 	void snapshot_keepalive(NodeId id, Peer& peer, Actions& output) {
 		if (peer.keepalive && now_ - peer.keepalive->sent < timing_.heartbeat) { return; }
 		auto rpc = token(); peer.keepalive = Flight{rpc, 0, 0, 0, now_, true};
@@ -1199,7 +1397,7 @@ private:
 		peer.blocked = batch.empty() && peer.next <= last_index();
 		if (peer.blocked) { peer.retry_after = deadline(timing_.heartbeat); ++held_back_; }
 		auto rpc = token(); peer.lacks_base = false;  // this append may change what the peer holds
-		peer.flights.push_back(Flight{rpc, previous, previous + batch.size(), probe, now_, false, bytes});
+		peer.flights.push_back(Flight{rpc, previous, previous + batch.size(), probe, now_, false, bytes, durable_.commit_index});
 		peer.window += bytes;
 		peer.next = previous + batch.size() + 1;  // optimistic (Raft §10.2.1)
 		output.emplace_back(Send{id, AppendRequest{hard_.term, rpc, previous, log_term(previous), durable_.commit_index, probe, std::move(batch), data_matched()}});
@@ -1264,36 +1462,38 @@ private:
 	RetainedStatePolicy retained_;
 	Timing timing_;
 	Flow flow_;
-	Role role_ = Role::Follower;
 	NodeId leader_ = 0;
 	std::size_t log_bytes_ = 0;
 	std::uint64_t now_ = 0, election_delay_, election_deadline_ = 0, heartbeat_deadline_ = 0;
 	Token next_token_ = 0;
 	Index applied_ = 0, delivered_through_ = 0;
 	std::uint64_t epoch_ = 0;
+	Role role_ = Role::Follower;  // beside the flags: one word holds them
 	bool started_ = false, capture_mode_ = false, retiring_ = false;
-	std::optional<FrozenCheckpoint> captured_;
+	bool timed_out_ = false;  // acted on a TimeoutNow; campaigns once durable
+	bool handed_off_ = false;  // a self-removing leader tried its transfer
+	bool term_record_ = false;  // a reopen's first batch carries the hard state
+	bool resting_ = false;  // quiescence: at rest, its timers stopped
+	std::unique_ptr<FrozenCheckpoint> captured_;  // rare state off the idle object: a checkpoint's capture
 	std::shared_ptr<CaptureOwner> capture_owner_ = std::make_shared<CaptureOwner>(CaptureOwner{this});
 	std::optional<Pending> pending_;
-	std::optional<PendingInstall> install_;
+	std::unique_ptr<PendingInstall> install_;  // rare state off the idle object: an installation
 	std::map<NodeId, Peer> peers_;
 	std::set<NodeId> grants_;
-	std::optional<Term> prevote_;  // the term a pre-vote in progress asks for
+	Term prevote_ = 0;  // the term a pre-vote in progress asks for, above 0; 0 for none
 	std::set<NodeId> prevotes_;
 	std::map<NodeId, std::uint64_t> answered_;  // a leader's last answer from each voter
 	std::uint64_t leader_contact_ = 0;
 	std::vector<PendingRead> reads_;
-	std::optional<Transfer> transfer_;  // a leader's transfer in progress (D6)
+	std::unique_ptr<Transfer> transfer_;  // a leader's transfer in progress (D6), off the idle object
 	std::pair<NodeId, Token> acted_timeout_{};  // the last TimeoutNow this node acted on
-	bool timed_out_ = false;
 	std::uint64_t leadership_start_ = 0;  // when this node last became leader
 	std::uint64_t held_back_ = 0;  // appends sent empty: the peer's next entry is above its limits
 	std::map<NodeId, Limits> peer_limits_;  // members' node limits, as the host reported them
-	std::uint64_t membership_version_ = 0;  // bumped whenever a membership or a report changes
-	mutable std::optional<Limits> wire_cache_;
-	mutable std::pair<std::uint64_t, Index> wire_key_{};
-	bool handed_off_ = false;  // a self-removing leader tried its transfer
+	std::uint64_t membership_version_ = 1;  // bumped whenever a membership or a report changes
+	mutable WireCap wire_;
 	Index witness_bound_ = 0;  // a witness truncates only through this (D9)
+	NodeId resume_ = 0;  // a reopen's leader at close, resumed at Start
 };
 
 } // namespace kronuz::consensus

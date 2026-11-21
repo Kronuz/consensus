@@ -1222,6 +1222,16 @@ inline void send_message(HostTransport &transport, std::uint32_t loop, GroupId g
 	const auto kind = append && !append->entries.empty() ? FrameKind::data : FrameKind::control;
 	transport.send(loop, LinkLane::Control, kind, {group, local, send.peer}, node, encode(send.message, limits));
 }
+// The Driver's SendTransfer for `group`, from its incarnation `local` to `peer` on `node`: one
+// snapshot transfer frame (RFTXFR01), a data frame on Bulk within the group's credit.
+inline void send_transfer(HostTransport &transport, std::uint32_t loop, GroupId group, kronuz::consensus::NodeId local,
+						  kronuz::consensus::NodeId node, kronuz::consensus::NodeId peer, std::string_view frame) {
+	transport.send(loop, LinkLane::Bulk, FrameKind::data, {group, local, peer}, node, frame);
+}
+// Whether a received message is a snapshot transfer frame (the Driver's transfer()), not a Receive.
+inline bool is_transfer(const Received &received) noexcept {
+	return std::string_view(received.payload).substr(0, 8) == "RFTXFR01";
+}
 // A received message as the Driver's Receive from its source incarnation; nullopt when its bytes
 // do not decode. The transport admitted the source by the per-frame rule.
 inline std::optional<kronuz::consensus::Receive> receive_message(const Received &received,

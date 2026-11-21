@@ -104,7 +104,9 @@ struct NodeSink {
 	void operator()(GroupId, Send notice);
 	void operator()(GroupId, Committed notice);
 	void operator()(GroupId, RoleChanged notice);
-	void operator()(GroupId, ActivateInstall notice);
+	void operator()(GroupId, SendTransfer notice);
+	void operator()(GroupId, ValidateImage notice);
+	void operator()(GroupId, ActivateImage notice);
 	void operator()(GroupId, CheckpointPublished notice);
 	void operator()(GroupId, RepairCompleted notice);
 	void operator()(GroupId, SnapshotNeeded notice);
@@ -772,7 +774,9 @@ void NodeSink::operator()(GroupId g, SnapshotNeeded notice) {
 	++sim->snapshots_needed[g];
 	trace("node %llu group %llu SnapshotNeeded for peer %llu", (unsigned long long)node->id, (unsigned long long)g, (unsigned long long)notice.peer);
 }
-void NodeSink::operator()(GroupId g, ActivateInstall) {
+void NodeSink::operator()(GroupId, SendTransfer) { fail("a transfer frame without snapshots"); }
+void NodeSink::operator()(GroupId, ValidateImage) { fail("a validation without snapshots"); }
+void NodeSink::operator()(GroupId g, ActivateImage) {
 	if (sim->witness(node->id, g)) { fail("a witness member was asked to activate an image"); }
 }
 

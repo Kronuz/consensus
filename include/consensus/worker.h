@@ -221,7 +221,7 @@ public:
 		if (closing_ || fenced() || !core_) { return false; }
 		if (maintenance_io_ || io_job_) { return (maintenance_io_ && maintenance_io_->done()) || (io_job_ && io_job_->done()); }
 		return !store_.accounting() || !initialization_.empty() || maintenance_due() || persist_ || application_ || completion_ ||
-			activation_completion_ || installation_waiting() || (timer_blocked_ && !cutover_debt_) || preparation_runnable() || source_runnable() || !held_.empty();
+			activation_completion_ || (timer_blocked_ && !cutover_debt_) || preparation_runnable() || source_runnable() || !held_.empty();
 	}
 	Index base_index() const noexcept { return core_ ? core_->base_index() : 0; }
 	LogBoundary base_boundary() const noexcept { return core_ ? core_->base_boundary() : LogBoundary{}; }
@@ -389,6 +389,12 @@ public:
 		if (fenced() || !checkpoint_ || id.owner_ != checkpoint_owner_ || id.token_ != checkpoint_->token) { return std::nullopt; }
 		auto incoming = std::get_if<Incoming>(&checkpoint_->mode); return incoming ? std::optional<SnapshotContext>{incoming->context} : std::nullopt;
 	}
+	// The incoming image's verified bytes, from its verified EOF until the snapshot ends.
+	kronuz::journal::ArtifactReader* snapshot_image(const SnapshotId& id) {
+		auto operation = fenced() ? nullptr : find_snapshot(id);
+		auto incoming = operation && !operation->cancel_reason ? std::get_if<Incoming>(&operation->mode) : nullptr;
+		return incoming && incoming->reader ? &*incoming->reader : nullptr;
+	}
 	CancelResult reject_snapshot_validation(const SnapshotId& id) { return cancel_snapshot(id, SnapshotReason::InvalidApplication); }
 	CancelResult cancel_snapshot(const SnapshotId& id) { return cancel_snapshot(id, SnapshotReason::Canceled); }
 	const SnapshotResult* pending_snapshot_result() const noexcept { return snapshot_result_ ? &*snapshot_result_ : nullptr; }
@@ -526,7 +532,7 @@ public:
 				completion_ = Persisted{persist_->token}; persist_.reset(); ++foreground_; return TurnResult::Stored;
 			}
 			if (!output_.empty()) {
-				if (preparation_runnable() || source_ || installation_waiting()) { maintenance(); return fenced() ? TurnResult::Fenced : maintenance_io_ ? TurnResult::IOPending : capture_funding_pressure_ ? TurnResult::Pressure : TurnResult::Maintenance; }
+				if (preparation_runnable() || source_) { maintenance(); return fenced() ? TurnResult::Fenced : maintenance_io_ ? TurnResult::IOPending : capture_funding_pressure_ ? TurnResult::Pressure : TurnResult::Maintenance; }
 				return TurnResult::Blocked;
 			}
 			if (application_) {
@@ -549,7 +555,8 @@ public:
 				ingest(core_->step(current_time)); auto value = *activation_completion_; activation_completion_.reset();
 				ingest(core_->step(value)); ++foreground_; return TurnResult::Completed;
 			}
-			if (installation_waiting()) { maintenance(); return fenced() ? TurnResult::Fenced : maintenance_io_ ? TurnResult::IOPending : capture_funding_pressure_ ? TurnResult::Pressure : TurnResult::Maintenance; }
+			// An installed image waits for its activation, which only the application moves.
+			if (installation_waiting()) { if (core_->busy()) { ingest(core_->step(current_time)); } return TurnResult::Blocked; }
 			if (timer_blocked_ && !cutover_debt_) {
 				auto result = submit(current_time, true);
 				if (result == SubmitResult::Accepted) { timer_blocked_ = false; timer_due_ = true; return TurnResult::Idle; }

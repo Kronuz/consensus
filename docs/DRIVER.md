@@ -249,7 +249,7 @@ descriptor), Accepted, Chunk (offset, up to 64 KiB, final), Credit (cumulative, 
 chunk it names), Result (installed, caught up, rejected or failed, with the receiver's term) and
 Cancel. A sender keeps `SnapshotLimits::window` chunks in flight. The Sink's `SendTransfer` is
 one whole frame for the peer incarnation `peer`; the host sends it with
-`transport::send_transfer(transport, loop, group, local, node, frame)`, a data frame on the Bulk
+`transport::send_transfer(transport, loop, group, local, node, transfer.peer, transfer.frame)`, a data frame on the Bulk
 connection. A received message whose payload `transport::is_transfer` names goes to
 `transfer(group, received.route.source, std::move(received.payload))`; every other one to
 `receive`. A frame is bound to its group's cluster and configuration identities and to its

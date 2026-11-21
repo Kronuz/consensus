@@ -46,6 +46,10 @@ endif()
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	enable_testing()
 	file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/.scratch")  # the tests' state
+	# faultlab's faultfs, the crash model the journal tests run on; test-only. It reuses the
+	# completion target declared above.
+	FetchContent_Declare(faultlab GIT_REPOSITORY https://github.com/Kronuz/faultlab.git GIT_TAG a3b71d1b9bdcfa3664dbce8725f14c07bb14845f)
+	FetchContent_MakeAvailable(faultlab)
 	foreach(t consensus checkpoint_encoder retained_log retirement simulation membership pipeline retained_state)
 		add_executable(consensus_${t}_test test/${t}_test.cc)
 		target_link_libraries(consensus_${t}_test PRIVATE consensus::consensus)
@@ -179,6 +183,11 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 		target_link_libraries(consensus_worker_completion_bench PRIVATE consensus::consensus completion::asio reactor::reactor)
 	endif()
 
+	# The tests that build a journal run it on faultfs.
+	foreach(t simulation shared_worker shared_cluster wave_open waiter blocking_entry driver)
+		target_link_libraries(consensus_${t}_test PRIVATE faultlab::faultlab)
+	endforeach()
+
 	# Transport tests; they check with assert, so NDEBUG stays off.
 	# The fixture's certificates come from the openssl beside the linked library: macOS's
 	# /usr/bin/openssl is LibreSSL, whose certificates OpenSSL 3 rejects.
@@ -197,6 +206,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 		add_test(NAME consensus_transport_${t} COMMAND consensus_transport_${t}_test)
 		set_tests_properties(consensus_transport_${t} PROPERTIES TIMEOUT 30)
 	endforeach()
+	target_link_libraries(consensus_transport_peers_test PRIVATE faultlab::faultlab)  # its Nodes' journal runs on faultfs
 	set_tests_properties(consensus_transport_peers PROPERTIES TIMEOUT 50)  # under TSan a run takes up to 25 s
 	# A scenario that throws with its voters running reports the failure instead of hanging.
 	add_test(NAME consensus_transport_peers_throwing COMMAND consensus_transport_peers_test throwing)

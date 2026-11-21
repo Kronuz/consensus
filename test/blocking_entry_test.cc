@@ -29,7 +29,7 @@
 // under TSan.
 //   blocking_entry_test [case]
 #include "consensus/driver.h"
-#include "journal/memory_io.h"
+#include "faultlab/faultfs.h"
 
 #include <chrono>
 #include <cstdio>
@@ -40,7 +40,7 @@
 
 using namespace kronuz::consensus;
 namespace j = kronuz::journal;
-namespace jt = kronuz::journal::testing;
+namespace fl = kronuz::faultlab;
 
 namespace {
 
@@ -80,14 +80,15 @@ struct Sink {
 };
 
 struct Entry {
-	jt::Disk disk;
+	fl::filesystem disk;
 	task::blocking_scheduler scheduler;
 	j::InlineCompletion io;
 	std::unique_ptr<j::Host> host;
 	Sink sink;
 	std::unique_ptr<Driver<Sink>> driver;
 	Entry() {
-		host = std::make_unique<j::Host>(std::make_shared<jt::MemoryIO>(disk, "host/"), j::Identity{'B', 'E'}, j::HostOptions{1, turn_options});
+		disk.make_directory("host");
+		host = std::make_unique<j::Host>(std::make_shared<fl::io>(disk, "host"), j::Identity{'B', 'E'}, j::HostOptions{1, turn_options});
 		driver = std::make_unique<Driver<Sink>>(Seams{task::scheduler_ref::of(scheduler), j::completion_ref::of(io), *host, 0, 3}, sink);
 		sink.driver = driver.get();
 	}

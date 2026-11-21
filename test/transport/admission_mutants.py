@@ -23,6 +23,8 @@ mutant_commit.MUTANTS = {
     # A5: an issuer takes any token
     "any-token": (T + "admission_join.h", "\t\tif (secret.size() != secret_.size() || CRYPTO_memcmp(secret.data(), secret_.data(), secret_.size()) != 0)",
                   "\t\tif (false)"),
+    # connection_test peer_gone: a connection's writes raise SIGPIPE on a closed peer
+    "send-signals": (T + "connection.h", "data, std::size_t(n), MSG_NOSIGNAL);", "data, std::size_t(n), 0);"),
     # A2: a removal leaves the node's links up
     "remove-keeps-links": (T + "links.h", "\t\t\t\t\tif (link)\n\t\t\t\t\t\tlink->connection->abort();",
                            "\t\t\t\t\tif (link)\n\t\t\t\t\t\t(void)link;"),

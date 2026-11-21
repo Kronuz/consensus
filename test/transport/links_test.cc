@@ -8,7 +8,6 @@
 #include <asio/post.hpp>
 #include <atomic>
 #include <cassert>
-#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -388,7 +387,6 @@ constexpr Case cases[] = {{"dial", dial},	  {"simultaneous", simultaneous},	  {"
 int main(int argc, char **argv) {
 	assert(argc >= 2);
 	fixture = argv[1];
-	std::signal(SIGPIPE, SIG_IGN);  // the host's duty where SO_NOSIGPIPE is missing (connection.h)
 	int ran = 0;
 	for (const auto &c : cases) {
 		if (argc > 2 && std::strcmp(argv[2], c.name) != 0)

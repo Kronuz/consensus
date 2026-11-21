@@ -18,8 +18,8 @@
 #include <cstdlib>
 #include <filesystem>
 #include <functional>
+#include <faultlab/faultfs.h>
 #include <journal/journal.h>
-#include <journal/memory_io.h>
 #include <openssl/pem.h>
 #include <openssl/x509v3.h>
 #include <thread>
@@ -207,8 +207,8 @@ FixedConfiguration fixed(NodeId local) {
 
 // The transport's host: a Worker over in-memory storage and its snapshot channel.
 struct Node {
-	kronuz::journal::testing::Disk disk;
-	kronuz::journal::testing::MemoryIO io{disk};
+	kronuz::faultlab::filesystem disk;
+	kronuz::faultlab::io io{disk};
 	Worker worker_;
 	SnapshotChannel channel_;
 	std::vector<std::string> commands;

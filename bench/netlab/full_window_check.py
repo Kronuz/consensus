@@ -4,7 +4,10 @@
 #
 # Usage: full_window_check.py OUT (a netlab bench run's result-3.json and diag-3.jsonl; docs/mechanisms/append-pacing.md).
 """A3's bar on a netlab run: after a 10 s warmup of the sustained large load, every 5 s window
-advances the applied index, no role changes during the load, and large_throughput answers."""
+advances the applied index, no role changes during the load, and large_throughput answers.
+
+The windows end where the load does: the bench stops sampling when the load answers, which is
+at its seconds or sooner, when it commits its 128 MiB cap (2048 x 64 KiB)."""
 
 from __future__ import annotations
 
@@ -43,15 +46,19 @@ def main(out: Path, label: str = "65536B-32") -> int:
             if applied:
                 samples.append((float(s["t"]), max(applied)))
         windows = []
+        ran = 0.0
         if samples and seconds:
             t0 = samples[0][0]
-            edges = [t0 + 10 + 5 * i for i in range(int((seconds - 10) // 5) + 1)]
+            ran = min(seconds, samples[-1][0] - t0)
+            edges = [t0 + 10 + 5 * i for i in range(int((ran - 10) // 5) + 1)]
             windows = [
                 (round(b - t0), applied_at(samples, a), applied_at(samples, b))
                 for a, b in pairwise(edges)
             ]
         stalled = [w for w in windows if w[2] <= w[1]]
-        print(f"   windows (end s, applied at start, at end): {windows}")
+        print(
+            f"   load ran {ran:.1f} s of {seconds:g}; windows (end s, applied at start, at end): {windows}"
+        )
         passed = "error" not in lt and not roles and bool(windows) and not stalled
         print(
             f"   {'PASS' if passed else 'FAIL'}: answered={'error' not in lt} role_changes={len(roles)} windows={len(windows)} stalled={len(stalled)}"

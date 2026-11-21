@@ -76,4 +76,16 @@ In a longer scratch model of the same links (32 in flight, 20 s), pacing matched
 throughput at 10,000 B/ms (752 against 770 commits) and beat it at 3,000 B/ms (31.4 against
 11.2 commits/s) and 1,500 B/ms (15.7 against 3.3).
 
-The netem bench itself is criterion A3 of Detent's consensus-full-window-stall quest.
+The netem bench is criterion A3 of Detent's consensus-full-window-stall quest. Its sustained run
+keeps 32 x 64 KiB in flight for 60 s over three nodes at 20 ms, and
+`bench/netlab/full_window_check.py` checks that every 5 s window after the first 10 s commits,
+with no role change. The windows end where the load does: the bench caps a load at 128 MiB
+(2,048 x 64 KiB), so a fast load answers before 60 s.
+
+| Shape | Before (consensus:8801b99) | After |
+|---|---|---|
+| 1% loss | elections from 2 s, nothing applied in 60 s, no answer in 90 s | 0.44 MB/s, every window commits, no role change |
+| 5% reorder | 1.82 MB/s, p99 2,784 ms, every window commits | 3.15 MB/s, p99 1,253 ms, its 2,048 commits in 42.6 s |
+
+Under reordering the leader's paced appends average 213 to 794 KiB (median 576 KiB, largest 1,152
+KiB) where the unpaced leader sends 2 MiB; nothing shrank them to a stall.

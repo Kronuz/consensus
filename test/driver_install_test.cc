@@ -479,7 +479,7 @@ void crash() {
 		auto* l = c.leader();
 		check(l && three.applied == l->applied, "after the cut at operation " + std::to_string(k) + " node 3's application state equals the leader's");
 	}
-	check(cuts > 0 && old_replica > 0 && new_replica > 0, "cuts land before and after the install is durable");
+	check(cuts > 0 && old_replica > 0 && new_replica > 0 && resumed > 0, "cuts land before the install is durable, after it, and between its publish and activated()");
 	std::cerr << "crash: " << span << " operations, " << cuts << " cuts: " << old_replica << " old replicas, " << new_replica << " new (" << resumed << " activated at recovery)\n";
 }
 

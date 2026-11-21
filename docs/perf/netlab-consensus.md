@@ -32,7 +32,7 @@ TABLE_WHERE
   inside one kernel; and one kernel gives every node one clock.
 - **Each shape** starts a fresh cluster and runs, in order:
   1. Round trip (A1): ping from node 1 to each peer, 10 replies each; the median must be within
-     10% of the set round trip past the held floor, below.
+     10% of the set round trip past the guest's floor at that delay, below.
   2. Majority only (A1): the leader and as many followers as keep it a minority are cut off
      (netlab `partition` both ways); a write on the cut leader must stay unacknowledged through
      the heal, while the majority's new leader commits one.
@@ -53,19 +53,25 @@ TABLE_WHERE
   when refused (`rejected`, `superseded`); one unanswered for 1 s stays open (unknown) and its
   client takes a new name. The new leader must be elected within one election: `election_max` +
   heartbeat + 2 round trips + 200 ms.
-- **Held floor.** netem in the guest pays its timer's latency each time it holds a packet, so
-  every delayed shape reads above its setting by a constant. The floor is ping's median with netem
-  holding each packet 1 us each way, measured before the shapes; the unshaped round trip is
-  recorded beside it.
+- **Floor at a delay.** netem holds each packet on an hrtimer, once per direction, and the guest
+  wakes that timer late, so a delayed shape reads above its setting. The floor at a delay `d` is
+  the unshaped round trip plus two timer wakes, each as late as a sleep of `d` wakes in the same
+  guest (`timer_late`: 30 sleeps with timer slack 1 ns, their median), measured right after the
+  shape's pings. The jitter allowed is twice the wakes' spread (p90 less median), at least 0.1 ms.
+  `bench.py calibrate` checks the model: ping under netem holds of 1 us to 80 ms beside the
+  sleep lateness at each (Calibration, below).
 - **Hunt rows** compare with ping's measured round trip plus A1's 10%: a commit at one in flight
   is one round trip, so its p50 over that plus loopback's p99, or its p99 over two round trips plus
   loopback's p99; an RPC p99 over one round trip plus loopback's; an election past 3 timeouts.
 
 `bench/netlab/selftest.py` runs the same harness without root: faultlab's real `Netlab` over a
 fake runner that records every command and answers ping from the shapes set, and a fake cluster
-that elects only in a majority component. Four mutants each fail their check: ping off by 50%
-(round trip), a cut leader that acknowledges (majority only, history), a new leader that lacks
-each key's last write (history), elections at 4 timeouts (the election bound).
+that elects only in a majority component, its guest timer waking 0.3 ms late. Five mutants each
+fail their check: ping off by 50% (round trip), a timer lateness measured as 0 (round trip), a
+cut leader that acknowledges (majority only, history), a new leader that lacks each key's last
+write (history), elections at 4 timeouts (the election bound). It also checks that a failed
+measurement is a table cell, not a crash, and that the cut leader's term is read from its own
+cluster's role changes.
 
 ## Results
 

@@ -133,11 +133,11 @@ struct World {
 	bool run() {
 		for (step_ = 0; step_ < step_bound && !failures; ++step_) {
 			advance(1 + random_() % 4);
-			const auto pick = random_() % 100;
-			if (pick < 40) { for (int k = 0; k < 4; ++k) { deliver_one(); } }
-			else if (pick < 75) { auto& n = node(1 + random_() % 4); complete_io(n); }
-			else if (pick < 90) { for (auto& [id, n] : nodes_) { apply(*n); } }
-			else if (pick < 91 && phase_ >= promoted) { transfer(); }
+			const auto pick = random_() % 1000;
+			if (pick < 400) { for (int k = 0; k < 4; ++k) { deliver_one(); } }
+			else if (pick < 750) { auto& n = node(1 + random_() % 4); complete_io(n); }
+			else if (pick < 900) { for (auto& [id, n] : nodes_) { apply(*n); } }
+			else if (pick < 902 && phase_ >= promoted) { transfer(); }
 			drive();
 			if (phase_ == done) { break; }
 		}
@@ -301,9 +301,14 @@ private:
 		} else if (joiner && leaving_ && !find_member(m, leaving_)) {
 			if (phase_ < removed) { phase_ = removed; removal_ = m; }
 			if (removed_everywhere() && !probe_) { start(*l, probe_ = std::make_shared<Call>(), l->driver->propose(group, "after")); l->run(); }
-			if (probe_ && probe_->done && (probe_->error || !probe_->placed)) { probe_.reset(); }  // proposes again
+			if (probe_ && probe_->done && (probe_->error || !probe_->placed || superseded(*probe_->placed, l))) { probe_.reset(); }  // proposes again
 			if (probe_ && probe_->placed && applied_everywhere(*probe_->placed)) { phase_ = done; }
 		}
+	}
+	// Another term's entry took the placement, or a later term leads (a deposed leader placed it).
+	bool superseded(const Placement& p, Node* l) {
+		auto took = sequence_.find(p.index);
+		return (took != sequence_.end() && took->second.term != p.term) || (!applied_everywhere(p) && l->state()->term > p.term);
 	}
 	// The data members of the final membership: the ones that apply.
 	std::vector<Node*> data_members() {

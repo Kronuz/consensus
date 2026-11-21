@@ -115,7 +115,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	# D3 through the Driver: a replacement, add, promote and the core's removal, over seeds.
 	add_executable(consensus_driver_replace_test test/driver_replace_test.cc)
 	target_link_libraries(consensus_driver_replace_test PRIVATE consensus::consensus)
-	add_test(NAME consensus_driver_replace COMMAND consensus_driver_replace_test 200)
+	add_test(NAME consensus_driver_replace COMMAND consensus_driver_replace_test 1000)
 	set_tests_properties(consensus_driver_replace PROPERTIES TIMEOUT 300)
 	add_executable(consensus_driver_close_test test/driver_close_test.cc)
 	target_link_libraries(consensus_driver_close_test PRIVATE consensus::consensus)

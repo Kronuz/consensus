@@ -60,7 +60,8 @@ case $what in
 		guest 'sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq g++ cmake ninja-build libssl-dev git >/dev/null'
 		git archive HEAD | guest 'rm -rf ~/src && mkdir ~/src && tar -xf - -C ~/src'
 		guest 'set -e; cmake -S ~/src -B ~/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PROJECT_consensus_INCLUDE=$HOME/src/bench/netlab/node.cmake >/dev/null
-			ninja -C ~/build consensus_netlab_node | tail -1; file ~/build/consensus_netlab_node; ldd ~/build/consensus_netlab_node'
+			ninja -C ~/build consensus_netlab_node >~/build.log 2>&1 || { grep -E "error|FAILED" -A6 ~/build.log | head -60; tail -5 ~/build.log; exit 1; }
+			tail -1 ~/build.log; file ~/build/consensus_netlab_node; ldd ~/build/consensus_netlab_node'
 		mkdir -p "$(dirname "$bin")"
 		guest 'cat ~/build/consensus_netlab_node' >"$bin.part"
 		chmod +x "$bin.part"

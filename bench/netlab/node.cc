@@ -189,6 +189,14 @@ struct Node {
 		for (NodeId m = 1; m <= N; ++m)
 			pins[m] = pin_of(names[m]);
 		HostTransportOptions options;
+		options.open_of = [](GroupId) {
+			GroupOpen open;
+			open.cluster.fill('T');
+			open.group.fill('G');
+			open.epoch.fill('E');
+			open.profile.fill(0x5A);
+			return open;
+		};
 		options.member_of = [N](GroupId, NodeId incarnation) -> std::optional<Member> {
 			if (incarnation < 1 || incarnation > N)
 				return std::nullopt;
@@ -236,12 +244,7 @@ struct Node {
 					emit("error", "\"why\":" + json_string(why(e)));
 					std::_Exit(3);
 				}
-				GroupOpen open;
-				open.cluster.fill('T');
-				open.group.fill('G');
-				open.epoch.fill('E');
-				open.profile.fill(0x5A);
-				transport->store(group, id, open);
+				transport->store(group, id);
 				opened.set_value();
 			});
 		});

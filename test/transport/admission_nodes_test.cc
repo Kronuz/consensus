@@ -247,7 +247,7 @@ void policy_case() {
 		std::printf("  %-7s node %llu %s\n", w.name, (unsigned long long)got.node, got.node ? "" : pin_fault_name(got.fault));
 		check(got.node == w.node && (got.node || got.fault == w.fault), w.name);
 	}
-	check(!pre_approved_pins()(certificate("n1").get(), nullptr).node, "pre-approved pins admit no unpinned certificate");
+	check(!pre_approved_pins(), "pre-approved pins are no policy: only pins admit");
 
 	auto tls = context("n1");
 	const ClusterCa derived(tls->native_handle(), 1);

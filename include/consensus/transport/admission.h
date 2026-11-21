@@ -41,11 +41,9 @@ struct Trust {
 // several loops at once, outside the pins' lock.
 using TrustPolicy = std::function<Trust(X509 *leaf, STACK_OF(X509) *chain)>;
 
-// Pre-approved pins only: a certificate is a node's once NodePins::admit(node, pin) named it,
-// whatever signed it.
-inline TrustPolicy pre_approved_pins() {
-	return [](X509 *, STACK_OF(X509) *) { return Trust{}; };
-}
+// Pre-approved pins only, as no policy: a certificate is a node's once NodePins::admit(node, pin)
+// named it, whatever signed it, and every other one is unpinned.
+inline TrustPolicy pre_approved_pins() { return {}; }
 
 // The cluster CA as trust anchor: a certificate that chains to the CA and whose subjectAltName URI
 // is the cluster's prefix and a decimal node id (`spiffe://<cluster>/node/` and 17, say) joins as

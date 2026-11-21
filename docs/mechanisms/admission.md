@@ -56,8 +56,8 @@ reached another node, records nothing.
   under the prefix, two of them, or a zero-padded id is `cluster`. A local certificate that names
   no node leaves only pins admitting, as before this mechanism. `ClusterCa(ca, prefix)` takes
   both explicitly.
-- **Pre-approved pins.** `pre_approved_pins()` admits nothing by itself: a node joins only once
-  `admit(node, pin)` named its certificate.
+- **Pre-approved pins.** `pre_approved_pins()` is no policy, and admits nothing by itself: a node
+  joins only once `admit(node, pin)` named its certificate; every other certificate is `unpinned`.
 
 The policy runs only for certificates no pin names. A pinned node is checked against its pin on
 every connection, whichever policy recorded it.

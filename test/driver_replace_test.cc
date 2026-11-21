@@ -62,7 +62,8 @@ constexpr GroupId group = 7;
 constexpr std::size_t step_bound = 40000;
 const j::TurnLogOptions turn_options{16 * 1024, 1024, 1, 4, 4096};
 const j::AdmissionLimits admission{{8u << 20, 4096}, {64 * 1024, 3}, {4u << 20, 4}, 16, 3};
-constexpr Timing timing{20, 40, 100, 200, 60000};
+bool quiesce = false;  // Timing::quiesce: groups rest; the test sends no Wake or LeaderGone
+Timing timing() { Timing t{20, 40, 100, 200, 60000}; t.quiesce = quiesce; return t; }
 Limits limits() {
 	Limits l;
 	l.command_bytes = 1024; l.rpc_bytes = 4096; l.log_bytes = 1 << 20; l.log_entries = 4096; l.control_entries = 4; l.rpc_entries = 8;
@@ -74,7 +75,7 @@ void fail(const std::string& what) {
 	if (failures++ < 20) { std::fprintf(stderr, "replace seed %llu: %s\n", (unsigned long long)current_seed, what.c_str()); }
 }
 const bool tracing = std::getenv("SIM_REPLACE_TRACE") != nullptr;
-std::uint64_t writes_committed = 0, elections_mid_removal = 0;
+std::uint64_t writes_committed = 0, elections_mid_removal = 0, settle_elections = 0, settle_leaderless = 0;
 
 std::shared_ptr<j::IO> host_io(fl::filesystem& disk) {
 	const auto names = disk.list();
@@ -200,14 +201,20 @@ private:
 	}
 	// Runs on with no new changes, then checks the final state by value.
 	void settle_and_check() {
+		const auto changes_before = leader_changes;
+		std::uint64_t leaderless_since = 0, leaderless_most = 0;
 		for (std::size_t k = 0; k < 3000 && !failures; ++k) {
 			advance(1 + random_() % 4);
 			for (int d = 0; d < 4; ++d) { deliver_one(); }
 			complete_io(node(1 + random_() % 4));
 			for (auto& [id, n] : nodes_) { apply(*n); }
 			write();
+			if (leader()) { leaderless_since = 0; } else if (!leaderless_since) { leaderless_since = now_; }
+			if (leaderless_since) { leaderless_most = std::max(leaderless_most, now_ - leaderless_since); }
 		}
 		if (failures) { return; }
+		settle_elections += leader_changes - changes_before;
+		settle_leaderless = std::max(settle_leaderless, leaderless_most);
 		// The final membership: the founding one without the leaving member, the joiner in its role.
 		std::set<std::pair<NodeId, int>> expected, got;
 		const MemberRole leaving_role = witness_ && leaving_ == 3 ? MemberRole::Witness : MemberRole::Voter;
@@ -262,7 +269,7 @@ private:
 		if (id <= 3) { o.configuration.voters = {1, 2, 3}; }  // node 4 joins
 		o.configuration.cluster[0] = 'R'; o.configuration.configuration[0] = 'P';
 		if (witness_ && id <= 3) { o.founding = Membership{{{1, 1, MemberRole::Voter}, {2, 2, MemberRole::Voter}, {3, 3, MemberRole::Witness}}, 4, 0}; }
-		o.admission = admission; o.limits = limits(); o.timing = timing; o.scheduling = WorkerLimits{16, 128};
+		o.admission = admission; o.limits = limits(); o.timing = timing(); o.scheduling = WorkerLimits{16, 128};
 		n.driver->open(group, std::move(o));
 		start(n, opens_.emplace_back(std::make_shared<Call>()), n.driver->create(group, j::Identity{'G', static_cast<char>('0' + id)}));
 		n.run();
@@ -439,6 +446,7 @@ void NodeSink::operator()(GroupId, Fenced notice) { world->on_fenced(node, notic
 int main(int argc, char** argv) {
 	const std::uint64_t seeds = argc > 1 ? std::strtoull(argv[1], nullptr, 10) : 100;
 	const std::uint64_t first = argc > 2 ? std::strtoull(argv[2], nullptr, 10) : 1;
+	quiesce = argc > 3 && std::string(argv[3]) == "quiesce";
 	std::uint64_t completed = 0, leader_left = 0, witness_left = 0, leader_changes = 0, transfers = 0, changes = 0;
 	for (std::uint64_t seed = first; seed < first + seeds && !failures; ++seed) {
 		current_seed = seed;
@@ -448,9 +456,10 @@ int main(int argc, char** argv) {
 		leader_changes += world.leader_changes; transfers += world.transfers; changes += world.changes;
 		witness_left += world.witness_left(); leader_left += world.leader_left;
 	}
-	std::printf("  %llu committed client writes checked, %llu elections between promotion and removal\n", (unsigned long long)writes_committed, (unsigned long long)elections_mid_removal);
-	std::printf("driver replacement: %llu of %llu seeds completed (%llu replaced their leader, %llu a witness), %llu elections, %llu transfers, %llu changes issued: %s\n",
-		(unsigned long long)completed, (unsigned long long)seeds, (unsigned long long)leader_left, (unsigned long long)witness_left, (unsigned long long)leader_changes,
+	std::printf("  %llu committed client writes checked, %llu elections between promotion and removal, %llu while settling (longest leaderless %llu ms)\n", (unsigned long long)writes_committed,
+		(unsigned long long)elections_mid_removal, (unsigned long long)settle_elections, (unsigned long long)settle_leaderless);
+	std::printf("driver replacement%s: %llu of %llu seeds completed (%llu replaced their leader, %llu a witness), %llu elections, %llu transfers, %llu changes issued: %s\n",
+		quiesce ? " at rest" : "", (unsigned long long)completed, (unsigned long long)seeds, (unsigned long long)leader_left, (unsigned long long)witness_left, (unsigned long long)leader_changes,
 		(unsigned long long)transfers, (unsigned long long)changes, failures ? "FAIL" : "ok");
 	return failures ? 1 : 0;
 }

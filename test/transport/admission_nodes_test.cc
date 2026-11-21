@@ -478,6 +478,15 @@ template <class P> bool step(std::initializer_list<Stepped *> loops, P done, std
 	}
 	return true;
 }
+// Runs `f` on `loop`, as the transport runs remove_node and stop.
+template <class F> bool on(Stepped &loop, F f) {
+	bool done = false;
+	asio::post(loop.io, [&] {
+		f();
+		done = true;
+	});
+	return step({&loop}, [&] { return done; });
+}
 template <class T> struct Result {
 	std::optional<T> value;
 	void spawn(Stepped &loop, task::task<T> t) {
@@ -519,11 +528,11 @@ struct Node {
 		links->route(peer.node, {"127.0.0.1", peer.acceptor.local_endpoint().port()});
 	}
 };
-// Stops every Links and steps the loops until they drain.
-bool stop_all(std::initializer_list<Links *> links, std::initializer_list<Stepped *> loops) {
-	for (auto *l : links)
-		l->stop();
-	return step(loops, [&] { return std::all_of(links.begin(), links.end(), [](Links *l) { return l->drained(); }); });
+// Stops each Links on its loop and steps the loops until they drain.
+bool stop_all(std::initializer_list<std::pair<Links *, Stepped *>> links, std::initializer_list<Stepped *> loops) {
+	for (auto [l, at] : links)
+		on(*at, [l] { l->stop(); });
+	return step(loops, [&] { return std::all_of(links.begin(), links.end(), [](auto l) { return l.first->drained(); }); });
 }
 
 // R5: a connection whose TLS passed before remove_node must not become a link once its hellos run.
@@ -538,7 +547,7 @@ void epoch_case() {
 		Result<std::shared_ptr<Connection>> tls;
 		tls.spawn(loop, one.links->connect(3, LinkLane::Control));
 		check(step({&loop}, [&] { return tls.value.has_value(); }) && *tls.value, "dial: node 1's TLS to node 3 completes");
-		one.links->remove(3);
+		on(loop, [&] { one.links->remove(3); });
 		Result<bool> offered;
 		offered.spawn(loop, one.links->offer(3, LinkLane::Control, std::move(*tls.value)));
 		tls.value.reset();
@@ -546,7 +555,7 @@ void epoch_case() {
 				  !one.links->find(3, LinkLane::Control),
 			  "dial: removed before its hellos, it becomes no link");
 		check(step({&loop}, [&] { return !three.links->find(1, LinkLane::Control); }), "dial: node 3's end of it ends");
-		check(stop_all({one.links.get(), three.links.get()}, {&loop}), "dial: drained");
+		check(stop_all({{one.links.get(), &loop}, {three.links.get(), &loop}}, {&loop}), "dial: drained");
 	}
 	{
 		// The accept: node 1 accepts on loop a and moves node 3's connection to its owner on loop b.
@@ -563,12 +572,12 @@ void epoch_case() {
 		dialed.spawn(c, three.links->dial(1, LinkLane::Control));
 		// An empty owner drains once its moved accept arrives: until then it is not drained.
 		check(step({&a, &c}, [&] { return !home->drained(); }), "accept: node 3 authenticated on loop a, moved to loop b");
-		home->remove(3);
+		home->remove(3);  // on loop b's thread, ahead of the moved accept queued there
 		check(step({&a, &b, &c}, [&] { return dialed.value.has_value(); }) && !*dialed.value && !one.established &&
 				  !home->find(3, LinkLane::Control) && !one.links->find(3, LinkLane::Control),
 			  "accept: removed before its hellos, it becomes no link");
 		check(!three.links->find(1, LinkLane::Control), "accept: node 3 has no link either");
-		check(stop_all({one.links.get(), home.get(), three.links.get()}, {&a, &b, &c}), "accept: drained");
+		check(stop_all({{one.links.get(), &a}, {home.get(), &b}, {three.links.get(), &c}}, {&a, &b, &c}), "accept: drained");
 	}
 }
 // Starts `t` on `loop`; its future holds its value, or what it threw.

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copies include/ to OUT/include with one seeded fault, which waiter_test, driver_test,
 # membership_test or the Driver simulation must catch (under ASan for the resume-before-unlink
-# pair). Each names its header, the text it replaces and the replacement:
+# pair). Each names its header, the text it replaces and the replacement, or a list of those:
 #   driver_mutants.py NAME OUT      (NAME "list" prints the names)
 import pathlib, shutil, sys
 
@@ -53,6 +53,24 @@ MUTANTS = {
         "if (b.index < base_index_ || b.index > durable_.commit_index ||",
         "if (b.index > durable_.commit_index ||",
     ),
+    # D3's removal is proposed from any drive, not only an admitted Tick: the Persisted after
+    # the promotion's commit then persists with no reservation (driver_replace_test).
+    "removal-from-any-drive": ("core.h",
+        "\t\tif (tick) {\n\t\t\tif (auto next = removal())",
+        "\t\tif (true) {\n\t\t\tif (auto next = removal())",
+    ),
+    # A leader's Tick is admitted with no reservation though its removal is due (driver_replace_test).
+    "removal-tick-unplanned": ("worker.h",
+        "plan = removal ? plan_event(ChangeMembership{0, std::move(*removal)}, false, limits_, scheduling_.retained) : EventAdmissionPlan{};",
+        "plan = EventAdmissionPlan{}; (void)removal;",
+    ),
+    # Both: the code before D3's funded removal, where Xapiand's placement repair fenced
+    # (driver_replace_test's seed 26 has its shape).
+    "removal-unreserved": [
+        ("core.h", "\t\tif (tick) {\n\t\t\tif (auto next = removal())", "\t\tif (true) {\n\t\t\tif (auto next = removal())"),
+        ("worker.h", "plan = removal ? plan_event(ChangeMembership{0, std::move(*removal)}, false, limits_, scheduling_.retained) : EventAdmissionPlan{};",
+            "plan = EventAdmissionPlan{}; (void)removal;"),
+    ],
     # A witness incarnation may become a learner or voter (R16).
     "witness-becomes-data": ("core.h",
         "\t\t\tif (old && old->role == MemberRole::Witness && x.role != MemberRole::Witness) { reject(RejectReason::InvalidMembership); return; }\n",
@@ -69,11 +87,12 @@ def main():
     root = pathlib.Path(__file__).resolve().parent.parent
     shutil.rmtree(out / "include", ignore_errors=True)
     shutil.copytree(root / "include", out / "include")
-    header, search, replace = MUTANTS[name]
-    path = out / "include" / "consensus" / header
-    text = path.read_text()
-    if text.count(search) != 1:
-        sys.exit("mutation point not found once: " + name)
-    path.write_text(text.replace(search, replace, 1))
+    edits = MUTANTS[name]
+    for header, search, replace in edits if isinstance(edits, list) else [edits]:
+        path = out / "include" / "consensus" / header
+        text = path.read_text()
+        if text.count(search) != 1:
+            sys.exit("mutation point not found once: " + name)
+        path.write_text(text.replace(search, replace, 1))
 
 main()

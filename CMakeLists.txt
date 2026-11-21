@@ -95,8 +95,8 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 		add_test(NAME consensus_waiter_${c} COMMAND consensus_waiter_test ${c})
 		set_tests_properties(consensus_waiter_${c} PROPERTIES TIMEOUT 600)
 	endforeach()
-	# A seeded fault (test/driver_mutants.py), for the waiter, driver and membership tests' mutant jobs.
-	set(CONSENSUS_DRIVER_MUTANT "" CACHE STRING "a test/driver_mutants.py fault built into consensus_waiter_test, consensus_driver_test and consensus_membership_test")
+	# A seeded fault (test/driver_mutants.py), for the waiter, driver, driver replacement and membership tests' mutant jobs.
+	set(CONSENSUS_DRIVER_MUTANT "" CACHE STRING "a test/driver_mutants.py fault built into consensus_waiter_test, consensus_driver_test, consensus_driver_replace_test and consensus_membership_test")
 	if(CONSENSUS_DRIVER_MUTANT)
 		execute_process(COMMAND python3 "${CMAKE_CURRENT_SOURCE_DIR}/test/driver_mutants.py" "${CONSENSUS_DRIVER_MUTANT}" "${CMAKE_CURRENT_BINARY_DIR}/mutant" RESULT_VARIABLE mutant_result)
 		if(NOT mutant_result EQUAL 0)
@@ -116,6 +116,17 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	endif()
 	add_test(NAME consensus_driver COMMAND consensus_driver_test)
 	set_tests_properties(consensus_driver PROPERTIES TIMEOUT 120)
+	# D3 through the Driver: a replacement, add, promote and the core's removal, over seeds.
+	add_executable(consensus_driver_replace_test test/driver_replace_test.cc)
+	target_link_libraries(consensus_driver_replace_test PRIVATE consensus::consensus)
+	if(CONSENSUS_DRIVER_MUTANT)
+		target_include_directories(consensus_driver_replace_test BEFORE PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/mutant/include")
+	endif()
+	# 1000 seeds in four parts, so each fits a sanitizer build's timeout and they run in parallel.
+	foreach(first 1 251 501 751)
+		add_test(NAME consensus_driver_replace_${first} COMMAND consensus_driver_replace_test 250 ${first})
+		set_tests_properties(consensus_driver_replace_${first} PROPERTIES TIMEOUT 300)
+	endforeach()
 	add_executable(consensus_driver_close_test test/driver_close_test.cc)
 	target_link_libraries(consensus_driver_close_test PRIVATE consensus::consensus)
 	add_test(NAME consensus_driver_close COMMAND consensus_driver_close_test)
@@ -188,7 +199,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	endif()
 
 	# The tests that build a journal run it on faultfs.
-	foreach(t simulation shared_worker shared_cluster wave_open waiter blocking_entry driver driver_close worker)
+	foreach(t simulation shared_worker shared_cluster wave_open waiter blocking_entry driver driver_close driver_replace worker)
 		target_link_libraries(consensus_${t}_test PRIVATE faultlab::faultlab)
 	endforeach()
 

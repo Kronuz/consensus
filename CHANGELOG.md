@@ -8,6 +8,10 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 
 ## 2026-11-20
 
+### Fixed
+
+- A leader paces each follower's appends to its path ([docs/mechanisms/append-pacing.md](docs/mechanisms/append-pacing.md)). A frame starts at 64 KiB, doubles on a fast answer up to `rpc_bytes`, scales down to what is answered within half the shorter of `rpc_timeout` and `election_min`, and drops back to 64 KiB when a flight times out. Before, a Driver group (built with `Flow{}`) sent appends of up to `rpc_bytes` (2 MiB). Over a path that moves about 0.5 MB/s (TCP under 1% loss at 40 ms round trip), one such append held the connection for about 4 s. The followers then campaigned, the leader's CheckQuorum stepped it down, and each timeout resent the whole batch, so a full window stopped committing (`full_window_stall_test`). No API or wire format changes.
+
 ### Added
 
 - Multicast seeds ([docs/mechanisms/seeds.md](docs/mechanisms/seeds.md)): `transport::Seeds` announces a node's services (each a name and its port, up to 8 per host) by UDP multicast on the Xapian-era group and port (239.192.168.1:58880), and offers the services a listener asks for as seeds to dial over TLS, each failed dial backing off from 1 s to 60 s per dial target (source address and services, never the announcer-chosen sender), at most 16 targets per source address. The datagram, `DTSD0001` (`seeds_codec.h`), is bounded at 512 bytes and versioned; malformed, oversized, wrong-version and other-cluster datagrams are counted and dropped. Unavailable multicast is reported once through `on_unavailable` and nothing throws; a failed setup is retried with backoff, and a failing receive backs off instead of spinning. The tests fail instead of skipping where `CI` is set. Its decoder has a libFuzzer target (`consensus_fuzz_seeds`) whose corpus replays in ctest.

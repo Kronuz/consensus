@@ -46,7 +46,7 @@ endif()
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	enable_testing()
 	file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/.scratch")  # the tests' state
-	foreach(t consensus checkpoint_encoder retained_log retirement simulation membership pipeline retained_state)
+	foreach(t consensus checkpoint_encoder retained_log retirement simulation membership pipeline retained_state full_window_stall)
 		add_executable(consensus_${t}_test test/${t}_test.cc)
 		target_link_libraries(consensus_${t}_test PRIVATE consensus::consensus)
 		add_test(NAME consensus_${t} COMMAND consensus_${t}_test)

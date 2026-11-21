@@ -312,12 +312,27 @@ private:
 	struct Peer {
 		Index next = 1, matched = 0; std::deque<Flight> flights; std::uint64_t retry_after = 0; std::optional<SnapshotFlight> snapshot{}; std::optional<std::uint64_t> snapshot_retry_clock{}; bool blocked = false;
 		std::optional<Flight> keepalive{}; bool verified = false, lacks_base = false; std::uint64_t window = 0;
+		// The payload bytes one append carries, paced to the path (docs/mechanisms/append-pacing.md).
+		std::uint64_t frame = frame_floor;
 		// Back to one flight, resuming at `from` (the oldest flight's start: nothing before it is in doubt).
 		void reset_flights(Index from) { flights.clear(); window = 0; verified = false; next = std::max(matched + 1, from); }
 	};
 	struct PendingRead { RequestId request; Token probe; Term term; Index index; std::set<NodeId> acknowledgements; };
 	struct Transfer { NodeId target; Token token; std::uint64_t until; bool sent = false; };
 	static constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
+	// Where an append's pacing starts, and the least it cuts to (one entry always goes).
+	static constexpr std::uint64_t frame_floor = 64 << 10;
+	// How long an append may take to be answered: within half the shorter of the RPC timeout and
+	// the election timeout, the follower hears its leader before it campaigns.
+	std::uint64_t frame_target() const { return std::min({timing_.rpc_timeout, timing_.election_min, std::uint64_t{1} << 32}) / 2; }
+	// An answered append paces the next: one slower than the target scales the frame down to it,
+	// one within half the target that filled at least half the frame doubles it, to rpc_bytes.
+	void pace(Peer& peer, const Flight& flight) const {
+		if (!flight.bytes) { return; }
+		const auto took = now_ - flight.sent, target = frame_target();
+		if (took > target) { peer.frame = std::max(frame_floor, flight.bytes * target / took); }
+		else if (2 * took <= target && 2 * flight.bytes >= peer.frame) { peer.frame = std::min<std::uint64_t>(2 * peer.frame, limits_.rpc_bytes); }
+	}
 	bool is_voter(NodeId incarnation) const { return votes_in(membership(), incarnation); }
 	std::vector<NodeId> voters() const {
 		std::vector<NodeId> out;
@@ -997,6 +1012,7 @@ private:
 			return;
 		} else if (response.success) {
 			if (response.matched != at->through) { return; }
+			pace(peer, *at);
 			acknowledge_read(source, response.read_probe);
 			acknowledge(source, peer, response.matched, output);
 		} else {
@@ -1117,8 +1133,8 @@ private:
 		for (auto& [id, peer] : peers_) {
 			if (peer.snapshot && peer.snapshot->phase == SnapshotPhase::AwaitSource && peer.snapshot->key.boundary != LogBoundary{base_index_, base_term_}) { release_snapshot(id, peer, SnapshotReleaseReason::Stale, output); }
 			if (peer.snapshot && now_ - peer.snapshot->started >= timing_.snapshot_timeout) { release_snapshot(id, peer, SnapshotReleaseReason::TimedOut, output, true); }
-			// A timed-out flight returns the peer to one flight at its verified progress.
-			if (!peer.flights.empty() && now_ - peer.flights.front().sent >= timing_.rpc_timeout) { peer.reset_flights(peer.flights.front().previous + 1); }
+			// A timed-out flight returns the peer to one flight at its verified progress, paced from the floor.
+			if (!peer.flights.empty() && now_ - peer.flights.front().sent >= timing_.rpc_timeout) { peer.reset_flights(peer.flights.front().previous + 1); peer.frame = frame_floor; }
 			if (peer.snapshot || (peer.flights.empty() && heartbeat) || peer.next <= last_index()) {
 				auto probe = needed_probe(id);
 				replicate(id, peer, output, probe);
@@ -1180,7 +1196,8 @@ private:
 		// Node limits bound each entry; the group's limits in force, and the nodes', bound the
 		// batch, which always takes a first entry that fits the nodes.
 		const auto wire = peer_wire_limits(id); const auto& group = limits_in_force();
-		const auto rpc_entries = std::min(wire.rpc_entries, group.rpc_entries), rpc_bytes = std::min({wire.rpc_bytes, group.rpc_bytes, flow_.frame_bytes ? flow_.frame_bytes : wire.rpc_bytes});
+		const auto rpc_entries = std::min(wire.rpc_entries, group.rpc_entries);
+		const auto rpc_bytes = std::min<std::uint64_t>({wire.rpc_bytes, group.rpc_bytes, flow_.frame_bytes ? flow_.frame_bytes : wire.rpc_bytes, peer.frame});
 		for (Index index = peer.next; index <= last_index() && batch.size() < rpc_entries; ++index) {
 			const auto& entry = log_entry(index);
 			if (!fits(entry, wire) || entry.payload.size() > wire.rpc_bytes) { break; }

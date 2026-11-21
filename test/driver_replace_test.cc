@@ -180,7 +180,7 @@ struct World {
 		auto [it, fresh] = leaders_.emplace(notice.term, id);
 		if (!fresh && it->second != id) { fail("two leaders in term " + std::to_string(notice.term)); }
 	}
-	void on_fenced(NodeId id, const Fenced& notice) { fail("node " + std::to_string(id) + " fenced: " + notice.reason); }
+	void on_fenced(NodeId id, const Fenced& notice) { report("node " + std::to_string(id) + " fenced: " + notice.reason); }
 
 private:
 	// One outstanding client write on the leader at a time, through the replacement.

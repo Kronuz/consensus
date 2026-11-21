@@ -28,10 +28,15 @@
 //   rejected  validation_failed keeps node 3's state; the leader's retry, validated, installs (A2)
 //   stale     an answer with a stale token, and a transfer frame cut short, are dropped and counted
 //   restart   node 3 restarts between validation and its answer; the leader's retry installs
+//   crash     node 3's disk loses power at each of its operations from the heal through the install
+//             (`crash STRIDE`: every STRIDE-th): it recovers the old replica or the complete new one,
+//             never an image its application activated that consensus did not persist (A3)
 #include "consensus/driver.h"
 #include "journal/memory_io.h"
 
+#include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <deque>
 #include <functional>
 #include <iostream>
@@ -62,14 +67,22 @@ constexpr std::uint32_t format = 7;
 
 Limits limits() { Limits l; l.command_bytes = 1024; l.rpc_bytes = 4096; l.log_bytes = 64 * 1024; l.log_entries = 64; l.control_entries = 4; l.rpc_entries = 8; return l; }
 
-// The application's state: the payloads it applied, in index order. Its image is that list.
+// The application's state: the payloads it applied, in index order. Its image is that list, its
+// length first, then 150,000 bytes of filler, so a transfer spans three chunks.
+constexpr std::size_t filler = 150000;
 std::string encode_image(const std::vector<std::string>& applied) {
-	std::string bytes;
+	std::string bytes(4, '\0');
 	for (const auto& p : applied) { const auto n = static_cast<std::uint32_t>(p.size()); bytes.append(reinterpret_cast<const char*>(&n), 4); bytes += p; }
+	const auto length = static_cast<std::uint32_t>(bytes.size() - 4);
+	std::memcpy(bytes.data(), &length, 4);
+	for (std::size_t k = 0; k < filler; ++k) { bytes.push_back(static_cast<char>('a' + k % 26)); }
 	return bytes;
 }
 std::vector<std::string> decode_image(std::string_view bytes) {
 	std::vector<std::string> applied;
+	std::uint32_t length = 0; std::memcpy(&length, bytes.data(), 4);
+	check(bytes.size() == 4 + length + filler, "an image of its entries and the filler");
+	bytes = bytes.substr(4, length);
 	while (bytes.size() >= 4) {
 		std::uint32_t n = 0; std::memcpy(&n, bytes.data(), 4); bytes.remove_prefix(4);
 		applied.emplace_back(bytes.substr(0, n)); bytes.remove_prefix(n);
@@ -134,6 +147,9 @@ struct Node {
 	std::vector<std::string> validated_image;     // what validation read
 	int validations = 0, activations = 0, restores = 0;
 	bool hold = false;                            // leaves a ValidateImage unanswered
+	// The application's own durable state, which a power cut keeps: the boundary of the image it
+	// staged at validation, and of the one it activated (strata's stage and activation).
+	Index staged = 0, active = 0;
 	std::function<bool(const std::vector<std::string>&)> accept = [](const auto&) { return true; };
 
 	void boot(Cluster& c, std::uint64_t now);
@@ -183,14 +199,31 @@ struct Cluster {
 		n.run();
 		check(done && !error, "node " + std::to_string(n.id) + " creates its group");
 	}
-	// Restarts a node from its disk: the application restores its latest checkpoint's image.
-	void restart(Node& n) {
-		n.shut();
+	// Restarts a node from its disk, after a clean shutdown or a power cut: the application
+	// restores its latest checkpoint's image, and finishes an activation it staged for it.
+	void restart(Node& n, bool power_cut = false) {
+		if (power_cut) {
+			n.disk.cut = std::min(n.disk.cut, n.disk.operations);
+			n.stop->request(task::cancel_reason::shutdown);
+			n.run();
+			check(n.turns_done && n.driver_done, "node " + std::to_string(n.id) + "'s loop stops after a power cut");
+			n.driver.reset(); n.host.reset();
+			n.disk.power_loss();
+			n.disk.cut = std::numeric_limits<std::uint64_t>::max();
+		} else {
+			n.shut();
+		}
 		n.boot(*this, now);
-		n.applied.clear(); n.applying.reset(); n.validation.reset(); n.activation.reset();
+		n.applied.clear(); n.applying.reset(); n.validation.reset(); n.activation.reset(); n.sink.fenced.clear();
 		n.driver->open(group, options(n.id));
 		bool done = false; std::exception_ptr error;
-		task::spawn(task::scheduler_ref::of(n.scheduler), n.driver->recover(group, [&n](j::ArtifactReader& image) { n.applied = decode_image(read_all(image)); ++n.restores; }),
+		task::spawn(task::scheduler_ref::of(n.scheduler), n.driver->recover(group, [&n](j::ArtifactReader& image) {
+				n.applied = decode_image(read_all(image)); ++n.restores;
+				const Index base = n.applied.size();
+				if (n.staged == base) { n.active = base; }
+				check(n.active <= base, "node " + std::to_string(n.id) + "'s application activated an image at " + std::to_string(n.active) + " that consensus did not persist (restored " + std::to_string(base) + ")");
+				if (n.staged <= base) { n.staged = 0; }
+			}),
 			[&](std::exception_ptr e) { done = true; error = e; });
 		n.run();
 		check(done && !error, "node " + std::to_string(n.id) + " recovers its group");
@@ -291,6 +324,7 @@ void Sink::operator()(GroupId, ValidateImage v) {
 	++node->validations;
 	check(v.source != node->id && v.boundary.index != 0, "a validation names its source and boundary");
 	node->validation.emplace(v.token, read_all(v.image));
+	node->staged = v.boundary.index;
 }
 void Sink::operator()(GroupId, ActivateImage a) {
 	++node->activations;
@@ -298,6 +332,7 @@ void Sink::operator()(GroupId, ActivateImage a) {
 	check(image.size() == a.boundary.index, "the activated image holds the state through its boundary");
 	check(image == node->validated_image, "the activated image is the one validated");
 	node->applied = std::move(image);
+	node->active = a.boundary.index;
 	node->activation = a.token;
 }
 
@@ -307,6 +342,7 @@ std::vector<std::string> prefix(const std::vector<std::string>& v, std::size_t n
 // leader's checkpoint, which compacted the log it would need. Returns the checkpoint's boundary.
 Index lag(Cluster& c) {
 	for (int k = 0; k < 3; ++k) { c.commit("before" + std::to_string(k)); }
+	check(c.checkpoint(c.nodes.at(3)), "node 3 checkpoints before it is cut off");
 	c.isolated.insert(3);
 	for (int k = 0; k < 12; ++k) { c.commit("during" + std::to_string(k)); }
 	auto* l = c.leader();
@@ -392,11 +428,51 @@ void restart() {
 	check(l && three.applied == l->applied, "node 3's application state equals the leader's");
 }
 
+// A3: node 3's disk fails at its k-th operation after the heal, for every k through a whole
+// install (or every stride-th); the node then loses power, restarts and recovers.
+std::uint64_t stride = 1;
+void crash() {
+	std::uint64_t span = 0;
+	{
+		Cluster c;
+		lag(c);
+		auto& three = c.nodes.at(3);
+		const auto from = three.disk.operations;
+		c.isolated.clear();
+		check(c.until([&] { return three.activations > 0; }), "the uncut install");
+		c.commit("after");
+		span = three.disk.operations - from;
+	}
+	std::uint64_t cuts = 0, old_replica = 0, new_replica = 0;
+	for (std::uint64_t k = 1; k <= span && !failures; k += stride) {
+		Cluster c;
+		const Index boundary = lag(c);
+		auto& three = c.nodes.at(3);
+		const Index before = three.state()->applied;  // node 3's checkpoint, which it restores
+		three.disk.cut = three.disk.operations + k;
+		c.isolated.clear();
+		c.until([&] { return three.disk.dead() || (three.activations > 0 && three.state() && three.state()->applied > boundary); });
+		if (!three.disk.dead()) { continue; }  // the install finished first
+		++cuts;
+		c.restart(three, true);
+		auto s = three.state();
+		const Index restored = s ? s->applied : 0;
+		check(restored == before || restored == boundary, "a cut at operation " + std::to_string(k) + " recovers the old replica (" + std::to_string(before) + ") or the new one (" + std::to_string(boundary) + "), not " + std::to_string(restored));
+		old_replica += restored == before; new_replica += restored == boundary;
+		c.commit("after");
+		auto* l = c.leader();
+		check(l && three.applied == l->applied, "after the cut at operation " + std::to_string(k) + " node 3's application state equals the leader's");
+	}
+	check(cuts > 0 && old_replica > 0 && new_replica > 0, "cuts land before and after the install is durable");
+	std::cerr << "crash: " << span << " operations, " << cuts << " cuts: " << old_replica << " old replicas, " << new_replica << " new\n";
+}
+
 const std::map<std::string, void (*)()> cases{
 	{"lagging", &lagging},
 	{"rejected", &rejected},
 	{"stale", &stale},
 	{"restart", &restart},
+	{"crash", &crash},
 };
 
 }  // namespace
@@ -406,6 +482,7 @@ int main(int argc, char** argv) {
 		auto found = cases.find(argv[1]);
 		if (found == cases.end()) { std::cerr << "unknown case " << argv[1] << '\n'; return 2; }
 		std::cerr << "case " << argv[1] << '\n';
+		if (argc > 2) { stride = std::max<std::uint64_t>(1, std::strtoull(argv[2], nullptr, 10)); }
 		found->second();
 	} else {
 		for (const auto& [name, run] : cases) { std::cerr << "case " << name << '\n'; run(); }

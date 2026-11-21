@@ -117,6 +117,17 @@ MUTANTS = {
     # the control: Detent:73e96d6's rule, only a sender that votes in the receiver's membership
     "voters-only": (T + "host_transport.h", "source && source->node != node)",
                     "!source || source->role == kronuz::consensus::MemberRole::Learner || source->node != node)"),
+    # driver.h, worker.h (consensus-driver-install: a Driver group's install)
+    "no-transfer-out": ("include/consensus/driver.h",
+                        "\t\t\tsink_(g.id, SendTransfer{out->session.peer, std::string(out->bytes.data(), out->bytes.size())});\n", ""),
+    "failed-validates": ("include/consensus/driver.h",
+                         "else { const auto result = w.reject_snapshot_validation(*id); taken = result == CancelResult::Canceled || result == CancelResult::Pending; }",
+                         "else { taken = w.validation_succeeded(*id, token) == ValidationAck::Accepted; }"),
+    "activate-on-validated": ("include/consensus/driver.h", "if (taken) { in.validating = 0; } else { ++g.dropped; }",
+                              "if (taken) { in.validating = 0; if (valid) { auto c = w.snapshot_context(*id); sink_(g.id, ActivateImage{token, {c->descriptor.through, c->descriptor.term}, *w.snapshot_image(*id)}); } } else { ++g.dropped; }"),
+    "activation-wait-maintains": ("include/consensus/worker.h",
+                                  "if (installation_waiting()) { if (core_->busy()) { ingest(core_->step(current_time)); } return TurnResult::Blocked; }",
+                                  "if (installation_waiting()) { maintenance(); return fenced() ? TurnResult::Fenced : maintenance_io_ ? TurnResult::IOPending : capture_funding_pressure_ ? TurnResult::Pressure : TurnResult::Maintenance; }"),
 }
 
 

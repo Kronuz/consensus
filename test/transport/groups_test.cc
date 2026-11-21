@@ -1044,6 +1044,8 @@ struct Node {
 	std::mutex mutex;
 	std::map<GroupId, std::vector<std::string>> applied;
 	std::atomic<std::uint64_t> misplaced{0};  // frames delivered off their group's loop
+	std::atomic<bool> hold_apply{false};  // Committed ranges stay out for application, the last in `held`
+	std::atomic<Index> held{0};
 	// Each group is founded by `voters`; with none, this node is a joiner (D5).
 	Node(NodeId id, std::uint32_t L, std::uint16_t port, std::shared_ptr<j::IO> io, const std::vector<GroupId> &groups,
 		 const std::map<NodeId, PeerAddress> &peers, std::vector<NodeId> voters = {1, 2, 3}, bool quiesce = false)
@@ -1161,6 +1163,10 @@ void GroupSink::operator()(GroupId g, Committed n) {
 				node->applied[g].push_back(e.payload);
 			last = e.index;
 		}
+	}
+	if (last && node->hold_apply) {
+		node->held = last;  // out for application until the test fails it
+		return;
 	}
 	if (last)
 		node->host.post(loop, [n = node, k = loop, g, last] {
@@ -1357,6 +1363,65 @@ void quiescent() {
 		std::printf("quiescent: group %llu committed on the other two: %s\n", (unsigned long long)g, ok ? "yes" : "NO");
 		assert(ok);
 	}
+}
+
+// Quiescence: the leader's group fences at rest while its node stays up, so no node-pair report
+// fires; its Driver sends Gone, and the followers elect within their timeout.
+void quiescent_fence() {
+	const GroupId g = groups_on(2, 0, 1)[0];
+	Cluster c("quiescent-fence", {g});
+	for (NodeId n = 1; n <= 3; ++n)
+		c.start(n, 2, {1, 2, 3}, true);
+	step("quiescent fence: the group elects, commits and rests");
+	const bool ok = commit_everywhere(c.of({1, 2, 3}), g, "before", 30'000);
+	assert(ok);
+	const bool rested = until([&] {
+		for (NodeId n = 1; n <= 3; ++n)
+			if (auto s = c.nodes[n]->state(g); !s || !s->resting)
+				return false;
+		return true;
+	}, 10'000);
+	std::printf("quiescent fence: every replica at rest: %s\n", rested ? "yes" : "NO");
+	assert(rested);
+	const NodeId leader = c.leader({1, 2, 3}, g);
+	const auto at = c.nodes[leader]->state(g);
+	assert(leader && at);
+	// The leader's application holds a command out, the followers apply it and rest, then the
+	// leader's application fails at it: its group fences.
+	step("quiescent fence: node " + std::to_string(leader) + "'s application holds a command, the followers rest");
+	auto &node = *c.nodes[leader];
+	const auto k = node.host.transport->loop_of_group(g);
+	node.hold_apply = true;
+	node.host.post(k, [&node, k, g] { task::spawn(task::scheduler_ref::of(node.host.loops[k]->scheduler), proposing(node.per[k]->driver.get(), g, "held"), [](std::exception_ptr) {}); });
+	const bool held = until([&] {
+		if (!node.held)
+			return false;
+		for (NodeId n = 1; n <= 3; ++n)
+			if (n != leader)
+				if (auto s = c.nodes[n]->state(g); !c.nodes[n]->has(g, "held") || !s || !s->resting)
+					return false;
+		return true;
+	}, 10'000);
+	std::printf("quiescent fence: the followers applied the held command and rest: %s\n", held ? "yes" : "NO");
+	assert(held);
+	step("quiescent fence: the leader's group fences on node " + std::to_string(leader));
+	const auto fenced = steady::now();
+	node.host.post(k, [&node, k, g, through = Index(node.held)] { node.per[k]->driver->application_failed(g, through, "the test fails the application"); });
+	const bool elected = until([&] {
+		for (NodeId n = 1; n <= 3; ++n)
+			if (auto s = n == leader ? std::nullopt : c.nodes[n]->state(g); s && s->role == Role::Leader && s->term > at->term)
+				return true;
+		return false;
+	}, 10'000);
+	std::uint64_t reported = 0;
+	for (NodeId n = 1; n <= 3; ++n)
+		for (std::uint32_t l = 0; l != 2; ++l)
+			reported += c.nodes[n]->host.transport->stats(l).gone;
+	std::printf("quiescent fence: a follower elected %llu ms after the fence: %s; node-gone reports %llu\n", (unsigned long long)ms_since(fenced),
+				elected ? "yes" : "NO", (unsigned long long)reported);
+	assert(elected && "Gone elects without a node-pair report");
+	assert(reported == 0 && "the leader's node stayed up");
+	assert(ms_since(fenced) < 5'000 && "within the election timeout");
 }
 
 Membership with_learner(Membership m, NodeId incarnation) {
@@ -2508,7 +2573,7 @@ int main(int argc, char **argv) {
 	else if (which == "upload")
 		timed("upload", upload);
 	else if (which == "driver")
-		driver(), quiescent();
+		driver(), quiescent(), quiescent_fence();
 	else if (which == "refill")
 		refill();
 	else if (which == "identity")

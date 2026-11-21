@@ -258,7 +258,7 @@ public:
 		return GroupState{w.role(), w.term(), w.leader(), w.committed(), w.applied_index(), w.membership().value_or(Membership{}), w.resting()};
 	}
 	// The group's closed state, RFTCLOS1 (docs/mechanisms/quiescence.md), when it can close
-	// now: started, no call or frame waiting, at rest at a checkpoint covering applied
+	// now: started, no call or frame waiting, at a checkpoint covering applied
 	// (Core::closed_state). The host keeps it beside the checkpoint and hands it to recover.
 	std::optional<std::string> closed_state(GroupId id) const {
 		auto found = groups_.find(id);
@@ -575,6 +575,23 @@ private:
 	}
 	RequestId next_request() noexcept { return ++requests_; }
 	std::string fence_reason(const Group& g) const { return g.fence_reason.empty() ? "consensus group fenced" : g.fence_reason; }
+	// The Sink hears a fence once, and the group's other members hear Gone in its term: a
+	// follower of this replica elects within its timeout, as on LeaderGone, though the node
+	// stays up (docs/mechanisms/quiescence.md).
+	void report_fence(Group& g) {
+		if (std::exchange(g.fence_seen, true)) { return; }
+		sink_(g.id, Fenced{fence_reason(g)});
+		const auto& w = *g.worker;
+		const Term term = w.term();
+		if (!term) { return; }
+		const NodeId local = w.configuration().local;
+		auto membership = w.membership();
+		if (!membership || membership->members.empty()) {
+			for (auto voter : w.configuration().voters) { if (voter != local) { sink_(g.id, Send{voter, Gone{term}}); } }
+			return;
+		}
+		for (const auto& member : membership->members) { if (member.incarnation != local) { sink_(g.id, Send{member.incarnation, Gone{term}}); } }
+	}
 	// D5: a voting member (voter or witness) other than this node.
 	bool has_peer(const Group& g) const {
 		const auto& w = *g.worker;
@@ -903,7 +920,7 @@ private:
 					if (auto* x = find(g, value.request)) { x->published = value; complete(g, *x); } else { sink_(g.id, std::move(value)); }
 				} else if constexpr (std::is_same_v<T, Fenced>) {
 					g.fence_reason = value.reason;
-					if (!g.fence_seen) { g.fence_seen = true; sink_(g.id, std::move(value)); }
+					report_fence(g);
 				} else if constexpr (std::is_same_v<T, Committed>) {
 					// A witness keeps the log but no application state: it acknowledges its own ranges.
 					if (witness_range(g, value)) { g.applied = Applied{value.entries.back().index}; mark_ready(g); } else { sink_(g.id, std::move(value)); }
@@ -919,7 +936,7 @@ private:
 	void settle(Group& g) {
 		auto& w = *g.worker;
 		if (w.fenced()) {
-			if (!g.fence_seen) { g.fence_seen = true; sink_(g.id, Fenced{fence_reason(g)}); }
+			report_fence(g);
 			fail_all(g, std::make_exception_ptr(fenced(fence_reason(g))));
 			if (g.closed) { return; }
 		}

@@ -138,6 +138,9 @@ struct PreVoteRequest { Term term; Index last_index; Term last_term; };
 struct PreVoteResponse { Term term; Term request_term; bool granted; };
 // A transferring leader tells a caught-up voter to campaign now (Track C, D6).
 struct TimeoutNow { Term term; Index last_index; Token token; };
+// Quiescence (docs/mechanisms/quiescence.md): the sender's replica of the group stopped in
+// `term` (its Driver reports a fence); a follower of it drops it as on LeaderGone.
+struct Gone { Term term; };
 struct AppendRequest {
 	Term term;
 	Token rpc;
@@ -171,7 +174,7 @@ struct AppendResponse {
 	Token read_probe;
 	std::optional<LogBoundary> compacted{};
 };
-using Message = std::variant<VoteRequest, VoteResponse, AppendRequest, AppendResponse, SnapshotResponse, PreVoteRequest, PreVoteResponse, TimeoutNow>;
+using Message = std::variant<VoteRequest, VoteResponse, AppendRequest, AppendResponse, SnapshotResponse, PreVoteRequest, PreVoteResponse, TimeoutNow, Gone>;
 
 struct Start {};
 // The host supplies absolute monotonic time and a fresh randomized election

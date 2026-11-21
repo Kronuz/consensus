@@ -1317,11 +1317,53 @@ void restarts() {
 	expect(elected != 0 && g.replicas.at(elected).core->term() > term, "a restarted leader is not locked out: the group elects");
 }
 
+// A transfer to a follower at rest: the target's campaign ends its rest, so it leads with its
+// timers and its term entry is on the old leader within the settle, the third voter down too.
+void transfer() {
+	for (bool down : {false, true}) {
+		Group g(3, true);
+		const NodeId leader = rest(g, "a");
+		const Term term = g.replicas.at(leader).core->term();
+		const NodeId target = leader % 3 + 1, third = 6 - leader - target;
+		if (down) { g.replicas.at(third).core.reset(); }
+		g.act(leader, g.replicas.at(leader).core->step(TransferLeadership{1000001, target}));
+		g.settle();
+		const auto& t = *g.replicas.at(target).core;
+		const std::string at = down ? " (the third voter down)" : "";
+		expect(t.role() == Role::Leader && t.term() == term + 1, "the target leads the next term" + at);
+		expect(g.replicas.at(leader).core->last_index() == t.last_index(), "its term entry is on the old leader within the settle" + at);
+	}
+}
+
+// A leader's replica fenced on a live node raises no LeaderGone; its Driver sends Gone, and the
+// followers at rest elect within the timeout. Gone from a follower changes nothing.
+void gone() {
+	Group g(3, true);
+	const NodeId leader = rest(g, "a");
+	const Term term = g.replicas.at(leader).core->term();
+	const NodeId a = leader % 3 + 1, b = 6 - leader - a;
+	g.act(a, g.replicas.at(a).core->step(Receive{b, Gone{term}}));
+	expect(g.replicas.at(a).core->leader() == leader && g.replicas.at(a).core->resting(), "Gone from a follower changes nothing");
+	(void)g.replicas.at(leader).core->step(StorageFault{"quiescence: the leader's storage fails"});
+	expect(g.replicas.at(leader).core->role() == Role::Fenced, "the leader fences, its node up");
+	for (NodeId id : {a, b}) { g.act(id, g.replicas.at(id).core->step(Receive{leader, Gone{term}})); }
+	const auto from = g.now();
+	NodeId elected = 0;
+	for (int n = 0; n < 100 && !elected; ++n) {
+		g.tick(20);
+		for (NodeId id : {a, b}) { if (g.replicas.at(id).core->role() == Role::Leader) { elected = id; } }
+	}
+	expect(elected && g.replicas.at(elected).core->term() > term, "Gone from the leader elects a new leader in a later term");
+	expect(g.now() - from <= 2 * g.election_max(), "within the election timeout and a round: " + std::to_string(g.now() - from));
+}
+
 bool run() {
 	at_rest();
 	leader_gone();
 	restarts();
-	std::printf("quiescence: at rest, LeaderGone and restarts: %s\n", failures ? "FAILED" : "ok");
+	transfer();
+	gone();
+	std::printf("quiescence: at rest, LeaderGone, restarts, transfer and Gone: %s\n", failures ? "FAILED" : "ok");
 	return !failures;
 }
 

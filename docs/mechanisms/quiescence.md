@@ -26,8 +26,9 @@ each group's heartbeats and election timers.
   `TransferLeadership`, `Repair`), a `PeerLimits` report or `Wake`: it heartbeats at once and
   starts CheckQuorum's window afresh, and rests again once every replica acknowledges that
   round. A follower's rest ends on `Wake` or on another member's pre-vote or vote (refused, as
-  within `election_min`), on a frame that leaves it behind its leader's commit, or on a term
-  change. Its election timer then runs, and it re-acknowledges its durable log to its leader: a
+  within `election_min`), on a frame that leaves it behind its leader's commit, on a term
+  change, or on its own campaign (a transfer's `TimeoutNow`). Every role change ends a rest: a
+  candidate or a new leader runs its timers. Its election timer then runs, and it re-acknowledges its durable log to its leader: a
   leader that still leads wakes on that frame and heartbeats it back to rest; one that no longer
   leads ignores it, and the follower elects at its timeout.
 - **`LeaderGone{node}`** is the detector's report that `node` (a `Member::node`) stopped
@@ -37,12 +38,19 @@ each group's heartbeats and election timers.
   connection per peer node is the detector: `HostTransport::on_node_gone` reports its end
   ([host-transport](host-transport.md), Node gone; `groups_test driver`: a stopped leader
   node's groups elect 1.6 s after its stop, at a 1-2 s election timeout).
+- **`Gone{term}`** is the per-group report of a replica that stopped while its node stays up,
+  which no node-pair detector sees. When a group fences, its Driver sends `Gone` in the group's
+  term to every other member, and a follower of that replica in that term handles it as
+  `LeaderGone`; from anyone else it changes nothing. The fenced Core sends nothing itself: the
+  Driver reads its term and membership (`driver_test fence_tells_peers`; `groups_test driver`:
+  a leader's group fenced at rest on a live node, a follower elects within the timeout with no
+  node-gone report).
 
 Rest changes no safety argument: a commit still needs a quorum's acknowledgement in the leader's
 term and a read a quorum's probe, so a leader at rest that a partition deposed commits nothing
 and serves no read in its old term. What it trades is detection: a follower at rest under a
-leader it cannot reach elects only on `LeaderGone`, so a host enables `quiesce` only with a
-detector. A restarted member is never locked out: its campaign wakes the leader at rest, or, if
+leader it cannot reach elects only on `LeaderGone` or `Gone`, so a host enables `quiesce` only
+with a detector. A restarted member is never locked out: its campaign wakes the leader at rest, or, if
 it was the leader, its own pre-vote is not refused. A follower that alone hears `LeaderGone`
 wakes the other with its pre-vote, and the two elect within two timeouts (`simulation_test`, quiescence cases; half of
 the random seeds quiesce under a detector oracle).

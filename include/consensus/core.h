@@ -293,7 +293,8 @@ public:
 	NodeId leader() const noexcept { return leader_; }
 	// The closed state, when this replica can close now: started, not fenced or retiring,
 	// nothing persisting or out for application, applied at the commit index and a checkpoint
-	// there (docs/mechanisms/quiescence.md).
+	// there (docs/mechanisms/quiescence.md). Rest is not required: closing an awake group is
+	// safe, and its reopen may cost an election.
 	std::optional<ClosedState> closed_state() const {
 		if (!started_ || retiring_ || role_ == Role::Fenced || busy() || delivered_through_ || applied_ != durable_.commit_index ||
 			base_index_ != applied_ || membership().members.empty()) { return std::nullopt; }
@@ -509,7 +510,7 @@ private:
 	}
 	// A report that fails validation is ignored: a zero limit would empty every RPC.
 	// Quiescence: what ends a rest. A leader's: a frame, a request, a report, or Wake; a
-	// follower's: Wake (its leader's frames decide its rest, and LeaderGone ends it).
+	// follower's: Wake (its leader's frames decide its rest; LeaderGone or its leader's Gone ends it).
 	bool wakes(const Event& event) const {
 		if (std::holds_alternative<Wake>(event)) { return true; }
 		// A follower wakes on another member's (pre-)vote: its leader, if it still leads, hears
@@ -555,8 +556,9 @@ private:
 	// election timeout, as on a missed heartbeat.
 	void handle(LeaderGone gone, Actions& output) {
 		if (!started_ || role_ != Role::Follower || gone.node == 0 || leader_node() != gone.node) { return; }
-		follower(0, output); leader_contact_ = 0;
+		leader_lost(output);
 	}
+	void leader_lost(Actions& output) { follower(0, output); leader_contact_ = 0; }
 	void handle(PeerLimits report, Actions&) {
 		if (!report.incarnation || report.incarnation == configuration_.local) { return; }
 		try { validate_limits(report.limits); } catch (const std::invalid_argument&) { return; }
@@ -982,12 +984,12 @@ private:
 		// A pre-vote request names the term its sender would campaign at: answered without
 		// changing this node's term or ballot (Track C, D7).
 		if (auto request = std::get_if<PreVoteRequest>(&receive.message)) {
-			bool grant = request->term > hard_.term && !heard_from_leader(receive.authenticated_peer) && log_up_to_date(request->last_index, request->last_term);
+			bool grant = request->term > hard_.term && !heard_from_leader() && log_up_to_date(request->last_index, request->last_term);
 			output.emplace_back(Send{receive.authenticated_peer, PreVoteResponse{hard_.term, request->term, grant}}); return;
 		}
 		// The leader-contact guard: a voter that heard from a current leader within
 		// election_min ignores a vote request unless it comes from a leadership transfer.
-		if (auto request = std::get_if<VoteRequest>(&receive.message); request && !request->transfer && heard_from_leader(receive.authenticated_peer)) { return; }
+		if (auto request = std::get_if<VoteRequest>(&receive.message); request && !request->transfer && heard_from_leader()) { return; }
 		auto incoming_term = std::visit([](const auto& message) { return message.term; }, receive.message);
 		bool changed = incoming_term > hard_.term;
 		Actions deferred;
@@ -1015,15 +1017,16 @@ private:
 	bool valid(const PreVoteRequest& request) const { return valid(VoteRequest{request.term, request.last_index, request.last_term}); }
 	bool valid(const PreVoteResponse& response) const { return response.request_term > 0; }
 	bool valid(const TimeoutNow& request) const { return request.term > 0 && request.token > 0 && request.last_index < maximum; }
+	bool valid(const Gone& gone) const { return gone.term > 0; }
 	bool log_up_to_date(Index index, Term term) const {
 		return term > log_term(last_index()) || (term == log_term(last_index()) && index >= last_index());
 	}
 	// A leader is a current leader too: it refuses pre-votes and ignores untransferred votes,
 	// so a rejoining node cannot depose it (D7); CheckQuorum removes a leader cut off.
-	// A follower at rest holds its leader current until LeaderGone, except to that leader itself,
-	// whose own campaign shows it no longer leads.
-	bool heard_from_leader(NodeId source) const {
-		return role_ == Role::Leader || (role_ == Role::Follower && leader_ != 0 && (now_ - leader_contact_ < timing_.election_min || (resting_ && source != leader_)));
+	// A follower at rest wakes on another member's (pre-)vote, and the wake holds its leader
+	// current (wake()); its leader's own campaign does not wake it, so it is answered.
+	bool heard_from_leader() const {
+		return role_ == Role::Leader || (role_ == Role::Follower && leader_ != 0 && now_ - leader_contact_ < timing_.election_min);
 	}
 	bool valid(const VoteResponse&) const { return true; }
 	bool valid(const SnapshotResponse& response) const { return valid_snapshot_response(response); }
@@ -1057,6 +1060,10 @@ private:
 		if (request.term != hard_.term || role_ != Role::Follower || leader_ != source || request.last_index != last_index() ||
 			!self || self->role != MemberRole::Voter || acted_timeout_ == std::pair{source, request.token}) { return; }
 		acted_timeout_ = {source, request.token}; timed_out_ = true;
+	}
+	// The leader's replica stopped (its Driver reports its fence): as LeaderGone, per group.
+	void receive_message(NodeId source, Gone gone, StorageBatch&, Actions& output) {
+		if (role_ == Role::Follower && leader_ == source && gone.term == hard_.term) { leader_lost(output); }
 	}
 	void receive_message(NodeId source, PreVoteResponse response, StorageBatch&, Actions& output) {
 		if (!prevote_ || response.request_term != prevote_ || !response.granted || role_ == Role::Leader || !is_voter(source)) { return; }
@@ -1310,7 +1317,7 @@ private:
 	}
 	void campaign(Actions& output, bool transfer = false) {
 		++hard_.term; hard_.voted_for = configuration_.local; prevote_ = 0; prevotes_.clear();
-		role_ = Role::Candidate; leader_ = 0; grants_ = {configuration_.local}; reset_election();
+		role_ = Role::Candidate; leader_ = 0; grants_ = {configuration_.local}; resting_ = false; reset_election();
 		Actions deferred; deferred.emplace_back(RoleChanged{role_, hard_.term, 0});
 		for (NodeId voter : voters()) {
 			if (voter != configuration_.local) { deferred.emplace_back(Send{voter, VoteRequest{hard_.term, last_index(), log_term(last_index()), transfer}}); }
@@ -1331,7 +1338,7 @@ private:
 	// a heartbeat due at once.
 	void lead() {
 		role_ = Role::Leader; leader_ = configuration_.local; peers_.clear(); grants_.clear(); answered_.clear(); transfer_.reset();
-		leadership_start_ = now_; handed_off_ = false;
+		leadership_start_ = now_; handed_off_ = false; resting_ = false;
 		for (NodeId replica : replicas()) {
 			peers_.emplace(replica, Peer{last_index() + 1, 0, {}});
 			if (is_voter(replica)) { answered_[replica] = now_; }

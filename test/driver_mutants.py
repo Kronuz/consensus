@@ -71,6 +71,12 @@ MUTANTS = {
         ("worker.h", "plan = removal ? plan_event(ChangeMembership{0, std::move(*removal)}, false, limits_, scheduling_.retained) : EventAdmissionPlan{};",
             "plan = EventAdmissionPlan{}; (void)removal;"),
     ],
+    # Quiescence: a leader takes a woken follower's unprompted acknowledgement as nothing new and
+    # rests with that follower's timer running (driver_replace_test 1 1080 quiesce).
+    "wake-ack-unanswered": ("core.h",
+        "\t\t\tpeer.told = 0;\n\t\t\tacknowledge_read(source, response.read_probe);\n",
+        "\t\t\tacknowledge_read(source, response.read_probe);\n",
+    ),
     # A witness incarnation may become a learner or voter (R16).
     "witness-becomes-data": ("core.h",
         "\t\t\tif (old && old->role == MemberRole::Witness && x.role != MemberRole::Witness) { reject(RejectReason::InvalidMembership); return; }\n",

@@ -550,8 +550,8 @@ private:
 	}
 	// Ends a rest: a leader heartbeats at once, rests again only once every replica acknowledges
 	// that round, and starts CheckQuorum's window afresh; a follower's election timer runs from
-	// now, and it re-acknowledges its durable log to its leader, which wakes on it if it still
-	// leads (a pending persistence answers it on its own).
+	// now, and it re-acknowledges its durable log to its leader, which heartbeats it back to
+	// rest if it still leads, awake or not (a pending persistence answers it on its own).
 	void wake(Actions& output) {
 		resting_ = false;
 		if (role_ == Role::Leader) {
@@ -1204,6 +1204,9 @@ private:
 			// A superseded flight's success in this term still proves the follower holds this
 			// log through `matched` (log matching); a late failure is stale.
 			if (!response.success || peer.snapshot || response.matched > last_index()) { return; }
+			// Quiescence: unprompted, it may be a woken follower's, whose timer now runs; the
+			// leader rests again only once a heartbeat puts that follower back to rest.
+			peer.told = 0;
 			acknowledge_read(source, response.read_probe);
 			if (response.matched <= peer.matched) { return; }
 			acknowledge(source, peer, response.matched, output);

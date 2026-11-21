@@ -31,12 +31,17 @@
 //   - one leader per term, and every node applies a prefix of one sequence of entries;
 //   - the removal commits: every data member of the final membership applies it, and a
 //     command proposed after it commits there too;
+//   - while settling, the group is without a leader for at most three election timeouts;
 //   - after settling, every member holds the replacement's membership by value, exactly one
 //     removal (of three configurations) committed, the removed member does not lead, and
 //     every committed client write holds its value on every data member.
-// `driver_replace_test [seeds] [first]`; SIM_REPLACE_TRACE=1 logs each node's notices. Seed 26
+// `driver_replace_test [seeds] [first] [quiesce]`; `quiesce` runs it with groups at rest
+// (Timing::quiesce, no Wake or LeaderGone); SIM_REPLACE_TRACE=1 logs each node's notices. Seed 26
 // has the shape of strata's placement-repair replace seed 1: node 2 leads term 2 and removes
 // leaving voter 3 (`driver_replace_test 1 26`; driver_mutants.py's removal-unreserved fences it).
+// Seed 1080 at rest: a removed member's pre-votes wake the leader and both followers, and a leader
+// that rests without heartbeating a woken follower is deposed by it (`driver_replace_test 1 1080
+// quiesce`; driver_mutants.py's wake-ack-unanswered).
 #include "consensus/driver.h"
 #include "faultlab/faultfs.h"
 
@@ -215,6 +220,8 @@ private:
 		if (failures) { return; }
 		settle_elections += leader_changes - changes_before;
 		settle_leaderless = std::max(settle_leaderless, leaderless_most);
+		// The election bound: a timeout, a split round and a timeout again.
+		if (leaderless_most > 3 * timing().election_max) { report("no leader for " + std::to_string(leaderless_most) + " ms while settling"); return; }
 		// The final membership: the founding one without the leaving member, the joiner in its role.
 		std::set<std::pair<NodeId, int>> expected, got;
 		const MemberRole leaving_role = witness_ && leaving_ == 3 ? MemberRole::Witness : MemberRole::Voter;

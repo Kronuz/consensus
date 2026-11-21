@@ -28,9 +28,20 @@ each group's heartbeats and election timers.
   round. A follower's rest ends on `Wake` or on another member's pre-vote or vote (refused, as
   within `election_min`), on a frame that leaves it behind its leader's commit, on a term
   change, or on its own campaign (a transfer's `TimeoutNow`). Every role change ends a rest: a
-  candidate or a new leader runs its timers. Its election timer then runs, and it re-acknowledges its durable log to its leader: a
-  leader that still leads wakes on that frame and heartbeats it back to rest; one that no longer
-  leads ignores it, and the follower elects at its timeout.
+  candidate or a new leader runs its timers. Its election timer then runs, and it
+  re-acknowledges its durable log to its leader. One that no longer leads ignores it, and the
+  follower elects at its timeout.
+- **A woken follower's acknowledgement is answered.** The acknowledgement answers none of the
+  leader's appends, and a leader that still leads takes it as that follower awake: it rests
+  again only once it has heartbeat that follower its commit and heard the answer, which puts the
+  follower back to rest. This holds whether the frame woke the leader or found it awake. A
+  member's pre-vote wakes the leader and its followers alike, so the leader's heartbeat can reach
+  a follower still at rest, before the pre-vote wakes it; were the follower's acknowledgement then
+  taken as nothing new, the leader would rest with that follower's election timer running, and the
+  follower would elect at its timeout against a live leader (`driver_replace_test 1 1080
+  quiesce`: a removed member's pre-votes woke both followers, and one deposed the leader). Rest
+  stops heartbeats only while every follower rests too; a follower's timer that runs is always
+  fed.
 - **`LeaderGone{node}`** is the detector's report that `node` (a `Member::node`) stopped
   answering. A follower whose leader is on that node drops it and elects within its election
   timeout, as after a missed heartbeat. `Driver::leader_gone(node)` raises it at every open group

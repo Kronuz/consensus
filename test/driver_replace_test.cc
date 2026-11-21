@@ -34,7 +34,9 @@
 //   - after settling, every member holds the replacement's membership by value, exactly one
 //     removal (of three configurations) committed, the removed member does not lead, and
 //     every committed client write holds its value on every data member.
-// `driver_replace_test [seeds] [first]`; SIM_REPLACE_TRACE=1 logs each node's notices.
+// `driver_replace_test [seeds] [first]`; SIM_REPLACE_TRACE=1 logs each node's notices. Seed 26
+// has the shape of strata's placement-repair replace seed 1: node 2 leads term 2 and removes
+// leaving voter 3 (`driver_replace_test 1 26`; driver_mutants.py's removal-unreserved fences it).
 #include "consensus/driver.h"
 #include "faultlab/faultfs.h"
 

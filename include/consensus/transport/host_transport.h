@@ -356,6 +356,8 @@ struct HostTransportStats {
 	// A level: records this loop's connections hold of what they owe their peers (credit, closed),
 	// repaid ones included until they are freed; and closed answers dropped past `closes`.
 	std::atomic<std::uint64_t> owed{0}, unanswered{0};
+	// Peer nodes reported gone on this loop: one per Control connection that ended.
+	std::atomic<std::uint64_t> gone{0};
 	// The receive bound: connections ended for data past a group's window, control frames refused.
 	std::atomic<std::uint64_t> overrun{0}, flooded{0};
 };
@@ -377,6 +379,9 @@ class HostTransport {
 	// per incarnation and connection, before that source's first admitted frame on it (Core's
 	// PeerLimits, which caps what the group's leader sends that member).
 	using ReportLimits = std::function<void(GroupId, const kronuz::consensus::PeerLimits &)>;
+	// On each loop: a peer node whose Control connection ended, so this host no longer hears it.
+	// One detector per node pair, in place of each group's heartbeats (quiescence's LeaderGone).
+	using NodeGone = std::function<void(kronuz::consensus::NodeId)>;
 
 	// A served call: its events, or none to answer unknown_method. The handler acts on the call
 	// from its events, which run on the call's loop; `call` names it to write, consume and stop.
@@ -431,6 +436,8 @@ class HostTransport {
 	void on_deliver(std::uint32_t loop, Deliver deliver) { loops_.at(loop).deliver = std::move(deliver); }
 	// Before any frame arrives: where loop `loop` reports its peers' limits.
 	void on_peer_limits(std::uint32_t loop, ReportLimits report) { loops_.at(loop).report = std::move(report); }
+	// Before start(): where loop `loop` hears that a peer node is gone.
+	void on_node_gone(std::uint32_t loop, NodeGone gone) { loops_.at(loop).gone = std::move(gone); }
 	// On `loop`: its connections' counters, hellos refused by version among them.
 	const LinkStats &link_stats(std::uint32_t loop) const { return loops_.at(loop).links->stats(); }
 	// On the group's loop: the host stores `group` as its incarnation `incarnation`, with the open
@@ -826,6 +833,7 @@ class HostTransport {
 		std::unique_ptr<Links> links;
 		Deliver deliver;
 		ReportLimits report;
+		NodeGone gone;
 		std::map<std::pair<kronuz::consensus::NodeId, LinkLane>, Lane> lanes;
 		std::vector<std::vector<Outgoing>> out;  // this loop's groups' frames, by connection loop
 		std::vector<Batch> in;                   // this read's frames, by group loop
@@ -1112,6 +1120,15 @@ class HostTransport {
 		}
 		if (!lane.active.empty() || waiting)
 			pump(k, link.peer, link.lane);
+		if (link.lane == LinkLane::Control && !loops_[k].stopping)
+			for (std::uint32_t j = 0; j != loops_.size(); ++j)
+				on(j, [this, j, node = link.peer] {
+					auto &there = loops_[j];
+					if (there.stopping || !there.gone)
+						return;
+					++there.stats.gone;
+					there.gone(node);
+				});
 	}
 	// On the connection's loop, each frame: credit and closed apply here; a message or an open
 	// joins its group loop's batch for this read; a lane frame goes to the call table at once (T5).

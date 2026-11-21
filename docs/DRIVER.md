@@ -103,6 +103,10 @@ public:
 	// the caller on its own scheduler. Each completes per its D8 row (below).
 	task::task<void> create(GroupId, kronuz::journal::Identity, task::cancel_token = {});
 	template <class Restore> task::task<void> recover(GroupId, Restore, task::cancel_token = {});
+	// recover, then reopen with the RFTCLOS1 bytes closed_state() gave at close: a matching record
+	// resumes its term with no election (docs/mechanisms/quiescence.md); damaged or another
+	// replica's bytes complete it with kronuz::journal::Corruption before any recovery IO.
+	template <class Restore> task::task<void> recover(GroupId, Restore, std::optional<std::string> closed, task::cancel_token = {});
 	task::task<Placement> propose(GroupId, std::string command, task::cancel_token = {});
 	task::task<void> committed(GroupId, Placement, task::cancel_token = {});
 	task::task<Placement> change_membership(GroupId, Membership next, task::cancel_token = {});
@@ -115,6 +119,9 @@ public:
 	// On the loop: an open group's role, term, leader, indexes and membership in force.
 	struct GroupState { Role role; Term term; NodeId leader; Index committed, applied; Membership membership; };
 	std::optional<GroupState> state(GroupId) const;
+	// The closed state (RFTCLOS1) when the group can close now: started, no call or frame
+	// waiting, at rest at a checkpoint covering applied; bound to the host table's incarnation.
+	std::optional<std::string> closed_state(GroupId) const;
 	std::size_t armed_group_timers() const;     // groups whose wheel entry is armed
 	std::vector<std::uint64_t> waiting_groups() const;  // groups holding a waiter, in order
 	std::size_t in_flight() const;              // IO tasks and turn watches: a group's only frames

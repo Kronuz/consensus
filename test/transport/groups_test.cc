@@ -1046,9 +1046,11 @@ struct Node {
 	std::mutex mutex;
 	std::map<GroupId, std::vector<std::string>> applied;
 	std::atomic<std::uint64_t> misplaced{0};  // frames delivered off their group's loop
+	std::atomic<bool> hold_apply{false};  // Committed ranges stay out for application, the last in `held`
+	std::atomic<Index> held{0};
 	// Each group is founded by `voters`; with none, this node is a joiner (D5).
 	Node(NodeId id, std::uint32_t L, std::uint16_t port, std::shared_ptr<j::IO> io, const std::vector<GroupId> &groups,
-		 const std::map<NodeId, PeerAddress> &peers, std::vector<NodeId> voters = {1, 2, 3}, HostTransportOptions options = {})
+		 const std::map<NodeId, PeerAddress> &peers, std::vector<NodeId> voters = {1, 2, 3}, HostTransportOptions options = {}, bool quiesce = false)
 		: host(id, L, port) {
 		options.member_of = [this](GroupId g, NodeId incarnation) -> std::optional<Member> {
 			auto s = per[host.transport->loop_of_group(g)]->driver->state(g);
@@ -1065,6 +1067,7 @@ struct Node {
 			p->driver = std::make_unique<Driver<GroupSink>>(Seams{ref, j::completion_ref::of(p->io), *journal, k, id * 31 + k}, p->sink);
 			task::spawn(ref, journal->driver(k).run(j::completion_ref::of(p->io), p->stop.token()), [q = p.get()](std::exception_ptr) { q->turns_done = true; });
 			task::spawn(ref, p->driver->run(p->stop.token()), [q = p.get()](std::exception_ptr) { q->driver_done = true; });
+			host.transport->on_node_gone(k, [this, k](NodeId gone) { per[k]->driver->leader_gone(gone); });
 			host.transport->on_deliver(k, [this, k](const Received &r) {
 				if (const NodeId c = cut; c && (host.node == c || r.node == c))
 					return false;
@@ -1094,6 +1097,7 @@ struct Node {
 				o.admission = admission;
 				o.scheduling = WorkerLimits{16, 128};
 				o.limits.command_bytes = o.limits.rpc_bytes = 4096;  // a full batch fits the 16 KiB segments' turn room
+				o.timing.quiesce = quiesce;
 				driver->open(g, std::move(o));
 				auto opening = journal->status(g) == j::GroupStatus::stored ? driver->recover(g, [](j::ArtifactReader &) {})
 																			: driver->create(g, j::Identity{'G', char('0' + host.node)});
@@ -1161,6 +1165,10 @@ void GroupSink::operator()(GroupId g, Committed n) {
 			last = e.index;
 		}
 	}
+	if (last && node->hold_apply) {
+		node->held = last;  // out for application until the test fails it
+		return;
+	}
 	if (last)
 		node->host.post(loop, [n = node, k = loop, g, last] {
 			if (auto &d = n->per[k]->driver)
@@ -1220,14 +1228,14 @@ struct Cluster {
 	}
 	std::filesystem::path directory(NodeId n) const { return root / ("node" + std::to_string(n)); }
 	// Starts node `n` with L loops, or restarts it on its journal.
-	void start(NodeId n, std::uint32_t L, std::vector<NodeId> voters = {1, 2, 3}) {
+	void start(NodeId n, std::uint32_t L, std::vector<NodeId> voters = {1, 2, 3}, bool quiesce = false) {
 		nodes[n].reset();
 		std::map<NodeId, PeerAddress> peers;
 		for (NodeId m = 1; m <= 4; ++m)
 			if (m != n)
 				peers[m] = {"127.0.0.1", ports[m]};
 		nodes[n] = std::make_unique<Node>(n, L, ports[n], std::make_shared<j::PosixIO>(directory(n)), groups, peers, std::move(voters),
-										  options_of(n));
+										  options_of(n), quiesce);
 	}
 	std::vector<Node *> of(std::initializer_list<NodeId> ids) {
 		std::vector<Node *> r;
@@ -1279,6 +1287,144 @@ void driver() {
 					(unsigned long long)restarted, s ? (unsigned long long)s->term : 0ull, s ? (unsigned long long)s->committed : 0ull);
 		assert(ok);
 	}
+}
+
+// Quiescence A2: three nodes of 2 loops, groups at rest arm no timer; the leaders' node stops,
+// and the transport's node-pair detector (its Control connection's end) raises LeaderGone at
+// every group following a leader there, which elect within their timeout and commit again.
+void quiescent() {
+	const std::vector<GroupId> groups{groups_on(2, 0, 1)[0], groups_on(2, 1, 1)[0]};
+	Cluster c("quiescent", groups);
+	for (NodeId n = 1; n <= 3; ++n)
+		c.start(n, 2, {1, 2, 3}, true);
+	auto all = c.of({1, 2, 3});
+	for (auto g : groups) {
+		step("quiescent: group " + std::to_string(g) + " elects and commits");
+		const bool ok = commit_everywhere(all, g, "before-" + std::to_string(g), 30'000);
+		std::printf("quiescent: group %llu committed on all three nodes: %s\n", (unsigned long long)g, ok ? "yes" : "NO");
+		assert(ok);
+	}
+	// Both groups led from one node, so its stop leaves every group leaderless.
+	step("quiescent: both groups led from one node");
+	NodeId gone = c.leader({1, 2, 3}, groups[0]);
+	for (int tries = 0; c.leader({1, 2, 3}, groups[1]) != gone && tries < 20; ++tries) {
+		const NodeId from = c.leader({1, 2, 3}, groups[1]);
+		if (from)
+			c.nodes[from]->call(groups[1], [g = groups[1], gone](Driver<GroupSink> *d) { return transferring(d, g, gone); }, 5s);
+		std::this_thread::sleep_for(100ms);
+	}
+	assert(gone && c.leader({1, 2, 3}, groups[1]) == gone);
+	step("quiescent: every replica rests");
+	const bool rested = until([&] {
+		for (NodeId n = 1; n <= 3; ++n)
+			for (auto g : groups)
+				if (auto s = c.nodes[n]->state(g); !s || !s->resting)
+					return false;
+		return true;
+	}, 10'000);
+	std::printf("quiescent: every replica of both groups at rest: %s\n", rested ? "yes" : "NO");
+	assert(rested);
+	std::map<GroupId, Term> terms;
+	for (auto g : groups)
+		terms[g] = c.nodes[gone]->state(g)->term;
+	// At rest nothing elects: a follower's election timer does not run.
+	std::this_thread::sleep_for(3s);
+	for (auto g : groups)
+		for (NodeId n = 1; n <= 3; ++n) {
+			auto s = c.nodes[n]->state(g);
+			assert(s && s->term == terms[g] && s->resting && "nothing moves at rest past an election timeout");
+		}
+	step("quiescent: node " + std::to_string(gone) + " stops");
+	std::vector<NodeId> rest;
+	for (NodeId n = 1; n <= 3; ++n)
+		if (n != gone)
+			rest.push_back(n);
+	const auto stopped = steady::now();
+	c.nodes[gone].reset();
+	for (auto g : groups) {
+		const bool elected = until([&] {
+			for (auto n : rest)
+				if (auto s = c.nodes[n]->state(g); s && s->role == Role::Leader && s->term > terms[g])
+					return true;
+			return false;
+		}, 10'000);
+		std::printf("quiescent: group %llu elected a new leader %llu ms after node %llu stopped: %s\n", (unsigned long long)g,
+					(unsigned long long)ms_since(stopped), (unsigned long long)gone, elected ? "yes" : "NO");
+		assert(elected);
+		// Election timeout (2 s here) and a round, plus the stop itself and this poll.
+		assert(ms_since(stopped) < 5'000 && "within the election timeout");
+	}
+	std::uint64_t reported = 0;
+	for (auto n : rest)
+		for (std::uint32_t k = 0; k != 2; ++k)
+			reported += c.nodes[n]->host.transport->stats(k).gone;
+	std::printf("quiescent: node-gone reports on the other two hosts' loops: %llu\n", (unsigned long long)reported);
+	auto two = c.of({rest[0], rest[1]});
+	for (auto g : groups) {
+		step("quiescent: group " + std::to_string(g) + " commits on the other two");
+		const bool ok = commit_everywhere(two, g, "after-" + std::to_string(g), 30'000);
+		std::printf("quiescent: group %llu committed on the other two: %s\n", (unsigned long long)g, ok ? "yes" : "NO");
+		assert(ok);
+	}
+}
+
+// Quiescence: the leader's group fences at rest while its node stays up, so no node-pair report
+// fires; its Driver sends Gone, and the followers elect within their timeout.
+void quiescent_fence() {
+	const GroupId g = groups_on(2, 0, 1)[0];
+	Cluster c("quiescent-fence", {g});
+	for (NodeId n = 1; n <= 3; ++n)
+		c.start(n, 2, {1, 2, 3}, true);
+	step("quiescent fence: the group elects, commits and rests");
+	const bool ok = commit_everywhere(c.of({1, 2, 3}), g, "before", 30'000);
+	assert(ok);
+	const bool rested = until([&] {
+		for (NodeId n = 1; n <= 3; ++n)
+			if (auto s = c.nodes[n]->state(g); !s || !s->resting)
+				return false;
+		return true;
+	}, 10'000);
+	std::printf("quiescent fence: every replica at rest: %s\n", rested ? "yes" : "NO");
+	assert(rested);
+	const NodeId leader = c.leader({1, 2, 3}, g);
+	const auto at = c.nodes[leader]->state(g);
+	assert(leader && at);
+	// The leader's application holds a command out, the followers apply it and rest, then the
+	// leader's application fails at it: its group fences.
+	step("quiescent fence: node " + std::to_string(leader) + "'s application holds a command, the followers rest");
+	auto &node = *c.nodes[leader];
+	const auto k = node.host.transport->loop_of_group(g);
+	node.hold_apply = true;
+	node.host.post(k, [&node, k, g] { task::spawn(task::scheduler_ref::of(node.host.loops[k]->scheduler), proposing(node.per[k]->driver.get(), g, "held"), [](std::exception_ptr) {}); });
+	const bool held = until([&] {
+		if (!node.held)
+			return false;
+		for (NodeId n = 1; n <= 3; ++n)
+			if (n != leader)
+				if (auto s = c.nodes[n]->state(g); !c.nodes[n]->has(g, "held") || !s || !s->resting)
+					return false;
+		return true;
+	}, 10'000);
+	std::printf("quiescent fence: the followers applied the held command and rest: %s\n", held ? "yes" : "NO");
+	assert(held);
+	step("quiescent fence: the leader's group fences on node " + std::to_string(leader));
+	const auto fenced = steady::now();
+	node.host.post(k, [&node, k, g, through = Index(node.held)] { node.per[k]->driver->application_failed(g, through, "the test fails the application"); });
+	const bool elected = until([&] {
+		for (NodeId n = 1; n <= 3; ++n)
+			if (auto s = n == leader ? std::nullopt : c.nodes[n]->state(g); s && s->role == Role::Leader && s->term > at->term)
+				return true;
+		return false;
+	}, 10'000);
+	std::uint64_t reported = 0;
+	for (NodeId n = 1; n <= 3; ++n)
+		for (std::uint32_t l = 0; l != 2; ++l)
+			reported += c.nodes[n]->host.transport->stats(l).gone;
+	std::printf("quiescent fence: a follower elected %llu ms after the fence: %s; node-gone reports %llu\n", (unsigned long long)ms_since(fenced),
+				elected ? "yes" : "NO", (unsigned long long)reported);
+	assert(elected && "Gone elects without a node-pair report");
+	assert(reported == 0 && "the leader's node stayed up");
+	assert(ms_since(fenced) < 5'000 && "within the election timeout");
 }
 
 Membership with_learner(Membership m, NodeId incarnation) {
@@ -2524,7 +2670,7 @@ int main(int argc, char **argv) {
 	else if (which == "upload")
 		timed("upload", upload);
 	else if (which == "driver")
-		driver();
+		driver(), quiescent(), quiescent_fence();
 	else if (which == "refill")
 		refill();
 	else if (which == "identity")

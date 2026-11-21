@@ -156,7 +156,7 @@ class Driver {
 	using Kind = driver_detail::Kind;
 
 public:
-	struct GroupState { Role role; Term term; NodeId leader; Index committed, applied; Membership membership; };
+	struct GroupState { Role role; Term term; NodeId leader; Index committed, applied; Membership membership; bool resting = false; };
 
 	Driver(Seams seams, Sink& sink)
 		: scheduler_(seams.scheduler), io_(seams.io), host_(seams.host), turns_(seams.host.driver(seams.loop)), loop_(seams.loop), sink_(sink),
@@ -225,7 +225,25 @@ public:
 		on_loop();
 		auto* g = live(id);
 		if (!g || g->closing) { count_drop(id); return; }
-		g->limits.push_back(limits); mark_ready(*g);
+		g->notices.emplace_back(limits); mark_ready(*g);
+	}
+	// Quiescence (docs/mechanisms/quiescence.md): ends the group's rest, as a request or a frame
+	// due for it would.
+	void wake(GroupId id) {
+		on_loop();
+		auto* g = live(id);
+		if (!g || g->closing) { count_drop(id); return; }
+		g->notices.emplace_back(Wake{}); mark_ready(*g);
+	}
+	// The node-pair detector's report: `node` stopped answering. Every open group following a
+	// leader on it drops that leader and elects within its election timeout.
+	void leader_gone(NodeId node) {
+		on_loop();
+		for (auto& [id, group] : groups_) {
+			auto& g = *group;
+			if (g.closing || !g.started || g.worker->role() != Role::Follower || g.worker->leader_node() != node) { continue; }
+			g.notices.emplace_back(LeaderGone{node}); mark_ready(g);
+		}
 	}
 	// An open group's own count; an id not open (closed, never opened) reads the count of plain
 	// calls dropped on every id not open.
@@ -237,7 +255,19 @@ public:
 		auto found = groups_.find(id);
 		if (found == groups_.end()) { return std::nullopt; }
 		const auto& w = *found->second->worker;
-		return GroupState{w.role(), w.term(), w.leader(), w.committed(), w.applied_index(), w.membership().value_or(Membership{})};
+		return GroupState{w.role(), w.term(), w.leader(), w.committed(), w.applied_index(), w.membership().value_or(Membership{}), w.resting()};
+	}
+	// The group's closed state, RFTCLOS1 (docs/mechanisms/quiescence.md), when it can close
+	// now: started, no call or frame waiting, at a checkpoint covering applied
+	// (Core::closed_state). The host keeps it beside the checkpoint and hands it to recover.
+	std::optional<std::string> closed_state(GroupId id) const {
+		auto found = groups_.find(id);
+		if (found == groups_.end()) { return std::nullopt; }
+		const auto& g = *found->second;
+		if (!g.started || g.closing || g.head || !g.inbox.empty()) { return std::nullopt; }
+		auto state = g.worker->closed_state();
+		if (!state) { return std::nullopt; }
+		return encode_closed_state(*state, closed_identity(id, *g.worker));
 	}
 	// The groups whose wheel entry is armed: group timers, which the blocking entry never
 	// counts as a reason to wait (D5 step 4).
@@ -275,10 +305,24 @@ public:
 	}
 	template <class Restore>
 	task::task<void> recover(GroupId id, Restore restore, task::cancel_token token = {}) {
+		return recover(id, std::move(restore), std::nullopt, std::move(token));
+	}
+	// Recovers the group and reopens it with the closed state the host kept at close
+	// (closed_state): a matching one resumes its term with no election, a stale one is unused.
+	// Damaged bytes or another replica's fail the call with kronuz::journal::Corruption.
+	template <class Restore>
+	task::task<void> recover(GroupId id, Restore restore, std::optional<std::string> closed, task::cancel_token token = {}) {
 		Call call(*this, Kind::open, std::move(token));
 		co_await call.enter();
 		if (call.begin(id, false) && !call.resume_open()) {
-			try { call.group->worker->recover(std::move(restore)); call.group->opened = true; }
+			try {
+				auto& w = *call.group->worker;
+				std::optional<ClosedState> reopen;  // refused before any recovery IO
+				if (closed) { reopen = decode_closed_state(*closed, closed_identity(id, w)); }
+				w.recover(std::move(restore));
+				if (reopen) { w.reopen(*reopen); }
+				call.group->opened = true;
+			}
 			catch (...) { call.fail(opening_error(id)); }
 		}
 		co_await call;
@@ -370,7 +414,7 @@ private:
 		std::optional<std::pair<Index, std::string>> application_failure;
 		std::optional<std::pair<Token, std::optional<std::string>>> activation;
 		std::unique_ptr<SnapshotActivation> activating;
-		std::vector<PeerLimits> limits;
+		std::vector<Event> notices;  // PeerLimits, Wake and LeaderGone, in order
 		std::string fence_reason;
 		Group* ready_next = nullptr;
 		std::uint64_t dropped = 0;
@@ -531,6 +575,23 @@ private:
 	}
 	RequestId next_request() noexcept { return ++requests_; }
 	std::string fence_reason(const Group& g) const { return g.fence_reason.empty() ? "consensus group fenced" : g.fence_reason; }
+	// The Sink hears a fence once, and the group's other members hear Gone in its term: a
+	// follower of this replica elects within its timeout, as on LeaderGone, though the node
+	// stays up (docs/mechanisms/quiescence.md).
+	void report_fence(Group& g) {
+		if (std::exchange(g.fence_seen, true)) { return; }
+		sink_(g.id, Fenced{fence_reason(g)});
+		const auto& w = *g.worker;
+		const Term term = w.term();
+		if (!term) { return; }
+		const NodeId local = w.configuration().local;
+		auto membership = w.membership();
+		if (!membership || membership->members.empty()) {
+			for (auto voter : w.configuration().voters) { if (voter != local) { sink_(g.id, Send{voter, Gone{term}}); } }
+			return;
+		}
+		for (const auto& member : membership->members) { if (member.incarnation != local) { sink_(g.id, Send{member.incarnation, Gone{term}}); } }
+	}
 	// D5: a voting member (voter or witness) other than this node.
 	bool has_peer(const Group& g) const {
 		const auto& w = *g.worker;
@@ -628,6 +689,14 @@ private:
 			if (g.closed) { erase(g); host_.settle(loop_); }
 		}
 	}
+	// What binds a closed state to this replica: its configuration's identities and member
+	// incarnation, and the host table's incarnation of the group.
+	ClosedIdentity closed_identity(GroupId id, const Worker& w) const {
+		auto entry = host_.entry(id);
+		if (!entry) { throw kronuz::journal::Corruption("closed state of a group the host does not hold"); }
+		const auto& c = w.configuration();
+		return {c.cluster, c.configuration, id, entry->incarnation, c.local};
+	}
 	// create's or recover's failure. The host's hold refuses a group a failed close left in
 	// doubt with EIO before any IO, holding nothing; an EIO from later IO leaves the hold held.
 	std::exception_ptr opening_error(GroupId id) {
@@ -706,7 +775,7 @@ private:
 		auto& w = *g.worker;
 		std::uint64_t at = w.next_deadline();
 		at = at > max_ms ? never : at * 1'000'000;
-		const bool waiting = !g.inbox.empty() || !g.limits.empty() || unadmitted(g) || g.retiring;
+		const bool waiting = !g.inbox.empty() || !g.notices.empty() || unadmitted(g) || g.retiring;
 		if (waiting && !g.io && !g.watching) { at = std::min(at, scheduler_.now() + retry_ns); }
 		if (at == never) { disarm(g); return; }
 		scheduler_.arm(g, at);
@@ -746,10 +815,10 @@ private:
 			return true;
 		}
 		bool progress = false;
-		while (!g.closing && !g.limits.empty()) {
-			Event event = g.limits.front();
+		while (!g.closing && !g.notices.empty()) {
+			Event event = g.notices.front();
 			if (w.try_submit_retained(event) != SubmitResult::Accepted) { break; }
-			g.limits.erase(g.limits.begin()); progress = true;
+			g.notices.erase(g.notices.begin()); progress = true;
 		}
 		std::size_t taken = 0;
 		while (!g.closing && taken < g.inbox.size()) {
@@ -851,7 +920,7 @@ private:
 					if (auto* x = find(g, value.request)) { x->published = value; complete(g, *x); } else { sink_(g.id, std::move(value)); }
 				} else if constexpr (std::is_same_v<T, Fenced>) {
 					g.fence_reason = value.reason;
-					if (!g.fence_seen) { g.fence_seen = true; sink_(g.id, std::move(value)); }
+					report_fence(g);
 				} else if constexpr (std::is_same_v<T, Committed>) {
 					// A witness keeps the log but no application state: it acknowledges its own ranges.
 					if (witness_range(g, value)) { g.applied = Applied{value.entries.back().index}; mark_ready(g); } else { sink_(g.id, std::move(value)); }
@@ -867,7 +936,7 @@ private:
 	void settle(Group& g) {
 		auto& w = *g.worker;
 		if (w.fenced()) {
-			if (!g.fence_seen) { g.fence_seen = true; sink_(g.id, Fenced{fence_reason(g)}); }
+			report_fence(g);
 			fail_all(g, std::make_exception_ptr(fenced(fence_reason(g))));
 			if (g.closed) { return; }
 		}
@@ -911,7 +980,7 @@ private:
 	// record; the rest drain as they complete.
 	void begin_close(Group& g) {
 		g.closing = true;
-		g.inbox.clear(); std::vector<Receive>().swap(g.inbox); g.limits.clear();
+		g.inbox.clear(); std::vector<Receive>().swap(g.inbox); g.notices.clear();
 		for (auto* x = g.head; x;) {
 			auto* next = x->next;
 			if (!holds_record(g, *x)) { complete(g, *x, std::make_exception_ptr(closed{})); }

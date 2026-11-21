@@ -15,10 +15,10 @@ import tempfile
 T = "include/consensus/transport/"
 MUTANTS = {
     # deadline.h (A1)
-    "no-extension": (T + "deadline.h", "if (self.extend_late_ && !self.extended_ && late > wheel::timer_wheel::tick) {", "if (false) {"),
-    "uncapped": (T + "deadline.h", "self.extended_ = std::min(late, self.timeout_);", "self.extended_ = late;"),
-    "twice": (T + "deadline.h", "if (self.extend_late_ && !self.extended_ && late > wheel::timer_wheel::tick) {",
-              "if (self.extend_late_ && late > wheel::timer_wheel::tick) {"),
+    "no-extension": (T + "deadline.h", "\t\tif (self.extend_late_ && !self.extended_)\n", "\t\tif (false)\n"),
+    "uncapped": (T + "deadline.h", "return late > wheel::timer_wheel::tick ? std::min(late, timeout) : 0;",
+                 "return late > wheel::timer_wheel::tick ? late : 0;"),
+    "twice": (T + "deadline.h", "\t\tif (self.extend_late_ && !self.extended_)\n", "\t\tif (self.extend_late_)\n"),
     "wake-ignores-extension": (T + "deadline.h", "\t\tif (state_ != outcome::pending)\n\t\t\treturn;\n\t\tstate_ = outcome::woken;",
                                "\t\tif (state_ != outcome::pending || extended_)\n\t\t\treturn;\n\t\tstate_ = outcome::woken;"),
     "entry-left-armed": (T + "deadline.h", "\t\tif (armed())\n\t\t\tloop_.cancel(*this);\n\t\tleave();", "\t\tleave();"),
@@ -62,6 +62,11 @@ MUTANTS = {
     "late-always-extends": (T + "deadline.h", "if (self.extend_late_ && !self.extended_", "if (!self.extended_"),
     "keepalive-extends": (T + "connection.h", "late_deadline idle(loop_, options_.keepalive, false);",
                           "late_deadline idle(loop_, options_.keepalive);"),
+    # consensus-quiescence A2: LeaderGone dropped for one group, and in Core
+    "leader-gone-skips-one": ("include/consensus/driver.h", "g.notices.emplace_back(LeaderGone{node}); mark_ready(g);",
+                              "if (&g != groups_.begin()->second.get()) { g.notices.emplace_back(LeaderGone{node}); mark_ready(g); }"),
+    "node-gone-unreported": (T + "host_transport.h", "if (link.lane == LinkLane::Control && !loops_[k].stopping)", "if (false)"),
+    "leader-gone-ignored": ("include/consensus/core.h", "\t\tfollower(0, output); leader_contact_ = 0;\n", "\t\t(void)output;\n"),
     # links.h (A4's tie-break, A1's lookup)
     "refuse-when-offered": (T + "links.h", "return !offered || peer < pins_.local();", "return !offered;"),
     "accept-when-offered": (T + "links.h", "return !offered || peer < pins_.local();", "return true || offered;"),

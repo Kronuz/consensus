@@ -168,6 +168,21 @@ Queues are bounded: a group queues at most 64 control frames and 8 MiB of data f
 connection; more are dropped and counted. A lane with frames and no connection dials, at
 most once per `redial` (200 ms) after a failed dial.
 
+## Node gone: one detector per node pair
+
+A host's Control connection to a peer node is the pair's failure detector: its keepalive (1 s)
+and `dead_after` (5 s) already bound how long a silent peer stays connected, whatever the group
+count. When the Control link to a node ends, except at `stop()`, every loop hears it through
+`on_node_gone(loop, fn)` with the node id, and counts it in `HostTransportStats::gone`. A host
+running quiescent groups ([quiescence](quiescence.md), Rest) wires it to
+`Driver::leader_gone(node)`, which raises `LeaderGone` at every open group following a leader
+there: groups at rest arm no timer, and this report replaces their heartbeats and election
+timeouts. A report for a node that comes back costs a pre-vote round, not a leader: the pre-vote
+wakes the leader at rest, which heartbeats its followers back.
+
+The detector holds while the Control connection stays up; a connection closed for idleness would
+need its end told apart from a lost peer.
+
 ## Tables
 
 Every per-group table is one `GroupTable<V>`: entries dense in a vector (grown by 1.5x), found
@@ -217,7 +232,7 @@ keep every byte and the closed (`coalesce-drops-credit`). `consensus_transport_g
 | `credit` | a group whose loop stalls 1.5 s has at most its window at the receiver; another group's heartbeats keep a 59 ms gap | `no-credit` |
 | `reader` | `reader_test`: a group refused for 3 s beside a heartbeat group on the reader's own loop; the heartbeat's longest gap stays near 100 ms | |
 | `upload` | four groups upload 2 MiB appends of 1 MiB commands to a reader throttled to 40 MB/s; a heartbeat and a vote on the same connection keep under the 1,000 ms election timeout, or under 1.6 times the 8 MiB window over the reader's delivery rate across the run when the runner slows it (a control frame waits behind at most one window; 216 macos-15-intel probe runs put the gap at 0.34-1.44 of that, the reader at 6-26 MiB/s against 38 nominal); a run delivering under two windows fails | `bulk-ahead-of-control` (the gap becomes the whole 4 s upload) |
-| `driver` | three nodes of 2 loops, a Driver per loop with its Sink's `Send` over the transport: two groups elect and commit, the first group's leader restarts, and both commit again on all three | |
+| `driver` | three nodes of 2 loops, a Driver per loop with its Sink's `Send` over the transport: two groups elect and commit, the first group's leader restarts, and both commit again on all three; then, quiescent, both groups led from one node rest (nothing moves for 3 s), that node stops, and the node-gone report elects each within its timeout | `node-gone-unreported` |
 | `refill` | frames of 40 KiB against a 64 KiB window, so one goes at a time: after the receiver refuses frames for 1 s, and after it restarts with a frame outstanding, a marker frame still arrives | `no-credit-on-refuse`, `no-reset-on-end` |
 | `identity` | host 1 sends 20 rounds to host 2, which stores `ok`, four groups each with one open field differing, and one group not yet: none of the mismatched or unstored groups' frames arrive (80 `unopened`), a destination not held and a source on another node are refused (20 `misrouted`, 20 `spoofed`), and an unnamed source is admitted (20); the late group opens once stored; host 1 storing `ok` under another epoch is refused until host 2 stores the same; a forgotten group's frames are refused | `admit-unstored`, `admit-unopened`, `admit-misrouted`, `admit-spoofed`, `open-cluster`, `open-group`, `open-epoch`, `open-profile`, `closed-ignored`, `open-once` |
 | `joiner` | `frame_admission`: four nodes of 2 loops; incarnation 4 on node 4 starts with an empty membership, catches up as a learner, is promoted and commits with the others | `voters-only` (the control) |

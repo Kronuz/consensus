@@ -29,6 +29,10 @@
 //   flow_bench one FIXTURE DIR PIPELINE FRAME COMMAND SECONDS
 //            one three-voter group led by node 1, proposing COMMAND-byte commands as fast as its
 //            leader persists them, Flow{PIPELINE, 4 MiB, FRAME}: committed MB/s, commit latency
+//   flow_bench verify FIXTURE DIR COMMANDS
+//            correctness, no timing: one three-voter group proposes COMMANDS distinguishable
+//            commands; every node must apply each placed command once, byte-equal, in index order
+//            (exit 1 if not)
 //   flow_bench many FIXTURE DIR SLOW HOT SECONDS
 //            100 three-voter groups on one connection per node pair, each proposing a 4 KiB command
 //            every 10 ms; node 2's barrier for group 0 is stretched SLOW times; HOT 1 makes group 0
@@ -318,6 +322,7 @@ struct Options {
 	GroupId slow_group = 0;       // its storage at `slow_node` is its own, stretched `slow` times
 	NodeId slow_node = 2;
 	unsigned slow = 1;
+	std::uint64_t verify = 0;  // proposes this many distinguishable commands, then stops
 	GroupId hot = 0;  // a group that proposes `hot_command` bytes whenever it can, whatever period_us
 	std::size_t hot_command = 256 << 10;
 };
@@ -330,6 +335,13 @@ struct Track {
 	std::atomic<std::uint64_t> sent{0}, delivered{0};
 };
 std::map<GroupId, std::unique_ptr<Track>> tracks;
+
+// A command whose bytes name its request.
+std::string payload_of(RequestId request, std::size_t size) {
+	std::string s = "r" + std::to_string(request) + ";";
+	s.resize(std::max(size, s.size()), char('a' + request % 26));
+	return s;
+}
 
 struct Node;
 // A group's Core on its node, with what it holds while the Core persists.
@@ -345,6 +357,8 @@ struct Group {
 	// While measuring: the leader's commits, a node's applies, and inbox overflows.
 	Samples commit_us;
 	std::uint64_t committed = 0, commands = 0, inbox_drops = 0, proposals = 0;
+	std::map<Index, RequestId> placed;                  // verify: the leader's placements
+	std::vector<std::pair<Index, std::string>> applied;  // verify: every Command this node applied
 	std::array<std::uint64_t, 11> rejects{};  // by RejectReason
 };
 
@@ -462,6 +476,8 @@ struct Node {
 				g.track->sent += entry_bytes(s->message);
 			send_message(*transport, 0, g.id, id, s->peer, *s, o.limits);
 		} else if (auto *placed = std::get_if<ProposalPlaced>(&a)) {
+			if (o.verify)
+				g.placed[placed->index] = placed->request;
 			const auto asked = g.asked.find(placed->request);
 			if (asked != g.asked.end()) {
 				std::lock_guard hold(g.track->mutex);
@@ -471,6 +487,10 @@ struct Node {
 		} else if (auto *c = std::get_if<Committed>(&a)) {
 			if (c->entries.empty())
 				return;
+			if (o.verify)
+				for (const auto &e : c->entries)
+					if (e.kind == EntryKind::Command)
+						g.applied.emplace_back(e.index, e.payload);
 			if (measuring) {
 				const auto now = us_now();
 				std::lock_guard hold(g.track->mutex);
@@ -516,6 +536,8 @@ struct Node {
 	void propose(Group &g) {
 		if (g.core->role() != Role::Leader || g.core->busy())
 			return;
+		if (o.verify && g.placed.size() + g.asked.size() >= o.verify)
+			return;
 		const auto now = us_now();
 		const bool hot = g.id == o.hot;
 		if (!hot && o.period_us) {
@@ -526,7 +548,7 @@ struct Node {
 		g.asked[++g.request] = now;
 		if (measuring)
 			++g.proposals;
-		step(g, Propose{g.request, std::string(hot ? o.hot_command : o.command, 'c')});
+		step(g, Propose{g.request, o.verify ? payload_of(g.request, o.command) : std::string(hot ? o.hot_command : o.command, 'c')});
 	}
 };
 
@@ -629,12 +651,39 @@ void one(const std::filesystem::path &dir, std::uint32_t pipeline, std::size_t f
 		auto &g = c.group(1, 1000);
 		return std::tuple{g.committed, g.commands, g.commit_us.at(0.5), g.commit_us.at(0.99), proposals_line(g)};
 	});
+	if (!commands)
+		throw std::runtime_error("one: no command committed");
 	std::printf("one: barrier %s, pipeline %u frame %zu command %zu: %.1f MB/s committed (%llu commands in %.2f s), commit p50 %llu us p99 %llu us\n", barrier_name().c_str(), pipeline,
 				frame, command, double(committed) / secs / 1e6, (unsigned long long)commands, secs, (unsigned long long)p50, (unsigned long long)p99);
 	for (NodeId n = 1; n <= 3; ++n)
 		std::printf("  node %llu storage: %s\n", (unsigned long long)n, storage_line(*c.nodes[n - 1]->storage).c_str());
 	const auto dropped = c.nodes[0]->transport->stats(0).dropped.load();
 	std::printf("  leader %s; transport dropped %llu frames\n", leader.c_str(), (unsigned long long)dropped);
+}
+
+// Throws unless every node applied exactly the leader's placed commands, byte-equal, in order.
+void verify(const std::filesystem::path &dir, std::uint64_t commands) {
+	Options o;
+	o.command = 64;
+	o.verify = commands;
+	const std::vector<GroupId> ids{1000};
+	Cluster c(o, dir, ids);
+	c.led(ids);
+	auto snapshot = [&](NodeId n) {
+		return c.nodes[n - 1]->at([&] { return std::pair{c.group(n, 1000).placed.size(), c.group(n, 1000).applied.size()}; });
+	};
+	for (int i = 0; snapshot(1).first != commands || snapshot(1).second != commands || snapshot(2).second != commands || snapshot(3).second != commands; ++i) {
+		if (i == 6000)
+			throw std::runtime_error("verify: not every node applied " + std::to_string(commands) + " commands in 30 s");
+		std::this_thread::sleep_for(5ms);
+	}
+	std::vector<std::pair<Index, std::string>> expected;
+	for (const auto &[index, request] : c.nodes[0]->at([&] { return c.group(1, 1000).placed; }))
+		expected.emplace_back(index, payload_of(request, o.command));
+	for (NodeId n = 1; n <= 3; ++n)
+		if (c.nodes[n - 1]->at([&] { return c.group(n, 1000).applied; }) != expected)
+			throw std::runtime_error("verify: node " + std::to_string(n) + " applied bytes differ from the proposed commands");
+	std::printf("verify: ok, %llu commands applied once, byte-equal and in order on 3 nodes\n", (unsigned long long)commands);
 }
 
 void many(const std::filesystem::path &dir, unsigned slow, bool hot, unsigned seconds) {
@@ -679,6 +728,8 @@ void many(const std::filesystem::path &dir, unsigned slow, bool hot, unsigned se
 		});
 	};
 	auto lead = seen(1, false), apply = seen(2, false), lead0 = seen(1, true), apply0 = seen(2, true);
+	if (!lead.bytes || !apply.bytes || !lead0.bytes)
+		throw std::runtime_error("many: a group committed nothing");
 	const auto leader0 = c.nodes[0]->at([&] { return proposals_line(c.group(1, ids[0])); });
 	std::printf("many: barrier %s, slow %u hot %d, 99 groups: leader commit %.2f MB/s p50 %llu us p99 %llu us; node 2 applies %.2f MB/s p50 %llu us p99 %llu us\n", barrier_name().c_str(), slow,
 				int(hot), double(lead.bytes) / secs / 1e6, (unsigned long long)lead.us.at(0.5), (unsigned long long)lead.us.at(0.99),
@@ -819,7 +870,7 @@ int main(int argc, char **argv) {
 	::signal(SIGPIPE, SIG_IGN);  // the host's duty where SO_NOSIGPIPE is missing (connection.h)
 	const std::vector<std::string> a(argv + 1, argv + argc);
 	auto usage = [] {
-		std::fprintf(stderr, "usage: flow_bench barrier DIR SECONDS | one FIXTURE DIR PIPELINE FRAME COMMAND SECONDS | many FIXTURE DIR SLOW HOT SECONDS | gap FIXTURE LANE FRAME SECONDS\n");
+		std::fprintf(stderr, "usage: flow_bench barrier DIR SECONDS | one FIXTURE DIR PIPELINE FRAME COMMAND SECONDS | verify FIXTURE DIR COMMANDS | many FIXTURE DIR SLOW HOT SECONDS | gap FIXTURE LANE FRAME SECONDS\n");
 		return 2;
 	};
 	try {
@@ -832,6 +883,8 @@ int main(int argc, char **argv) {
 		fixture = a[1];
 		if (a.size() == 7 && a[0] == "one")
 			one(a[2], std::uint32_t(std::stoul(a[3])), std::stoul(a[4]), std::stoul(a[5]), unsigned(std::stoul(a[6])));
+		else if (a.size() == 4 && a[0] == "verify")
+			verify(a[2], std::stoull(a[3]));
 		else if (a.size() == 6 && a[0] == "many")
 			many(a[2], unsigned(std::stoul(a[3])), a[4] == "1", unsigned(std::stoul(a[5])));
 		else if (a.size() == 5 && a[0] == "gap")

@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Runs bench/flow_bench.cc's rows in the Linux gate VM, with netem on lo for the round trip
 # (docs/perf/flow-control.md): flow_bench_vm.sh build|smoke|diag|a1|a2|a3, from a checkout's root.
+# A failed row (the bench exits non-zero) or an unknown row fails the script, and `smoke` verifies.
 # The VM is left as found: a job that started it stops it. The VM builds once per source tree.
 set -euo pipefail
 VM="${FLOW_VM:-$HOME/.scratch/vm-document-gate/vm.sh} linux"
-what=$1
+what=${1:-}
+case $what in build|smoke|diag|a1|a2|a3) ;; *) echo "usage: flow_bench_vm.sh build|smoke|diag|a1|a2|a3" >&2; exit 2;; esac
 commit=$(git rev-parse HEAD:bench HEAD:include HEAD:CMakeLists.txt | tr "\n" -)
 # The marker names a VM this script started, so a job stopped before its cleanup leaves it to the next.
 marker=$HOME/.scratch/flow-bench-vm-started
@@ -26,7 +28,7 @@ trap 'exit 143' INT TERM
 for i in $(seq 60); do $VM ssh true 2>/dev/null && break; sleep 5; done
 if [[ $($VM ssh 'cat ~/consensus-flow-build/COMMIT 2>/dev/null || true') != "$commit" ]]; then
 	git archive --prefix=consensus-flow/ HEAD | $VM ssh 'rm -rf ~/consensus-flow && tar -xf - -C ~'
-	$VM ssh 'set -e; [ -f /usr/include/openssl/ssl.h ] || sudo apt-get install -y -q libssl-dev >/dev/null; cd ~/consensus-flow; cmake -S . -B ~/consensus-flow-build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PROJECT_consensus_INCLUDE=$PWD/bench/flow_bench.cmake >/dev/null
+	$VM ssh 'set -e; [ -f /usr/include/openssl/ssl.h ] || sudo apt-get install -y -q libssl-dev >/dev/null; cd ~/consensus-flow; cmake -S . -B ~/consensus-flow-build -G Ninja -DCMAKE_BUILD_TYPE=Release >/dev/null
 		ninja -C ~/consensus-flow-build consensus_flow_bench | tail -1
 		cd ~/consensus-flow-build && ctest -R consensus_tls_certificates >/dev/null'
 	$VM ssh "echo $commit > ~/consensus-flow-build/COMMIT"
@@ -48,6 +50,7 @@ started=$(date +%s)
 case $1 in
 smoke)
 	net 10
+	FLOW_BARRIER=1000 $B verify $F $D 200
 	$B barrier $D 1
 	FLOW_BARRIER=1000 $B one $F $D 4 262144 262144 1
 	FLOW_BARRIER=1000 $B many $F $D 10 1 1;;

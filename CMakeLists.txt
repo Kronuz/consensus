@@ -278,4 +278,10 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	target_link_libraries(consensus_transport_idle PRIVATE consensus::transport)
 	add_test(NAME consensus_transport_idle COMMAND consensus_transport_idle ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture cost --quick)
 	set_tests_properties(consensus_transport_idle PROPERTIES FIXTURES_REQUIRED consensus_tls TIMEOUT 120)
+	# The flow bench (docs/perf/flow-control.md) and its value test: every proposed command is
+	# applied once, byte-equal and in order, on every node; timing is left to flow_bench_vm.sh.
+	add_executable(consensus_flow_bench bench/flow_bench.cc)
+	target_link_libraries(consensus_flow_bench PRIVATE consensus::transport)
+	add_test(NAME consensus_flow_bench_verify COMMAND consensus_flow_bench verify ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture ${CMAKE_CURRENT_BINARY_DIR}/flow-verify 200)
+	set_tests_properties(consensus_flow_bench_verify PROPERTIES FIXTURES_REQUIRED consensus_tls TIMEOUT 60 ENVIRONMENT FLOW_BARRIER=1000)
 endif()

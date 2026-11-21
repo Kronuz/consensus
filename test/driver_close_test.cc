@@ -174,7 +174,9 @@ struct Sink {
 		for (auto& e : c.entries) { if (e.kind == EntryKind::Command) { commands[g].push_back(std::move(e.payload)); } }
 	}
 	void operator()(GroupId, RoleChanged) {}
-	void operator()(GroupId, ActivateInstall) {}
+	void operator()(GroupId, SendTransfer) {}
+	void operator()(GroupId, ValidateImage) {}
+	void operator()(GroupId, ActivateImage) {}
 	void operator()(GroupId, CheckpointPublished) {}
 	void operator()(GroupId, RepairCompleted) {}
 	void operator()(GroupId g, Fenced) { ++fenced; if (on_fenced) { on_fenced(g); } }

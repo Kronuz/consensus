@@ -28,10 +28,12 @@
 #pragma once
 
 #include "worker.h"
+#include "snapshot_channel.h"
 #include "journal/blocking.h"
 
 #include <atomic>
 #include <concepts>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <random>
@@ -85,12 +87,19 @@ struct Seams {
 	std::uint64_t seed = 0;
 };
 
+// The install notices (docs/DRIVER.md, Install). `image` is borrowed for the Sink call only.
+struct SendTransfer { NodeId peer; std::string frame; };
+struct ValidateImage { Token token; LogBoundary boundary; NodeId source; kronuz::journal::ArtifactReader& image; };
+struct ActivateImage { Token token; LogBoundary boundary; kronuz::journal::ArtifactReader& image; };
+
 template <class S>
-concept sink = requires(S& s, GroupId g) {
+concept sink = requires(S& s, GroupId g, kronuz::journal::ArtifactReader& image) {
 	s(g, std::declval<Send>());
 	s(g, std::declval<Committed>());
 	s(g, std::declval<RoleChanged>());
-	s(g, std::declval<ActivateInstall>());
+	s(g, std::declval<SendTransfer>());
+	s(g, ValidateImage{0, {}, 0, image});
+	s(g, ActivateImage{0, {}, image});
 	s(g, std::declval<CheckpointPublished>());
 	s(g, std::declval<RepairCompleted>());
 	s(g, std::declval<SnapshotNeeded>());
@@ -209,6 +218,17 @@ public:
 		if (!g) { count_drop(id); return; }
 		g->application_failure.emplace(through, std::move(reason)); mark_ready(*g);
 	}
+	// A received transfer frame (RFTXFR01) from the source incarnation the transport admitted.
+	void transfer(GroupId id, NodeId source, std::string frame) {
+		on_loop();
+		auto* g = live(id);
+		if (!g || g->closing || !g->worker->snapshot_policy()) { count_drop(id); return; }
+		auto& in = installing(*g);
+		if (in.frames.size() >= g->inbox_limit) { ++g->dropped; return; }
+		in.frames.emplace_back(source, std::move(frame)); mark_ready(*g);
+	}
+	void validated(GroupId id, Token token) { validation(id, token, true); }
+	void validation_failed(GroupId id, Token token) { validation(id, token, false); }
 	void activated(GroupId id, Token token) {
 		on_loop();
 		auto* g = live(id);
@@ -400,6 +420,16 @@ private:
 	template <class S, class T> friend T consensus::run(Driver<S>&, task::blocking_scheduler&, task::task<T>);
 	enum class Holder : std::uint8_t { none, reactor, entry };
 
+	// A group's install state, from its first transfer to its close (docs/DRIVER.md, Install).
+	struct Install {
+		Install(Worker& worker, std::uint64_t timeout) : channel(worker, timeout) {}
+		SnapshotChannel channel;
+		std::deque<std::pair<NodeId, std::string>> frames;  // received, not yet taken by the channel
+		std::uint64_t active = 0;  // when the channel last took a frame, in scheduler ns
+		Token validating = 0;                               // the ValidateImage the Sink holds
+		std::optional<std::pair<Token, bool>> answer;       // validated or validation_failed
+	};
+
 	struct Group : wheel::timer_entry {
 		Driver* driver = nullptr;
 		GroupId id = 0;
@@ -414,6 +444,7 @@ private:
 		std::optional<std::pair<Index, std::string>> application_failure;
 		std::optional<std::pair<Token, std::optional<std::string>>> activation;
 		std::unique_ptr<SnapshotActivation> activating;
+		std::unique_ptr<Install> install;
 		std::vector<Event> notices;  // PeerLimits, Wake and LeaderGone, in order
 		std::string fence_reason;
 		Group* ready_next = nullptr;
@@ -739,6 +770,7 @@ private:
 				progress |= result == TurnResult::Inventory || result == TurnResult::Stored || result == TurnResult::Completed || result == TurnResult::Maintenance;
 				progress |= result == TurnResult::Idle && w.runnable();  // the Tick left work behind it
 				progress |= drain(g);
+				progress |= install_step(g);
 				// What admission submits answers in the same turn (a Reject before settle()).
 				if (admit(g)) { progress = true; drain(g); }
 				const bool was_retiring = g.retiring;
@@ -775,8 +807,16 @@ private:
 		auto& w = *g.worker;
 		std::uint64_t at = w.next_deadline();
 		at = at > max_ms ? never : at * 1'000'000;
-		const bool waiting = !g.inbox.empty() || !g.notices.empty() || unadmitted(g) || g.retiring;
+		const bool waiting = !g.inbox.empty() || !g.notices.empty() || unadmitted(g) || g.retiring || (g.install && !g.install->frames.empty());
 		if (waiting && !g.io && !g.watching) { at = std::min(at, scheduler_.now() + retry_ns); }
+		// An incoming image ends at the channel's receive timeout, which only a step sees: a
+		// resting group wakes for it, and once a timeout later while the image waits on its answer.
+		if (g.install && g.install->channel.incoming_snapshot()) {
+			const auto timeout = g.timing.snapshot_timeout * 1'000'000;
+			auto deadline = g.install->active + timeout;
+			if (deadline <= scheduler_.now()) { deadline = scheduler_.now() + timeout; }
+			at = std::min(at, deadline);
+		}
 		if (at == never) { disarm(g); return; }
 		scheduler_.arm(g, at);
 	}
@@ -942,7 +982,9 @@ private:
 		}
 		if (auto activation = w.snapshot_activation(); activation && (!g.activating || g.activating->token != activation->token)) {
 			g.activating = std::make_unique<SnapshotActivation>(*activation);
-			sink_(g.id, ActivateInstall{activation->token, 0, {activation->descriptor.through, activation->descriptor.term}});
+			auto* image = w.snapshot_image(activation->snapshot);
+			if (!image) { throw std::logic_error("an activation without its image"); }
+			sink_(g.id, ActivateImage{activation->token, {activation->descriptor.through, activation->descriptor.term}, *image});
 		}
 		for (auto* x = g.head; x;) {
 			auto* next = x->next;
@@ -981,6 +1023,7 @@ private:
 	void begin_close(Group& g) {
 		g.closing = true;
 		g.inbox.clear(); std::vector<Receive>().swap(g.inbox); g.notices.clear();
+		if (g.install) { g.install->frames.clear(); }
 		for (auto* x = g.head; x;) {
 			auto* next = x->next;
 			if (!holds_record(g, *x)) { complete(g, *x, std::make_exception_ptr(closed{})); }
@@ -1014,8 +1057,87 @@ private:
 		if (!g.retiring) { g.retiring = true; w.close(); }
 		if (!w.drained() || g.io || g.watching) { return; }
 		disarm(g);
+		// The channel goes first, once drained: the closing Worker ended its transfer.
+		if (g.install) { g.install->channel.run_one(tick(g)); g.install.reset(); }
 		g.worker.reset(); g.closed = true;
 		for (auto* x = g.head; x;) { auto* next = x->next; complete(g, *x); x = next; }
+	}
+
+	Install& installing(Group& g) {
+		if (!g.install) { g.install = std::make_unique<Install>(*g.worker, g.timing.snapshot_timeout); }
+		return *g.install;
+	}
+	void validation(GroupId id, Token token, bool valid) {
+		on_loop();
+		auto* g = live(id);
+		if (!g || !g->install) { count_drop(id); return; }
+		g->install->answer.emplace(token, valid); mark_ready(*g);
+	}
+	// A transfer session's identity: an incarnation's, the same at both ends of the pair.
+	static Identity session_identity(NodeId incarnation) {
+		Identity id{'D', 'X', 'F', 'R'};
+		for (unsigned i = 0; i < 8; ++i) { id[8 + i] = static_cast<char>(incarnation >> (8 * i)); }
+		return id;
+	}
+	TrustedSession session(const Group& g, NodeId peer) const {
+		return {peer, session_identity(g.worker->configuration().local), session_identity(peer)};
+	}
+	// Opens the peer's session on the channel; false when the channel refuses it.
+	bool open_session(Install& in, const TrustedSession& session) {
+		if (in.channel.session_open(session)) { return true; }
+		try { in.channel.register_session(session); return true; } catch (const std::exception&) { return false; }
+	}
+	// The group's transfers: the Sink's validation answer, received frames into the channel, its
+	// step, its frames out to the Sink, and the image's validation (docs/DRIVER.md, Install).
+	bool install_step(Group& g) {
+		auto& w = *g.worker;
+		if (!g.install && !(w.snapshot_policy() && w.snapshot_source())) { return false; }
+		auto& in = installing(g);
+		bool progress = false;
+		if (in.answer) {
+			auto [token, valid] = *in.answer; in.answer.reset();
+			auto id = in.channel.incoming_snapshot();
+			bool taken = false;
+			if (id && token && token == in.validating) {
+				if (valid) { taken = w.validation_succeeded(*id, token) == ValidationAck::Accepted; }
+				else { const auto result = w.reject_snapshot_validation(*id); taken = result == CancelResult::Canceled || result == CancelResult::Pending; }
+			}
+			if (taken) { in.validating = 0; } else { ++g.dropped; }
+			progress = true;
+		}
+		while (!in.frames.empty()) {
+			auto& [source, frame] = in.frames.front();
+			const auto peer = session(g, source);
+			// A frame the host transport carried arrives whole: its length prefix is its size.
+			std::string_view prefix(frame);
+			const bool whole = prefix.size() >= 12 && prefix.substr(0, 8) == "RFTXFR01" && [&] { prefix.remove_prefix(8); return kronuz::journal::get32(prefix) == frame.size(); }();
+			if (!whole || !open_session(in, peer)) { in.frames.pop_front(); ++g.dropped; progress = true; continue; }
+			const auto result = in.channel.receive(peer, frame);
+			if (result.consumed || result.result == TransferReceive::Accepted) { in.active = scheduler_.now(); }
+			frame.erase(0, result.consumed);
+			if (frame.empty() || result.result == TransferReceive::Closed) { in.frames.pop_front(); progress = true; }
+			if (result.result == TransferReceive::Closed) { ++g.dropped; continue; }
+			if (result.result == TransferReceive::Busy) { break; }
+		}
+		if (auto source = w.snapshot_source()) { open_session(in, session(g, source->peer)); }
+		in.channel.run_one(tick(g));
+		while (auto out = in.channel.outbound()) {
+			sink_(g.id, SendTransfer{out->session.peer, std::string(out->bytes.data(), out->bytes.size())});
+			in.channel.consume_output(out->token, out->bytes.size());
+			progress = true;
+		}
+		// The readback's chunks passed their CRC32C; the application validates the whole image.
+		while (auto view = w.validation_chunk()) {
+			if (w.consume_validation(view->snapshot, view->chunk) != ValidationAck::Accepted) { break; }
+			progress = true;
+			if (!view->verified_eof) { continue; }
+			auto context = w.snapshot_context(view->snapshot);
+			auto* image = w.snapshot_image(view->snapshot);
+			if (!context || !image) { throw std::logic_error("a validation without its image"); }
+			in.validating = view->chunk;
+			sink_(g.id, ValidateImage{view->chunk, {context->descriptor.through, context->descriptor.term}, context->authenticated_peer, *image});
+		}
+		return progress;
 	}
 
 	// IO the machine issued for itself runs under the loop's shutdown token only (D8).

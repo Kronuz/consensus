@@ -135,13 +135,23 @@ refuses the retiring end's redial, and the caller redials.
 An incoming connection is unauthenticated until its TLS handshake passes the pins, so `Links`
 bounds those: at most `handshakes` (4) at once, and at most `handshakes_per_source` (2) from one
 address, since a node dials each lane once at a time. A newcomer replaces the oldest instead of
-being refused: the source's oldest when the source is at its cap, else the pool's oldest when the
-pool is full. A peer holding idle connections from one address keeps 2 slots and cannot lock a
-real dialer out. An attacker with many addresses can still delay links: a real handshake is
-dropped when 4 newer connections arrive before it completes, so the attacker must keep opening
-connections faster than a handshake takes (milliseconds) for as long as it delays. Each of its
-connections holds a slot for at most the `handshake` deadline (5 s), and a dial that arrives once
-the flood stops replaces what is left of it.
+being refused: the source's oldest when the source is at its cap, else, when the pool is full, its
+oldest from an address no route names. A newcomer from a peer's address (a literal one, or a
+name's cached answer) replaces the pool's oldest when every slot is a peer's; one from an unknown
+address is then refused. So a flood from addresses the cluster does not name never drops a peer's
+pending handshake (`links_test churn`, mutant `no-peer-priority`), and a peer holding idle
+connections from one address keeps 2 slots and cannot lock a real dialer out.
+
+What is left: a flood from a peer's own address, or one that lands while no peer handshake is
+pending, delays links. A real handshake is dropped when `handshakes` newer connections (from its
+own address, `handshakes_per_source`) arrive before it completes, so the rate the flood needs is
+the pool's size per handshake time: thousands a second on loopback, tens a second across a WAN,
+where a handshake takes a round trip or more. The per-source cap keys on the exact address; an
+IPv6 attacker holding a /64 has as many sources as it wants, so there the pool is the only bound.
+A connection leaves the pool once its pins pass, before the hellos: only an authenticated node
+holds hello-phase connections, each for at most the `handshake` deadline (5 s). Each unknown
+connection holds a slot for at most that deadline too. Keeping an unauthenticated flood out
+belongs to the network (an allowlist of the cluster's addresses).
 
 ## Checks
 

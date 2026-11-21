@@ -25,6 +25,7 @@ int main(int argc, char** argv) {
 		std::ofstream(std::string(argv[1]) + "/seed-" + std::to_string(n++), std::ios::binary) << selector << bytes;
 	};
 	write(0, transport::encode(TimeoutNow{7, 11, 21}));
+	write(0, transport::encode(Gone{7}));
 	write(0, transport::encode(AppendRequest{7, 11, 9, 6, 8, 13, {{10, 7, EntryKind::Configuration, encode_membership(limited)}}, 9}));
 	write(0, transport::encode(VoteRequest{8, 9, 6, true}));
 	write(8, transport::encode_fetch({transport::FetchKind::Request, 1, 0, "history/blocks/0001"}));

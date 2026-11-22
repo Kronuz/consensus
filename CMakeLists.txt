@@ -143,10 +143,44 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	add_executable(consensus_worker_test test/worker_test.cc)
 	target_link_libraries(consensus_worker_test PRIVATE consensus::consensus)
 	add_test(NAME consensus_worker COMMAND consensus_worker_test)
-	# Each seeded fault in tools/mutants.sh must fail the simulation (it reads Ninja's commands).
-	if(CMAKE_GENERATOR MATCHES "Ninja")
-		add_test(NAME consensus_mutants COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/mutants.sh ${CMAKE_BINARY_DIR} 400 10000)
-		set_tests_properties(consensus_mutants PROPERTIES TIMEOUT 1800)  # 14 faults, each built three ways: about 800 s on a busy host
+	# Each seeded fault in tools/mutants.sh must fail the simulation (it reads Ninja's commands and
+	# needs bash). One test per mutant, so ctest -j runs them in parallel; the TIMEOUT is four
+	# times the slowest of the macOS, Linux and FreeBSD gate hosts' time (floor 600 s), for sanitizers.
+	find_program(CONSENSUS_BASH bash)
+	if(CMAKE_GENERATOR MATCHES "Ninja" AND CONSENSUS_BASH)
+		set(consensus_mutants
+			recovered-delivery-byte-accounting-underflows=600
+			sends-before-durability=600
+			votes-and-pre-votes-without-the-log-check=700
+			repair-with-a-delivery-outstanding=600
+			membership-change-before-the-leader-commits-in-its-term=652
+			no-membership-rollback-on-a-replaced-suffix=600
+			a-removed-leader-counts-itself=600
+			a-follower-checks-entries-by-its-node-limits-not-by-position=600
+			a-leader-grants-pre-votes=640
+			learners-refuse-votes=600
+			repair-ignores-the-term-at-the-base-boundary=1712
+			repair-above-the-commit-index=600
+			repair-below-base-index=600
+			a-leader-ignores-members-node-limits=1016
+			commit-of-an-earlier-term-by-counting=844
+			a-follower-ignores-leadergone=896
+			a-read-counts-every-acknowledgement=900)
+		set(consensus_mutant_names "")
+		foreach(entry IN LISTS consensus_mutants)
+			string(REPLACE "=" ";" entry "${entry}")
+			list(GET entry 0 mutant)
+			list(GET entry 1 seconds)
+			list(APPEND consensus_mutant_names ${mutant})
+			add_test(NAME consensus_mutant_${mutant} COMMAND ${CONSENSUS_BASH} ${CMAKE_CURRENT_SOURCE_DIR}/tools/mutants.sh ${CMAKE_BINARY_DIR} 400 10000 ${mutant})
+			set_tests_properties(consensus_mutant_${mutant} PROPERTIES TIMEOUT ${seconds})
+		endforeach()
+		# A mutant added to the script without a test here would go unrun.
+		execute_process(COMMAND ${CONSENSUS_BASH} ${CMAKE_CURRENT_SOURCE_DIR}/tools/mutants.sh --list OUTPUT_VARIABLE listed OUTPUT_STRIP_TRAILING_WHITESPACE)
+		string(REPLACE "\n" ";" listed "${listed}")
+		if(NOT "${listed}" STREQUAL "${consensus_mutant_names}")
+			message(FATAL_ERROR "tools/mutants.sh --list differs from the consensus_mutant_ tests: ${listed}")
+		endif()
 	endif()
 	# Its real-file cases are flush-bound on macOS (F_FULLFSYNC): 145-170 s alone, more on a busy disk.
 	set_tests_properties(consensus_worker PROPERTIES TIMEOUT 600)

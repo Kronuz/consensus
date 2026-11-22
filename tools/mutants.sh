@@ -1,20 +1,27 @@
 #!/usr/bin/env bash
 # Seeds a known fault into a copy of the core and runs the simulation harness against it:
 # every mutant must be caught. Prints the seeds the harness needed for each.
-#   tools/mutants.sh BUILD_DIR [seeds] [steps]
+#   tools/mutants.sh BUILD_DIR [seeds] [steps] [name]
+#   tools/mutants.sh --list
+# With a name (the mutant's lower-case, dash-separated slug) it runs that mutant alone;
+# --list prints the slugs.
 # BUILD_DIR is a configured build of this repository (for the dependencies' include paths).
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
-build="${1:?usage: mutants.sh BUILD_DIR [seeds] [steps]}"
-seeds="${2:-2000}"
-steps="${3:-2000}"
-work="$build/mutants"
-mkdir -p "$work"
-# The harnesses' compile commands without their dependency and output flags: the
-# randomized simulation, and the unit suite whose scripts force the rare schedules.
-compile=$(ninja -C "$build" -t commands consensus_simulation_test | grep -- '-c .*simulation_test.cc' | sed 's/ -MD .*//')
-compile_unit=$(ninja -C "$build" -t commands consensus_consensus_test | grep -- '-c .*consensus_test.cc' | sed 's/ -MD .*//')
-compile_membership=$(ninja -C "$build" -t commands consensus_membership_test | grep -- '-c .*membership_test.cc' | sed 's/ -MD .*//')
+slug() { echo "$1" | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9][^a-z0-9]*/-/g; s/^-//; s/-$//'; }
+if [[ ${1:-} != --list ]]; then
+	build="${1:?usage: mutants.sh BUILD_DIR [seeds] [steps] [name]}"
+	seeds="${2:-2000}"
+	steps="${3:-2000}"
+	only="${4:-}"
+	work="$build/mutants"
+	mkdir -p "$work"
+	# The harnesses' compile commands without their dependency and output flags: the
+	# randomized simulation, and the unit suite whose scripts force the rare schedules.
+	compile=$(ninja -C "$build" -t commands consensus_simulation_test | grep -- '-c .*simulation_test.cc' | sed 's/ -MD .*//')
+	compile_unit=$(ninja -C "$build" -t commands consensus_consensus_test | grep -- '-c .*consensus_test.cc' | sed 's/ -MD .*//')
+	compile_membership=$(ninja -C "$build" -t commands consensus_membership_test | grep -- '-c .*membership_test.cc' | sed 's/ -MD .*//')
+fi
 # name, search, replace (tab-separated), applied to include/consensus/core.h. An unclamped
 # follower commit is not among them: every append that reaches a divergent suffix replaces
 # it in the same RPC, so the fault cannot be observed until coalesced heartbeats (Track C,
@@ -47,10 +54,17 @@ bounded() {
 	wait
 	return "$rc"
 }
+if [[ ${1:-} == --list ]]; then
+	for m in "${mutants[@]}"; do slug "${m%%$'\t'*}"; done
+	exit 0
+fi
 status=0
+ran=0
 for m in "${mutants[@]}"; do
 	IFS=$'\t' read -r name search replace <<<"$m"
-	dir="$work/$(echo "$name" | tr ' ' '-')"
+	[[ -z $only || $only == "$(slug "$name")" ]] || continue
+	ran=$((ran + 1))
+	dir="$work/$(slug "$name")"
 	rm -rf "$dir" && mkdir -p "$dir" && cp -R "$root/include" "$dir/include"
 	python3 - "$dir/include/consensus/core.h" "$search" "$replace" <<'PY'
 import sys
@@ -74,4 +88,5 @@ PY
 	echo "$name: unit $unit, membership $membership, simulation $simulation ($seeds seeds$first)"
 	if [[ $unit == no && $membership == no && $simulation == no ]]; then status=1; fi
 done
+if [[ $ran == 0 ]]; then echo "no mutant named $only"; exit 1; fi
 exit $status

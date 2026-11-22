@@ -15,6 +15,8 @@
 //   s5        s1, with both acknowledgements lost.
 //   s6        driver_replace_test 1 1080 quiesce: one follower's acknowledgement reaches the
 //             leader while it is still awake for the other's answer to its round.
+//   s7        a stale frame from the leader (b's append, delivered again once b committed) ends
+//             a follower's rest, and the follower's answer to it is lost.
 // usage: quiescence_test [case]
 #include "consensus/core.h"
 
@@ -23,6 +25,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -169,13 +172,7 @@ void s2(bool control) {
 		for (auto id : g.followers(l)) { all &= !g.replicas.at(id).held.empty() && g.core(id).resting(); }
 		return all;
 	};
-	// b's frame ended each follower's rest, so its re-acknowledgement falls due with that frame:
-	// lost here, so that only the one deferred behind the persistence can keep the leader awake.
-	for (int n = 0; n < 60 && !held(); ++n) {
-		g.tick_only(1);
-		std::erase_if(g.network, [&](const Envelope& e) { return e.to == l && std::holds_alternative<AppendResponse>(e.message); });
-		g.settle();
-	}
+	for (int n = 0; n < 60 && !held(); ++n) { g.tick(1); }
 	expect(held(), name + ": both followers rest with the commit persisting");
 	if (!control) { for (NodeId id = 1; id <= 3; ++id) { g.prevote(id); } }
 	for (auto id : g.followers(l)) { g.release(id); }
@@ -233,6 +230,23 @@ void s6() {
 	g.quiet("s6", term, 0);
 }
 
+void s7() {
+	Group g; const NodeId l = g.rest(); const Term term = g.core(l).term();
+	const NodeId f = l % 3 + 1;
+	g.act(l, g.core(l).step(Propose{++g.request, "b"}));
+	std::optional<Envelope> append;
+	for (auto& e : g.network) { if (e.to == f && std::holds_alternative<AppendRequest>(e.message)) { append = e; } }
+	expect(append.has_value(), "s7: b's append to a follower");
+	g.settle();
+	for (int n = 0; n < 10 && !g.all_rest(); ++n) { g.tick(60); }
+	expect(g.all_rest(), "s7: the group rests with b committed");
+	g.deliver(*append);  // the stale frame: nothing new, and the follower leaves rest
+	expect(!g.core(f).resting(), "s7: the stale frame ends the follower's rest");
+	std::erase_if(g.network, [&](const Envelope& e) { return e.from == f; });  // its answer, lost
+	g.settle();
+	g.quiet("s7", term, 0);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -246,6 +260,7 @@ int main(int argc, char** argv) {
 	run("s4", [] { s4(false); });
 	run("s5", [] { s4(true); });
 	run("s6", s6);
+	run("s7", s7);
 	std::printf("quiescence: %s\n", failures ? "FAILED" : "ok");
 	return failures ? 1 : 0;
 }

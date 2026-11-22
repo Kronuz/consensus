@@ -399,11 +399,11 @@ public:
 		Actions output;
 		if (role_ == Role::Fenced) { return output; }
 		try {
-			const bool rested = resting_; const auto followed = std::pair{hard_.term, leader_};
+			const bool rested = resting_; const auto followed = std::pair{hard_.term, leader_}; const auto held = std::pair{last_index(), hard_.commit_index};
 			if (resting_ && wakes(event)) { wake(output); }
 			std::visit([&](auto&& value) { handle(std::move(value), output); }, std::move(event));
 			if (!resting_ && leader_at_rest()) { resting_ = true; }
-			reacknowledge(rested, followed, output);
+			reacknowledge(rested && held == std::pair{last_index(), hard_.commit_index}, followed, output);
 		}
 		catch (const std::exception& error) { fence(error.what(), output); }
 		return output;
@@ -564,12 +564,13 @@ private:
 			leader_contact_ = now_; reset_election(); acknowledge_at_ = now_;
 		}
 	}
-	// A follower that leaves rest and keeps its leader re-acknowledges its durable log to it
-	// every heartbeat interval, once nothing persists, until a frame from it rests it again: a
-	// leader that still leads wakes or stays awake on it and heartbeats it back to rest.
-	void reacknowledge(bool rested, std::pair<Term, NodeId> followed, Actions& output) {
+	// A follower that leaves rest and keeps its leader, woken or on a frame that tells it nothing
+	// new (a stale one), re-acknowledges its durable log to it every heartbeat interval, once
+	// nothing persists, until a frame from it rests it again: a leader that still leads wakes or
+	// stays awake on it and heartbeats it back to rest. `stale`: such a frame ended the rest.
+	void reacknowledge(bool stale, std::pair<Term, NodeId> followed, Actions& output) {
 		if (role_ != Role::Follower || resting_ || !leader_ || std::pair{hard_.term, leader_} != followed) { acknowledge_at_ = maximum; return; }
-		if (rested && acknowledge_at_ == maximum) { acknowledge_at_ = deadline(timing_.heartbeat); }  // a frame ended it: answered
+		if (stale && acknowledge_at_ == maximum) { acknowledge_at_ = deadline(timing_.heartbeat); }  // its answer went with it
 		if (now_ < acknowledge_at_ || busy()) { return; }
 		acknowledge_at_ = deadline(timing_.heartbeat);
 		output.emplace_back(Send{leader_, AppendResponse{hard_.term, token(), true, last_index(), last_index() + 1, 0}});

@@ -87,6 +87,11 @@ MUTANTS = {
         "\t\tacknowledge_at_ = deadline(timing_.heartbeat);\n\t\toutput.emplace_back(Send{leader_, AppendResponse{",
         "\t\tacknowledge_at_ = maximum - 1;\n\t\toutput.emplace_back(Send{leader_, AppendResponse{",
     ),
+    # A stale frame that ends a follower's rest leaves it owing nothing (s7).
+    "stale-frame-silent": ("core.h",
+        "\t\tif (stale && acknowledge_at_ == maximum) { acknowledge_at_ = deadline(timing_.heartbeat); }  // its answer went with it\n",
+        "",
+    ),
     # A follower woken while it persists drops its acknowledgement (s2).
     "wake-ack-dropped-busy": ("core.h",
         "\t\tif (now_ < acknowledge_at_ || busy()) { return; }\n",

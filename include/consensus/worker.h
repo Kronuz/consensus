@@ -206,6 +206,8 @@ public:
 	bool resting() const noexcept { return core_ && core_->resting(); }
 	bool transferring() const noexcept { return core_ && core_->transferring(); }
 	Index last_index() const noexcept { return core_ ? core_->last_index() : 0; }
+	// The index a witness may truncate its log through (Core::witness_bound).
+	Index witness_bound() const noexcept { return core_ ? core_->witness_bound() : 0; }
 	std::optional<Term> term_at(Index index) const { return core_ ? core_->term_at(index) : std::nullopt; }
 	// The closed state, when this replica can close now (Core::closed_state): open, not fenced.
 	std::optional<ClosedState> closed_state() const { return core_ && !closing_ && !fenced() ? core_->closed_state() : std::nullopt; }
@@ -741,8 +743,9 @@ private:
 		if (fenced()) { return SubmitResult::Fenced; }
 		if (!maintenance_tick && hold(event)) { return SubmitResult::Accepted; }
 		if (!ready() || !output_.empty() || ((maintenance_due() || timer_blocked_) && !maintenance_tick) || cutover_debt_ || core_->busy() || completion_ || application_) { return SubmitResult::Busy; }
-		// A repair waits for a checkpoint in flight, whose capture predates it.
-		if (std::holds_alternative<Repair>(event) && (checkpoint_ || delivered_)) { return SubmitResult::Busy; }
+		// A repair or an install request waits for a checkpoint or image in flight, and for a
+		// delivered range: the capture predates it, and the request stops delivery.
+		if ((std::holds_alternative<Repair>(event) || std::holds_alternative<RequestInstall>(event)) && (checkpoint_ || delivered_)) { return SubmitResult::Busy; }
 		try {
 			std::array<std::optional<kronuz::journal::AppendReservation>, 3> acquired;
 			for (std::size_t i = 0; i < plan.count; ++i) {

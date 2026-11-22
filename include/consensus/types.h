@@ -188,7 +188,7 @@ struct InstallRequest { Term term; Token request; LogBoundary base; };
 // (a witness or a removed incarnation).
 enum class InstallRequestReply : std::uint8_t { Started, InFlight, Current, NotLeader, NotMember };
 struct InstallRequestResponse { Term term; Token request; InstallRequestReply result; NodeId leader = 0; };
-using Message = std::variant<VoteRequest, VoteResponse, AppendRequest, AppendResponse, SnapshotResponse, PreVoteRequest, PreVoteResponse, TimeoutNow, Gone>;
+using Message = std::variant<VoteRequest, VoteResponse, AppendRequest, AppendResponse, SnapshotResponse, PreVoteRequest, PreVoteResponse, TimeoutNow, Gone, InstallRequest, InstallRequestResponse>;
 
 struct Start {};
 // The host supplies absolute monotonic time and a fresh randomized election
@@ -244,7 +244,7 @@ struct PeerLimits { NodeId incarnation; Limits limits; };
 // that a node (Member::node) stopped answering on its connection, for every group it hosts.
 struct Wake {};
 struct LeaderGone { NodeId node; };
-using Event = std::variant<Start, Tick, Receive, Propose, Read, Persisted, Applied, Failed, LocalCheckpoint, StorageFault, InstallPrepared, InstallActivated, InstallActivationFailed, SnapshotSourceReady, SnapshotTransferFailed, Repair, ChangeMembership, TransferLeadership, PeerLimits, Wake, LeaderGone>;
+using Event = std::variant<Start, Tick, Receive, Propose, Read, Persisted, Applied, Failed, LocalCheckpoint, StorageFault, InstallPrepared, InstallActivated, InstallActivationFailed, SnapshotSourceReady, SnapshotTransferFailed, Repair, ChangeMembership, TransferLeadership, PeerLimits, Wake, LeaderGone, RequestInstall>;
 
 enum class Role : std::uint8_t { Follower, Candidate, Leader, Fenced };
 // Current: the leader refused an install request: one image per requester per leader base.

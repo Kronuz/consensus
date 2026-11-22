@@ -132,7 +132,9 @@ int main() {
 					  {{10, 7, EntryKind::Command, std::string("a\0b", 3)}, {11, 7, EntryKind::NoOp, {}}}},
 		AppendResponse{7, 11, true, 11, 12, 13, LogBoundary{8, 6}},
 		SnapshotResponse{7, {7, 19, {11, 7}}, SnapshotReply::Installed},
-		VoteRequest{8, 9, 6, true}, PreVoteRequest{8, 9, 6}, PreVoteResponse{7, 8, true}, TimeoutNow{7, 11, 21}, Gone{7}};
+		VoteRequest{8, 9, 6, true}, PreVoteRequest{8, 9, 6}, PreVoteResponse{7, 8, true}, TimeoutNow{7, 11, 21}, Gone{7},
+		InstallRequest{7, 11, {9, 6}}, InstallRequestResponse{7, 11, InstallRequestReply::NotLeader, 2},
+		InstallRequestResponse{7, 12, InstallRequestReply::Started}};
 	kronuz::consensus::transport::Hello local;
 	local.cluster[0] = 'c';
 	local.group[0] = 'g';

@@ -116,7 +116,7 @@ concept capture = requires(C& c, std::span<char> chunk) {
 
 namespace driver_detail {
 
-enum class Kind : std::uint8_t { open, propose, committed, read, transfer, repair, checkpoint, close };
+enum class Kind : std::uint8_t { open, propose, committed, read, transfer, repair, reinstall, checkpoint, close };
 
 // A caller suspended on a group, in the caller's frame (docs/DRIVER.md, "Waiters"). The loop
 // links it and completes it; a token's callback, on any thread, claims it and hops to the loop,
@@ -274,8 +274,9 @@ public:
 	// The index a witness may truncate its log through (D9, Core::witness_bound): what every data
 	// voter has matched, as its current leader reports it; absent for a group not open.
 	std::optional<Index> witness_bound(GroupId id) const {
-		if (!groups_.contains(id)) { return std::nullopt; }
-		throw std::logic_error("witness_bound: not implemented");
+		auto found = groups_.find(id);
+		if (found == groups_.end()) { return std::nullopt; }
+		return found->second->worker->witness_bound();
 	}
 	std::optional<GroupState> state(GroupId id) const {
 		auto found = groups_.find(id);
@@ -401,9 +402,9 @@ public:
 	// request in progress; LeaderMustTransfer, this replica leads; InvalidRepair, a witness, which
 	// holds no state, or a removed incarnation (the leader answers NotMember).
 	task::task<RepairCompleted> reinstall(GroupId id, task::cancel_token token = {}) {
-		Call call(*this, Kind::repair, std::move(token));
+		Call call(*this, Kind::reinstall, std::move(token));
 		co_await call.enter();
-		call.fail(std::make_exception_ptr(std::logic_error("reinstall: not implemented")));
+		if (call.begin(id, true)) { call.waiter.event = RequestInstall{call.waiter.request}; }
 		co_await call;
 		co_return *call.waiter.repaired;
 	}

@@ -28,20 +28,26 @@ each group's heartbeats and election timers.
   round. A follower's rest ends on `Wake` or on another member's pre-vote or vote (refused, as
   within `election_min`), on a frame that leaves it behind its leader's commit, on a term
   change, or on its own campaign (a transfer's `TimeoutNow`). Every role change ends a rest: a
-  candidate or a new leader runs its timers. Its election timer then runs, and it
-  re-acknowledges its durable log to its leader. One that no longer leads ignores it, and the
+  candidate or a new leader runs its timers. A follower's election timer then runs.
+- **A follower that leaves rest under its leader re-acknowledges.** When a follower's rest ends
+  and it keeps its leader and term (a wake, or a frame from that leader that does not rest it),
+  it sends that leader an acknowledgement of its durable log: on a wake at once, or as soon as
+  its persistence completes, and again after every heartbeat interval with no frame from that
+  leader, until a frame rests it again. A leader at rest wakes on it. An awake leader takes it,
+  since it answers none of its appends, as that follower awake: it rests again only on the
+  follower's answer to a frame sent after the acknowledgement arrived, so an answer the
+  acknowledgement overtook does not count. A leader that no longer leads ignores it, and the
   follower elects at its timeout.
-- **A woken follower's acknowledgement is answered.** The acknowledgement answers none of the
-  leader's appends, and a leader that still leads takes it as that follower awake: it rests
-  again only once it has heartbeat that follower its commit and heard the answer, which puts the
-  follower back to rest. This holds whether the frame woke the leader or found it awake. A
-  member's pre-vote wakes the leader and its followers alike, so the leader's heartbeat can reach
-  a follower still at rest, before the pre-vote wakes it; were the follower's acknowledgement then
-  taken as nothing new, the leader would rest with that follower's election timer running, and the
-  follower would elect at its timeout against a live leader (`driver_replace_test 1 1080
-  quiesce`: a removed member's pre-votes woke both followers, and one deposed the leader). Rest
-  stops heartbeats only while every follower rests too; a follower's timer that runs is always
-  fed.
+- **A follower's running timer is fed.** A leader rests only once every replica answered a frame
+  that rests it, so a follower awake under a leader at rest left rest after that answer without
+  leaving its leader: the case above. Its acknowledgement goes out within a heartbeat interval,
+  whether a persistence deferred it, it overtook the
+  answer, or a lost one is resent, and the leader heartbeats it back to rest; a leader rests over
+  a running election timer for at most a heartbeat interval (`quiescence_test`, s1 to s6). Only
+  acknowledgements lost for an election timeout let the follower elect, as lost heartbeats would
+  for an awake follower. Without the rule, a member's pre-vote that woke the leader and its
+  followers alike left the leader at rest over a follower's timer, and that follower deposed it
+  (`driver_replace_test 1 1080 quiesce`).
 - **`LeaderGone{node}`** is the detector's report that `node` (a `Member::node`) stopped
   answering. A follower whose leader is on that node drops it and elects within its election
   timeout, as after a missed heartbeat. `Driver::leader_gone(node)` raises it at every open group

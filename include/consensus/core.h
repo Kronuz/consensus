@@ -333,7 +333,7 @@ public:
 	// now or past; every other deadline counts only while ahead of the clock.
 	std::uint64_t next_deadline() const {
 		if (!started_ || retiring_ || role_ == Role::Fenced || busy() || resting_) { return maximum; }
-		if (role_ != Role::Leader) { return is_voter(configuration_.local) && hard_.term != maximum ? election_deadline_ : maximum; }
+		if (role_ != Role::Leader) { return std::min(is_voter(configuration_.local) && hard_.term != maximum ? election_deadline_ : maximum, acknowledge_at_); }
 		auto at = peers_.empty() ? maximum : heartbeat_deadline_;  // a leader with nobody to heartbeat sleeps
 		auto later = [&](std::uint64_t base, std::uint64_t delay) {
 			const auto due = delay > maximum - base ? maximum : base + delay;
@@ -399,9 +399,11 @@ public:
 		Actions output;
 		if (role_ == Role::Fenced) { return output; }
 		try {
+			const bool rested = resting_; const auto followed = std::pair{hard_.term, leader_};
 			if (resting_ && wakes(event)) { wake(output); }
 			std::visit([&](auto&& value) { handle(std::move(value), output); }, std::move(event));
 			if (!resting_ && leader_at_rest()) { resting_ = true; }
+			reacknowledge(rested, followed, output);
 		}
 		catch (const std::exception& error) { fence(error.what(), output); }
 		return output;
@@ -435,6 +437,7 @@ private:
 		Index next = 1, matched = 0; std::vector<Flight> flights; std::uint64_t retry_after = 0; std::optional<SnapshotFlight> snapshot{}; std::optional<std::uint64_t> snapshot_retry_clock{}; bool blocked = false;
 		std::optional<Flight> keepalive{}; bool verified = false, lacks_base = false; std::uint64_t window = 0;
 		Index told = 0;  // the commit index an acknowledged append carried
+		Token woke = 0;  // the last token issued when an unprompted acknowledgement arrived
 		// The payload bytes one append carries, paced to the path (docs/mechanisms/append-pacing.md).
 		std::uint64_t frame = frame_floor;
 		// Back to one flight, resuming at `from` (the oldest flight's start: nothing before it is in doubt).
@@ -550,18 +553,26 @@ private:
 	}
 	// Ends a rest: a leader heartbeats at once, rests again only once every replica acknowledges
 	// that round, and starts CheckQuorum's window afresh; a follower's election timer runs from
-	// now, and it re-acknowledges its durable log to its leader, which heartbeats it back to
-	// rest if it still leads, awake or not (a pending persistence answers it on its own).
-	void wake(Actions& output) {
+	// now, and its re-acknowledgement is due at once (reacknowledge).
+	void wake(Actions&) {
 		resting_ = false;
 		if (role_ == Role::Leader) {
 			for (auto& [id, at] : answered_) { at = now_; }
 			for (auto& [id, peer] : peers_) { peer.told = 0; }
 			heartbeat_deadline_ = now_;
 		} else {
-			leader_contact_ = now_; reset_election();
-			if (leader_ && !busy()) { output.emplace_back(Send{leader_, AppendResponse{hard_.term, token(), true, last_index(), last_index() + 1, 0}}); }
+			leader_contact_ = now_; reset_election(); acknowledge_at_ = now_;
 		}
+	}
+	// A follower that leaves rest and keeps its leader re-acknowledges its durable log to it
+	// every heartbeat interval, once nothing persists, until a frame from it rests it again: a
+	// leader that still leads wakes or stays awake on it and heartbeats it back to rest.
+	void reacknowledge(bool rested, std::pair<Term, NodeId> followed, Actions& output) {
+		if (role_ != Role::Follower || resting_ || !leader_ || std::pair{hard_.term, leader_} != followed) { acknowledge_at_ = maximum; return; }
+		if (rested && acknowledge_at_ == maximum) { acknowledge_at_ = deadline(timing_.heartbeat); }  // a frame ended it: answered
+		if (now_ < acknowledge_at_ || busy()) { return; }
+		acknowledge_at_ = deadline(timing_.heartbeat);
+		output.emplace_back(Send{leader_, AppendResponse{hard_.term, token(), true, last_index(), last_index() + 1, 0}});
 	}
 	// A leader at rest has nothing to send: every replica acknowledged its whole log and its
 	// commit index, its term's entry is committed, the membership in force is committed and
@@ -1106,6 +1117,7 @@ private:
 			output.emplace_back(Send{source, AppendResponse{hard_.term, request.rpc, false, 0, last_index() + 1, request.read_probe}}); return;
 		}
 		follower(source, output); leader_contact_ = now_;
+		acknowledge_at_ = std::max(acknowledge_at_, deadline(timing_.heartbeat));  // re-acknowledged after a silent interval
 		if (base_index_ && (request.previous < base_index_ || (request.previous == base_index_ && request.previous_term != base_term_))) {
 			output.emplace_back(Send{source, AppendResponse{hard_.term, request.rpc, false, 0, base_index_ + 1, request.read_probe, LogBoundary{base_index_, base_term_}}}); return;
 		}
@@ -1205,8 +1217,8 @@ private:
 			// log through `matched` (log matching); a late failure is stale.
 			if (!response.success || peer.snapshot || response.matched > last_index()) { return; }
 			// Quiescence: unprompted, it may be a woken follower's, whose timer now runs; the
-			// leader rests again only once a heartbeat puts that follower back to rest.
-			peer.told = 0;
+			// leader rests again only on its answer to a frame sent after this one arrived.
+			peer.told = 0; peer.woke = next_token_;
 			acknowledge_read(source, response.read_probe);
 			if (response.matched <= peer.matched) { return; }
 			acknowledge(source, peer, response.matched, output);
@@ -1215,7 +1227,7 @@ private:
 		} else if (response.success) {
 			if (response.matched != at->through) { return; }
 			pace(peer, *at);
-			peer.told = std::max(peer.told, at->commit);
+			if (at->rpc > peer.woke) { peer.told = std::max(peer.told, at->commit); }
 			acknowledge_read(source, response.read_probe);
 			acknowledge(source, peer, response.matched, output);
 		} else {
@@ -1504,6 +1516,7 @@ private:
 	std::set<NodeId> prevotes_;
 	std::map<NodeId, std::uint64_t> answered_;  // a leader's last answer from each voter
 	std::uint64_t leader_contact_ = 0;
+	std::uint64_t acknowledge_at_ = maximum;  // a follower that left rest: its next re-acknowledgement
 	std::vector<PendingRead> reads_;
 	std::unique_ptr<Transfer> transfer_;  // a leader's transfer in progress (D6), off the idle object
 	std::pair<NodeId, Token> acted_timeout_{};  // the last TimeoutNow this node acted on

@@ -71,11 +71,26 @@ MUTANTS = {
         ("worker.h", "plan = removal ? plan_event(ChangeMembership{0, std::move(*removal)}, false, limits_, scheduling_.retained) : EventAdmissionPlan{};",
             "plan = EventAdmissionPlan{}; (void)removal;"),
     ],
-    # Quiescence: a leader takes a woken follower's unprompted acknowledgement as nothing new and
-    # rests with that follower's timer running (driver_replace_test 1 1080 quiesce).
+    # Quiescence (quiescence_test): a leader takes a woken follower's unprompted acknowledgement
+    # as nothing new and rests with that follower's timer running (s1, s6; driver_replace_test 1 1080 quiesce).
     "wake-ack-unanswered": ("core.h",
-        "\t\t\tpeer.told = 0;\n\t\t\tacknowledge_read(source, response.read_probe);\n",
-        "\t\t\tacknowledge_read(source, response.read_probe);\n",
+        "\t\t\tpeer.told = 0; peer.woke = next_token_;\n",
+        "",
+    ),
+    # ... or counts an answer the acknowledgement overtook (s4).
+    "wake-ack-overtaken": ("core.h",
+        "\t\t\tif (at->rpc > peer.woke) { peer.told = std::max(peer.told, at->commit); }\n",
+        "\t\t\tpeer.told = std::max(peer.told, at->commit);\n",
+    ),
+    # A woken follower acknowledges once, not every heartbeat until it rests (s5).
+    "wake-ack-once": ("core.h",
+        "\t\tacknowledge_at_ = deadline(timing_.heartbeat);\n\t\toutput.emplace_back(Send{leader_, AppendResponse{",
+        "\t\tacknowledge_at_ = maximum - 1;\n\t\toutput.emplace_back(Send{leader_, AppendResponse{",
+    ),
+    # A follower woken while it persists drops its acknowledgement (s2).
+    "wake-ack-dropped-busy": ("core.h",
+        "\t\tif (now_ < acknowledge_at_ || busy()) { return; }\n",
+        "\t\tif (busy() && now_ >= acknowledge_at_) { acknowledge_at_ = deadline(timing_.heartbeat); }\n\t\tif (now_ < acknowledge_at_ || busy()) { return; }\n",
     ),
     # A witness incarnation may become a learner or voter (R16).
     "witness-becomes-data": ("core.h",

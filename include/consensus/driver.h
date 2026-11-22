@@ -392,11 +392,14 @@ public:
 	// cannot (docs/mechanisms/install-request.md): the leader ships its base once through the
 	// snapshot channel, and the call completes as repair's does, at the image's boundary with the
 	// epoch advanced, the committed entries after it delivered from this replica's own log.
-	// Fails with rejected{reason}: Current, the leader's base is not above this replica's (repair
-	// from its own base, or ask again once the leader checkpoints past it); NotLeader, no leader
-	// known, the one asked does not lead, or leadership changed before the image was admitted;
-	// Busy, an install, persistence, delivered range or another request in progress;
-	// LeaderMustTransfer, this replica leads; InvalidRepair, a witness, which holds no state.
+	// Fails with rejected{reason}: Current, the leader ships at most one image per requester per
+	// leader base, so it refuses when it holds no image, its base is below this replica's, or it
+	// already shipped this replica one at that base; it keeps one entry per member, dropped at a
+	// leader change (repair from this replica's own base, or ask again once the leader checkpoints
+	// past it); NotLeader, no leader known, the one asked does not lead, or leadership changed
+	// before the image was admitted; Busy, an install, persistence, delivered range or another
+	// request in progress; LeaderMustTransfer, this replica leads; InvalidRepair, a witness, which
+	// holds no state, or a removed incarnation (the leader answers NotMember).
 	task::task<RepairCompleted> reinstall(GroupId id, task::cancel_token token = {}) {
 		Call call(*this, Kind::repair, std::move(token));
 		co_await call.enter();

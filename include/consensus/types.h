@@ -179,11 +179,13 @@ struct AppendResponse {
 // boundary, which the leader compares with its own. The follower resends it each heartbeat
 // until answered; `request` correlates the answer.
 struct InstallRequest { Term term; Token request; LogBoundary base; };
-// Started: the leader treats the requester as below its base, and the snapshot channel ships
-// its image. InFlight: an install to the requester is already under way; it answers the
-// request. Current: the leader's base is not above the requester's, so no image is shipped.
-// NotLeader: the responder does not lead `term`; `leader` names the leader it knows, 0 for none.
-// NotMember: the requester is no data member (a witness or a removed incarnation).
+// Started: the leader ships the requester its image through the snapshot channel. InFlight: an
+// image to the requester is already under way. Current: the leader ships at most one image per
+// requester per leader base, so it ships none when it holds no image, its base is below the
+// requester's, or it already shipped the requester one at its current base; it keeps one entry
+// per member, dropped at a leader change. NotLeader: the responder does not lead `term`;
+// `leader` names the leader it knows, 0 for none. NotMember: the requester is no data member
+// (a witness or a removed incarnation).
 enum class InstallRequestReply : std::uint8_t { Started, InFlight, Current, NotLeader, NotMember };
 struct InstallRequestResponse { Term term; Token request; InstallRequestReply result; NodeId leader = 0; };
 using Message = std::variant<VoteRequest, VoteResponse, AppendRequest, AppendResponse, SnapshotResponse, PreVoteRequest, PreVoteResponse, TimeoutNow, Gone>;
@@ -245,7 +247,7 @@ struct LeaderGone { NodeId node; };
 using Event = std::variant<Start, Tick, Receive, Propose, Read, Persisted, Applied, Failed, LocalCheckpoint, StorageFault, InstallPrepared, InstallActivated, InstallActivationFailed, SnapshotSourceReady, SnapshotTransferFailed, Repair, ChangeMembership, TransferLeadership, PeerLimits, Wake, LeaderGone>;
 
 enum class Role : std::uint8_t { Follower, Candidate, Leader, Fenced };
-// Current: the leader refused an install request, its base not above this replica's.
+// Current: the leader refused an install request: one image per requester per leader base.
 enum class RejectReason { Busy, NotLeader, NotReady, LogFull, TooLarge, DuplicateRequest, InvalidCheckpoint, InvalidRepair, LeaderMustTransfer, InvalidMembership, InvalidTarget, Current };
 struct Persist { Token token; StorageBatch batch; };
 struct PersistCheckpoint { Token token; Token capture; RecoveredState state; };

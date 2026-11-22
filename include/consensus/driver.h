@@ -271,6 +271,12 @@ public:
 		auto found = groups_.find(id);
 		return found == groups_.end() ? dropped_unknown_ : found->second->dropped;
 	}
+	// The index a witness may truncate its log through (D9, Core::witness_bound): what every data
+	// voter has matched, as its current leader reports it; absent for a group not open.
+	std::optional<Index> witness_bound(GroupId id) const {
+		if (!groups_.contains(id)) { return std::nullopt; }
+		throw std::logic_error("witness_bound: not implemented");
+	}
 	std::optional<GroupState> state(GroupId id) const {
 		auto found = groups_.find(id);
 		if (found == groups_.end()) { return std::nullopt; }
@@ -379,6 +385,22 @@ public:
 		Call call(*this, Kind::repair, std::move(token));
 		co_await call.enter();
 		if (call.begin(id, false)) { call.waiter.event = Repair{call.waiter.request, boundary}; }
+		co_await call;
+		co_return *call.waiter.repaired;
+	}
+	// Restores a follower whose application state is lost from its leader's image, where repair
+	// cannot (docs/mechanisms/install-request.md): the leader ships its base once through the
+	// snapshot channel, and the call completes as repair's does, at the image's boundary with the
+	// epoch advanced, the committed entries after it delivered from this replica's own log.
+	// Fails with rejected{reason}: Current, the leader's base is not above this replica's (repair
+	// from its own base, or ask again once the leader checkpoints past it); NotLeader, no leader
+	// known, the one asked does not lead, or leadership changed before the image was admitted;
+	// Busy, an install, persistence, delivered range or another request in progress;
+	// LeaderMustTransfer, this replica leads; InvalidRepair, a witness, which holds no state.
+	task::task<RepairCompleted> reinstall(GroupId id, task::cancel_token token = {}) {
+		Call call(*this, Kind::repair, std::move(token));
+		co_await call.enter();
+		call.fail(std::make_exception_ptr(std::logic_error("reinstall: not implemented")));
 		co_await call;
 		co_return *call.waiter.repaired;
 	}

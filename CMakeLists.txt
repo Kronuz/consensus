@@ -145,9 +145,16 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	add_test(NAME consensus_worker COMMAND consensus_worker_test)
 	# Each seeded fault in tools/mutants.sh must fail the simulation (it reads Ninja's commands and
 	# needs bash). One test per mutant, so ctest -j runs them in parallel; the TIMEOUT is four
-	# times the slowest of the macOS, Linux and FreeBSD gate hosts' time (floor 600 s), for sanitizers.
+	# times the slowest of the macOS, Linux and FreeBSD gate hosts' time (floor 600 s).
+	# A sanitizer build proves nothing the plain build's mutants do not and cannot fit its CI time, so
+	# they register only without -fsanitize in the flags the shared CI sets (compile, config, link).
+	string(TOUPPER "${CMAKE_BUILD_TYPE}" consensus_build_type)
+	set(consensus_sanitized FALSE)
+	if("${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${consensus_build_type}} ${CMAKE_EXE_LINKER_FLAGS}" MATCHES "-fsanitize")
+		set(consensus_sanitized TRUE)
+	endif()
 	find_program(CONSENSUS_BASH bash)
-	if(CMAKE_GENERATOR MATCHES "Ninja" AND CONSENSUS_BASH)
+	if(CMAKE_GENERATOR MATCHES "Ninja" AND CONSENSUS_BASH AND NOT consensus_sanitized)
 		set(consensus_mutants
 			recovered-delivery-byte-accounting-underflows=600
 			sends-before-durability=600

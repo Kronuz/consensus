@@ -143,10 +143,44 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	add_executable(consensus_worker_test test/worker_test.cc)
 	target_link_libraries(consensus_worker_test PRIVATE consensus::consensus)
 	add_test(NAME consensus_worker COMMAND consensus_worker_test)
-	# Each seeded fault in tools/mutants.sh must fail the simulation (it reads Ninja's commands).
-	if(CMAKE_GENERATOR MATCHES "Ninja")
-		add_test(NAME consensus_mutants COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/mutants.sh ${CMAKE_BINARY_DIR} 400 10000)
-		set_tests_properties(consensus_mutants PROPERTIES TIMEOUT 1800)  # 14 faults, each built three ways: about 800 s on a busy host
+	# Each seeded fault in tools/mutants.sh must fail the simulation (it reads Ninja's commands and
+	# needs bash). One test per mutant, so ctest -j runs them in parallel; the TIMEOUT is four
+	# times the slowest of the macOS, Linux and FreeBSD gate hosts' time (floor 600 s), for sanitizers.
+	find_program(CONSENSUS_BASH bash)
+	if(CMAKE_GENERATOR MATCHES "Ninja" AND CONSENSUS_BASH)
+		set(consensus_mutants
+			recovered-delivery-byte-accounting-underflows=600
+			sends-before-durability=600
+			votes-and-pre-votes-without-the-log-check=700
+			repair-with-a-delivery-outstanding=600
+			membership-change-before-the-leader-commits-in-its-term=652
+			no-membership-rollback-on-a-replaced-suffix=600
+			a-removed-leader-counts-itself=600
+			a-follower-checks-entries-by-its-node-limits-not-by-position=600
+			a-leader-grants-pre-votes=640
+			learners-refuse-votes=600
+			repair-ignores-the-term-at-the-base-boundary=1712
+			repair-above-the-commit-index=600
+			repair-below-base-index=600
+			a-leader-ignores-members-node-limits=1016
+			commit-of-an-earlier-term-by-counting=844
+			a-follower-ignores-leadergone=896
+			a-read-counts-every-acknowledgement=900)
+		set(consensus_mutant_names "")
+		foreach(entry IN LISTS consensus_mutants)
+			string(REPLACE "=" ";" entry "${entry}")
+			list(GET entry 0 mutant)
+			list(GET entry 1 seconds)
+			list(APPEND consensus_mutant_names ${mutant})
+			add_test(NAME consensus_mutant_${mutant} COMMAND ${CONSENSUS_BASH} ${CMAKE_CURRENT_SOURCE_DIR}/tools/mutants.sh ${CMAKE_BINARY_DIR} 400 10000 ${mutant})
+			set_tests_properties(consensus_mutant_${mutant} PROPERTIES TIMEOUT ${seconds})
+		endforeach()
+		# A mutant added to the script without a test here would go unrun.
+		execute_process(COMMAND ${CONSENSUS_BASH} ${CMAKE_CURRENT_SOURCE_DIR}/tools/mutants.sh --list OUTPUT_VARIABLE listed OUTPUT_STRIP_TRAILING_WHITESPACE)
+		string(REPLACE "\n" ";" listed "${listed}")
+		if(NOT "${listed}" STREQUAL "${consensus_mutant_names}")
+			message(FATAL_ERROR "tools/mutants.sh --list differs from the consensus_mutant_ tests: ${listed}")
+		endif()
 	endif()
 	# Its real-file cases are flush-bound on macOS (F_FULLFSYNC): 145-170 s alone, more on a busy disk.
 	set_tests_properties(consensus_worker PROPERTIES TIMEOUT 600)
@@ -237,6 +271,14 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	# A contender on every port the system could hand out; the voters' own ports stay free.
 	add_test(NAME consensus_transport_peers_taken_ports COMMAND consensus_transport_peers_test taken-ports)
 	set_tests_properties(consensus_transport_peers_taken_ports PROPERTIES TIMEOUT 20)
+	# PeerOptions::wake (docs/mechanisms/peers-wake.md), one ctest entry per case.
+	add_executable(consensus_transport_peers_wake_test test/peers_wake_test.cc)
+	target_link_libraries(consensus_transport_peers_wake_test PRIVATE consensus::transport faultlab::faultlab)
+	target_compile_options(consensus_transport_peers_wake_test PRIVATE -UNDEBUG)
+	foreach(c idle control bulk)
+		add_test(NAME consensus_transport_peers_wake_${c} COMMAND consensus_transport_peers_wake_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture ${c})
+		set_tests_properties(consensus_transport_peers_wake_${c} PROPERTIES FIXTURES_REQUIRED consensus_tls TIMEOUT 60)
+	endforeach()
 	add_test(NAME consensus_transport_tls COMMAND consensus_transport_tls_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture)
 	add_test(NAME consensus_transport_pipe COMMAND consensus_transport_tls_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture --pipes)
 	add_test(NAME consensus_transport_authentication COMMAND consensus_transport_authentication_test ${CMAKE_CURRENT_BINARY_DIR}/tls-fixture)

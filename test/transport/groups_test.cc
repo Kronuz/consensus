@@ -2416,7 +2416,18 @@ void owe_order() {
 		for (auto g : bulk)
 			two.transport->send(0, LinkLane::Control, FrameKind::data, {g, 2, 1}, 1, std::string((4 << 20) - 1024, 'B'));
 	});
-	const bool backed = until([&] { return stats.sent > sent_before; }, 10'000);
+	// Backed: host 2's connection has stopped taking frames (the kernel buffers absorb the first
+	// bulk frames, so credit repaid before it stalls would go out ahead of the control frames).
+	auto last = stats.sent.load();
+	auto steady_since = steady::now();
+	const bool backed = until(
+		[&] {
+			if (const auto now = stats.sent.load(); now != last)
+				last = now, steady_since = steady::now();
+			return last > sent_before && ms_since(steady_since) >= 500;
+		},
+		30'000);
+	std::printf("owe-order: host 2's connection took %llu frames before it stalled\n", (unsigned long long)(last - sent_before));
 	std::vector<std::string> frames;
 	for (auto g : groups)
 		frames.push_back(RawPeer::frame(g, 1, 2, "d", FrameKind::data));

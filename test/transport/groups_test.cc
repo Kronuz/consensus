@@ -1046,12 +1046,15 @@ task::task<void> changing(Driver<GroupSink> *d, GroupId g, Membership next) {
 task::task<void> transferring(Driver<GroupSink> *d, GroupId g, NodeId target) { co_await d->transfer_leadership(g, target); }
 
 // The journal's I/O on the calling loop (InlineCompletion), with the longest one operation held
-// it, in ms: a slow sync blocks every connection that loop serves.
+// it, in ms: a slow sync blocks every connection that loop serves. `delay` makes the next
+// operation that much slower, as a runner's slow sync.
 struct TimedInline {
 	j::InlineCompletion inline_io;
-	std::atomic<std::uint64_t> longest{0};
+	std::atomic<std::uint64_t> longest{0}, delay{0};
 	task::task<void> run(std::shared_ptr<j::IOOperation> operation, task::cancel_token token = {}) {
 		const auto t = steady::now();
+		if (const auto ms = delay.exchange(0))
+			std::this_thread::sleep_for(std::chrono::milliseconds(ms));
 		co_await inline_io.run(std::move(operation), std::move(token));
 		longest = std::max<std::uint64_t>(longest, ms_since(t));
 	}
@@ -2518,6 +2521,7 @@ struct LoopLags {
 // group's Drivers over the transport; rounds of four 8 MiB fetches (method 1), both ways between
 // nodes, through 1 MiB lane budgets, while a command commits every 50 ms. Every fetch arrives
 // exact, every commit lands on all three within 2 s, and the leader keeps its term.
+// FETCH_ALONGSIDE_SLOW_SYNC=ms makes one follower's next sync that slow.
 std::string pattern(std::size_t n, unsigned seed) {
 	std::string s(n, '\0');
 	for (std::size_t i = 0; i != n; ++i)
@@ -2606,6 +2610,12 @@ void fetch_alongside() {
 	for (auto *n : all)
 		for (auto &p : n->per)
 			p->io.longest = 0;
+	// FETCH_ALONGSIDE_SLOW_SYNC=ms: a follower's next journal operation takes that much longer.
+	if (const char *ms = std::getenv("FETCH_ALONGSIDE_SLOW_SYNC")) {
+		const NodeId slow = leader == 2 ? 3 : 2;
+		c.nodes[slow]->per[c.nodes[slow]->host.transport->loop_of_group(g)]->io.delay = std::strtoull(ms, nullptr, 10);
+		std::printf("fetch-alongside: node %llu's next journal operation takes %s ms longer\n", (unsigned long long)slow, ms);
+	}
 	Stalls stalls;
 	LoopLags lags(all);
 	bool changed = false;

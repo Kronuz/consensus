@@ -116,7 +116,7 @@ concept capture = requires(C& c, std::span<char> chunk) {
 
 namespace driver_detail {
 
-enum class Kind : std::uint8_t { open, propose, committed, read, transfer, repair, checkpoint, close };
+enum class Kind : std::uint8_t { open, propose, committed, read, transfer, repair, reinstall, checkpoint, close };
 
 // A caller suspended on a group, in the caller's frame (docs/DRIVER.md, "Waiters"). The loop
 // links it and completes it; a token's callback, on any thread, claims it and hops to the loop,
@@ -271,6 +271,13 @@ public:
 		auto found = groups_.find(id);
 		return found == groups_.end() ? dropped_unknown_ : found->second->dropped;
 	}
+	// The index a witness may truncate its log through (D9, Core::witness_bound): what every data
+	// voter has matched, as its current leader reports it; absent for a group not open.
+	std::optional<Index> witness_bound(GroupId id) const {
+		auto found = groups_.find(id);
+		if (found == groups_.end()) { return std::nullopt; }
+		return found->second->worker->witness_bound();
+	}
 	std::optional<GroupState> state(GroupId id) const {
 		auto found = groups_.find(id);
 		if (found == groups_.end()) { return std::nullopt; }
@@ -379,6 +386,25 @@ public:
 		Call call(*this, Kind::repair, std::move(token));
 		co_await call.enter();
 		if (call.begin(id, false)) { call.waiter.event = Repair{call.waiter.request, boundary}; }
+		co_await call;
+		co_return *call.waiter.repaired;
+	}
+	// Restores a follower whose application state is lost from its leader's image, where repair
+	// cannot (docs/mechanisms/install-request.md): the leader ships its base once through the
+	// snapshot channel, and the call completes as repair's does, at the image's boundary with the
+	// epoch advanced, the committed entries after it delivered from this replica's own log.
+	// Fails with rejected{reason}: Current, the leader ships at most one image per requester per
+	// leader base, so it refuses when it holds no image, its base is below this replica's, or it
+	// already shipped this replica one at that base; it keeps one entry per member, dropped at a
+	// leader change (repair from this replica's own base, or ask again once the leader checkpoints
+	// past it); NotLeader, no leader known, the one asked does not lead, or leadership changed
+	// before the image was admitted; Busy, an install, persistence, delivered range or another
+	// request in progress; LeaderMustTransfer, this replica leads; InvalidRepair, a witness, which
+	// holds no state, or a removed incarnation (the leader answers NotMember).
+	task::task<RepairCompleted> reinstall(GroupId id, task::cancel_token token = {}) {
+		Call call(*this, Kind::reinstall, std::move(token));
+		co_await call.enter();
+		if (call.begin(id, true)) { call.waiter.event = RequestInstall{call.waiter.request}; }
 		co_await call;
 		co_return *call.waiter.repaired;
 	}

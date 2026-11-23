@@ -306,7 +306,7 @@ public:
 	// there (docs/mechanisms/quiescence.md). Rest is not required: closing an awake group is
 	// safe, and its reopen may cost an election.
 	std::optional<ClosedState> closed_state() const {
-		if (!started_ || retiring_ || role_ == Role::Fenced || busy() || delivered_through_ || applied_ != durable_.commit_index ||
+		if (!started_ || retiring_ || role_ == Role::Fenced || busy() || delivered_through_ || reinstall_ || applied_ != durable_.commit_index ||
 			base_index_ != applied_ || membership().members.empty()) { return std::nullopt; }
 		return ClosedState{durable_, {last_index(), log_term(last_index())}, membership(), membership_index(), leader_};
 	}
@@ -333,7 +333,7 @@ public:
 	// now or past; every other deadline counts only while ahead of the clock.
 	std::uint64_t next_deadline() const {
 		if (!started_ || retiring_ || role_ == Role::Fenced || busy() || resting_) { return maximum; }
-		if (role_ != Role::Leader) { return std::min(is_voter(configuration_.local) && hard_.term != maximum ? election_deadline_ : maximum, acknowledge_at_); }
+		if (role_ != Role::Leader) { return std::min({is_voter(configuration_.local) && hard_.term != maximum ? election_deadline_ : maximum, acknowledge_at_, install_deadline()}); }
 		auto at = peers_.empty() ? maximum : heartbeat_deadline_;  // a leader with nobody to heartbeat sleeps
 		auto later = [&](std::uint64_t base, std::uint64_t delay) {
 			const auto due = delay > maximum - base ? maximum : base + delay;
@@ -423,6 +423,7 @@ private:
 		Token token, prepared; RequestId request; LogBoundary boundary; HardState hard;
 		Actions deferred; bool retain_suffix, published = false;
 		std::optional<Membership> membership{};
+		RequestId reinstall = 0;  // the install request it serves, which completes at activation
 	};
 	struct Flight { Token rpc; Index previous, through; Token read_probe; std::uint64_t sent; bool keepalive = false; std::uint64_t bytes = 0; Index commit = 0; };
 	enum class SnapshotPhase { AwaitSource, Sending };
@@ -442,6 +443,9 @@ private:
 		std::uint64_t frame = frame_floor;
 		// Back to one flight, resuming at `from` (the oldest flight's start: nothing before it is in doubt).
 		void reset_flights(Index from) { flights.clear(); window = 0; verified = false; next = std::max(matched + 1, from); }
+		// Install requests (docs/mechanisms/install-request.md): `requested` while the image one
+		// started is owed; `imaged`, the base of the last image the peer installed or rejected.
+		bool requested = false; Index imaged = 0;
 	};
 	struct PendingRead { RequestId request; Token probe; Term term; Index index; std::set<NodeId> acknowledgements; };
 	struct Transfer { NodeId target; Token token; std::uint64_t until; bool sent = false; };
@@ -584,7 +588,7 @@ private:
 		const auto& committed = committed_membership();
 		if (committed != membership() || committed.leaving || !votes_in(committed, configuration_.local) || peers_.size() != replicas().size()) { return false; }
 		for (const auto& [id, peer] : peers_) {
-				if (!peer.flights.empty() || peer.snapshot || peer.keepalive || peer.blocked || peer.matched != last_index() || peer.told != durable_.commit_index) { return false; }
+				if (!peer.flights.empty() || peer.snapshot || peer.requested || peer.keepalive || peer.blocked || peer.matched != last_index() || peer.told != durable_.commit_index) { return false; }
 		}
 		return true;
 	}
@@ -652,11 +656,12 @@ private:
 	}
 	void fence(std::string reason, Actions& output) {
 		output.clear(); release_snapshots(SnapshotReleaseReason::Fenced, output);
-		role_ = Role::Fenced; pending_.reset(); install_.reset(); peers_.clear(); reads_.clear();
+		role_ = Role::Fenced; pending_.reset(); install_.reset(); reinstall_.reset(); peers_.clear(); reads_.clear();
 		output.emplace_back(Fenced{std::move(reason)});
 	}
 	void follower(NodeId leader, Actions& deferred) {
 		if (role_ != Role::Follower || leader_ != leader) { deferred.emplace_back(RoleChanged{Role::Follower, hard_.term, leader}); }
+		if (reinstall_ && (reinstall_->leader != leader || reinstall_->term != hard_.term)) { drop_install(RejectReason::NotLeader, deferred); }
 		release_snapshots(SnapshotReleaseReason::LeadershipLost, deferred);
 		role_ = Role::Follower; leader_ = leader; peers_.clear(); grants_.clear(); prevote_ = 0; prevotes_.clear(); answered_.clear(); transfer_.reset(); resting_ = false;
 		for (const auto& read : reads_) { deferred.emplace_back(Reject{read.request, RejectReason::NotLeader}); }
@@ -734,13 +739,17 @@ private:
 			request.leader_term == 0 || request.boundary.index == 0 || request.boundary.index == maximum ||
 			request.boundary.term == 0 || request.boundary.term > request.leader_term) { return InstallRejectReason::Invalid; }
 		if (request.leader_term < hard_.term) { return InstallRejectReason::StaleTerm; }
-		if (request.boundary.index <= durable_.commit_index) { return InstallRejectReason::CaughtUp; }
+		if (request.boundary.index <= durable_.commit_index && !(asked_by(request) && retains_suffix(request.boundary))) { return InstallRejectReason::CaughtUp; }
 		// A joiner knows no founding membership, so an install must name its base (D5).
 		const bool unnamed = !request.membership && configuration_.voters.empty();
 		if (unnamed && (!retains_suffix(request.boundary) || membership_at(request.boundary.index).members.empty())) {
 			return InstallRejectReason::Invalid;
 		}
 		return std::nullopt;
+	}
+	// The image a pending install request asked for: from its leader, in its term.
+	bool asked_by(const InstallPrepared& request) const {
+		return reinstall_ && reinstall_->leader == request.authenticated_peer && reinstall_->term == request.leader_term;
 	}
 	void handle(InstallPrepared request, Actions& output) {
 		auto rejection = install_rejection(request);
@@ -757,7 +766,9 @@ private:
 			return;
 		}
 		bool retain = retains_suffix(request.boundary);
-		next_hard.commit_index = request.boundary.index;
+		// A requested image at or below the commit index keeps the log above it and the index.
+		next_hard.commit_index = std::max(durable_.commit_index, request.boundary.index);
+		const RequestId reinstall = asked_by(request) ? reinstall_->request : 0;
 		RecoveredState state{configuration_, next_hard, request.boundary.index, request.boundary.term, {}, request.boundary.index};
 		// A joiner that retains its log below the entry naming its membership takes the
 		// membership the request names (condition 16).
@@ -773,7 +784,8 @@ private:
 		}
 		Actions deferred; hard_ = next_hard; follower(request.authenticated_peer, deferred); leader_contact_ = now_;
 		auto id = token(); install_ = std::make_unique<PendingInstall>(PendingInstall{id, request.prepared, request.request, request.boundary, next_hard, std::move(deferred), retain});
-		install_->membership = request.membership;
+		install_->membership = request.membership; install_->reinstall = reinstall;
+		if (reinstall) { reinstall_.reset(); }  // the install owns the request from here
 		if (capture_mode_) { captured_ = std::make_unique<FrozenCheckpoint>(FrozenCheckpoint(*this, id, state, retain ? entries_.size() - static_cast<std::size_t>(request.boundary.index - base_index_) : 0)); }
 		output.emplace_back(PersistInstall{id, request.prepared, std::move(state)});
 	}
@@ -782,6 +794,10 @@ private:
 		if (delivered_through_) { fence("snapshot activation precedes outstanding application completion", output); return; }
 		auto operation = std::move(*install_); install_.reset(); applied_ = operation.boundary.index; reset_election();
 		output.emplace_back(InstallCompleted{operation.request, operation.prepared, operation.boundary});
+		// A requested image completes as a repair: the epoch advances, and the committed entries
+		// after the boundary are delivered from this replica's own log.
+		if (operation.reinstall) { ++epoch_; output.emplace_back(RepairCompleted{operation.reinstall, operation.boundary, epoch_}); }
+		deliver(output);
 	}
 	void handle(InstallActivationFailed failure, Actions& output) {
 		if (install_ && install_->published && failure.token == install_->token) { fence(std::move(failure.error), output); }
@@ -792,6 +808,10 @@ private:
 	void release_snapshot(NodeId id, Peer& peer, SnapshotReleaseReason reason, Actions& output, bool probe = false) {
 		auto key = peer.snapshot->key; output.emplace_back(SnapshotReleased{id, key, reason}); peer.snapshot.reset();
 		peer.keepalive.reset();
+		// The peer answered for a whole image; a failed or stale transfer still owes it one.
+		// CaughtUp means it no longer asked, so that image is not its one at this base.
+		if (reason == SnapshotReleaseReason::CaughtUp || reason == SnapshotReleaseReason::Rejected) { peer.requested = false; }
+		if (reason == SnapshotReleaseReason::Rejected) { peer.imaged = key.boundary.index; }
 		peer.retry_after = deadline(timing_.rpc_timeout); peer.snapshot_retry_clock = now_;
 		if (probe) { peer.next = std::max(peer.matched + 1, key.boundary.index + 1); peer.lacks_base = false; }
 	}
@@ -810,7 +830,7 @@ private:
 	}
 
 	std::optional<RejectReason> checkpoint_rejection(const LocalCheckpoint& request) const {
-		if (!started_ || busy()) { return RejectReason::Busy; }
+		if (!started_ || busy() || reinstall_) { return RejectReason::Busy; }
 		if (request.capture == 0 || request.epoch != epoch_ || request.cluster != configuration_.cluster || request.configuration != configuration_.configuration ||
 			request.through <= base_index_ || request.through > applied_ || applied_ > durable_.commit_index ||
 			(witness_self() && request.through > witness_bound_) ||
@@ -850,6 +870,7 @@ private:
 	void handle(Repair request, Actions& output) {
 		auto reject = [&](RejectReason reason) { output.emplace_back(Reject{request.request, reason}); };
 		if (!started_ || busy() || delivered_through_) { reject(RejectReason::Busy); return; }
+		if (reinstall_) { reject(RejectReason::Busy); return; }  // a pending install request owns the state
 		if (role_ == Role::Leader && voter_count(membership()) > 1) { reject(RejectReason::LeaderMustTransfer); return; }
 		const auto b = request.boundary;
 		if (b.index < base_index_ || b.index > durable_.commit_index || (b.index == base_index_ ? b.term != base_term_ : log_term(b.index) != b.term)) {
@@ -859,6 +880,37 @@ private:
 		applied_ = b.index; ++epoch_;
 		output.emplace_back(RepairCompleted{request.request, b, epoch_});
 		deliver(output);
+	}
+	// A follower asks its leader for its image (docs/mechanisms/install-request.md).
+	void handle(RequestInstall request, Actions& output) {
+		auto reject = [&](RejectReason reason) { output.emplace_back(Reject{request.request, reason}); };
+		if (!started_ || busy() || delivered_through_ || reinstall_) { reject(RejectReason::Busy); return; }
+		if (role_ == Role::Leader) { reject(RejectReason::LeaderMustTransfer); return; }
+		if (witness_self()) { reject(RejectReason::InvalidRepair); return; }
+		if (role_ != Role::Follower || !leader_) { reject(RejectReason::NotLeader); return; }
+		if (resting_) { wake(output); }
+		reinstall_ = std::make_unique<Reinstall>(Reinstall{request.request, leader_, hard_.term, token(), now_, now_});
+		output.emplace_back(Send{leader_, InstallRequest{hard_.term, reinstall_->token, base_boundary()}});
+	}
+	void drop_install(RejectReason reason, Actions& output) {
+		output.emplace_back(Reject{reinstall_->request, reason}); reinstall_.reset();
+	}
+	// A pending request's next frame or end: unanswered, it is resent each heartbeat and fails
+	// NotLeader after an election timeout; answered, it is asked again after snapshot_timeout
+	// with no image admitted.
+	std::uint64_t install_deadline() const {
+		if (!reinstall_) { return maximum; }
+		auto after = [](std::uint64_t base, std::uint64_t delay) { return delay > maximum - base ? maximum : base + delay; };
+		const auto& r = *reinstall_;
+		return r.started ? after(r.since, timing_.snapshot_timeout) : std::min(after(r.sent, timing_.heartbeat), after(r.since, timing_.election_max));
+	}
+	void ask_install(Actions& output) {
+		if (!reinstall_ || now_ < install_deadline()) { return; }
+		auto& r = *reinstall_;
+		if (r.started) { r.started = false; r.since = now_; }
+		else if (now_ - r.since >= timing_.election_max) { drop_install(RejectReason::NotLeader, output); deliver(output); return; }
+		r.sent = now_;
+		output.emplace_back(Send{r.leader, InstallRequest{r.term, r.token, base_boundary()}});
 	}
 	void handle(Applied completion, Actions& output) {
 		if (completion.through <= applied_) { return; }
@@ -1060,6 +1112,12 @@ private:
 	bool valid(const PreVoteResponse& response) const { return response.request_term > 0; }
 	bool valid(const TimeoutNow& request) const { return request.term > 0 && request.token > 0 && request.last_index < maximum; }
 	bool valid(const Gone& gone) const { return gone.term > 0; }
+	bool valid(const InstallRequest& request) const {
+		return request.term > 0 && request.request > 0 && request.base.index < maximum && request.base.term <= request.term && ((request.base.index == 0) == (request.base.term == 0));
+	}
+	bool valid(const InstallRequestResponse& response) const {
+		return response.term > 0 && response.request > 0 && static_cast<unsigned>(response.result) <= static_cast<unsigned>(InstallRequestReply::NotMember);
+	}
 	bool log_up_to_date(Index index, Term term) const {
 		return term > log_term(last_index()) || (term == log_term(last_index()) && index >= last_index());
 	}
@@ -1104,6 +1162,33 @@ private:
 		acted_timeout_ = {source, request.token}; timed_out_ = true;
 	}
 	void receive_message(NodeId, Gone, StorageBatch&, Actions&) {}  // handled in handle(Receive)
+	// A leader ships at most one image per requester per leader base: `imaged` records the base
+	// of the image the peer last installed or rejected, and a leader change drops it with the peer.
+	void receive_message(NodeId source, InstallRequest request, StorageBatch&, Actions& output) {
+		auto answer = [&](InstallRequestReply result, NodeId leader = 0) {
+			output.emplace_back(Send{source, InstallRequestResponse{hard_.term, request.request, result, leader}});
+		};
+		// A witness that leads holds no image and is handing off (D9).
+		if (role_ != Role::Leader || request.term != hard_.term || witness_self()) { answer(InstallRequestReply::NotLeader, role_ == Role::Leader && witness_self() ? 0 : leader_); return; }
+		auto member = find_member(membership(), source);
+		auto found = peers_.find(source);
+		if (!member || member->role == MemberRole::Witness || found == peers_.end()) { answer(InstallRequestReply::NotMember); return; }
+		auto& peer = found->second;
+		if (peer.snapshot || peer.requested) { answer(InstallRequestReply::InFlight); return; }
+		if (!base_index_ || request.base.index > base_index_ || peer.imaged == base_index_) { answer(InstallRequestReply::Current); return; }
+		peer.requested = true;
+		answer(InstallRequestReply::Started);
+		if (peer.flights.empty()) { replicate(source, peer, output, needed_probe(source)); }
+	}
+	void receive_message(NodeId source, InstallRequestResponse response, StorageBatch&, Actions& output) {
+		if (!reinstall_ || response.request != reinstall_->token || source != reinstall_->leader || response.term != reinstall_->term) { return; }
+		switch (response.result) {
+		case InstallRequestReply::Started: case InstallRequestReply::InFlight: reinstall_->started = true; reinstall_->since = now_; return;
+		case InstallRequestReply::Current: drop_install(RejectReason::Current, output); return;
+		case InstallRequestReply::NotLeader: drop_install(RejectReason::NotLeader, output); return;
+		case InstallRequestReply::NotMember: drop_install(RejectReason::InvalidRepair, output); return;
+		}
+	}
 	void receive_message(NodeId source, PreVoteResponse response, StorageBatch&, Actions& output) {
 		if (!prevote_ || response.request_term != prevote_ || !response.granted || role_ == Role::Leader || !is_voter(source)) { return; }
 		prevotes_.insert(source);  // handle(Receive) campaigns once the quorum is in and nothing persists
@@ -1187,7 +1272,7 @@ private:
 		// never under a leader whose removal is in force or pending, which steps down unheard.
 		const auto& committed = committed_membership();
 		resting_ = timing_.quiesce && request.commit >= verified && verified == last_index() && committed == membership() &&
-			votes_in(committed, source) && committed.leaving != source;
+			votes_in(committed, source) && committed.leaving != source && !reinstall_;
 		output.emplace_back(Send{source, AppendResponse{hard_.term, request.rpc, true, verified, verified + 1, request.read_probe}});
 	}
 	// Adds a log mutation to a step's batch: a later one starts within or right after the
@@ -1254,7 +1339,7 @@ private:
 			peer.reset_flights(peer.next);  // later flights carry a failed prefix
 		}
 		auto needed = needed_probe(source);
-		if (peer.next <= last_index() || needed) {
+		if (peer.next <= last_index() || needed || peer.requested) {
 			replicate(source, peer, output, needed);
 		}
 	}
@@ -1284,6 +1369,7 @@ private:
 			output.emplace_back(SnapshotReleased{source, response.key, SnapshotReleaseReason::Installed}); peer.snapshot.reset();
 			peer.keepalive.reset(); peer.flights.clear(); peer.window = 0;
 			peer.matched = std::max(peer.matched, boundary.index); peer.next = peer.matched + 1; peer.retry_after = 0; peer.snapshot_retry_clock.reset(); peer.lacks_base = false;
+			peer.requested = false; peer.imaged = boundary.index;
 			replicate(source, peer, output, needed_probe(source));
 		} else { release_snapshot(source, peer, response.result == SnapshotReply::CaughtUp ? SnapshotReleaseReason::CaughtUp : SnapshotReleaseReason::Rejected, output, response.result == SnapshotReply::CaughtUp); }
 	}
@@ -1292,6 +1378,7 @@ private:
 	void drive(Actions& output, bool tick) {
 		if (!started_ || busy() || resting_) { return; }
 		if (role_ != Role::Leader) {
+			if (tick) { ask_install(output); }
 			// Campaigns require a separately admitted Tick. Slow persistence
 			// must not start another election from its completion callback.
 			if (!tick || now_ < election_deadline_ || hard_.term == maximum) { return; }
@@ -1349,7 +1436,7 @@ private:
 			if (peer.snapshot && now_ - peer.snapshot->started >= timing_.snapshot_timeout) { release_snapshot(id, peer, SnapshotReleaseReason::TimedOut, output, true); }
 			// A timed-out flight returns the peer to one flight at its verified progress, paced from the floor.
 			if (!peer.flights.empty() && now_ - peer.flights.front().sent >= timing_.rpc_timeout) { peer.reset_flights(peer.flights.front().previous + 1); peer.frame = frame_floor; }
-			if (peer.snapshot || (peer.flights.empty() && heartbeat) || peer.next <= last_index()) {
+			if (peer.snapshot || (peer.flights.empty() && (heartbeat || peer.requested)) || peer.next <= last_index()) {
 				auto probe = needed_probe(id);
 				replicate(id, peer, output, probe);
 			}
@@ -1361,6 +1448,7 @@ private:
 		++hard_.term; hard_.voted_for = configuration_.local; prevote_ = 0; prevotes_.clear();
 		role_ = Role::Candidate; leader_ = 0; grants_ = {configuration_.local}; resting_ = false; reset_election();
 		Actions deferred; deferred.emplace_back(RoleChanged{role_, hard_.term, 0});
+		if (reinstall_) { drop_install(RejectReason::NotLeader, deferred); }
 		for (NodeId voter : voters()) {
 			if (voter != configuration_.local) { deferred.emplace_back(Send{voter, VoteRequest{hard_.term, last_index(), log_term(last_index()), transfer}}); }
 		}
@@ -1403,9 +1491,9 @@ private:
 		// with flights out, only to send entries (heartbeats go when none is).
 		const std::size_t depth = peer.verified ? flow_.pipeline : 1;
 		if (peer.flights.size() >= depth || (!peer.flights.empty() && (peer.next > last_index() || peer.window >= flow_.window_bytes))) { return; }
-		if (peer.next <= base_index_) {
+		if (peer.next <= base_index_ || peer.requested) {
 			if (!peer.flights.empty()) { return; }  // an install starts once nothing is in flight
-			if (!peer.lacks_base) {
+			if (!peer.lacks_base && !peer.requested) {
 				peer.next = base_index_ + 1;  // a timeout or the leader's own compaction, not the peer, put it here
 			} else {
 				SnapshotKey key{durable_.term, token(), {base_index_, base_term_}};
@@ -1465,7 +1553,7 @@ private:
 		persist(StorageBatch{hard_, std::nullopt}, {}, output);
 	}
 	void deliver(Actions& output) {
-		if (busy() || delivered_through_ || applied_ >= durable_.commit_index) { return; }
+		if (busy() || delivered_through_ || reinstall_ || applied_ >= durable_.commit_index) { return; }
 		std::vector<Entry> batch; std::size_t bytes = 0;
 		for (Index index = applied_ + 1; index <= durable_.commit_index && batch.size() < limits_.rpc_entries; ++index) {
 			const auto& entry = log_entry(index);
@@ -1528,6 +1616,11 @@ private:
 	mutable WireCap wire_;
 	Index witness_bound_ = 0;  // a witness truncates only through this (D9)
 	NodeId resume_ = 0;  // a reopen's leader at close, resumed at Start
+	// A follower's install request (docs/mechanisms/install-request.md): asked of `leader` in
+	// `term`, its frames correlated by `token`; `since` the wait began, `sent` the last frame;
+	// `started` once the leader answered Started or InFlight.
+	struct Reinstall { RequestId request; NodeId leader; Term term; Token token; std::uint64_t since, sent; bool started = false; };
+	std::unique_ptr<Reinstall> reinstall_;  // rare state off the idle object
 };
 
 } // namespace kronuz::consensus

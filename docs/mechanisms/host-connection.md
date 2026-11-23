@@ -42,10 +42,12 @@ this node's own, an unpinned one or none is refused before any hello or frame. P
 
 ## The connection
 
-OpenSSL runs on the non-blocking socket (`SSL_set_fd`); readiness comes from `await_asio` on
-`async_wait`. `SSL_MODE_RELEASE_BUFFERS` frees the record buffers while idle, and the read buffer
-grows only by what arrived, so an idle connection holds neither. OpenSSL writes with plain
-`write()`, so where `SO_NOSIGPIPE` is missing (Linux) the host ignores `SIGPIPE`.
+OpenSSL runs on the non-blocking socket; readiness comes from `await_asio` on `async_wait`.
+`SSL_MODE_RELEASE_BUFFERS` frees the record buffers while idle, and the read buffer grows only by
+what arrived, so an idle connection holds neither. OpenSSL reads through its socket BIO and writes
+through the connection's own, which sends with `MSG_NOSIGNAL`: a write to a peer that closed fails
+with `EPIPE` and never raises `SIGPIPE`, so the host need not ignore it (`peer_gone` in
+`connection_test`).
 
 A host's loops share its TLS context. OpenSSL decodes a certificate's extensions on its first
 verification and publishes them through an atomic flag that ThreadSanitizer cannot see in

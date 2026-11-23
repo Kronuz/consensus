@@ -1,7 +1,8 @@
 // The host connection over loopback TCP with the TLS fixture: node authentication by the
 // host's pins (A2), frames, the keepalive and the dead-peer deadline, graceful close (A4), the
 // fd kept until run() returns, a slow but steady reader and a busy one (security review S1, N2),
-// a peer that never reads, and loops handshaking at once with the context Links took.
+// a peer that never reads, loops handshaking at once with the context Links took, and writes
+// to a closed peer that raise no SIGPIPE.
 //   consensus_transport_connection_test <fixture dir> [case]
 #include "consensus/transport/connection.h"
 #include "consensus/transport/links.h"
@@ -13,7 +14,6 @@
 #include <asio/post.hpp>
 #include <atomic>
 #include <cassert>
-#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -462,6 +462,31 @@ void abort_truncates() {
 	std::printf("abort_truncates: both ends failed\n");
 }
 
+// No write of a connection raises SIGPIPE, and nothing in this test ignores it: after the TLS
+// handshake the acceptor's socket closes, and the dialer writes its hello until a write fails.
+void peer_gone() {
+	Loop loop;
+	auto one = pins_of(1, "one"), two = pins_of(2, "two");
+	Pair p(loop, context("one"), context("two"));
+	auto [d, a] = p.handshake(one, 2, two);
+	assert(d.node == 2 && a.node == 1);
+	loop.call([&] { p.acceptor.reset(); });  // its fd closes; a write after meets a reset
+	auto hello = [&]() -> task::task<int> {
+		late_deadline deadline(loop.ref(), 2s);
+		co_await p.dialer->write_hello({1, LinkLane::Control, false, id('K'), id('d'), 1, 1}, deadline.token());
+		co_return 0;
+	};
+	std::exception_ptr failed;
+	int writes = 0;
+	while (!failed && writes != 100) {
+		loop.until([] { return false; }, 10ms);  // the peer's FIN, then its reset, arrive
+		loop.run(hello(), &failed);
+		++writes;
+	}
+	std::printf("peer_gone: write %d to the closed peer failed, with no SIGPIPE\n", writes);
+	assert(failed);
+}
+
 // A socket that takes the connection's fd number after an abort (dup2 onto it, the worst a
 // socket opened elsewhere could do): the connection must neither read its bytes nor write onto
 // it. `kept` is the stranger's own end under another number, `remote` its peer.
@@ -476,7 +501,7 @@ struct Stranger {
 		assert(::dup2(kept, old) == old);
 		for (int fd : {kept, remote})
 			::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL) | O_NONBLOCK);
-		assert(::write(remote, bytes.data(), bytes.size()) == ssize_t(bytes.size()));
+		assert(::send(remote, bytes.data(), bytes.size(), MSG_NOSIGNAL) == ssize_t(bytes.size()));
 	}
 	~Stranger() {
 		for (int fd : {kept, remote})
@@ -745,7 +770,7 @@ int reader_capacity(int pin) {
 	int held = 0, readback = 0;
 	for (int last = -1; held != last;) {  // until a round moves nothing more into the reader
 		last = held;
-		while (::send(writer, chunk.data(), chunk.size(), 0) > 0) {
+		while (::send(writer, chunk.data(), chunk.size(), MSG_NOSIGNAL) > 0) {
 		}
 		std::this_thread::sleep_for(20ms);
 		::ioctl(reader, FIONREAD, &held);
@@ -1019,7 +1044,7 @@ class Relay {
 		char buffer[64 * 1024];
 		const auto n = ::read(from, buffer, sizeof buffer);
 		for (ssize_t at = 0; at < n;) {
-			const auto w = ::write(to, buffer + at, std::size_t(n - at));
+			const auto w = ::send(to, buffer + at, std::size_t(n - at), MSG_NOSIGNAL);
 			if (w <= 0)
 				return false;
 			at += w;
@@ -1113,7 +1138,7 @@ struct Case {
 constexpr Case cases[] = {{"authenticate", authenticate}, {"wrong_node", wrong_node}, {"unpinned", unpinned},
 						  {"no_certificate", no_certificate}, {"pins", pins},		 {"frames", frames},
 						  {"keepalive", keepalive},	   {"dead_peer", dead_peer}, {"dead_extends", dead_extends}, {"graceful_close", graceful_close},
-						  {"abort_truncates", abort_truncates}, {"fd_reuse_reader", fd_reuse_reader},
+						  {"abort_truncates", abort_truncates}, {"peer_gone", peer_gone}, {"fd_reuse_reader", fd_reuse_reader},
 						  {"fd_reuse_writer", fd_reuse_writer}, {"slow_reader", slow_reader},
 						  {"busy_reader", busy_reader}, {"coarse_writer", coarse_writer}, {"nonreader", nonreader},
 						  {"shared_context", shared_context}};
@@ -1122,7 +1147,6 @@ constexpr Case cases[] = {{"authenticate", authenticate}, {"wrong_node", wrong_n
 int main(int argc, char **argv) {
 	assert(argc >= 2);
 	fixture = argv[1];
-	std::signal(SIGPIPE, SIG_IGN);  // the host's duty where SO_NOSIGPIPE is missing (connection.h)
 	std::setvbuf(stdout, nullptr, _IOLBF, 0);  // a case's line reaches the log before an assert aborts
 	int ran = 0;
 	for (const auto &c : cases) {

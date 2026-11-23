@@ -20,7 +20,7 @@
  * THE SOFTWARE.
  */
 
-// A Driver group's install (docs/DRIVER.md, Install): three nodes, each a host on a memory disk
+// A Driver group's install (docs/DRIVER.md, Install): three nodes, each a host on a faultfs disk
 // with one loop on an inline_scheduler, their Sinks' Send and SendTransfer carried in process.
 // Node 3 is cut off while the leader commits and checkpoints past it; healed, it installs the
 // leader's image and applies entries past its boundary. `driver_install_test [case]`:
@@ -34,8 +34,9 @@
 //   orphan    quiescent: the leader's transfer to node 3 stops after its first chunk and the
 //             leader goes; at rest, node 3 drops the image at its snapshot_timeout, then repairs
 #include "consensus/driver.h"
-#include "journal/memory_io.h"
+#include "faultlab/faultfs.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -50,7 +51,7 @@
 
 using namespace kronuz::consensus;
 namespace j = kronuz::journal;
-namespace jt = kronuz::journal::testing;
+namespace fl = kronuz::faultlab;
 
 namespace {
 
@@ -131,10 +132,23 @@ struct Sink {
 };
 static_assert(sink<Sink>);
 
+// The host's directory on `disk`, made on first use.
+std::shared_ptr<j::IO> host_io(fl::filesystem& disk) {
+	const auto names = disk.list();
+	if (std::find(names.begin(), names.end(), "host") == names.end()) { disk.make_directory("host"); }
+	return std::make_shared<fl::io>(disk, "host");
+}
+// A crash keeps any sector-boundary prefix of an unsynced append, as a real device may.
+const fl::crash_policy sector_cut{.size = fl::size_pick::sector};
+
 // A node: its host, one loop, its Driver and its application.
 struct Node {
 	NodeId id = 0;
-	jt::Disk disk;
+	fl::filesystem disk;
+	std::uint64_t cut_from = 0, cut_after = std::numeric_limits<std::uint64_t>::max(), crashes = 0;
+	// Power fails at the k-th mutating operation from now.
+	void cut_at(std::uint64_t k) { cut_from = disk.mutations(); cut_after = k; disk.power_off_after(k - 1); }
+	bool dead() const { return disk.mutations() - cut_from >= cut_after; }
 	task::inline_scheduler scheduler;
 	j::InlineCompletion io;
 	std::unique_ptr<j::Host> host;
@@ -208,13 +222,13 @@ struct Cluster {
 	// restores its latest checkpoint's image, and finishes an activation it staged for it.
 	void restart(Node& n, bool power_cut = false) {
 		if (power_cut) {
-			n.disk.cut = std::min(n.disk.cut, n.disk.operations);
+			n.disk.power_off_after(0);
 			n.stop->request(task::cancel_reason::shutdown);
 			n.run();
 			check(n.turns_done && n.driver_done, "node " + std::to_string(n.id) + "'s loop stops after a power cut");
 			n.driver.reset(); n.host.reset();
-			n.disk.power_loss();
-			n.disk.cut = std::numeric_limits<std::uint64_t>::max();
+			n.disk.crash(++n.crashes, sector_cut);
+			n.cut_after = std::numeric_limits<std::uint64_t>::max();
 		} else {
 			n.shut();
 		}
@@ -312,7 +326,7 @@ struct Cluster {
 };
 
 void Node::boot(Cluster& c, std::uint64_t now) {
-	host = std::make_unique<j::Host>(std::make_shared<jt::MemoryIO>(disk, "host/"), j::Identity{'N', static_cast<char>('0' + id)}, j::HostOptions{1, turn_options});
+	host = std::make_unique<j::Host>(host_io(disk), j::Identity{'N', static_cast<char>('0' + id)}, j::HostOptions{1, turn_options});
 	sink = Sink{&c, this};
 	scheduler.advance(now * ms - std::min(now * ms, scheduler.now()));
 	driver = std::make_unique<Driver<Sink>>(Seams{task::scheduler_ref::of(scheduler), j::completion_ref::of(io), *host, 0, 11 + id}, sink);
@@ -451,11 +465,11 @@ void crash() {
 		Cluster c;
 		lag(c);
 		auto& three = c.nodes.at(3);
-		const auto from = three.disk.operations;
+		const auto from = three.disk.mutations();
 		c.isolated.clear();
 		check(c.until([&] { return three.activations > 0; }), "the uncut install");
 		c.commit("after");
-		span = three.disk.operations - from;
+		span = three.disk.mutations() - from;
 	}
 	std::uint64_t cuts = 0, old_replica = 0, new_replica = 0, resumed = 0;
 	for (std::uint64_t k = 1; k <= span && !failures; k += stride) {
@@ -463,10 +477,10 @@ void crash() {
 		const Index boundary = lag(c);
 		auto& three = c.nodes.at(3);
 		const Index before = three.state()->applied;  // node 3's checkpoint, which it restores
-		three.disk.cut = three.disk.operations + k;
+		three.cut_at(k);
 		c.isolated.clear();
-		c.until([&] { return three.disk.dead() || (three.activations > 0 && three.state() && three.state()->applied > boundary); });
-		if (!three.disk.dead()) { continue; }  // the install finished first
+		c.until([&] { return three.dead() || (three.activations > 0 && three.state() && three.state()->applied > boundary); });
+		if (!three.dead()) { continue; }  // the install finished first
 		++cuts;
 		const bool activated = three.active == boundary;
 		c.restart(three, true);

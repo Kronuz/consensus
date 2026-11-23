@@ -241,6 +241,7 @@ struct Host {
 	static inline std::vector<Host *> hosts;
 };
 
+void print_stacks();
 // What a case that hangs leaves: its step, each host's loops (turning, blocked or stopped) with
 // their counters, and every thread's stack.
 void report_hang() {
@@ -270,6 +271,10 @@ void report_hang() {
 				std::printf("\n");
 			}
 	}
+	print_stacks();
+}
+// Every thread's stack, to stdout.
+void print_stacks() {
 	const auto pid = std::to_string(::getpid());
 #ifdef __APPLE__
 	const std::string stacks = "sample " + pid + " 1 -file /dev/stdout 2>&1";
@@ -2449,6 +2454,54 @@ void owe_order() {
 	assert(one.credits_at_control == 0 && "control frames go before credit");
 }
 
+// The longest each loop of each node went without turning while it runs: a 10 ms probe posted to
+// every loop, its wait counted until it runs. One loop late while the rest turn is a call that
+// blocked that loop; every loop late at once is the host stopping the process. The first loop
+// 1.5 s late prints every thread's stack.
+struct LoopLags {
+	struct Probe {
+		std::atomic<std::int64_t> posted{-1};  // ms since `began`, -1 when none waits
+		std::atomic<std::uint64_t> worst{0};
+	};
+	std::vector<Node *> nodes;
+	std::shared_ptr<std::vector<Probe>> probes;
+	std::atomic<bool> done{false};
+	bool dumped = false;  // the sampler's own
+	std::thread thread;
+	explicit LoopLags(std::vector<Node *> of) : nodes(std::move(of)), probes(std::make_shared<std::vector<Probe>>(nodes.size() * 2)) {
+		thread = std::thread([this] {
+			while (!done) {
+				for (std::size_t i = 0; i != probes->size(); ++i) {
+					auto &p = (*probes)[i];
+					const auto now = std::int64_t(ms_since(began));
+					if (const auto at = p.posted.load(); at >= 0) {
+						p.worst = std::max<std::uint64_t>(p.worst, std::uint64_t(now - at));
+						if (now - at >= 1'500 && !std::exchange(dumped, true)) {
+							std::printf("node %llu loop %zu has not turned for %lld ms; every thread's stack:\n",
+										(unsigned long long)nodes[i / 2]->host.node, i % 2, (long long)(now - at));
+							print_stacks();
+						}
+						continue;
+					}
+					p.posted = now;
+					nodes[i / 2]->host.post(std::uint32_t(i % 2), [probes = probes, i] {
+						auto &q = (*probes)[i];
+						q.worst = std::max<std::uint64_t>(q.worst, ms_since(began) - std::uint64_t(q.posted.load()));
+						q.posted = -1;
+					});
+				}
+				std::this_thread::sleep_for(10ms);
+			}
+		});
+	}
+	std::uint64_t worst(std::size_t node, std::uint32_t loop) const { return (*probes)[node * 2 + loop].worst; }
+	void stop() {
+		if (!done.exchange(true))
+			thread.join();
+	}
+	~LoopLags() { stop(); }
+};
+
 // fetch-alongside-consensus (D102, Peers' F2 on the lane's fetch): three nodes of 2 loops, a
 // group's Drivers over the transport; rounds of four 8 MiB fetches (method 1), both ways between
 // nodes, through 1 MiB lane budgets, while a command commits every 50 ms. Every fetch arrives
@@ -2539,6 +2592,7 @@ void fetch_alongside() {
 		return false;
 	};
 	Stalls stalls;
+	LoopLags lags(all);
 	bool changed = false;
 	step("fetch-alongside: " + std::to_string(rounds) + " rounds of four 8 MiB fetches beside commits");
 	start = steady::now();
@@ -2570,6 +2624,7 @@ void fetch_alongside() {
 	}
 	const auto elapsed = ms_since(start);
 	const auto stalled = stalls.stop();
+	lags.stop();
 	auto s = c.nodes[leader]->state(g);
 	const bool kept = s && s->role == Role::Leader && s->term == term;
 	for (auto &m : misses)
@@ -2585,10 +2640,10 @@ void fetch_alongside() {
 		}
 		auto t = c.nodes[n]->state(g);
 		std::printf("fetch-alongside: node %llu: %llu links established, %llu peers gone, calls ended connection_aborted %llu, "
-					"timed_out %llu; %s in term %llu\n",
+					"timed_out %llu; %s in term %llu; its loops went at most %llu and %llu ms without turning\n",
 					(unsigned long long)n, (unsigned long long)links, (unsigned long long)gone, (unsigned long long)aborted,
 					(unsigned long long)timed_out, !t ? "no state" : t->role == Role::Leader ? "leader" : "not leader",
-					(unsigned long long)(t ? t->term : 0));
+					(unsigned long long)(t ? t->term : 0), (unsigned long long)lags.worst(n - 1, 0), (unsigned long long)lags.worst(n - 1, 1));
 	}
 	std::printf("fetch-alongside: the host stalled this process at most %llu ms\n", (unsigned long long)stalled);
 	std::printf("fetch-alongside: %u rounds of %zu x 8 MiB fetched through 1 MiB lane budgets in %llu ms, %u of %u exact; %u commits "

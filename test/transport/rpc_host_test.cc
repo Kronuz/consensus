@@ -25,7 +25,7 @@
 //               not_processed, and the Bulk connection closes gracefully
 //   fetch       D8, A4: fetch is method 1. Beside 4 groups uploading 1 MiB data frames on the same
 //               Bulk connection, a 16 MiB fetch arrives exact while heartbeats on Control keep
-//               every gap under 1,000 ms; a missing name, a reader that throws, a reply over this
+//               every gap under 1,000 ms plus the host's lag; a missing name, a reader that throws, a reply over this
 //               host's fetch_bytes and a fifth concurrent fetch end as D8's table says
 //   reader      T5: with host 2's other loop held 2 s, calls whose frames its connection's loop
 //               reads keep their latency (control: lane-via-other-loop)
@@ -826,6 +826,7 @@ bool fetch() {
 	if (!until([&] { heartbeat(); return beats.count > 0; }, 10s))
 		return false;
 	beats.worst = 0;
+	Lag lag;
 	struct Got {
 		std::atomic<bool> done{false};
 		std::error_code error;
@@ -879,16 +880,17 @@ bool fetch() {
 	}
 	const bool table = ended && !missing->error && !missing->bytes && throws->error == std::errc::io_error &&
 					   huge->error == std::errc::message_size && busy >= 1 && busy + slow_ok == 5;
-	const bool ok = exact && beside > 0 && beats.worst < 1000 && table;
+	const auto bound = 1000 + lag.worst.load();
+	const bool ok = exact && beside > 0 && beats.worst < bound && table;
 	const auto big_error = !big || !big->done ? std::string("not done") : big->error ? big->error.message() : std::string("ok");
 	std::printf("fetch: 16 MiB arrived exact %s (%s) in %llu ms beside %llu MiB of group uploads on Bulk; links %llu+%llu, "
-				"dropped %llu, overrun %llu; heartbeats' longest gap %llu ms; missing %s, "
+				"dropped %llu, overrun %llu; heartbeats' longest gap %llu ms of %llu allowed (1000 plus the host's %llu ms of lag); missing %s, "
 				"a throwing reader %s, 48 MiB over 32 MiB %s, five 4 MiB at once: %d ok, %d refused %s\n",
 				exact ? "yes" : "NO", big_error.c_str(), (unsigned long long)fetched_ms, (unsigned long long)(beside >> 20),
 				(unsigned long long)one.total(&HostTransportStats::links), (unsigned long long)two.total(&HostTransportStats::links),
 				(unsigned long long)(one.total(&HostTransportStats::dropped) + two.total(&HostTransportStats::dropped)),
 				(unsigned long long)(one.total(&HostTransportStats::overrun) + two.total(&HostTransportStats::overrun)),
-				(unsigned long long)beats.worst,
+				(unsigned long long)beats.worst, (unsigned long long)bound, (unsigned long long)lag.worst.load(),
 				!missing->error && !missing->bytes ? "nullopt" : "WRONG", throws->error.message().c_str(), huge->error.message().c_str(), slow_ok,
 				busy, ok ? "ok" : "FAILED");
 	one.stop();

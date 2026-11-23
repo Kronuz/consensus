@@ -2487,14 +2487,17 @@ void fetch_alongside() {
 		std::atomic<bool> done{false};
 		std::error_code error;
 		std::optional<std::string> bytes;
+		std::uint64_t ended = 0;  // ms into the rounds
 	};
+	steady::time_point start;
 	auto fetch = [&](NodeId from, NodeId peer) {
 		auto got = std::make_shared<Fetched>();
 		auto &h = c.nodes[from]->host;
 		h.loops[h.transport->loop_of_node(peer)]->at([&] {
-			h.transport->fetch(peer, "history/table", [got](std::error_code e, std::optional<std::string> b) {
+			h.transport->fetch(peer, "history/table", [got, &start](std::error_code e, std::optional<std::string> b) {
 				got->error = e;
 				got->bytes = std::move(b);
+				got->ended = ms_since(start);
 				got->done = true;
 			});
 			return 0;
@@ -2514,12 +2517,35 @@ void fetch_alongside() {
 	std::uint64_t slowest = 0;
 	bool committed = true;
 	std::vector<std::shared_ptr<Fetched>> fetches;
+	std::vector<std::string> misses;  // each inexact fetch, each commit past 2 s, the first term change
+	// Each inexact fetch: its error, or its first byte that differs from the pattern.
+	auto check = [&](const Fetched &f, std::pair<NodeId, NodeId> pair) {
+		const auto want = pattern(size, unsigned(pair.second));
+		if (!f.error && f.bytes && *f.bytes == want)
+			return true;
+		std::string what = f.error ? "error " + f.error.message() : !f.bytes ? std::string("nullopt") : "";
+		if (what.empty()) {
+			const auto &got = *f.bytes;
+			std::size_t at = 0;
+			while (at != std::min(got.size(), want.size()) && got[at] == want[at])
+				++at;
+			char text[160];
+			std::snprintf(text, sizeof text, "%zu bytes of %zu, first differing byte %zu (got %d, want %d)", got.size(), want.size(), at,
+						  at < got.size() ? int(static_cast<unsigned char>(got[at])) : -1, int(static_cast<unsigned char>(want[at])));
+			what = text;
+		}
+		misses.push_back("round " + std::to_string(round) + ": node " + std::to_string(pair.first) + "'s fetch from node " +
+						 std::to_string(pair.second) + " ended at " + std::to_string(f.ended) + " ms: " + what);
+		return false;
+	};
+	Stalls stalls;
+	bool changed = false;
 	step("fetch-alongside: " + std::to_string(rounds) + " rounds of four 8 MiB fetches beside commits");
-	const auto start = steady::now();
+	start = steady::now();
 	while (ms_since(start) < 60'000) {
 		if (std::all_of(fetches.begin(), fetches.end(), [](auto &f) { return f->done.load(); })) {
 			for (std::size_t i = 0; i != fetches.size(); ++i)
-				exact += !fetches[i]->error && fetches[i]->bytes && *fetches[i]->bytes == pattern(size, unsigned(pairs[i].second));
+				exact += check(*fetches[i], pairs[i]);
 			fetches.clear();
 			if (round == rounds)
 				break;
@@ -2527,14 +2553,44 @@ void fetch_alongside() {
 			for (auto [from, peer] : pairs)
 				fetches.push_back(fetch(from, peer));
 		}
-		const auto begun = steady::now();
-		committed &= commit_everywhere(all, g, "command " + std::to_string(++commits), 2'000);
-		slowest = std::max(slowest, ms_since(begun));
+		const auto begun = ms_since(start);
+		const bool ok = commit_everywhere(all, g, "command " + std::to_string(++commits), 2'000);
+		const auto took = ms_since(start) - begun;
+		committed &= ok;
+		slowest = std::max(slowest, took);
+		if (!ok || took > 2'000)
+			misses.push_back("command " + std::to_string(commits) + " began at " + std::to_string(begun) + " ms: " +
+							 (ok ? "on all three in " + std::to_string(took) + " ms" : "not on all three within 2 s"));
+		if (auto s = c.nodes[leader]->state(g); !changed && !(s && s->role == Role::Leader && s->term == term)) {
+			changed = true;
+			misses.push_back("node " + std::to_string(leader) + " no longer leads term " + std::to_string(term) + " at " +
+							 std::to_string(ms_since(start)) + " ms");
+		}
 		std::this_thread::sleep_for(50ms);
 	}
 	const auto elapsed = ms_since(start);
+	const auto stalled = stalls.stop();
 	auto s = c.nodes[leader]->state(g);
 	const bool kept = s && s->role == Role::Leader && s->term == term;
+	for (auto &m : misses)
+		std::printf("fetch-alongside: %s\n", m.c_str());
+	for (NodeId n = 1; n <= 3; ++n) {
+		auto &h = c.nodes[n]->host;
+		std::uint64_t gone = 0, links = 0, aborted = 0, timed_out = 0;
+		for (std::uint32_t k = 0; k != h.loops.size(); ++k) {
+			gone += h.transport->stats(k).gone;
+			links += h.loops[k]->at([&] { return h.transport->link_stats(k).established; });
+			aborted += h.transport->lane_stats(k).ended(rpc::Outcome::connection_aborted);
+			timed_out += h.transport->lane_stats(k).ended(rpc::Outcome::timed_out);
+		}
+		auto t = c.nodes[n]->state(g);
+		std::printf("fetch-alongside: node %llu: %llu links established, %llu peers gone, calls ended connection_aborted %llu, "
+					"timed_out %llu; %s in term %llu\n",
+					(unsigned long long)n, (unsigned long long)links, (unsigned long long)gone, (unsigned long long)aborted,
+					(unsigned long long)timed_out, !t ? "no state" : t->role == Role::Leader ? "leader" : "not leader",
+					(unsigned long long)(t ? t->term : 0));
+	}
+	std::printf("fetch-alongside: the host stalled this process at most %llu ms\n", (unsigned long long)stalled);
 	std::printf("fetch-alongside: %u rounds of %zu x 8 MiB fetched through 1 MiB lane budgets in %llu ms, %u of %u exact; %u commits "
 				"beside them, each on all three within 2 s: %s (slowest %llu ms; 4 quiet ones before, slowest %llu ms); node %llu leads in "
 				"term %llu throughout: %s\n",

@@ -6,6 +6,12 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#consensus) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-23
+
+### Added
+
+- `WorkerLimits::flow` ([docs/DRIVER.md](docs/DRIVER.md), Replication flow): the `Flow` of every `Core` a `Worker` builds, so a Driver host sets it in `GroupOptions::scheduling.flow`. The default is `Flow{}`, as before. With `Flow{4, 4 << 20, 256 << 10}` a leader keeps up to four appends of at most 256 KiB in flight to each verified follower, where one flight of up to `rpc_bytes` was the only choice (at 10 ms round trip, 256 KiB per flight moves 16 MB/s, four move 64). A `Flow` with no pipeline or window is refused when the group opens (`driver_test flow_reaches_core`).
+
 ## 2026-11-21
 
 ### Added

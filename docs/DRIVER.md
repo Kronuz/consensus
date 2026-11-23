@@ -34,10 +34,19 @@ struct GroupOptions {
 	kronuz::journal::AdmissionLimits admission;
 	Limits limits{};
 	Timing timing{};
-	WorkerLimits scheduling{};
+	WorkerLimits scheduling{};                  // scheduling.flow: the replication Flow of every Core the group builds
 	std::optional<SnapshotLimits> snapshots{};
 	std::size_t inbox = 256;                    // received messages queued per group; more are dropped and counted
 };
+
+// Replication flow (D15). `WorkerLimits::flow`, so `GroupOptions::scheduling.flow` on a Driver
+// and the `scheduling` argument of a Worker, is the `Flow` of every Core the Worker builds (create,
+// recover and its validation Core). Its default, `Flow{}`, is one append in flight of up to
+// min(rpc_bytes, the leader's pacing); `Flow{4, 4 << 20, 256 << 10}` keeps up to four appends in
+// flight to each verified follower, at most 4 MiB unacknowledged and at most 256 KiB per append.
+// `Flow::pipeline` and `window_bytes` must be above 0, or the Worker refuses the group with
+// std::invalid_argument. The leader's per-follower append pacing (docs/mechanisms/append-pacing.md)
+// applies within the Flow. At 10 ms round trip, one 256 KiB flight moves 16 MB/s; four move 64.
 
 // The loop's seams. The host's journal (journal/host.h) holds every group's Store and the
 // loop's turn driver, host.driver(loop), which the host runs (TurnDriver::run) on the same

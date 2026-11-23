@@ -17,6 +17,11 @@
 //   expired  an expired certificate is refused by accept and dial (cluster CA)
 //   reload   a runtime reload of the certificate and CA bundle closes the links whose chain no
 //            longer verifies; a renewal under the new CA links again, pins unchanged (cluster CA)
+//   boot     a hello's boot checked against the directory's admitted one at each end, fetching
+//            when behind; the refusal's reason reaches the dialer (A5)
+//   redial   a call within the redial spacing after a failed dial dials once the spacing passes
+//   flood    the join pool on the transport port: a stalled joiner cut at the slot deadline, the
+//            address's cap, the rate, and a node's redials unharmed by the flood (A3)
 //   save     a joined node's files: the key owner-only, a failed write throws naming its file,
 //            and a save killed at any file leaves every file whole
 //   consensus_transport_admission_nodes_test <fixture dir> case [ca|pins]
@@ -123,11 +128,13 @@ struct Host {
 	std::string name;
 	std::vector<std::unique_ptr<Loop>> loops;
 	tcp::acceptor acceptor;
+	std::optional<tcp::acceptor> v6;  // a second listener, on ::1: another source on loopback
 	std::shared_ptr<asio::ssl::context> tls;
 	std::optional<NodePins> pins;
 	std::unique_ptr<HostTransport> transport;
 	bool running = false;
-	Host(NodeId n, std::string certificate, std::uint32_t L)
+	Host(NodeId n, std::string certificate, std::uint32_t L, JoinHook join = {}, JoinOptions joins = {},
+		 std::function<void(HostTransportOptions &)> tune = {})
 		: node(n), name(std::move(certificate)), loops(make(L)), acceptor(loops[0]->io, {asio::ip::address_v4::loopback(), 0}) {
 		tls = context(name);
 		const std::map<NodeId, Fingerprint> own{{node, pin_of(name)}};
@@ -146,6 +153,10 @@ struct Host {
 		};
 		options.links.connection.handshake = 2000ms;
 		options.redial = 50ms;
+		options.join = std::move(join);
+		options.joins = joins;
+		if (tune)
+			tune(options);
 		std::vector<HostLoop> at;
 		for (auto &l : loops)
 			at.push_back({l->io.get_executor(), task::scheduler_ref::of(l->scheduler)});
@@ -175,8 +186,11 @@ struct Host {
 		return loops;
 	}
 	PeerAddress address() const { return {"127.0.0.1", acceptor.local_endpoint().port()}; }
+	tcp::endpoint endpoint6() const { return {asio::ip::address_v6::loopback(), v6->local_endpoint().port()}; }
 	void start() {
 		transport->serve(acceptor);
+		if (v6)
+			transport->serve(*v6);
 		for (auto &l : loops)
 			l->thread = std::thread([l = l.get()] { l->io.run(); });
 		running = true;
@@ -443,6 +457,143 @@ std::string expired_certificate(const std::string &key, NodeId node) {
 	return name;
 }
 
+// A call that arrives within the redial spacing after a failed dial, with nothing else waiting,
+// dials once the spacing passes, not at its deadline: a peer whose certificate was just renewed
+// is redialed. Node 9's address accepts and stays silent, so each dial fails at the handshake
+// deadline (300 ms); the spacing is 1500 ms.
+void redial_case() {
+	Loop silent;
+	tcp::acceptor listener(silent.io, {asio::ip::address_v4::loopback(), 0});
+	std::vector<tcp::socket> held;
+	std::atomic<int> dials{0};
+	std::function<void()> next = [&] {
+		listener.async_accept([&](asio::error_code error, tcp::socket socket) {
+			if (error)
+				return;
+			held.push_back(std::move(socket));
+			++dials;
+			next();
+		});
+	};
+	next();
+	silent.thread = std::thread([&] { silent.io.run(); });
+	Host one(1, "n1", 2, {}, {}, [](HostTransportOptions &o) {
+		o.redial = 1500ms;
+		o.links.connection.handshake = 300ms;
+	});
+	one.start();
+	const PeerAddress nine{"127.0.0.1", listener.local_endpoint().port()};
+	one.at(9, [&] {
+		one.transport->admit_node(9, nine, std::nullopt);
+		return 0;
+	});
+	auto first = one.call(9, echo, "first", 100ms);
+	check(until([&] { return dials.load() == 1 && first->done.load(); }, 2000ms), "the first call dials once and ends");
+	std::this_thread::sleep_for(700ms);  // past the dial's handshake deadline: its failure saw no call waiting
+	const auto asked = steady::now();
+	auto second = one.call(9, echo, "second", 6000ms);
+	const bool redialed = until([&] { return dials.load() >= 2; }, 3000ms);
+	std::printf("  the second call dialed %lld ms after it began\n",
+				(long long)std::chrono::duration_cast<std::chrono::milliseconds>(steady::now() - asked).count());
+	check(redialed && !second->done.load(), "a call within the redial spacing dials when the spacing passes, before its deadline");
+	one.stop();
+	silent.at([&] {
+		listener.close();
+		held.clear();
+		return 0;
+	});
+	silent.join();
+}
+
+// The boot check (A5, M7): node 1 admits a peer's hello only for the boot its directory admitted,
+// fetching first when the hello names a newer directory version; the refusal names the reason.
+// Node 2 starts as a copy (boot C, while the directory admitted B): node 1 refuses it both ways,
+// and node 2 hears why; node 2 as boot B links. Node 3's hello names directory version 8 while
+// node 1 holds 5: node 1 fetches, finds boot D admitted, and links.
+constexpr std::uint32_t duplicate = 1;
+void boot_case() {
+	const auto boot = [](char c) {
+		Identity id{};
+		id.fill(c);
+		return id;
+	};
+	std::mutex directory_mutex;
+	std::uint64_t version = 5;
+	std::map<NodeId, Identity> admitted{{2, boot('B')}};
+	std::atomic<int> fetches{0};
+	const auto admits = [&](const NodeHello &peer, task::scheduler_ref loop) -> task::task<std::uint32_t> {
+		bool behind = false;
+		{
+			std::lock_guard hold(directory_mutex);
+			behind = peer.directory > version;
+		}
+		if (behind) {  // the fetch from the root, then the directory at the hello's version
+			++fetches;
+			late_deadline fetch(loop, 30ms);
+			co_await fetch.wait();
+			std::lock_guard hold(directory_mutex);
+			version = peer.directory;
+			admitted[3] = boot('D');
+		}
+		std::lock_guard hold(directory_mutex);
+		const auto it = admitted.find(peer.node);
+		co_return it != admitted.end() && it->second == peer.boot ? 0 : duplicate;
+	};
+	std::mutex heard_mutex;
+	std::vector<std::pair<NodeId, std::uint32_t>> heard;
+	Host one(1, "n1", 2, {}, {}, [&](HostTransportOptions &o) {
+		o.links.boot = boot('A');
+		o.links.directory = 5;
+		o.links.check_boot = admits;
+	});
+	Host two(2, "n2", 2, {}, {}, [&](HostTransportOptions &o) {
+		o.links.boot = boot('C');
+		o.links.directory = 5;
+		o.links.boot_refused = [&](NodeId peer, std::uint32_t reason) {
+			std::lock_guard hold(heard_mutex);
+			heard.emplace_back(peer, reason);
+		};
+	});
+	one.start();
+	two.start();
+	pair(one, two);
+	auto c = two.call(1, echo, "a copy", 1500ms);
+	auto d = one.call(2, echo, "a copy", 1500ms);
+	check(until([&] { return c->done.load() && d->done.load(); }, 4000ms) && c->status.outcome != rpc::Outcome::ok &&
+			  d->status.outcome != rpc::Outcome::ok,
+		  "a boot the directory did not admit neither calls nor answers");
+	const auto refused_here = [&] {
+		std::uint64_t sum = 0;
+		for (std::uint32_t k = 0; k != one.loops.size(); ++k)
+			sum += one.loops[k]->at([&] { return one.transport->link_stats(k).boot_refused; });
+		return sum;
+	};
+	bool named = false;
+	{
+		std::lock_guard hold(heard_mutex);
+		for (auto [peer, reason] : heard)
+			named |= peer == 1 && reason == duplicate;
+	}
+	std::printf("  node 1 refused %llu hellos; node 2 heard %zu refusals\n", (unsigned long long)refused_here(), heard.size());
+	// Node 2 has no check of its own: it starts node 1's dial at its reply, which node 1 then
+	// closes on reading node 2's boot.
+	check(!one.established(), "node 1 links to node 2 neither way");
+	check(named, "node 2 hears node 1's refusal and its reason: duplicate");
+	two.transport->boot(boot('B'), 5);
+	check(two.echoes(1, 8000ms) && one.echoes(2), "as the admitted boot, node 2 links and calls");
+
+	Host three(3, "n3", 2, {}, {}, [&](HostTransportOptions &o) {
+		o.links.boot = boot('D');
+		o.links.directory = 8;
+	});
+	three.start();
+	pair(one, three);
+	check(three.echoes(1, 8000ms) && fetches >= 1, "a hello naming a newer directory is checked after the fetch, and links");
+	one.stop();
+	two.stop();
+	three.stop();
+}
+
 // An expired certificate is refused on the shared port, by accept and by dial, before any hello.
 void expired_case() {
 	Host one(1, "n1", 2), four(4, expired_certificate("n4", 4), 2);
@@ -493,7 +644,19 @@ void reload_case() {
 			  d->status.outcome != rpc::Outcome::ok,
 		  "and neither node calls the other");
 	two.transport->reload(context("n2c2", "ca2"));
-	check(one.echoes(2, 8000ms) && two.echoes(1, 8000ms), "node 2 renewed under the second CA links again");
+	const bool relinked = one.echoes(2, 8000ms) && two.echoes(1, 8000ms);
+	if (!relinked)
+		for (auto *h : {&one, &two})
+			for (std::uint32_t k = 0; k != h->loops.size(); ++k) {
+				const auto st = h->loops[k]->at([&] { return h->transport->link_stats(k); });
+				std::printf("  node %llu loop %u: established %llu refused %llu abandoned %llu rejected %llu unverified %llu; "
+							"pins refused unverified %llu unpinned %llu\n",
+							(unsigned long long)h->node, k, (unsigned long long)st.established, (unsigned long long)st.refused,
+							(unsigned long long)st.abandoned, (unsigned long long)st.rejected,
+							(unsigned long long)st.unverified, (unsigned long long)h->pins->refused(PinFault::unverified),
+							(unsigned long long)h->pins->refused(PinFault::unpinned));
+			}
+	check(relinked, "node 2 renewed under the second CA links again");
 	check(one.pins->pin(2) == pin_of("n2") && two.pins->pin(1) == pin_of("n1"), "both pins unchanged");
 	one.stop();
 	two.stop();
@@ -761,10 +924,8 @@ template <class F> std::optional<JoinFault> fault_of(F f) {
 	return std::nullopt;
 }
 
-// Token v2 and the DTJN0002 exchange (A1, A2): the member serves joins on its own acceptor here.
+// Token v2 and the DTJN0002 exchange (A1, A2), on the member's transport port.
 void issue_case() {
-	Host one(1, "n1", 2);
-	one.start();
 	const auto ca = certificate("ca");
 	Identity cluster{};
 	cluster.fill('K');  // Host's
@@ -781,15 +942,15 @@ void issue_case() {
 		  "a cut or non-hex token is refused: malformed");
 
 	// The root's side: the secret's digest, a node per key (idempotent), asynchronous.
-	auto loop0 = task::scheduler_ref::of(one.loops[0]->scheduler);
+	std::optional<task::scheduler_ref> loop0;
 	const auto digest = join_secret_digest(token.secret);
 	std::mutex assigned_mutex;
 	std::map<Fingerprint, NodeId> assigned;
 	std::atomic<int> assigns{0};
-	Issuer issuer(ca.get(), key_of("ca").get(), ClusterCa(one.tls->native_handle(), 1).prefix(),
+	Issuer issuer(ca.get(), key_of("ca").get(), ClusterCa(context("n1")->native_handle(), 1).prefix(),
 				  [&](const JoinRequest &r) -> task::task<Issuer::Assignment> {
 					  ++assigns;
-					  late_deadline relay(loop0, 20ms);  // the relay to the root's leader
+					  late_deadline relay(*loop0, 20ms);  // the relay to the root's leader
 					  co_await relay.wait();
 					  if (!join_secret_matches(digest, r.secret))
 						  co_return Issuer::Assignment{0, JoinFault::token, {}};
@@ -799,21 +960,12 @@ void issue_case() {
 					  const auto [it, fresh] = assigned.try_emplace(r.key, NodeId(5 + assigned.size()));
 					  co_return Issuer::Assignment{it->second, JoinFault::refused, {}};
 				  });
-	JoinService service(one.tls, cluster, [&](JoinRequest r) { return issuer.issue(std::move(r)); });
-	auto &at = *one.loops[0];
-	tcp::acceptor acceptor(at.io, {asio::ip::address_v4::loopback(), 0});
-	const tcp::endpoint endpoint = acceptor.local_endpoint();
-	asio::post(at.io, [&] {
-		task::spawn(loop0, [](tcp::acceptor &acceptor, JoinService &service, task::scheduler_ref loop) -> task::task<void> {
-			for (;;) {
-				auto [error, socket] = co_await task::await_asio<void(asio::error_code, tcp::socket)>(
-					[&](auto h) { acceptor.async_accept(std::move(h)); });
-				if (error || !socket)
-					co_return;
-				task::spawn(loop, service.serve(std::move(*socket), loop), [](std::exception_ptr, std::optional<NodeId>) {});
-			}
-		}(acceptor, service, loop0));
-	});
+	// Node 1 serves joins on its transport port, beside its nodes.
+	Host one(1, "n1", 2, [&](JoinRequest r) { return issuer.issue(std::move(r)); });
+	loop0 = task::scheduler_ref::of(one.loops[0]->scheduler);
+	one.start();
+	const auto &service = *one.transport->joins();
+	const tcp::endpoint endpoint = one.acceptor.local_endpoint();
 
 	Loop joiner;
 	joiner.thread = std::thread([&] { joiner.io.run(); });
@@ -895,12 +1047,97 @@ void issue_case() {
 		check(one.echoes(5), "routed to it, node 1 calls it back");
 		five.stop();
 	}
-	asio::post(at.io, [&] {
-		asio::error_code ignored;
-		acceptor.close(ignored);
-	});
+	const auto joins = one.loops[0]->at([&] { return one.transport->link_stats(0).joins; });
+	std::printf("  node 1's port took %llu joins\n", (unsigned long long)joins);
+	// Two secrets, a cluster, a CA key, a name, one key three times, another key: 9 joins.
+	check(joins == 9, "every join came through node 1's transport port");
 	joiner.join();
 	one.stop();
+}
+
+// The join pool on the transport port (A3, M4): joiners come from ::1, node 2 from 127.0.0.1. A
+// joiner that stalls after its magic is cut at the slot deadline, one past its address's cap is
+// refused, joins past the rate wait, and all the while node 2's links, dropped again and again,
+// redial and finish their hellos within the handshake deadline.
+void flood_case() {
+	const auto ca = certificate("ca");
+	std::optional<task::scheduler_ref> loop0;
+	Issuer issuer(ca.get(), key_of("ca").get(), ClusterCa(context("n1")->native_handle(), 1).prefix(),
+				  [&](const JoinRequest &) -> task::task<Issuer::Assignment> {
+					  late_deadline relay(*loop0, 5ms);
+					  co_await relay.wait();
+					  co_return Issuer::Assignment{9, JoinFault::refused, {}};
+				  });
+	JoinOptions options;
+	options.slot = 1000ms;  // the default's 10 s, shortened
+	Host one(1, "n1", 2, [&](JoinRequest r) { return issuer.issue(std::move(r)); }, options), two(2, "n2", 2);
+	one.v6.emplace(one.loops[0]->io, tcp::endpoint(asio::ip::address_v6::loopback(), 0));
+	loop0 = task::scheduler_ref::of(one.loops[0]->scheduler);
+	one.start();
+	two.start();
+	pair(one, two);
+	check(one.echoes(2) && two.echoes(1), "nodes 1 and 2 link");
+	const auto &joins = *one.transport->joins();
+	Identity cluster{};
+	cluster.fill('K');
+	const auto token = fresh_join_token(cluster, ca.get());
+
+	// 12 joiners from ::1 send the magic and stall: 8 take the address's places, 4 are refused.
+	asio::io_context io;
+	std::vector<tcp::socket> stalled;
+	for (int i = 0; i != 12; ++i) {
+		stalled.emplace_back(io);
+		stalled.back().connect(one.endpoint6());
+		asio::write(stalled.back(), asio::buffer(join_magic.data(), join_magic.size()));
+	}
+	check(until([&] { return joins.busy() == 4 && joins.serving() == 8; }, 2000ms), "8 stalled joiners served, 4 past the address's cap refused");
+	const auto stalled_at = steady::now();
+	check(until([&] { return joins.cut() == 8 && !joins.serving(); }, 3000ms), "the 8 stalled joiners are cut at the slot deadline");
+	const auto freed = std::chrono::duration_cast<std::chrono::milliseconds>(steady::now() - stalled_at).count();
+	std::printf("  freed in %lld ms\n", (long long)freed);
+	check(freed <= 1500, "within the slot deadline");
+	stalled.clear();
+
+	// 8 joiners from ::1 join back to back for 3 s, past the rate, while node 2's links are dropped
+	// every 200 ms: each redial's hello finishes within the handshake deadline.
+	std::atomic<bool> flooding{true};
+	std::atomic<int> joined{0}, failed{0};
+	Loop joiner;
+	joiner.thread = std::thread([&] { joiner.io.run(); });
+	std::vector<std::thread> workers;
+	for (int w = 0; w != 8; ++w)
+		workers.emplace_back([&] {
+			while (flooding) {
+				try {
+					run(joiner, join(joiner.io.get_executor(), task::scheduler_ref::of(joiner.scheduler), one.endpoint6(), token,
+									 fresh_join_key()));
+					++joined;
+				} catch (...) {
+					++failed;
+				}
+			}
+		});
+	long long slowest = 0;
+	int answered = 0;
+	for (int round = 0; round != 12; ++round) {
+		std::this_thread::sleep_for(200ms);
+		one.remove(2);
+		one.admit(two);
+		const auto asked = steady::now();
+		answered += one.echoes(2, 2000ms);
+		slowest = std::max<long long>(slowest, std::chrono::duration_cast<std::chrono::milliseconds>(steady::now() - asked).count());
+	}
+	flooding = false;
+	for (auto &w : workers)
+		w.join();
+	std::printf("  %d joins, %d failed, %llu delayed, %llu refused at the caps; node 2's slowest echo %lld ms\n", joined.load(),
+				failed.load(), (unsigned long long)joins.delayed(), (unsigned long long)joins.busy(), slowest);
+	check(answered == 12, "under the flood, node 2 answers after each of 12 drops, within the handshake deadline");
+	check(joins.delayed() > 0 && joined > 0, "joins past the address's rate wait and are served");
+	check(until([&] { return !joins.serving(); }, 3000ms), "and the pool empties");
+	joiner.join();
+	one.stop();
+	two.stop();
 }
 
 mode_t mode_of(const std::filesystem::path &path) {
@@ -1037,13 +1274,13 @@ void save_case() {
 
 int main(int argc, char **argv) {
 	if (argc < 3) {
-		std::fprintf(stderr, "usage: %s <fixture dir> policy|join|refused|renew|remove|epoch|issue|save|expired|reload [ca|pins]\n", argv[0]);
+		std::fprintf(stderr, "usage: %s <fixture dir> policy|join|refused|renew|remove|epoch|issue|save|expired|reload|flood|boot|redial [ca|pins]\n", argv[0]);
 		return 2;
 	}
 	fixture = argv[1];
 	const std::string which = argv[2];
 	by_ca = argc < 4 || std::string(argv[3]) == "ca";
-	const bool one_policy = which == "policy" || which == "issue" || which == "save" || which == "expired" || which == "reload";
+	const bool one_policy = which == "policy" || which == "issue" || which == "save" || which == "expired" || which == "reload" || which == "flood" || which == "boot" || which == "redial";
 	std::printf("%s (%s)\n", which.c_str(), one_policy || by_ca ? "cluster CA" : "pre-approved pins");
 	watchdog(120s);
 	if (which == "policy")
@@ -1066,6 +1303,12 @@ int main(int argc, char **argv) {
 		expired_case();
 	else if (which == "reload")
 		reload_case();
+	else if (which == "flood")
+		flood_case();
+	else if (which == "boot")
+		boot_case();
+	else if (which == "redial")
+		redial_case();
 	else
 		return 2;
 	std::printf("%s\n", ok ? "PASS" : "FAIL");

@@ -424,55 +424,108 @@ inline void sync_directory(const std::filesystem::path &directory) {
 using JoinHook = std::function<task::task<JoinAnswer>(JoinRequest)>;
 
 struct JoinOptions {
-	// From the accept until the request arrived (magic, handshake, offer, request), then until
-	// the answer is written (the hook and its relay): a stalled joiner frees its slot.
+	// From the pool's taking a joiner until its request arrived (magic, handshake, offer,
+	// request), then until the answer is written (the hook and its relay): a stalled joiner frees
+	// its slot.
 	std::chrono::milliseconds slot{10000}, answer{10000};
+	// Joiners served at once, and from one address: past either, a joiner is refused, never a
+	// slot evicted. Each address opens `rate` a second, `rate` at once; past it a joiner waits.
+	std::size_t pool = 64, per_source = 8;
+	std::uint32_t rate = 10;
 };
 
-// A member's side of the exchange: any member serves joins of its cluster, its offer naming the
-// CAs its TLS context trusts, and the hook answers each request. Safe from several loops at once.
+// A member's side of the exchange, on the transport's port (Links hands it each connection whose
+// first byte is the magic's): any member serves joins of its cluster in its own pool, outside the
+// handshakes', its offer naming the CAs its TLS context trusts, and the hook answers each request.
+// Safe from several loops at once.
 class JoinService {
   public:
 	// `context` is the member's own transport context, whose leaf chains to the CAs it trusts.
-	// Throws std::invalid_argument for cluster zero, a context that trusts no CA, or no hook.
+	// Throws std::invalid_argument for cluster zero, a context that trusts no CA, no hook, or a
+	// zero pool, per-source cap or rate.
 	JoinService(std::shared_ptr<asio::ssl::context> context, kronuz::consensus::Identity cluster, JoinHook hook,
 				JoinOptions options = {})
-		: context_(std::move(context)), cluster_(cluster), hook_(std::move(hook)), options_(options) {
-		if (!context_ || cluster_ == kronuz::consensus::Identity{} || !hook_)
-			throw std::invalid_argument("join service: no context, cluster zero, or no hook");
+		: cluster_(cluster), hook_(std::move(hook)), options_(options) {
+		if (cluster_ == kronuz::consensus::Identity{} || !hook_ || !options_.pool || !options_.per_source || !options_.rate)
+			throw std::invalid_argument("join service: cluster zero, no hook, or a zero pool, cap or rate");
+		reload(std::move(context));
+	}
+	const kronuz::consensus::Identity &cluster() const noexcept { return cluster_; }
+	const JoinOptions &options() const noexcept { return options_; }
+	// The member's context from now on (HostTransport::reload): its CAs are the offer's.
+	void reload(std::shared_ptr<asio::ssl::context> context) {
+		if (!context)
+			throw std::invalid_argument("join service: no context");
 		JoinOffer offer{cluster_, {}};
 		std::unique_ptr<STACK_OF(X509), void (*)(STACK_OF(X509) *)> trusted(
-			X509_STORE_get1_all_certs(SSL_CTX_get_cert_store(context_->native_handle())),
+			X509_STORE_get1_all_certs(SSL_CTX_get_cert_store(context->native_handle())),
 			[](STACK_OF(X509) *certificates) { sk_X509_pop_free(certificates, X509_free); });
 		for (int i = 0; trusted && i < sk_X509_num(trusted.get()) && offer.cas.size() < join_offer_cas; ++i)
 			offer.cas.push_back(join_detail::der(sk_X509_value(trusted.get(), i)));
 		if (offer.cas.empty())
 			throw std::invalid_argument("join service: the context trusts no CA");
-		offer_ = encode_join_offer(offer);
+		auto bytes = encode_join_offer(offer);
+		std::lock_guard hold(mutex_);
+		context_ = std::move(context);
+		offer_ = std::move(bytes);
 	}
-	const kronuz::consensus::Identity &cluster() const noexcept { return cluster_; }
-	const JoinOptions &options() const noexcept { return options_; }
 	// Joins refused at this member for `fault`, the hook's refusals included.
 	std::uint64_t refused(JoinFault fault) const { return refused_[std::size_t(fault)].load(std::memory_order_relaxed); }
+	// Joiners refused at the pool's caps, delayed past their address's rate, and cut at the slot
+	// deadline; serving now.
+	std::uint64_t busy() const { return busy_.load(std::memory_order_relaxed); }
+	std::uint64_t delayed() const { return delayed_.load(std::memory_order_relaxed); }
+	std::uint64_t cut() const { return cut_.load(std::memory_order_relaxed); }
+	std::size_t serving() const {
+		std::lock_guard hold(mutex_);
+		return serving_;
+	}
 
-	// One joiner on an accepted `socket` whose magic is unread: the node it became, or 0 when it
-	// was refused (the joiner reads why) or failed.
-	task::task<kronuz::consensus::NodeId> serve(asio::ip::tcp::socket socket, task::scheduler_ref loop) {
+	// One joiner on an accepted `socket` whose magic is unread, on `loop`, until `stop`: the node
+	// it became, or 0 when it was refused (the joiner reads why), failed or cut.
+	task::task<kronuz::consensus::NodeId> serve(asio::ip::tcp::socket socket, task::scheduler_ref loop,
+												 task::cancel_token stop = {}) {
 		using namespace join_detail;
-		Stream stream(std::move(socket), *context_);
+		asio::error_code error;
+		auto source = socket.remote_endpoint(error).address();
+		if (source.is_v6() && source.to_v6().is_v4_mapped())
+			source = asio::ip::make_address_v4(asio::ip::v4_mapped, source.to_v6());
+		const auto delay = error ? std::nullopt : take(source);
+		if (!delay) {
+			busy_.fetch_add(1, std::memory_order_relaxed);
+			socket.close(error);
+			co_return 0;
+		}
+		Slot held(*this, source);
+		std::shared_ptr<asio::ssl::context> context;
+		std::string offer;
+		{
+			std::lock_guard hold(mutex_);
+			context = context_;
+			offer = offer_;
+		}
+		Stream stream(std::move(socket), *context);
 		SSL_set_verify(stream.native_handle(), SSL_VERIFY_NONE, nullptr);  // a joiner has no certificate yet
+		task::cancel_callback<Bounded::Close> stopped(stop, Bounded::Close{&stream});
 		JoinAnswer answer;
 		JoinRequest request;
+		bool requested = false;
 		try {
 			{
 				Bounded slot(loop, options_.slot, stream);
-				const auto magic = co_await read_bytes(stream.next_layer(), join_magic.size());
-				if (magic != join_magic)
-					throw JoinRefused(magic.starts_with("DTJN") ? JoinFault::version : JoinFault::malformed, "the magic");
-				co_await handshake(stream, asio::ssl::stream_base::server);
-				co_await write_frame(stream, offer_);
-				const auto bytes = co_await read_frame(stream);
 				try {
+					if (delay->count()) {
+						delayed_.fetch_add(1, std::memory_order_relaxed);
+						late_deadline rate(loop, *delay);
+						co_await rate.wait();
+					}
+					const auto magic = co_await read_bytes(stream.next_layer(), join_magic.size());
+					if (magic != join_magic)
+						throw JoinRefused(magic.starts_with("DTJN") ? JoinFault::version : JoinFault::malformed, "the magic");
+					co_await handshake(stream, asio::ssl::stream_base::server);
+					co_await write_frame(stream, offer);
+					const auto bytes = co_await read_frame(stream);
+					requested = true;
 					request = decode_join_request(bytes);
 					const auto key = signed_key(request.csr);
 					if (!key)
@@ -481,7 +534,13 @@ class JoinService {
 					if (request.cluster != cluster_)
 						throw JoinRefused(JoinFault::cluster, "a request for another cluster");
 				} catch (const JoinRefused &e) {
+					if (!requested)
+						throw;
 					answer = join_refusal(e.fault);
+				} catch (...) {
+					if (slot.deadline.state() == late_deadline::outcome::expired)
+						cut_.fetch_add(1, std::memory_order_relaxed);
+					throw;
 				}
 			}
 			Bounded bound(loop, options_.answer, stream);
@@ -509,14 +568,56 @@ class JoinService {
 	}
 
   private:
+	struct Source {
+		double tokens = 0;
+		std::chrono::steady_clock::time_point last;
+		std::size_t open = 0;
+	};
+	// Holds a joiner's place in the pool until it ends.
+	struct Slot {
+		JoinService &service;
+		asio::ip::address source;
+		Slot(JoinService &s, asio::ip::address a) : service(s), source(std::move(a)) {}
+		Slot(const Slot &) = delete;
+		~Slot() {
+			std::lock_guard hold(service.mutex_);
+			--service.serving_;
+			--service.sources_[source].open;
+		}
+	};
+	// A place in the pool for a joiner from `source`, and how long its address's rate delays it;
+	// none when the pool or the address is full.
+	std::optional<std::chrono::nanoseconds> take(const asio::ip::address &source) {
+		const auto now = std::chrono::steady_clock::now();
+		std::lock_guard hold(mutex_);
+		if (sources_.size() > 4 * options_.pool)  // addresses idle past a second hold full buckets
+			std::erase_if(sources_, [&](const auto &e) { return !e.second.open && now - e.second.last > std::chrono::seconds(1); });
+		if (serving_ >= options_.pool)
+			return std::nullopt;
+		const double rate = options_.rate;
+		auto [it, fresh] = sources_.try_emplace(source, Source{rate, now, 0});
+		auto &s = it->second;
+		if (s.open >= options_.per_source)
+			return std::nullopt;
+		s.tokens = std::min(rate, s.tokens + std::chrono::duration<double>(now - s.last).count() * rate);
+		s.last = now;
+		s.tokens -= 1;
+		++s.open;
+		++serving_;
+		return std::chrono::nanoseconds(s.tokens < 0 ? std::int64_t(-s.tokens / rate * 1e9) : 0);
+	}
 	void count(JoinFault fault) { refused_[std::size_t(fault)].fetch_add(1, std::memory_order_relaxed); }
 
-	std::shared_ptr<asio::ssl::context> context_;
 	kronuz::consensus::Identity cluster_;
 	JoinHook hook_;
 	JoinOptions options_;
+	mutable std::mutex mutex_;
+	std::shared_ptr<asio::ssl::context> context_;
 	std::string offer_;
+	std::size_t serving_ = 0;
+	std::map<asio::ip::address, Source> sources_;
 	std::atomic<std::uint64_t> refused_[join_faults] = {};
+	std::atomic<std::uint64_t> busy_{0}, delayed_{0}, cut_{0};
 };
 
 // The node holding the CA key (the root's leader, in Xapiand) signs. Its `assign` hook checks the

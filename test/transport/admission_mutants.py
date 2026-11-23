@@ -66,6 +66,18 @@ mutant_commit.MUTANTS = {
     "reload-keeps-links": (T + "links.h", "\t\t\t\t\t++stats_.unverified;\n\t\t\t\t\tlink->connection->abort();", "\t\t\t\t\t++stats_.unverified;"),
     # A4: a reload keeps verifying against the old CAs (reload)
     "reload-keeps-trust": (T + "node_pins.h", "\t\td.trust = std::move(trust);", "\t\t(void)trust;"),
+    # A4: a call within the redial spacing waits for its deadline (redial, and reload's relink)
+    "redial-at-deadline": (T + "host_transport.h", "if (auto it = here.rpc.find(node); which == LinkLane::Bulk && it != here.rpc.end() &&",
+                           "if (auto it = here.rpc.find(node); false && it != here.rpc.end() &&"),
+    # A5: an acceptor skips the boot check (boot: a copy's dial links)
+    "skip-boot-check": (T + "links.h", "\t\t\tif (options_.check_boot)\n\t\t\t\treason = co_await options_.check_boot(remote, loop_);",
+                        "\t\t\tif (false)\n\t\t\t\treason = co_await options_.check_boot(remote, loop_);"),
+    # A3: the join pool takes every joiner (flood: past the address's cap none is refused)
+    "join-no-cap": (T + "admission_join.h", "\t\tif (s.open >= options_.per_source)\n\t\t\treturn std::nullopt;\n", ""),
+    # A3: a joiner is never cut (flood: stalled joiners hold their slots)
+    "join-no-slot-deadline": (T + "admission_join.h", "\t\t\t\tBounded slot(loop, options_.slot, stream);", "\t\t\t\tBounded slot(loop, std::chrono::hours(1), stream);"),
+    # A3: no rate per address (flood: no joiner is delayed)
+    "join-no-rate": (T + "admission_join.h", "\t\ts.tokens -= 1;\n", ""),
     # A2: a removal leaves the node's links up
     "remove-keeps-links": (T + "links.h", "\t\t\t\t\tif (link)\n\t\t\t\t\t\tlink->connection->abort();",
                            "\t\t\t\t\tif (link)\n\t\t\t\t\t\t(void)link;"),

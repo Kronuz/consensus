@@ -290,13 +290,29 @@ inline Request request_of(std::string_view bytes) {
 		return nullptr;
 	return r;
 }
-// The key a CSR (DER) is signed by, or null when it is not a CSR its own key signed.
-inline Key signed_key(std::string_view csr) {
-	auto request = request_of(csr);
-	Key key(request ? X509_REQ_get_pubkey(request.get()) : nullptr);
-	if (!key || X509_REQ_verify(request.get(), key.get()) != 1)
-		return nullptr;
-	return key;
+// A joiner's CSR and its key, the key only when it is EC P-256, the type fresh_join_key makes:
+// decided before any signature work, so a request costs at most one P-256 verification
+// (docs/mechanisms/admission.md, The join pool).
+struct Csr {
+	Request request;
+	Key key;
+};
+inline Csr csr_of(std::string_view bytes) {
+	Csr csr{request_of(bytes), nullptr};
+	EVP_PKEY *key = csr.request ? X509_REQ_get0_pubkey(csr.request.get()) : nullptr;
+	char group[32];
+	std::size_t n = 0;
+	if (key && EVP_PKEY_get_base_id(key) == EVP_PKEY_EC && EVP_PKEY_get_group_name(key, group, sizeof group, &n) == 1 &&
+		std::string_view(group, n) == "prime256v1" && EVP_PKEY_up_ref(key) == 1)
+		csr.key.reset(key);
+	return csr;
+}
+// Whether the CSR's own key signed it.
+inline bool verifies(const Csr &csr) { return csr.key && X509_REQ_verify(csr.request.get(), csr.key.get()) == 1; }
+// The key a CSR (DER) is signed by, or null when it is not a P-256 CSR its own key signed.
+inline Key signed_key(std::string_view bytes) {
+	auto csr = csr_of(bytes);
+	return verifies(csr) ? std::move(csr.key) : nullptr;
 }
 inline Key key_of(std::string_view pem) {
 	std::unique_ptr<BIO, decltype(&BIO_free)> bio(BIO_new_mem_buf(pem.data(), int(pem.size())), BIO_free);
@@ -476,6 +492,8 @@ class JoinService {
 	std::uint64_t busy() const { return busy_.load(std::memory_order_relaxed); }
 	std::uint64_t delayed() const { return delayed_.load(std::memory_order_relaxed); }
 	std::uint64_t cut() const { return cut_.load(std::memory_order_relaxed); }
+	// CSR signatures verified: only P-256 requests reach one.
+	std::uint64_t verified() const { return verified_.load(std::memory_order_relaxed); }
 	std::size_t serving() const {
 		std::lock_guard hold(mutex_);
 		return serving_;
@@ -527,10 +545,13 @@ class JoinService {
 					const auto bytes = co_await read_frame(stream);
 					requested = true;
 					request = decode_join_request(bytes);
-					const auto key = signed_key(request.csr);
-					if (!key)
+					const auto csr = csr_of(request.csr);
+					if (!csr.key)
+						throw JoinRefused(JoinFault::malformed, "a request whose key is not P-256");
+					verified_.fetch_add(1, std::memory_order_relaxed);
+					if (!verifies(csr))
 						throw JoinRefused(JoinFault::malformed, "an unsigned request");
-					request.key = key_pin(key.get());
+					request.key = key_pin(csr.key.get());
 					if (request.cluster != cluster_)
 						throw JoinRefused(JoinFault::cluster, "a request for another cluster");
 				} catch (const JoinRefused &e) {
@@ -617,7 +638,7 @@ class JoinService {
 	std::size_t serving_ = 0;
 	std::map<asio::ip::address, Source> sources_;
 	std::atomic<std::uint64_t> refused_[join_faults] = {};
-	std::atomic<std::uint64_t> busy_{0}, delayed_{0}, cut_{0};
+	std::atomic<std::uint64_t> busy_{0}, delayed_{0}, cut_{0}, verified_{0};
 };
 
 // The node holding the CA key (the root's leader, in Xapiand) signs. Its `assign` hook checks the
@@ -643,16 +664,22 @@ class Issuer {
 	}
 	// Certificates signed so far: one per key and node within `retry`.
 	std::uint64_t signatures() const { return signatures_.load(std::memory_order_relaxed); }
+	// CSR signatures verified: only for P-256 requests `assign` admitted.
+	std::uint64_t verified() const { return verified_.load(std::memory_order_relaxed); }
 
 	// The answer for a request: the hook's node and its certificate, or the refusal. A JoinHook.
 	task::task<JoinAnswer> issue(JoinRequest request) {
-		const auto key = join_detail::signed_key(request.csr);
-		if (!key)
+		auto csr = join_detail::csr_of(request.csr);
+		if (!csr.key)
 			co_return join_refusal(JoinFault::malformed);
-		request.key = key_pin(key.get());
-		const auto assignment = co_await assign_(request);
+		request.key = key_pin(csr.key.get());
+		const auto assignment = co_await assign_(request);  // the secret, before any signature work
 		if (!assignment.node)
 			co_return join_refusal(assignment.fault, assignment.reason);
+		verified_.fetch_add(1, std::memory_order_relaxed);
+		if (!join_detail::verifies(csr))
+			co_return join_refusal(JoinFault::malformed);
+		const auto key = std::move(csr.key);
 		std::lock_guard hold(mutex_);
 		const auto now = std::chrono::steady_clock::now();
 		std::erase_if(recent_, [&](const auto &entry) { return now - entry.second.at > retry_; });
@@ -714,7 +741,7 @@ class Issuer {
 	std::chrono::minutes retry_;
 	std::mutex mutex_;
 	std::map<Fingerprint, Recent> recent_;  // what was signed within `retry`, by key
-	std::atomic<std::uint64_t> signatures_{0};
+	std::atomic<std::uint64_t> signatures_{0}, verified_{0};
 };
 
 // A joiner's key, made once and saved (save_join_key) before its first request, so a retry after a

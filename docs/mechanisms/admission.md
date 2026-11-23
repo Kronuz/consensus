@@ -102,9 +102,9 @@ joiner -> member   "DTJN0002" in the clear, then TLS that authenticates neither 
 member -> joiner   the offer: its cluster id and the CAs   joiner: the cluster is the token's
                    it trusts (at most 16)                  (cluster), a CA's key is the pin and
                                                            the member's leaf chains to it (ca)
-joiner -> member   the request: cluster id, secret,        member: its cluster (cluster), the
-                   requested node, the caller's detail,    CSR's signature (malformed); then
-                   a CSR for the saved key                 the hook
+joiner -> member   the request: cluster id, secret,        member: a P-256 CSR key, then its
+                   requested node, the caller's detail,    signature (malformed); its cluster
+                   a CSR for the saved key                 (cluster); then the hook
 member -> joiner   the answer: a fault and the hook's      joiner: the certificate is its key's,
                    reason, or the node and its certificate chains to the CA, names the node (issued)
 ```
@@ -115,13 +115,20 @@ its indexes (Xapiand's M3), their paths, so at most about 63 KiB of them. The jo
 secret only after the cluster and the CA's key match its token, so a host of another cluster, or
 one replaying the CA certificate with another CA's leaf, never sees it.
 
+A CSR's key must be EC P-256, the type `fresh_join_key` makes (`join_detail::csr_of`), decided
+from its encoding before any signature work: a request costs the member at most one P-256
+verification (about 0.26 ms), where a forged RSA-16384 CSR, made with no private key, would cost
+about 10 ms (security review S1). `JoinService::verified()` and `Issuer::verified()` count the
+verifications.
+
 The member's side is `JoinService`, which asks the issuer hook (`JoinHook`) for the answer:
 asynchronous, since in Xapiand it relays to the root's leader, which checks the secret, names
 the node by one command and signs. The hook must be idempotent per key (`JoinRequest::key`, the
 CSR key's pin): a retry gets the same node. Its refusals carry a fault (`token`, or `refused`
 with its own reason: expired, used, name) that the joiner reads as `JoinRefused::fault` and
-`reason`. `Issuer`, for the node holding the CA key, is one: its `assign` hook names the node,
-and it signs once per key and node within a retry window (10 minutes, in memory), so two joins
+`reason`. `Issuer`, for the node holding the CA key, is one: its `assign` hook checks the
+secret and names the node before the issuer verifies the CSR (P-256 only, as above), so a wrong
+secret costs no verification; it signs once per key and node within a retry window (10 minutes, in memory), so two joins
 with the same key at once, and a retry, get one certificate. The certificate names the node under
 the CA policy's prefix (`URI:<prefix><node>`), CA:FALSE, server and client auth, SHA-256, a year
 by default.
@@ -146,7 +153,7 @@ slot, and a node's handshake keeps the peer priority it had. The join pool (`Joi
 |---|---|---|
 | `pool` | 64 joins at once | past it a joiner is refused, never a slot evicted: 64 sockets and their TLS sessions |
 | `per_source` | 8 from one address | one address cannot fill the pool; an IPv6 /64 can, as for handshakes |
-| `rate` | 10 a second per address, 10 at once | past it a joiner waits for its turn in its slot (`delayed()`), so a flood costs at most 10 TLS handshakes a second per address on loop 0 |
+| `rate` | 10 a second per address, 10 at once | past it a joiner waits for its turn in its slot (`delayed()`), so a flood costs at most 10 TLS handshakes and 10 P-256 verifications a second per address on loop 0 |
 | `slot` | 10 s | from the pool's taking it until the request arrived: a joiner that stalls is cut (`cut()`), so 64 idle sockets free their slots within 10 s |
 | `answer` | 10 s | the hook and the answer's write; a hook that fails answers `refused` |
 
@@ -231,6 +238,10 @@ node). The messages of the faults that existed before keep their text.
   admitted 12 times: node 2 answers each time within the handshake deadline, and joins past the
   rate wait.
 - `boot` (CA): hello.md, The boot check.
+- `forged` (CA): a forged RSA-16384 CSR (no private key) is refused `malformed` with no
+  verification at the member or the issuer and no `assign`; a P-256 CSR with a bad signature costs
+  the member one verification; the issuer refuses a wrong secret (`token`) before verifying, and
+  with the secret verifies once and refuses the bad signature, signing nothing.
 - `redial` (CA): a call made within the redial spacing after a failed dial, with no other call
   waiting, dials once the spacing passes rather than waiting for its deadline, as the relink after
   a reload needs (the spacing 1500 ms, a silent peer failing each dial at its 300 ms handshake
@@ -247,4 +258,5 @@ chmodded) and `save-in-place` (each file written over the old one) fail `save`; 
 over the certificate's DER) fails `renew_*`; `reload-keeps-links` and `reload-keeps-trust` fail
 `reload`; `join-no-cap`, `join-no-slot-deadline` and `join-no-rate` fail `flood`;
 `skip-boot-check` (the acceptor skips the boot check) fails `boot`; `redial-at-deadline` (such a
-call waits for its deadline) fails `redial`.
+call waits for its deadline) fails `redial`; `csr-any-key` (any CSR key reaches verification) and
+`issue-verify-first` (the issuer verifies before the secret) fail `forged`.

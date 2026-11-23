@@ -19,6 +19,7 @@
 //            longer verifies; a renewal under the new CA links again, pins unchanged (cluster CA)
 //   boot     a hello's boot checked against the directory's admitted one at each end, fetching
 //            when behind; the refusal's reason reaches the dialer (A5)
+//   forged   a forged RSA-16384 CSR refused before any verification, the issuer's secret first
 //   redial   a call within the redial spacing after a failed dial dials once the spacing passes
 //   flood    the join pool on the transport port: a stalled joiner cut at the slot deadline, the
 //            address's cap, the rate, and a node's redials unharmed by the flood (A3)
@@ -36,6 +37,8 @@
 #include <future>
 #include <mutex>
 #include <csignal>
+#include <openssl/core_names.h>
+#include <openssl/param_build.h>
 #include <openssl/pem.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -455,6 +458,126 @@ std::string expired_certificate(const std::string &key, NodeId node) {
 	PEM_write_bio_X509(out.get(), c.get());
 	std::filesystem::copy_file(fixture / (key + ".key"), fixture / (name + ".key"), std::filesystem::copy_options::overwrite_existing);
 	return name;
+}
+
+template <class T> T run(Loop &loop, task::task<T> t);
+// A CSR for an RSA-16384 public key with a 64-bit exponent and a made-up signature: the most
+// verification work a CSR can ask of OpenSSL, made with no private key.
+std::string forged_rsa_csr() {
+	std::unique_ptr<BIGNUM, decltype(&BN_free)> n(BN_new(), BN_free), e(BN_new(), BN_free);
+	if (!n || !e || BN_rand(n.get(), 16384, BN_RAND_TOP_ONE, BN_RAND_BOTTOM_ODD) != 1 || BN_set_word(e.get(), ~0ul) != 1)
+		throw std::runtime_error("forged CSR: BN");
+	std::unique_ptr<OSSL_PARAM_BLD, decltype(&OSSL_PARAM_BLD_free)> b(OSSL_PARAM_BLD_new(), OSSL_PARAM_BLD_free);
+	OSSL_PARAM_BLD_push_BN(b.get(), OSSL_PKEY_PARAM_RSA_N, n.get());
+	OSSL_PARAM_BLD_push_BN(b.get(), OSSL_PKEY_PARAM_RSA_E, e.get());
+	std::unique_ptr<OSSL_PARAM, decltype(&OSSL_PARAM_free)> params(OSSL_PARAM_BLD_to_param(b.get()), OSSL_PARAM_free);
+	std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)> ctx(EVP_PKEY_CTX_new_from_name(nullptr, "RSA", nullptr),
+																	EVP_PKEY_CTX_free);
+	EVP_PKEY *raw = nullptr;
+	if (!params || !ctx || EVP_PKEY_fromdata_init(ctx.get()) != 1 ||
+		EVP_PKEY_fromdata(ctx.get(), &raw, EVP_PKEY_PUBLIC_KEY, params.get()) != 1)
+		throw std::runtime_error("forged CSR: key");
+	join_detail::Key key(raw);
+	join_detail::Request r(X509_REQ_new());
+	X509_REQ_set_pubkey(r.get(), key.get());
+	X509_ALGOR *alg = X509_ALGOR_new();
+	X509_ALGOR_set0(alg, OBJ_nid2obj(NID_sha256WithRSAEncryption), V_ASN1_NULL, nullptr);
+	X509_REQ_set1_signature_algo(r.get(), alg);
+	X509_ALGOR_free(alg);
+	const std::string sig(2048, '\x11');
+	ASN1_BIT_STRING *bits = ASN1_BIT_STRING_new();
+	ASN1_STRING_set(bits, sig.data(), int(sig.size()));
+	X509_REQ_set0_signature(r.get(), bits);
+	return join_detail::der(r.get());
+}
+// A P-256 CSR whose signature does not verify: its last signature byte flipped.
+std::string unsigned_p256_csr() {
+	auto key = join_detail::key_of(fresh_join_key());
+	join_detail::Request r(X509_REQ_new());
+	X509_REQ_set_pubkey(r.get(), key.get());
+	X509_REQ_sign(r.get(), key.get(), EVP_sha256());
+	auto der = join_detail::der(r.get());
+	der.back() = char(der.back() ^ 1);
+	return der;
+}
+// A joiner that sends `csr` as its request, as join() does with the CSR it signs; the answer.
+task::task<JoinAnswer> send_csr(asio::any_io_executor executor, task::scheduler_ref loop, tcp::endpoint endpoint,
+								JoinToken token, std::string csr) {
+	asio::ssl::context tls(asio::ssl::context::tls_client);
+	tls.set_verify_mode(asio::ssl::verify_none);
+	join_detail::Stream stream(tcp::socket(executor), tls);
+	join_detail::Bounded bound(loop, 5000ms, stream);
+	const auto connected = co_await task::await_asio<void(asio::error_code)>(
+		[&](auto h) { stream.lowest_layer().async_connect(endpoint, std::move(h)); });
+	if (connected)
+		throw std::system_error(connected, "send_csr: connect");
+	co_await join_detail::write_bytes(stream.next_layer(), std::string(join_magic));
+	co_await join_detail::handshake(stream, asio::ssl::stream_base::client);
+	(void)decode_join_offer(co_await join_detail::read_frame(stream));
+	co_await join_detail::write_frame(stream, encode_join_request({token.cluster, token.secret, 0, "detail", std::move(csr), {}}));
+	auto answer = decode_join_answer(co_await join_detail::read_frame(stream));
+	join_detail::close(stream);
+	co_return answer;
+}
+
+// A joiner's CSR costs at most one P-256 verification (security review S1): the member refuses
+// a forged RSA-16384 CSR before verifying it, and the issuer checks the secret before it
+// verifies, so a wrong secret with a bad P-256 signature costs no verification either.
+void forged_case() {
+	const auto ca = certificate("ca");
+	Identity cluster{};
+	cluster.fill('K');
+	const auto token = fresh_join_token(cluster, ca.get());
+	const auto digest = join_secret_digest(token.secret);
+	std::atomic<int> assigns{0};
+	Issuer issuer(ca.get(), key_of("ca").get(), ClusterCa(context("n1")->native_handle(), 1).prefix(),
+				  [&](const JoinRequest &r) -> task::task<Issuer::Assignment> {
+					  ++assigns;
+					  if (!join_secret_matches(digest, r.secret))
+						  co_return Issuer::Assignment{0, JoinFault::token, {}};
+					  co_return Issuer::Assignment{5, JoinFault::refused, {}};
+				  });
+	Host one(1, "n1", 2, [&](JoinRequest r) { return issuer.issue(std::move(r)); });
+	one.start();
+	const auto &service = *one.transport->joins();
+	Loop joiner;
+	joiner.thread = std::thread([&] { joiner.io.run(); });
+	auto send = [&](std::string csr, JoinToken t) {
+		return run(joiner, send_csr(joiner.io.get_executor(), task::scheduler_ref::of(joiner.scheduler),
+									one.acceptor.local_endpoint(), std::move(t), std::move(csr)));
+	};
+	const auto rsa = forged_rsa_csr();
+	auto ms = [](steady::time_point since) {
+		return std::chrono::duration<double, std::milli>(steady::now() - since).count();
+	};
+	auto since = steady::now();
+	for (int i = 0; i != 50; ++i)
+		(void)join_detail::csr_of(rsa);
+	std::printf("  csr_of on a forged RSA-16384 CSR: %.3f ms\n", ms(since) / 50);
+	since = steady::now();
+	const auto forged = send(rsa, token);
+	std::printf("  the forged request's round trip: %.1f ms\n", ms(since));
+	check(forged.fault == JoinFault::malformed && service.verified() == 0 && assigns == 0 && issuer.verified() == 0,
+		  "a forged RSA-16384 CSR is refused (malformed) before any verification");
+	const auto bad = unsigned_p256_csr();
+	check(send(bad, token).fault == JoinFault::malformed && service.verified() == 1 && assigns == 0,
+		  "a P-256 CSR with a bad signature costs the member one verification and is refused");
+
+	// The issuer alone (the root's side): the secret first.
+	JoinRequest request{token.cluster, token.secret, 0, "detail", bad, {}};
+	auto wrong = request;
+	wrong.secret[0] ^= 1;
+	const auto refused = run(joiner, issuer.issue(wrong));
+	check(refused.fault == JoinFault::token && assigns == 1 && issuer.verified() == 0,
+		  "the issuer refuses a wrong secret (token) before verifying the CSR");
+	const auto unsigned_ = run(joiner, issuer.issue(request));
+	check(unsigned_.fault == JoinFault::malformed && assigns == 2 && issuer.verified() == 1 && issuer.signatures() == 0,
+		  "with the secret, it verifies the CSR and refuses a bad signature (malformed), signing nothing");
+	check(run(joiner, issuer.issue({token.cluster, token.secret, 0, "detail", rsa, {}})).fault == JoinFault::malformed &&
+			  assigns == 2 && issuer.verified() == 1,
+		  "and refuses a forged RSA-16384 CSR before its secret or any verification");
+	joiner.join();
+	one.stop();
 }
 
 // A call that arrives within the redial spacing after a failed dial, with nothing else waiting,
@@ -1274,13 +1397,13 @@ void save_case() {
 
 int main(int argc, char **argv) {
 	if (argc < 3) {
-		std::fprintf(stderr, "usage: %s <fixture dir> policy|join|refused|renew|remove|epoch|issue|save|expired|reload|flood|boot|redial [ca|pins]\n", argv[0]);
+		std::fprintf(stderr, "usage: %s <fixture dir> policy|join|refused|renew|remove|epoch|issue|save|expired|reload|flood|boot|redial|forged [ca|pins]\n", argv[0]);
 		return 2;
 	}
 	fixture = argv[1];
 	const std::string which = argv[2];
 	by_ca = argc < 4 || std::string(argv[3]) == "ca";
-	const bool one_policy = which == "policy" || which == "issue" || which == "save" || which == "expired" || which == "reload" || which == "flood" || which == "boot" || which == "redial";
+	const bool one_policy = which == "policy" || which == "issue" || which == "save" || which == "expired" || which == "reload" || which == "flood" || which == "boot" || which == "redial" || which == "forged";
 	std::printf("%s (%s)\n", which.c_str(), one_policy || by_ca ? "cluster CA" : "pre-approved pins");
 	watchdog(120s);
 	if (which == "policy")
@@ -1309,6 +1432,8 @@ int main(int argc, char **argv) {
 		boot_case();
 	else if (which == "redial")
 		redial_case();
+	else if (which == "forged")
+		forged_case();
 	else
 		return 2;
 	std::printf("%s\n", ok ? "PASS" : "FAIL");

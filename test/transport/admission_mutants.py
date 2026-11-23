@@ -69,6 +69,14 @@ mutant_commit.MUTANTS = {
     # A4: a call within the redial spacing waits for its deadline (redial, and reload's relink)
     "redial-at-deadline": (T + "host_transport.h", "if (auto it = here.rpc.find(node); which == LinkLane::Bulk && it != here.rpc.end() &&",
                            "if (auto it = here.rpc.find(node); false && it != here.rpc.end() &&"),
+    # S1: any CSR key reaches verification (forged: the RSA-16384 CSR is verified, then refused)
+    "csr-any-key": (T + "admission_join.h",
+                    'if (key && EVP_PKEY_get_base_id(key) == EVP_PKEY_EC && EVP_PKEY_get_group_name(key, group, sizeof group, &n) == 1 &&\n\t\tstd::string_view(group, n) == "prime256v1" && EVP_PKEY_up_ref(key) == 1)',
+                    "if (key && ((void)EVP_PKEY_get_group_name(key, group, sizeof group, &n), true) && EVP_PKEY_up_ref(key) == 1)"),
+    # S1: the issuer verifies the CSR before the secret (forged: a wrong secret costs a verification)
+    "issue-verify-first": (T + "admission_join.h", "\t\tconst auto assignment = co_await assign_(request);  // the secret, before any signature work\n",
+                           "\t\tverified_.fetch_add(1, std::memory_order_relaxed);\n\t\tif (!join_detail::verifies(csr))\n"
+                           "\t\t\tco_return join_refusal(JoinFault::malformed);\n\t\tconst auto assignment = co_await assign_(request);\n"),
     # A5: an acceptor skips the boot check (boot: a copy's dial links)
     "skip-boot-check": (T + "links.h", "\t\t\tif (options_.check_boot)\n\t\t\t\treason = co_await options_.check_boot(remote, loop_);",
                         "\t\t\tif (false)\n\t\t\t\treason = co_await options_.check_boot(remote, loop_);"),

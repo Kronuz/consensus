@@ -336,7 +336,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	add_executable(consensus_transport_admission_nodes_test test/transport/admission_nodes_test.cc)
 	target_link_libraries(consensus_transport_admission_nodes_test PRIVATE consensus::transport)
 	target_compile_options(consensus_transport_admission_nodes_test PRIVATE -UNDEBUG)
-	foreach(c policy issue save expired reload flood boot redial)
+	foreach(c policy issue save expired reload flood boot redial forged)
 		add_test(NAME consensus_transport_admission_nodes_${c}
 			COMMAND consensus_transport_admission_nodes_test ${CMAKE_CURRENT_BINARY_DIR}/admission-fixture ${c})
 		set_tests_properties(consensus_transport_admission_nodes_${c} PROPERTIES FIXTURES_REQUIRED consensus_admission TIMEOUT 60)

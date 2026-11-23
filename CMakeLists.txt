@@ -154,8 +154,11 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 		set(consensus_sanitized TRUE)
 	endif()
 	find_program(CONSENSUS_BASH bash)
-	# Every seeded fault still applies (its pattern matches the source exactly once), in every build.
-	add_test(NAME consensus_mutants_apply_driver COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test/driver_mutants.py check ${CMAKE_BINARY_DIR}/mutants-apply-driver)
+	find_program(CONSENSUS_PYTHON3 python3)
+	# Every seeded fault still applies (its pattern matches the source exactly once), where the tools exist.
+	if(CONSENSUS_PYTHON3)
+		add_test(NAME consensus_mutants_apply_driver COMMAND ${CONSENSUS_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/test/driver_mutants.py check ${CMAKE_BINARY_DIR}/mutants-apply-driver)
+	endif()
 	if(CONSENSUS_BASH)
 		add_test(NAME consensus_mutants_apply_core COMMAND ${CONSENSUS_BASH} ${CMAKE_CURRENT_SOURCE_DIR}/tools/mutants.sh --check ${CMAKE_BINARY_DIR}/mutants-apply-core)
 	endif()

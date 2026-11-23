@@ -5,6 +5,7 @@
 #include <asio/ip/tcp.hpp>
 #include <asio/ssl/context.hpp>
 #include <climits>
+#include <cstdint>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -19,11 +20,37 @@
 #endif
 
 // One host connection (docs/mechanisms/host-connection.md): OpenSSL driven on the non-blocking
-// socket (SSL_set_fd, readiness through await_asio on async_wait), with SSL_MODE_RELEASE_BUFFERS
-// so an idle end holds no record buffers. Frames are a 4-byte little-endian length and the
-// bytes; a length of 0 is a keepalive. Everything runs on the connection's loop. OpenSSL writes
-// with plain write(): where SO_NOSIGPIPE is missing (Linux), the host must ignore SIGPIPE.
+// socket (readiness through await_asio on async_wait), with SSL_MODE_RELEASE_BUFFERS so an idle
+// end holds no record buffers. Frames are a 4-byte little-endian length and the bytes; a length
+// of 0 is a keepalive. Everything runs on the connection's loop. No write raises SIGPIPE.
 namespace kronuz::consensus::transport {
+namespace connection_detail {
+// The socket's write side for OpenSSL: send() with MSG_NOSIGNAL, so a write to a link the peer
+// closed fails with EPIPE instead of raising SIGPIPE (OpenSSL's socket BIO uses write()).
+inline BIO *socket_writes(int fd) {
+	static BIO_METHOD *const method = [] {
+		BIO_METHOD *m = BIO_meth_new(BIO_get_new_index() | BIO_TYPE_SOURCE_SINK, "consensus socket writes");
+		if (!m ||
+			BIO_meth_set_write(m, [](BIO *b, const char *data, int n) -> int {
+				const auto r = ::send(int(reinterpret_cast<std::intptr_t>(BIO_get_data(b))), data, std::size_t(n), MSG_NOSIGNAL);
+				BIO_clear_retry_flags(b);
+				if (r <= 0 && BIO_sock_should_retry(int(r)))
+					BIO_set_retry_write(b);
+				return int(r);
+			}) != 1 ||
+			BIO_meth_set_ctrl(m, [](BIO *, int command, long, void *) -> long { return command == BIO_CTRL_FLUSH; }) != 1)
+			throw std::runtime_error("connection: BIO_meth_new");
+		return m;
+	}();
+	BIO *bio = BIO_new(method);
+	if (bio) {
+		BIO_set_data(bio, reinterpret_cast<void *>(std::intptr_t(fd)));
+		BIO_set_init(bio, 1);
+	}
+	return bio;
+}
+} // namespace connection_detail
+
 struct ConnectionOptions {
 	std::chrono::milliseconds handshake{5000};  // TLS and the hellos
 	std::chrono::milliseconds keepalive{1000};  // a connection that sent nothing for this long sends a keepalive
@@ -48,12 +75,14 @@ class Connection {
 		socket_.non_blocking(true);
 		const int one = 1;
 		::setsockopt(socket_.native_handle(), IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-#ifdef SO_NOSIGPIPE
-		::setsockopt(socket_.native_handle(), SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
-#endif
+		const int fd = int(socket_.native_handle());
 		ssl_.reset(SSL_new(tls_->native_handle()));
-		if (!ssl_ || SSL_set_fd(ssl_.get(), int(socket_.native_handle())) != 1)
+		BIO *writes = ssl_ ? connection_detail::socket_writes(fd) : nullptr;
+		if (!writes)
 			throw std::runtime_error("connection: SSL_new");
+		SSL_set0_wbio(ssl_.get(), writes);  // reads stay OpenSSL's socket BIO
+		if (SSL_set_rfd(ssl_.get(), fd) != 1)
+			throw std::runtime_error("connection: SSL_set_rfd");
 		SSL_set_mode(ssl_.get(),
 					 SSL_MODE_RELEASE_BUFFERS | SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
 		dialer_ ? SSL_set_connect_state(ssl_.get()) : SSL_set_accept_state(ssl_.get());

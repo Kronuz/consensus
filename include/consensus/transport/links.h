@@ -11,7 +11,8 @@
 // A host's connections on one loop, at most one per peer node and lane, and how they start
 // (docs/mechanisms/host-connection.md): a dial resolves the peer's name and races its addresses
 // (RFC 8305), an accept takes any pinned node, and the DTHL0002 hellos settle duplicate dials
-// before any frame. Everything runs on the loop.
+// before any frame. Nodes are routed and removed while it runs (docs/mechanisms/admission.md).
+// Everything runs on the loop.
 namespace kronuz::consensus::transport {
 struct LinkOptions {
 	ConnectionOptions connection;
@@ -56,15 +57,8 @@ class Links {
 			throw std::invalid_argument("links: handshakes");
 		if (tls_)
 			cache_certificates(*tls_);  // before any loop handshakes with it: a host's loops share it
-		for (auto &[node, address] : addresses) {
-			auto &route = state_->routes[node];
-			route.address = address;
-			asio::error_code error;
-			const auto literal = asio::ip::make_address(address.host, error);
-			if (!error)
-				route.endpoints = interleave({literal}, address.port);
-			route.literal = !error;
-		}
+		for (auto &[node, address] : addresses)
+			route(node, address);
 	}
 	Links(const Links &) = delete;
 	Links &operator=(const Links &) = delete;
@@ -83,6 +77,40 @@ class Links {
 	std::function<Links *(kronuz::consensus::NodeId)> owner;
 
 	const LinkStats &stats() const noexcept { return stats_; }
+	// The pins every connection authenticates against, shared with every copy (node_pins.h).
+	NodePins &pins() noexcept { return pins_; }
+	bool routed(kronuz::consensus::NodeId peer) const noexcept { return state_->routes.contains(peer); }
+	// Dials to `peer` go to `address` from now on; a lookup of its old name is abandoned.
+	void route(kronuz::consensus::NodeId peer, PeerAddress address) {
+		auto &route = state_->routes[peer];
+		if (route.lookup)
+			route.lookup->abandon();
+		route.lookup.reset();
+		asio::error_code error;
+		const auto literal = asio::ip::make_address(address.host, error);
+		route.endpoints = error ? std::vector<asio::ip::tcp::endpoint>{} : interleave({literal}, address.port);
+		route.literal = !error;
+		route.address = std::move(address);
+		route.answer_by = 0;
+		++route.serial;
+		route.waiting.wake_all();
+	}
+	// Removes `peer` (NodePins::remove): its route goes, its links and its dial's hellos abort, and
+	// a connection of it that began authenticating before now never becomes a link.
+	void remove(kronuz::consensus::NodeId peer) {
+		pins_.remove(peer);
+		if (const auto it = state_->routes.find(peer); it != state_->routes.end()) {
+			if (it->second.lookup)
+				it->second.lookup->abandon();
+			it->second.waiting.wake_all();
+			state_->routes.erase(it);
+		}
+		for (auto lane : {LinkLane::Control, LinkLane::Bulk})
+			if (const auto it = slots_.find({peer, lane}); it != slots_.end())
+				for (const auto *link : {it->second.link.get(), it->second.offered.get()})
+					if (link)
+						link->connection->abort();
+	}
 	bool drained() const noexcept { return !tasks_ && !incoming_.load(std::memory_order_acquire); }
 	// The established, undrained link to `peer` on `lane`, or null.
 	const Link *find(kronuz::consensus::NodeId peer, LinkLane lane) const noexcept {
@@ -107,12 +135,13 @@ class Links {
 			co_return nullptr;
 		Task running(*this);
 		slot.dialing = true;
+		const auto since = pins_.epoch();  // before the handshake authenticates against the pins
 		std::shared_ptr<Connection> connection;
 		try {
 			auto socket = co_await race(peer);
 			if (socket && !stopping_) {
 				connection = std::make_shared<Connection>(loop_, std::move(*socket), tls_, true, options_.connection);
-				live_.push_back(connection);
+				live(connection, since);
 				late_deadline deadline(loop_, options_.connection.handshake);
 				co_await connection->handshake(pins_, peer, deadline.token());
 			}
@@ -176,7 +205,8 @@ class Links {
 		}
 		Task running(*this);
 		auto connection = std::make_shared<Connection>(loop_, std::move(socket), tls_, false, options_.connection);
-		live_.push_back(connection);
+		const auto since = pins_.epoch();
+		live(connection, since);
 		admit(source, connection);
 		kronuz::consensus::NodeId peer = 0;
 		try {
@@ -196,17 +226,19 @@ class Links {
 		forget(connection);
 		connection->rehome(home->loop_, home->executor_);
 		home->incoming_.fetch_add(1, std::memory_order_acq_rel);
-		asio::post(home->executor_, [home, peer, connection = std::move(connection)]() mutable {
-			task::spawn(home->loop_, home->adopt(peer, std::move(connection), true), [](std::exception_ptr, std::optional<bool>) {});
+		asio::post(home->executor_, [home, peer, since, connection = std::move(connection)]() mutable {
+			task::spawn(home->loop_, home->adopt(peer, std::move(connection), since), [](std::exception_ptr, std::optional<bool>) {});
 		});
 		co_return false;
 	}
 	// The accepted side once `peer` is authenticated: the dialer's hello, the tie-break, the reply.
-	// `moved`: the connection came from another loop's accept.
-	task::task<bool> adopt(kronuz::consensus::NodeId peer, std::shared_ptr<Connection> connection, bool moved = false) {
+	// `moved`: the connection came from another loop's accept, which began authenticating it at
+	// that pins epoch.
+	task::task<bool> adopt(kronuz::consensus::NodeId peer, std::shared_ptr<Connection> connection,
+						   std::optional<std::uint64_t> moved = std::nullopt) {
 		Task running(*this);
 		if (moved) {
-			live_.push_back(connection);
+			live(connection, *moved);
 			incoming_.fetch_sub(1, std::memory_order_acq_rel);
 		}
 		std::shared_ptr<Link> reserved;
@@ -218,6 +250,8 @@ class Links {
 			auto remote = co_await connection->read_hello(deadline.token());
 			auto link = std::make_shared<Link>(Link{peer, remote.lane, connection, hello(remote.lane), remote, false, 0});
 			check_node_hello(remote, link->local, peer, false);
+			if (!current(*link))
+				throw std::runtime_error("links: the peer was removed");
 			link->local.refused = !wins(peer, remote.lane);
 			if (link->local.refused) {
 				++stats_.refused;
@@ -286,6 +320,7 @@ class Links {
 		std::vector<asio::ip::tcp::endpoint> endpoints;
 		std::shared_ptr<Lookup> lookup;
 		std::uint64_t answer_by = 0;  // the last lookup's deadline, on the loop's clock
+		std::uint64_t serial = 0;     // raised by each route(): an older lookup's answer is stale
 		wait_list waiting;
 	};
 	// What a lookup's thread reaches through a weak reference.
@@ -335,9 +370,14 @@ class Links {
 		const bool offered = it != slots_.end() && it->second.offered;
 		return !offered || peer < pins_.local();
 	}
-	// Makes `link` the lane's link: false when stopping.
+	// Whether the link's peer is pinned and was not removed since its connection began authenticating.
+	bool current(const Link &link) const {
+		const auto it = since_.find(link.connection.get());
+		return it != since_.end() && pins_.current(link.peer, it->second);
+	}
+	// Makes `link` the lane's link: false when stopping, or its peer is not current().
 	bool reserve(const std::shared_ptr<Link> &link) {
-		if (stopping_)
+		if (stopping_ || !current(*link))
 			return false;
 		link->rpc = negotiate_rpc(link->local, link->remote);
 		slots_[{link->peer, link->lane}].link = link;
@@ -366,9 +406,15 @@ class Links {
 		if (on_ended)
 			on_ended(*link);
 	}
+	void live(const std::shared_ptr<Connection> &connection, std::uint64_t since) {
+		live_.push_back(connection);
+		since_[connection.get()] = since;
+	}
 	void forget(const std::shared_ptr<Connection> &connection) {
-		if (connection)
+		if (connection) {
 			std::erase(live_, connection);
+			since_.erase(connection.get());
+		}
 	}
 	// Makes room for an incoming connection before it authenticates: when its source is full,
 	// its oldest ends at once; when the pool is, its oldest from an unknown address, else, for a
@@ -425,10 +471,10 @@ class Links {
 			std::weak_ptr<Shared> weak = state_;
 			try {
 				route.lookup = Lookup::start(options_.resolver, route.address.host,
-											 [executor = executor_, weak, peer, this](auto found) {
-												 asio::post(executor, [weak, peer, this, found = std::move(found)]() mutable {
+											 [executor = executor_, weak, peer, serial = route.serial, this](auto found) {
+												 asio::post(executor, [weak, peer, serial, this, found = std::move(found)]() mutable {
 													 if (auto shared = weak.lock())
-														 resolved(*shared, peer, std::move(found));
+														 resolved(*shared, peer, serial, std::move(found));
 												 });
 											 });
 			} catch (const std::system_error &) {
@@ -448,9 +494,13 @@ class Links {
 			++stats_.lookup_timeouts;
 		co_return state_->routes.at(peer).endpoints;
 	}
-	// A lookup's answer, on the loop: a changed set replaces the cache; an empty one keeps it.
-	void resolved(Shared &shared, kronuz::consensus::NodeId peer, std::vector<asio::ip::address> found) {
-		auto &route = shared.routes.at(peer);
+	// A lookup's answer, on the loop: a changed set replaces the cache; an empty one keeps it. An
+	// answer for a route since removed or moved is dropped.
+	void resolved(Shared &shared, kronuz::consensus::NodeId peer, std::uint64_t serial, std::vector<asio::ip::address> found) {
+		const auto it = shared.routes.find(peer);
+		if (it == shared.routes.end() || it->second.serial != serial)
+			return;
+		auto &route = it->second;
 		route.lookup.reset();
 		if (found.empty())
 			++stats_.lookup_failures;
@@ -508,6 +558,7 @@ class Links {
 	std::shared_ptr<Shared> state_;
 	std::map<std::pair<kronuz::consensus::NodeId, LinkLane>, Slot> slots_;
 	std::vector<std::shared_ptr<Connection>> live_;
+	std::map<const Connection *, std::uint64_t> since_;  // the pins epoch each live connection began authenticating at
 	std::vector<std::shared_ptr<Race>> races_;
 	std::vector<Handshake> handshaking_;
 	asio::ip::tcp::acceptor *acceptor_ = nullptr;

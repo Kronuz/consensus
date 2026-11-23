@@ -294,6 +294,26 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	set_tests_properties(consensus_transport_tls consensus_transport_pipe consensus_transport_authentication consensus_transport_connection consensus_transport_links
 		PROPERTIES FIXTURES_REQUIRED consensus_tls TIMEOUT 30)
 	set_tests_properties(consensus_transport_connection PROPERTIES TIMEOUT 120)  # the slow readers run for seconds each
+	# Nodes admitted and removed at runtime (docs/mechanisms/admission.md): its own certificates,
+	# one ctest entry per case and trust policy.
+	add_test(NAME consensus_admission_certificates COMMAND ${CMAKE_COMMAND} -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/admission-fixture
+		-DOPENSSL=${CONSENSUS_TEST_OPENSSL} -P ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/admission_certificates.cmake)
+	set_tests_properties(consensus_admission_certificates PROPERTIES FIXTURES_SETUP consensus_admission TIMEOUT 60)
+	add_executable(consensus_transport_admission_nodes_test test/transport/admission_nodes_test.cc)
+	target_link_libraries(consensus_transport_admission_nodes_test PRIVATE consensus::transport)
+	target_compile_options(consensus_transport_admission_nodes_test PRIVATE -UNDEBUG)
+	foreach(c policy issue save)
+		add_test(NAME consensus_transport_admission_nodes_${c}
+			COMMAND consensus_transport_admission_nodes_test ${CMAKE_CURRENT_BINARY_DIR}/admission-fixture ${c})
+		set_tests_properties(consensus_transport_admission_nodes_${c} PROPERTIES FIXTURES_REQUIRED consensus_admission TIMEOUT 60)
+	endforeach()
+	foreach(c join refused remove epoch)
+		foreach(p ca pins)
+			add_test(NAME consensus_transport_admission_nodes_${c}_${p}
+				COMMAND consensus_transport_admission_nodes_test ${CMAKE_CURRENT_BINARY_DIR}/admission-fixture ${c} ${p})
+			set_tests_properties(consensus_transport_admission_nodes_${c}_${p} PROPERTIES FIXTURES_REQUIRED consensus_admission TIMEOUT 150)
+		endforeach()
+	endforeach()
 	# The host transport (host_transport.h): one ctest entry per case.
 	add_executable(consensus_transport_groups_test test/transport/groups_test.cc)
 	target_link_libraries(consensus_transport_groups_test PRIVATE consensus::transport)

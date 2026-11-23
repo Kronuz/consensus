@@ -60,6 +60,12 @@ mutant_commit.MUTANTS = {
          "}\n"
          "[[maybe_unused]] inline std::string checked_file(const std::filesystem::path &directory, const char *name, const std::string &bytes, bool secret) {\n"),
     ],
+    # A4: pins over the certificate's DER, not its key (renew: a renewed certificate is refused)
+    "pin-der": (T + "node_pins.h", "\t\tconst auto digest = key_pin(leaf.get());", "\t\tconst auto digest = certificate_fingerprint(leaf.get());"),
+    # A4: a reload keeps the links whose chain no longer verifies (reload)
+    "reload-keeps-links": (T + "links.h", "\t\t\t\t\t++stats_.unverified;\n\t\t\t\t\tlink->connection->abort();", "\t\t\t\t\t++stats_.unverified;"),
+    # A4: a reload keeps verifying against the old CAs (reload)
+    "reload-keeps-trust": (T + "node_pins.h", "\t\td.trust = std::move(trust);", "\t\t(void)trust;"),
     # A2: a removal leaves the node's links up
     "remove-keeps-links": (T + "links.h", "\t\t\t\t\tif (link)\n\t\t\t\t\t\tlink->connection->abort();",
                            "\t\t\t\t\tif (link)\n\t\t\t\t\t\t(void)link;"),

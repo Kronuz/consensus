@@ -480,6 +480,18 @@ class HostTransport {
 			fail(it->second, rpc::Outcome::not_connected);
 	}
 
+	// From any thread: `tls`, a context with this node's renewed certificate (the same key) or a
+	// new CA bundle, replaces the host's. New connections use it, every check verifies against
+	// its CAs, and each loop then aborts the links whose peer's chain no longer verifies. Throws
+	// std::invalid_argument when its certificate is not this node's key.
+	void reload(std::shared_ptr<asio::ssl::context> tls) {
+		if (!tls)
+			throw std::invalid_argument("host transport: reload without a context");
+		cache_certificates(*tls);  // before any loop handshakes with it
+		loops_[0].links->pins().reload(tls->native_handle());
+		for (auto &loop : loops_)
+			asio::post(loop.at.executor, [links = loop.links.get(), tls] { links->reload(tls); });
+	}
 	// Accepts on `acceptor`, a socket of loop 0, until stop().
 	void serve(asio::ip::tcp::acceptor &acceptor) { task::spawn(loops_[0].at.scheduler, loops_[0].links->serve(acceptor)); }
 

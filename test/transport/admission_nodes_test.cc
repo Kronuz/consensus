@@ -13,6 +13,10 @@
 //            asynchronous hook names it, and two joins and a retry with the key get one
 //            certificate; a version 1 token, another cluster's, another CA key's, a wrong and a
 //            missing secret, a node the hook refuses and an impostor are refused by name
+//   renew    a renewed certificate (the same key) is the node's, its pin unchanged (A4)
+//   expired  an expired certificate is refused by accept and dial (cluster CA)
+//   reload   a runtime reload of the certificate and CA bundle closes the links whose chain no
+//            longer verifies; a renewal under the new CA links again, pins unchanged (cluster CA)
 //   save     a joined node's files: the key owner-only, a failed write throws naming its file,
 //            and a save killed at any file leaves every file whole
 //   consensus_transport_admission_nodes_test <fixture dir> case [ca|pins]
@@ -50,11 +54,18 @@ std::unique_ptr<X509, decltype(&X509_free)> certificate(const std::string &name)
 	assert(c);
 	return c;
 }
-Fingerprint pin_of(const std::string &name) { return certificate_fingerprint(certificate(name).get()); }
-std::shared_ptr<asio::ssl::context> context(const std::string &name) {
+std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> key_of(const std::string &name) {
+	std::unique_ptr<BIO, decltype(&BIO_free)> input(BIO_new_file((fixture / (name + ".key")).c_str(), "r"), BIO_free);
+	std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> k(PEM_read_bio_PrivateKey(input.get(), nullptr, nullptr, nullptr),
+														  EVP_PKEY_free);
+	assert(k);
+	return k;
+}
+Fingerprint pin_of(const std::string &name) { return key_pin(certificate(name).get()); }
+std::shared_ptr<asio::ssl::context> context(const std::string &name, const std::string &ca = "ca") {
 	auto c = std::make_shared<asio::ssl::context>(asio::ssl::context::tls);
 	reactor::tls::configure(*c, {(fixture / (name + ".pem")).string(), (fixture / (name + ".key")).string(),
-								 (fixture / "ca.pem").string()},
+								 (fixture / (ca + ".pem")).string()},
 							reactor::tls::Role::Peer);
 	return c;
 }
@@ -377,6 +388,117 @@ void refused_case() {
 		h->stop();
 }
 
+// A renewed certificate (n3r: node 3's key, a new certificate) is node 3's with no operator step:
+// its pin is the key's. A new key under node 3's name (n3b) is refused in refused_case.
+void renew_case() {
+	Host one(1, "n1", 2), three(3, "n3", 2);
+	one.start();
+	three.start();
+	pair(one, three);
+	check(one.echoes(3) && one.pins->pin(3) == pin_of("n3"), "node 3 joins");
+	three.stop();
+	std::this_thread::sleep_for(300ms);
+	check(pin_of("n3r") == pin_of("n3") && certificate_fingerprint(certificate("n3r").get()) !=
+												   certificate_fingerprint(certificate("n3").get()),
+		  "the renewed certificate is another certificate for the same key");
+	Host renewed(3, "n3r", 2);
+	renewed.start();
+	renewed.admit(one);
+	one.at(3, [&] {
+		one.transport->admit_node(3, renewed.address());  // its address moves; nothing else changes
+		return 0;
+	});
+	check(one.echoes(3) && renewed.echoes(1), "node 3 with its renewed certificate calls and answers");
+	check(one.pins->pin(3) == pin_of("n3") && !one.pins->refused(PinFault::repinned) && !one.pins->refused(PinFault::unpinned),
+		  "its pin is unchanged, and nothing was refused");
+	one.stop();
+	renewed.stop();
+}
+
+// A certificate that expired an hour ago, for `key`'s key, signed by the fixture's CA.
+std::string expired_certificate(const std::string &key, NodeId node) {
+	const auto ca = certificate("ca");
+	auto ca_key = key_of("ca"), subject = key_of(key);
+	std::unique_ptr<X509, decltype(&X509_free)> c(X509_new(), X509_free);
+	const std::string uri = "URI:" + std::string(prefix) + std::to_string(node);
+	bool ok = X509_set_version(c.get(), 2) == 1 && ASN1_INTEGER_set(X509_get_serialNumber(c.get()), 77) == 1 &&
+			  X509_set_subject_name(c.get(), X509_get_subject_name(ca.get())) == 1 &&
+			  X509_set_issuer_name(c.get(), X509_get_subject_name(ca.get())) == 1 &&
+			  X509_gmtime_adj(X509_getm_notBefore(c.get()), -7200) && X509_gmtime_adj(X509_getm_notAfter(c.get()), -3600) &&
+			  X509_set_pubkey(c.get(), subject.get()) == 1;
+	X509V3_CTX v3;
+	X509V3_set_ctx(&v3, ca.get(), c.get(), nullptr, nullptr, 0);
+	for (const auto &[nid, value] : {std::pair{NID_basic_constraints, "critical,CA:FALSE"},
+									 {NID_ext_key_usage, "serverAuth,clientAuth"},
+									 {NID_subject_alt_name, uri.c_str()}}) {
+		X509_EXTENSION *extension = ok ? X509V3_EXT_conf_nid(nullptr, &v3, nid, value) : nullptr;
+		ok = extension && X509_add_ext(c.get(), extension, -1) == 1;
+		X509_EXTENSION_free(extension);
+	}
+	assert(ok && X509_sign(c.get(), ca_key.get(), EVP_sha256()) > 0);
+	const auto name = "expired" + std::to_string(node);
+	std::unique_ptr<BIO, decltype(&BIO_free)> out(BIO_new_file((fixture / (name + ".pem")).c_str(), "w"), BIO_free);
+	PEM_write_bio_X509(out.get(), c.get());
+	std::filesystem::copy_file(fixture / (key + ".key"), fixture / (name + ".key"), std::filesystem::copy_options::overwrite_existing);
+	return name;
+}
+
+// An expired certificate is refused on the shared port, by accept and by dial, before any hello.
+void expired_case() {
+	Host one(1, "n1", 2), four(4, expired_certificate("n4", 4), 2);
+	one.start();
+	four.start();
+	pair(one, four);
+	const auto before = one.pins->refused(PinFault::unverified);
+	auto in = four.call(1, echo, "expired", 1500ms);
+	auto out = one.call(4, echo, "expired", 1500ms);
+	check(until([&] { return in->done.load() && out->done.load(); }, 4000ms) && in->status.outcome != rpc::Outcome::ok &&
+			  out->status.outcome != rpc::Outcome::ok,
+		  "an expired certificate neither calls nor answers");
+	std::printf("  established %llu, refused unverified %llu\n", (unsigned long long)one.established(),
+				(unsigned long long)(one.pins->refused(PinFault::unverified) - before));
+	check(!one.established() && !one.pins->pin(4), "no link, and no pin recorded");
+	one.stop();
+	four.stop();
+}
+
+// Reloading at runtime: node 1 trusts only ca2, with its own key's ca2 certificate (n1c2), and its
+// link to node 2 (ca's) closes and stays closed; node 2 renewed under ca2 (n2c2) links again, both
+// pins unchanged. A certificate of another key is refused.
+void reload_case() {
+	Host one(1, "n1", 2), two(2, "n2", 2);
+	one.start();
+	two.start();
+	pair(one, two);
+	check(one.echoes(2) && two.echoes(1), "nodes 1 and 2 link under the first CA");
+	bool refused = false;
+	try {
+		one.transport->reload(context("n1k", "ca2"));
+	} catch (const std::invalid_argument &e) {
+		std::printf("  %s\n", e.what());
+		refused = true;
+	}
+	check(refused, "a certificate of another key is refused");
+	one.transport->reload(context("n1c2", "ca2"));
+	const auto unverified = [&] {
+		std::uint64_t sum = 0;
+		for (std::uint32_t k = 0; k != one.loops.size(); ++k)
+			sum += one.loops[k]->at([&] { return one.transport->link_stats(k).unverified; });
+		return sum;
+	};
+	check(until([&] { return unverified() >= 1; }, 2000ms), "the reload closes node 2's links: their chain no longer verifies");
+	auto c = one.call(2, echo, "after the reload", 1500ms);
+	auto d = two.call(1, echo, "after the reload", 1500ms);
+	check(until([&] { return c->done.load() && d->done.load(); }, 4000ms) && c->status.outcome != rpc::Outcome::ok &&
+			  d->status.outcome != rpc::Outcome::ok,
+		  "and neither node calls the other");
+	two.transport->reload(context("n2c2", "ca2"));
+	check(one.echoes(2, 8000ms) && two.echoes(1, 8000ms), "node 2 renewed under the second CA links again");
+	check(one.pins->pin(2) == pin_of("n2") && two.pins->pin(1) == pin_of("n1"), "both pins unchanged");
+	one.stop();
+	two.stop();
+}
+
 // The loop count for node 1 under which nodes 2 and 3 share a loop: removing 3 runs beside 2's links.
 std::uint32_t shared_loop() {
 	for (std::uint32_t L = 2; L != 16; ++L) {
@@ -628,13 +750,6 @@ task::task<std::size_t> impostor(tcp::acceptor &listener, std::shared_ptr<asio::
 	} catch (...) {
 	}
 	co_return received;
-}
-std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> key_of(const std::string &name) {
-	std::unique_ptr<BIO, decltype(&BIO_free)> input(BIO_new_file((fixture / (name + ".key")).c_str(), "r"), BIO_free);
-	std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> k(PEM_read_bio_PrivateKey(input.get(), nullptr, nullptr, nullptr),
-														  EVP_PKEY_free);
-	assert(k);
-	return k;
 }
 template <class F> std::optional<JoinFault> fault_of(F f) {
 	try {
@@ -922,13 +1037,13 @@ void save_case() {
 
 int main(int argc, char **argv) {
 	if (argc < 3) {
-		std::fprintf(stderr, "usage: %s <fixture dir> policy|join|refused|remove|epoch|issue|save [ca|pins]\n", argv[0]);
+		std::fprintf(stderr, "usage: %s <fixture dir> policy|join|refused|renew|remove|epoch|issue|save|expired|reload [ca|pins]\n", argv[0]);
 		return 2;
 	}
 	fixture = argv[1];
 	const std::string which = argv[2];
 	by_ca = argc < 4 || std::string(argv[3]) == "ca";
-	const bool one_policy = which == "policy" || which == "issue" || which == "save";
+	const bool one_policy = which == "policy" || which == "issue" || which == "save" || which == "expired" || which == "reload";
 	std::printf("%s (%s)\n", which.c_str(), one_policy || by_ca ? "cluster CA" : "pre-approved pins");
 	watchdog(120s);
 	if (which == "policy")
@@ -945,6 +1060,12 @@ int main(int argc, char **argv) {
 		issue_case();
 	else if (which == "save")
 		save_case();
+	else if (which == "renew")
+		renew_case();
+	else if (which == "expired")
+		expired_case();
+	else if (which == "reload")
+		reload_case();
 	else
 		return 2;
 	std::printf("%s\n", ok ? "PASS" : "FAIL");

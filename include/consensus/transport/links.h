@@ -31,6 +31,7 @@ struct LinkOptions {
 struct LinkStats {
 	std::uint64_t established = 0, refused = 0, abandoned = 0, rejected = 0, evicted = 0;
 	std::uint64_t version_refused = 0;  // hellos whose wire versions shared none with this node's
+	std::uint64_t unverified = 0;       // links a reload closed: their peer's chain no longer verifies
 	std::uint64_t lookups = 0, lookup_failures = 0, lookup_timeouts = 0;
 };
 // An established connection and the hellos that made it.
@@ -110,6 +111,17 @@ class Links {
 				for (const auto *link : {it->second.link.get(), it->second.offered.get()})
 					if (link)
 						link->connection->abort();
+	}
+	// Takes `tls` for new connections (HostTransport::reload, after NodePins::reload) and aborts
+	// every link, established or offered, whose peer's chain no longer verifies.
+	void reload(std::shared_ptr<asio::ssl::context> tls) {
+		tls_ = std::move(tls);
+		for (auto &[key, slot] : slots_)
+			for (const auto *link : {slot.link.get(), slot.offered.get()})
+				if (link && !pins_.verifies(link->connection->native_handle())) {
+					++stats_.unverified;
+					link->connection->abort();
+				}
 	}
 	bool drained() const noexcept { return !tasks_ && !incoming_.load(std::memory_order_acquire); }
 	// The established, undrained link to `peer` on `lane`, or null.
@@ -370,8 +382,11 @@ class Links {
 		const bool offered = it != slots_.end() && it->second.offered;
 		return !offered || peer < pins_.local();
 	}
-	// Whether the link's peer is pinned and was not removed since its connection began authenticating.
+	// Whether the link's peer's chain verifies against the CAs trusted now, and the peer is pinned
+	// and was not removed since its connection began authenticating.
 	bool current(const Link &link) const {
+		if (!pins_.verifies(link.connection->native_handle()))
+			return false;
 		const auto it = since_.find(link.connection.get());
 		return it != since_.end() && pins_.current(link.peer, it->second);
 	}

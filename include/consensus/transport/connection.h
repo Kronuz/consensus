@@ -99,6 +99,8 @@ class Connection {
 	// Write waits that reached dead_after with the send queue drained: a slow reader, kept.
 	std::uint64_t drained_expiries() const noexcept { return drained_expiries_; }
 	const asio::ip::tcp::socket &socket() const noexcept { return socket_; }
+	// Its TLS session, for checks of the peer's certificate on the connection's loop.
+	SSL *native_handle() const noexcept { return ssl_.get(); }
 
 	// After each read's frames went to the handler, also a read that fails after handing some
 	// over; when the queue is empty and the writer would wait, so a sender keeps its own queues

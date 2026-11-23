@@ -8,6 +8,10 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 
 ## 2026-11-21
 
+### Added
+
+- `PeerOptions::wake` ([docs/mechanisms/peers-wake.md](docs/mechanisms/peers-wake.md)): a `std::function<void()>`, empty by default, that `Peers` calls on its executor whenever a frame or event leaves the owner work: a Control input retained for `admit()`, a Bulk frame the snapshot channel took, ran or refused, a snapshot frame written, a Bulk session opened or lost (a fetch's second deadline included). It is called before the owner could see that work and never otherwise: not at rest, not for dials, Control lanes, fetch frames or fetch completions, and never from inside a call the host made into `Peers`. The host may call back into `Peers` from it. A host loop can now sleep until it is called or the Worker's next deadline; before, a Control frame waited for the owner's next turn with nothing to wake it (`peers_wake_test`).
+
 ### Fixed
 
 - A replacement no longer fences its leader with "persistence lacks preowned reservation" when the core removes the leaving member (D3). The core proposed that removal from whichever event drove it after the promotion committed: a leader's `Tick`, which the Worker admitted with no append reservation, or the `Persisted` after an `AppendResponse` whose one hard-state append the commit had used. Only an admitted `Tick` proposes it now, and the Worker plans a leader's `Tick` as that change (`Core::removal()`: its configuration append and the commit continuation), so the removal follows the promotion's commit by at most a heartbeat. `driver_replace_test` runs the replacement through the Driver (add, promote beside any voting member, the leader or a witness included, remove) over 1000 seeds with delayed, dropped and duplicated messages and leadership transfers.

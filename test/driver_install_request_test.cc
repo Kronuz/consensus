@@ -387,6 +387,7 @@ template <class T> const T* first(const Actions& actions) {
 	for (const auto& a : actions) { if (auto v = std::get_if<T>(&a)) { return v; } }
 	return nullptr;
 }
+template <class T> const T* first(Actions&&) = delete;  // the pointer would outlive the batch
 std::unique_ptr<Core> follower_core(std::optional<Membership> membership = std::nullopt, NodeId leader = 2) {
 	RecoveredState state; state.configuration = configuration(1); state.hard = HardState{1, std::nullopt, 4};
 	for (Index i = 1; i <= 5; ++i) { state.entries.push_back({i, 1, i == 1 ? EntryKind::NoOp : EntryKind::Command, i == 1 ? "" : "x" + std::to_string(i)}); }
@@ -468,11 +469,13 @@ void after_install() {
 	Cluster c;
 	for (int k = 0; k < 3; ++k) { c.commit("a" + std::to_string(k)); }
 	auto* l = c.leader(); auto* f = c.follower();
-	check(c.checkpoint(*l) && c.checkpoint(*f), "the leader and the replica checkpoint at the same base");
+	const Index base = l->applied.size();
+	check(f->applied.size() == base && c.checkpoint(*l) && c.checkpoint(*f), "the leader and the replica checkpoint at the same base");
 	c.commit("b");
 	const int needed = l->sink.needed;
 	auto o = c.finish(c.reinstall(*f));
-	check(o->result && o->result->boundary.index == 3, "the damaged replica at the leader's base gets its image: reason " + name(o->reason));
+	check(o->result && o->result->boundary.index == base, "the damaged replica at the leader's base " + std::to_string(base) + " gets its image: reason " + name(o->reason) +
+		(o->result ? ", boundary " + std::to_string(o->result->boundary.index) : std::string()));
 	int refused = 0;
 	for (int k = 0; k < 20; ++k) { refused += c.finish(c.reinstall(*f), 200)->reason == RejectReason::Current; }
 	check(refused == 20, "every later request is Current: " + std::to_string(refused));
@@ -497,14 +500,23 @@ void leader_lost_at(bool mid) {
 	auto [l, f, base] = below(c, false);
 	(void)base;
 	const NodeId gone = l->id;
+	auto* other = c.follower(f);
+	check(other && c.checkpoint(*other), "the other follower checkpoints, so as the next leader it holds an image");
+	if (!other) { return; }
 	auto o = c.reinstall(*f);
 	const int needed = l->sink.needed;
 	check(c.until([&] { return mid ? c.frames[{gone, f->id}] >= 3 : l->sink.needed > needed; }), "the leader starts the image");
+	// The requester never campaigns, so the other follower leads next.
+	const NodeId requester = f->id;
+	c.drop = [requester](const Packet& p) {
+		auto m = std::get_if<Message>(&p.body);
+		return p.from == requester && m && (std::holds_alternative<PreVoteRequest>(*m) || std::holds_alternative<VoteRequest>(*m));
+	};
 	c.isolate(gone);
 	c.finish(o);
 	check(o->reason == RejectReason::NotLeader, std::string(mid ? "mid-transfer" : "before the transfer") + ", the call fails NotLeader: reason " + name(o->reason));
 	check(f->activations == 0, "no image was activated");
-	check(c.until([&] { auto* x = c.leader(); return x && x->id != gone; }), "another leader");
+	check(c.until([&] { auto* x = c.leader(); return x == other && f->state()->leader == other->id; }), "the other follower leads, and the requester knows it");
 	auto again = c.finish(c.reinstall(*f));
 	check(again->result.has_value(), "the new leader ships the image: reason " + name(again->reason));
 	check(f->activations == 1, "one image in all");
@@ -561,12 +573,16 @@ void non_leader() {
 		witnessed = false;
 	}
 	auto lonely = follower_core(std::nullopt, 0);
-	auto none = first<Reject>(lonely->step(RequestInstall{5}));
+	const auto alone = lonely->step(RequestInstall{5});
+	auto none = first<Reject>(alone);
 	check(none && none->reason == RejectReason::NotLeader, "with no leader known the call is NotLeader");
 	auto removed = follower_core();
-	auto ask = first<Send>(removed->step(RequestInstall{5}));
-	const auto token = ask ? std::get<InstallRequest>(ask->message).request : 0;
-	auto member = first<Reject>(removed->step(Receive{2, InstallRequestResponse{1, token, InstallRequestReply::NotMember}}));
+	const auto asked = removed->step(RequestInstall{5});
+	auto ask = first<Send>(asked);
+	auto frame = ask ? std::get_if<InstallRequest>(&ask->message) : nullptr;
+	check(frame != nullptr, "the request goes out");
+	const auto answered = removed->step(Receive{2, InstallRequestResponse{1, frame ? frame->request : 0, InstallRequestReply::NotMember}});
+	auto member = first<Reject>(answered);
 	check(member && member->reason == RejectReason::InvalidRepair, "a removed incarnation's call is InvalidRepair");
 	// Unanswered: resent each heartbeat while the leader keeps heartbeating, NotLeader after an
 	// election timeout.
@@ -611,9 +627,11 @@ void witness_bound() {
 	}
 	check(w.witness_bound() == 4 && w.applied() == 6, "the witness's bound is what the data voters matched, below what it applied");
 	const auto& id = configuration(3);
-	auto past = first<Reject>(w.step(LocalCheckpoint{1, 9, 5, 1, id.cluster, id.configuration}));
+	const auto beyond = w.step(LocalCheckpoint{1, 9, 5, 1, id.cluster, id.configuration});
+	auto past = first<Reject>(beyond);
 	check(past && past->reason == RejectReason::InvalidCheckpoint, "one past the bound is InvalidCheckpoint");
-	auto through = first<PersistCheckpoint>(w.step(LocalCheckpoint{2, 10, 4, 1, id.cluster, id.configuration}));
+	const auto bounded = w.step(LocalCheckpoint{2, 10, 4, 1, id.cluster, id.configuration});
+	auto through = first<PersistCheckpoint>(bounded);
 	check(through != nullptr, "a checkpoint through the bound is accepted");
 	if (through) { w.step(Persisted{through->token}); }
 	check(w.base_index() == 4 && w.last_index() == 6 && w.term_at(5) == Term{1} && w.term_at(6) == Term{1}, "it keeps every record above the bound");

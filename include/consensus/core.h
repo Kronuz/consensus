@@ -855,7 +855,8 @@ private:
 	}
 	void handle(Repair request, Actions& output) {
 		auto reject = [&](RejectReason reason) { output.emplace_back(Reject{request.request, reason}); };
-		if (!started_ || busy() || delivered_through_ || reinstall_) { reject(RejectReason::Busy); return; }
+		if (!started_ || busy() || delivered_through_) { reject(RejectReason::Busy); return; }
+		if (reinstall_) { reject(RejectReason::Busy); return; }  // a pending install request owns the state
 		if (role_ == Role::Leader && voter_count(membership()) > 1) { reject(RejectReason::LeaderMustTransfer); return; }
 		const auto b = request.boundary;
 		if (b.index < base_index_ || b.index > durable_.commit_index || (b.index == base_index_ ? b.term != base_term_ : log_term(b.index) != b.term)) {

@@ -131,6 +131,9 @@ public:
 	task::task<Placement> change_membership(GroupId, Membership next, task::cancel_token = {});
 	task::task<void> transfer_leadership(GroupId, NodeId target, task::cancel_token = {});
 	task::task<RepairCompleted> repair(GroupId, LogBoundary, task::cancel_token = {});
+	// A follower whose application state is lost asks its leader for its image
+	// (docs/mechanisms/install-request.md); completes as repair does, at the image's boundary.
+	task::task<RepairCompleted> reinstall(GroupId, task::cancel_token = {});
 	template <capture Capture> task::task<CheckpointPublished> checkpoint(GroupId, std::uint64_t application_cap, Capture, task::cancel_token = {});
 	task::task<ReadReady> read(GroupId, task::cancel_token = {});
 	task::task<void> close(GroupId);            // retirement until drained; no caller token
@@ -142,6 +145,7 @@ public:
 	// waiting, at rest at a checkpoint covering applied; bound to the host table's incarnation.
 	std::optional<std::string> closed_state(GroupId) const;
 	std::size_t armed_group_timers() const;     // groups whose wheel entry is armed
+	std::optional<Index> witness_bound(GroupId) const;  // Core::witness_bound: a witness truncates through it (D9); absent for a group not open
 	std::vector<std::uint64_t> waiting_groups() const;  // groups holding a waiter, in order
 	std::size_t in_flight() const;              // IO tasks and turn watches: a group's only frames
 };
@@ -166,6 +170,7 @@ T run(Driver<Sink>& driver, task::blocking_scheduler& scheduler, task::task<T> w
 | `read` | the read index is confirmed and the application has applied through it (`applied`) | `task::cancelled`; the slot is dropped when the index arrives | `closed` |
 | `transfer_leadership` | the target leads (`RoleChanged`); `transfer_failed` when Core's transfer deadline passes or another node leads | `task::cancelled`; Core carries on | `closed` |
 | `repair` | `RepairCompleted` | `task::cancelled`; Core carries on, the Sink gets `RepairCompleted` | `closed` |
+| `reinstall` | `RepairCompleted` once the leader's image is activated; `rejected` with `Current`, `NotLeader`, `Busy`, `LeaderMustTransfer` or `InvalidRepair` (docs/mechanisms/install-request.md) | `task::cancelled`; Core keeps the request until its image activates or it fails, and the Sink gets `RepairCompleted` | `closed` |
 | `checkpoint` | `CheckpointPublished` | before publication starts it is cancelled and its reservation reclaimed; after, publication finishes and the Sink gets `CheckpointPublished`; the caller gets `task::cancelled` either way | started publication: completes when published; else `closed` |
 | `close` | the group's state is freed and its row erased: `groups()` no longer counts it, and the id opens again on this Driver; a late plain call is dropped and counted with the ids not open. Close completes on an open, fenced or never-created row, and on an id the Driver never held. The drained Worker hands its group back to the host: a row whose last record is a checkpoint covering every batch closes into the host's table, which then keeps nothing of it; any other row (fenced, or with records after its checkpoint) is released, its records durable in the log and its in-memory state parked. Either way the id recovers again in the same live host. A close whose table commit fails fences the row, which is then released; the host keeps the group in doubt (journal's `Host::hold` refuses it with EIO), so `create` and `recover` of that id on any Driver over that host complete with `close_in_doubt` until the host reopens and recovers it from its disk | no token | - |
 
@@ -277,8 +282,8 @@ transfer that lost one (a refused or dropped frame, a connection that ended) sta
 leader's `Timing::snapshot_timeout`, and the leader then starts it over. The follower ends its
 side after its own `snapshot_timeout` without a frame, a resting group included (it wakes for
 that deadline). Once the final chunk arrives, the image waits for `validated` or
-`validation_failed` however long it takes. Until the image ends, the follower's `repair` and
-`checkpoint` calls wait behind it.
+`validation_failed` however long it takes. Until the image ends, the follower's `repair`,
+`reinstall` and `checkpoint` calls wait behind it.
 
 **Validation.** The follower writes the chunks to a replacement artifact, syncs it, and reads it
 back through its CRC32C. Then the Sink gets `ValidateImage` once per transfer: `token`, the
@@ -337,7 +342,8 @@ loops:
 
 `propose`, `committed`, `change_membership`, `transfer_leadership` and `read` on a group whose
 membership has a voting member (voter or witness) other than this node throw `needs_peer` and
-submit nothing; `create`, `recover`, `checkpoint`, `repair` and `close` need no peer.
+submit nothing, and so does `reinstall`, which asks the leader; `create`, `recover`,
+`checkpoint`, `repair` and `close` need no peer.
 
 ## From the Worker's `try_submit`
 
@@ -351,6 +357,7 @@ submit nothing; `create`, `recover`, `checkpoint`, `repair` and `close` need no 
 | `ChangeMembership{request, next}` | `change_membership(group, next)` |
 | `TransferLeadership{request, target}` | `transfer_leadership(group, target)` |
 | `Repair{request, boundary}` | `repair(group, boundary)` |
+| `RequestInstall{request}` | `reinstall(group)` |
 | `PeerLimits{...}` | `peer_limits(group, limits)` |
 | `applied`, `application_failed` | the same plain calls |
 | `reserve_checkpoint`, `attach_capture`, `offer_application_chunk` | `checkpoint(group, cap, capture)` |

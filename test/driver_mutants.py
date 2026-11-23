@@ -2,7 +2,8 @@
 # Copies include/ to OUT/include with one seeded fault, which waiter_test, driver_test,
 # membership_test or the Driver simulation must catch (under ASan for the resume-before-unlink
 # pair). Each names its header, the text it replaces and the replacement, or a list of those:
-#   driver_mutants.py NAME OUT      (NAME "list" prints the names)
+#   driver_mutants.py NAME OUT      (NAME "list" prints the names; "check" applies every mutant
+#                                    into OUT and fails if any pattern does not match exactly once)
 import pathlib, shutil, sys
 
 MUTANTS = {
@@ -38,8 +39,8 @@ MUTANTS = {
     ),
     # A local checkpoint captures none of the retained log above its boundary (msg-1).
     "checkpoint-drops-suffix": ("core.h",
-        "\t\tif (capture_mode_) { captured_ = FrozenCheckpoint(*this, id, state, entries_.size() - first); }\n",
-        "\t\tif (capture_mode_) { captured_ = FrozenCheckpoint(*this, id, state, 0); }\n",
+        "\t\tif (capture_mode_) { captured_ = std::make_unique<FrozenCheckpoint>(FrozenCheckpoint(*this, id, state, entries_.size() - first)); }\n",
+        "\t\tif (capture_mode_) { captured_ = std::make_unique<FrozenCheckpoint>(FrozenCheckpoint(*this, id, state, 0)); }\n",
     ),
     # A shared append acknowledges its record (Persisted) once staged, before its loop's turn
     # barrier makes it durable; the Driver simulation's power cuts catch it.
@@ -104,21 +105,37 @@ MUTANTS = {
     ),
 }
 
-def main():
-    name = sys.argv[1]
-    if name == "list":
-        print("\n".join(MUTANTS))
-        return
-    out = pathlib.Path(sys.argv[2])
-    root = pathlib.Path(__file__).resolve().parent.parent
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+def apply(name, out):
+    """Copies include/ to out/include with the mutant applied; returns an error text or None.
+    A pattern that does not match exactly once is an error: the mutant would prove nothing."""
     shutil.rmtree(out / "include", ignore_errors=True)
-    shutil.copytree(root / "include", out / "include")
+    shutil.copytree(ROOT / "include", out / "include")
     edits = MUTANTS[name]
     for header, search, replace in edits if isinstance(edits, list) else [edits]:
         path = out / "include" / "consensus" / header
         text = path.read_text()
         if text.count(search) != 1:
-            sys.exit("mutation point not found once: " + name)
+            return "mutation point not found once: " + name
         path.write_text(text.replace(search, replace, 1))
+    return None
+
+def main():
+    name = sys.argv[1]
+    if name == "list":
+        print("\n".join(MUTANTS))
+        return
+    if name == "check":  # applies every mutant into scratch directory OUT; fails if any does not apply
+        out = pathlib.Path(sys.argv[2])
+        errors = [e for n in MUTANTS if (e := apply(n, out))]
+        shutil.rmtree(out / "include", ignore_errors=True)
+        if errors:
+            sys.exit("\n".join(errors))
+        print("all %d mutants apply" % len(MUTANTS))
+        return
+    error = apply(name, pathlib.Path(sys.argv[2]))
+    if error:
+        sys.exit(error)
 
 main()

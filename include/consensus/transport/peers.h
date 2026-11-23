@@ -49,6 +49,11 @@ struct PeerOptions {
 	FetchReader reader;
 	std::size_t fetches = 4, fetch_bytes = 64 * 1024 * 1024;
 	std::chrono::milliseconds fetch_deadline{30000};
+	// Called on the executor, from Peers' own completions only, when a frame or event leaves the
+	// owner work: a Control input for admit(), a Bulk frame or a written snapshot frame for the
+	// snapshot channel, a Bulk session opened or lost (docs/mechanisms/peers-wake.md). It must
+	// not throw; it may call back into Peers. Empty: none.
+	std::function<void()> wake;
 };
 struct PeerStats {
 	std::uint64_t admitted = 0, rejected = 0, dropped = 0, reconnects = 0;
@@ -316,11 +321,14 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 			admission_wake.cancel();
 		}
 	};
-	void close(const std::shared_ptr<Connection> &connection) {
+	// Returns whether the snapshot channel lost an open session, which leaves the owner work.
+	bool close(const std::shared_ptr<Connection> &connection) {
 		connection->append.abandon(std::chrono::steady_clock::now(), stats_.append);
 		connection->close();
+		bool lost = false;
 		if (connection->trusted && !connection->notified) {
 			connection->notified = true;
+			lost = node_->channel().session_open(*connection->trusted);
 			node_->channel().session_closed(*connection->trusted);
 		}
 		for (auto &[id, fetching] : connection->fetching) {
@@ -330,6 +338,16 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 		connection->fetching.clear();
 		connection->requests.clear();
 		connection->serving.clear();
+		return lost;
+	}
+	// close() from Peers' own completions; a host call into Peers wakes no one.
+	void end(const std::shared_ptr<Connection> &connection) {
+		if (close(connection))
+			wake();
+	}
+	void wake() noexcept {
+		if (options_.wake)
+			options_.wake();
 	}
 	// A reply unfinished at fetch_deadline fails its fetch; one unfinished a deadline later
 	// closes the bulk lane, whose peer is hung or gone, which frees the fetch's slot.
@@ -347,7 +365,7 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 			if (found == connection->fetching.end())
 				return;
 			if (std::exchange(found->second.late, true)) {
-				owner->close(connection);
+				owner->end(connection);
 				return;
 			}
 			owner->fail(found->second, std::errc::timed_out);
@@ -680,6 +698,8 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 				connection->trusted =
 					kronuz::consensus::TrustedSession{remote.node, local.connection, remote.connection};
 				node_->channel().register_session(*connection->trusted);
+				if (node_->channel().session_open(*connection->trusted))
+					wake();
 			}
 			++stats_.admitted;
 			using namespace asio::experimental::awaitable_operators;
@@ -688,8 +708,10 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 			if (!stopping_)
 				++stats_.rejected;
 		}
-		close(connection);
+		const bool lost = close(connection);
 		std::erase(connections_, connection);
+		if (lost)
+			wake();
 	}
 	asio::awaitable<void> reader(std::shared_ptr<Connection> connection) {
 		try {
@@ -710,6 +732,7 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 						connection->append.receive(*response, connection->received_at, stats_.append);
 					}
 					++stats_.received;
+					wake();
 					while (connection->input) {
 						if (stopping_ || connection->closing)
 							throw std::runtime_error("peer admission closed");
@@ -728,8 +751,13 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 					while (!bytes.empty() || busy) {
 						if (stopping_ || connection->closing)
 							throw std::runtime_error("bulk session closed");
+						const bool open = node_->channel().session_open(*connection->trusted);
 						auto result = node_->channel().receive(*connection->trusted, bytes);
 						bytes = bytes.subspan(result.consumed);
+						// The channel took bytes, ran the frame it held, or lost the session.
+						if (result.consumed || result.result == kronuz::consensus::TransferReceive::Accepted ||
+							(result.result == kronuz::consensus::TransferReceive::Closed && open))
+							wake();
 						if (result.result == kronuz::consensus::TransferReceive::Closed || stopping_ ||
 							connection->closing)
 							throw std::runtime_error("bulk session closed");
@@ -740,7 +768,7 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 				}
 			}
 		} catch (...) {
-			close(connection);
+			end(connection);
 			throw;
 		}
 	}
@@ -786,7 +814,8 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 						connection->writing = true;
 						co_await connection->session->send(flight.take_frame());
 						connection->writing = false;
-						flight.consume_if_current(node_->channel());
+						if (flight.consume_if_current(node_->channel()))
+							wake();
 						continue;
 					}
 				}
@@ -795,7 +824,7 @@ class Peers : public std::enable_shared_from_this<Peers<Host>> {
 				co_await connection->wake.async_wait(asio::redirect_error(asio::use_awaitable, error));
 			}
 		} catch (...) {
-			close(connection);
+			end(connection);
 			throw;
 		}
 	}

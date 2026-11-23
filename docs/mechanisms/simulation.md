@@ -10,11 +10,11 @@ on the slowest runner class, not the typical one.
 The linux-asan-ubsan runners come in classes that differ by up to 2.2x in every test, not only
 this one. Over 46 runs on 2026-11-21..23, keyed by `consensus_consensus`'s time:
 
-| Class | consensus_consensus | consensus_liveness | suite total |
+| Class | consensus_consensus | consensus_liveness | consensus_shared_worker |
 |---|---|---|---|
-| fast | 2.3 s | 62-67 s | 2545-2673 s |
-| typical | 2.8-3.1 s | 78-82 s | 1583 s (45204437379) |
-| slow | 4.4-4.7 s | 160-176 s | 2512-3105 s |
+| fast | 2.3 s | 62-67 s | 121-139 s |
+| typical | 2.8-3.1 s | 78-82 s | 137-145 s |
+| slow | 4.4-4.7 s | 160-176 s | 233-258 s |
 
 The simulation took 170 s on the typical class and passed 300 s on the slow one
 (45234099713, 45204597820), with no hang: per seed the heal's round counts repeat exactly

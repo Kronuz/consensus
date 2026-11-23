@@ -1045,9 +1045,21 @@ task::task<void> changing(Driver<GroupSink> *d, GroupId g, Membership next) {
 }
 task::task<void> transferring(Driver<GroupSink> *d, GroupId g, NodeId target) { co_await d->transfer_leadership(g, target); }
 
+// The journal's I/O on the calling loop (InlineCompletion), with the longest one operation held
+// it, in ms: a slow sync blocks every connection that loop serves.
+struct TimedInline {
+	j::InlineCompletion inline_io;
+	std::atomic<std::uint64_t> longest{0};
+	task::task<void> run(std::shared_ptr<j::IOOperation> operation, task::cancel_token token = {}) {
+		const auto t = steady::now();
+		co_await inline_io.run(std::move(operation), std::move(token));
+		longest = std::max<std::uint64_t>(longest, ms_since(t));
+	}
+};
+
 struct Node {
 	struct PerLoop {
-		j::InlineCompletion io;
+		TimedInline io;
 		GroupSink sink;
 		std::unique_ptr<Driver<GroupSink>> driver;
 		task::cancel_source stop;
@@ -2591,6 +2603,9 @@ void fetch_alongside() {
 						 std::to_string(pair.second) + " ended at " + std::to_string(f.ended) + " ms: " + what);
 		return false;
 	};
+	for (auto *n : all)
+		for (auto &p : n->per)
+			p->io.longest = 0;
 	Stalls stalls;
 	LoopLags lags(all);
 	bool changed = false;
@@ -2640,10 +2655,12 @@ void fetch_alongside() {
 		}
 		auto t = c.nodes[n]->state(g);
 		std::printf("fetch-alongside: node %llu: %llu links established, %llu peers gone, calls ended connection_aborted %llu, "
-					"timed_out %llu; %s in term %llu; its loops went at most %llu and %llu ms without turning\n",
+					"timed_out %llu; %s in term %llu; its loops went at most %llu and %llu ms without turning, their journal I/O "
+					"held them at most %llu and %llu ms at once\n",
 					(unsigned long long)n, (unsigned long long)links, (unsigned long long)gone, (unsigned long long)aborted,
 					(unsigned long long)timed_out, !t ? "no state" : t->role == Role::Leader ? "leader" : "not leader",
-					(unsigned long long)(t ? t->term : 0), (unsigned long long)lags.worst(n - 1, 0), (unsigned long long)lags.worst(n - 1, 1));
+					(unsigned long long)(t ? t->term : 0), (unsigned long long)lags.worst(n - 1, 0), (unsigned long long)lags.worst(n - 1, 1),
+					(unsigned long long)c.nodes[n]->per[0]->io.longest.load(), (unsigned long long)c.nodes[n]->per[1]->io.longest.load());
 	}
 	std::printf("fetch-alongside: the host stalled this process at most %llu ms\n", (unsigned long long)stalled);
 	std::printf("fetch-alongside: %u rounds of %zu x 8 MiB fetched through 1 MiB lane budgets in %llu ms, %u of %u exact; %u commits "

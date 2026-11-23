@@ -174,7 +174,21 @@ struct AppendResponse {
 	Token read_probe;
 	std::optional<LogBoundary> compacted{};
 };
-using Message = std::variant<VoteRequest, VoteResponse, AppendRequest, AppendResponse, SnapshotResponse, PreVoteRequest, PreVoteResponse, TimeoutNow, Gone>;
+// An install request (docs/mechanisms/install-request.md): a follower whose application state
+// is lost asks its leader in `term` for the leader's image; `base` is the requester's own base
+// boundary, which the leader compares with its own. The follower resends it each heartbeat
+// until answered; `request` correlates the answer.
+struct InstallRequest { Term term; Token request; LogBoundary base; };
+// Started: the leader ships the requester its image through the snapshot channel. InFlight: an
+// image to the requester is already under way. Current: the leader ships at most one image per
+// requester per leader base, so it ships none when it holds no image, its base is below the
+// requester's, or it already shipped the requester one at its current base; it keeps one entry
+// per member, dropped at a leader change. NotLeader: the responder does not lead `term`;
+// `leader` names the leader it knows, 0 for none. NotMember: the requester is no data member
+// (a witness or a removed incarnation).
+enum class InstallRequestReply : std::uint8_t { Started, InFlight, Current, NotLeader, NotMember };
+struct InstallRequestResponse { Term term; Token request; InstallRequestReply result; NodeId leader = 0; };
+using Message = std::variant<VoteRequest, VoteResponse, AppendRequest, AppendResponse, SnapshotResponse, PreVoteRequest, PreVoteResponse, TimeoutNow, Gone, InstallRequest, InstallRequestResponse>;
 
 struct Start {};
 // The host supplies absolute monotonic time and a fresh randomized election
@@ -210,6 +224,11 @@ struct Failed { FailureSource source; Token token; std::string error; };
 // entries after it from its own log. Hard state, role, leader, and commit index stay as
 // they are. A host reports damage this way, never as Failed{Application}, which fences.
 struct Repair { RequestId request; LogBoundary boundary; };
+// The host's application state is lost below what Repair can rewind to (docs/mechanisms/
+// install-request.md): the follower asks its leader for an install, accepts the image even at
+// or below its commit index while it retains the boundary's entry, and answers with
+// RepairCompleted once the image is activated, its epoch advanced.
+struct RequestInstall { RequestId request; };
 // A leader proposes the membership that follows its current one (Track C, D3): at most one
 // voter or witness added or removed, any learners; a learner's promotion beside a voter
 // it replaces names that voter as `leaving`, and the core removes it once that commits.
@@ -225,10 +244,11 @@ struct PeerLimits { NodeId incarnation; Limits limits; };
 // that a node (Member::node) stopped answering on its connection, for every group it hosts.
 struct Wake {};
 struct LeaderGone { NodeId node; };
-using Event = std::variant<Start, Tick, Receive, Propose, Read, Persisted, Applied, Failed, LocalCheckpoint, StorageFault, InstallPrepared, InstallActivated, InstallActivationFailed, SnapshotSourceReady, SnapshotTransferFailed, Repair, ChangeMembership, TransferLeadership, PeerLimits, Wake, LeaderGone>;
+using Event = std::variant<Start, Tick, Receive, Propose, Read, Persisted, Applied, Failed, LocalCheckpoint, StorageFault, InstallPrepared, InstallActivated, InstallActivationFailed, SnapshotSourceReady, SnapshotTransferFailed, Repair, ChangeMembership, TransferLeadership, PeerLimits, Wake, LeaderGone, RequestInstall>;
 
 enum class Role : std::uint8_t { Follower, Candidate, Leader, Fenced };
-enum class RejectReason { Busy, NotLeader, NotReady, LogFull, TooLarge, DuplicateRequest, InvalidCheckpoint, InvalidRepair, LeaderMustTransfer, InvalidMembership, InvalidTarget };
+// Current: the leader refused an install request: one image per requester per leader base.
+enum class RejectReason { Busy, NotLeader, NotReady, LogFull, TooLarge, DuplicateRequest, InvalidCheckpoint, InvalidRepair, LeaderMustTransfer, InvalidMembership, InvalidTarget, Current };
 struct Persist { Token token; StorageBatch batch; };
 struct PersistCheckpoint { Token token; Token capture; RecoveredState state; };
 struct PersistInstall { Token token, prepared; RecoveredState state; };

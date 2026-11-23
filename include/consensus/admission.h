@@ -99,7 +99,8 @@ inline EventAdmissionPlan plan_event(const Event& event, bool busy, Limits limit
 					// Answered without persistence.
 				} else if constexpr (std::is_same_v<M, VoteResponse>) {
 					if (!busy) { add(AdmissionClass::Control, noop); add(AdmissionClass::Control, hard); }
-				} else if constexpr (std::is_same_v<M, VoteRequest> || std::is_same_v<M, AppendResponse> || std::is_same_v<M, SnapshotResponse> || std::is_same_v<M, Gone>) {
+				} else if constexpr (std::is_same_v<M, VoteRequest> || std::is_same_v<M, AppendResponse> || std::is_same_v<M, SnapshotResponse> || std::is_same_v<M, Gone> ||
+					std::is_same_v<M, InstallRequest> || std::is_same_v<M, InstallRequestResponse>) {
 					if constexpr (std::is_same_v<M, SnapshotResponse>) { if (!valid_snapshot_response(message)) { throw std::invalid_argument("invalid snapshot response"); } }
 					if (!busy) { add(AdmissionClass::Control, hard); }
 				} else {
@@ -112,7 +113,7 @@ inline EventAdmissionPlan plan_event(const Event& event, bool busy, Limits limit
 				add(AdmissionClass::Control, hard);
 			}
 		} else if constexpr (std::is_same_v<T, Start> || std::is_same_v<T, Read> || std::is_same_v<T, Repair> || std::is_same_v<T, TransferLeadership> || std::is_same_v<T, PeerLimits> ||
-			std::is_same_v<T, Wake> || std::is_same_v<T, LeaderGone>) {
+			std::is_same_v<T, Wake> || std::is_same_v<T, LeaderGone> || std::is_same_v<T, RequestInstall>) {
 			// These events emit no persistence action.
 		} else {
 			static_assert(std::is_same_v<T, void>, "new consensus event requires an admission plan");

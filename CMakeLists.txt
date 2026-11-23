@@ -126,7 +126,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	# A follower's install request (docs/mechanisms/install-request.md), a ctest entry per case.
 	add_executable(consensus_driver_install_request_test test/driver_install_request_test.cc)
 	target_link_libraries(consensus_driver_install_request_test PRIVATE consensus::consensus)
-	foreach(c lost_state behind current after_install unrequested leader_lost second_request non_leader witness_bound)
+	foreach(c lost_state behind current after_install lost_record unrequested leader_lost second_request non_leader witness_bound)
 		add_test(NAME consensus_install_request_${c} COMMAND consensus_driver_install_request_test ${c})
 		set_tests_properties(consensus_install_request_${c} PROPERTIES TIMEOUT 300)
 	endforeach()

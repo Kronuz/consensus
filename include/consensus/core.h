@@ -441,7 +441,7 @@ private:
 		// Back to one flight, resuming at `from` (the oldest flight's start: nothing before it is in doubt).
 		void reset_flights(Index from) { flights.clear(); window = 0; verified = false; next = std::max(matched + 1, from); }
 		// Install requests (docs/mechanisms/install-request.md): `requested` while the image one
-		// started is owed; `imaged`, the base the peer last got or was granted an image at.
+		// started is owed; `imaged`, the base of the last image the peer installed or rejected.
 		bool requested = false; Index imaged = 0;
 	};
 	struct PendingRead { RequestId request; Token probe; Term term; Index index; std::set<NodeId> acknowledgements; };
@@ -797,7 +797,9 @@ private:
 		auto key = peer.snapshot->key; output.emplace_back(SnapshotReleased{id, key, reason}); peer.snapshot.reset();
 		peer.keepalive.reset();
 		// The peer answered for a whole image; a failed or stale transfer still owes it one.
+		// CaughtUp means it no longer asked, so that image is not its one at this base.
 		if (reason == SnapshotReleaseReason::CaughtUp || reason == SnapshotReleaseReason::Rejected) { peer.requested = false; }
+		if (reason == SnapshotReleaseReason::Rejected) { peer.imaged = key.boundary.index; }
 		peer.retry_after = deadline(timing_.rpc_timeout); peer.snapshot_retry_clock = now_;
 		if (probe) { peer.next = std::max(peer.matched + 1, key.boundary.index + 1); peer.lacks_base = false; }
 	}
@@ -1149,7 +1151,7 @@ private:
 	}
 	void receive_message(NodeId, Gone, StorageBatch&, Actions&) {}  // handled in handle(Receive)
 	// A leader ships at most one image per requester per leader base: `imaged` records the base
-	// it granted or delivered one at, and a leader change drops it with the peer.
+	// of the image the peer last installed or rejected, and a leader change drops it with the peer.
 	void receive_message(NodeId source, InstallRequest request, StorageBatch&, Actions& output) {
 		auto answer = [&](InstallRequestReply result, NodeId leader = 0) {
 			output.emplace_back(Send{source, InstallRequestResponse{hard_.term, request.request, result, leader}});
@@ -1162,7 +1164,7 @@ private:
 		auto& peer = found->second;
 		if (peer.snapshot || peer.requested) { answer(InstallRequestReply::InFlight); return; }
 		if (!base_index_ || request.base.index > base_index_ || peer.imaged == base_index_) { answer(InstallRequestReply::Current); return; }
-		peer.requested = true; peer.imaged = base_index_;
+		peer.requested = true;
 		answer(InstallRequestReply::Started);
 		if (peer.flights.empty()) { replicate(source, peer, output, needed_probe(source)); }
 	}
@@ -1478,7 +1480,6 @@ private:
 			if (!peer.lacks_base && !peer.requested) {
 				peer.next = base_index_ + 1;  // a timeout or the leader's own compaction, not the peer, put it here
 			} else {
-				if (peer.requested) { peer.imaged = base_index_; }
 				SnapshotKey key{durable_.term, token(), {base_index_, base_term_}};
 				peer.snapshot.emplace(SnapshotFlight{key, SnapshotPhase::AwaitSource, now_}); peer.snapshot_retry_clock.reset();
 				output.emplace_back(SnapshotNeeded{id, key}); snapshot_keepalive(id, peer, output); return;

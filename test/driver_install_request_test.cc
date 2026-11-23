@@ -637,11 +637,44 @@ void witness_bound() {
 	check(w.base_index() == 4 && w.last_index() == 6 && w.term_at(5) == Term{1} && w.term_at(6) == Term{1}, "it keeps every record above the bound");
 }
 
+// The requester loses its record while the leader still owes it the image (every answer and
+// transfer frame to it is dropped until the call fails NotLeader; a restart drops it the same way).
+// The retry image is CaughtUp, which is not its one image: the next call still gets it.
+void lost_record() {
+	Cluster c;
+	for (int k = 0; k < 3; ++k) { c.commit("a" + std::to_string(k)); }
+	auto* l = c.leader(); auto* f = c.follower();
+	const Index base = l->applied.size();
+	check(f->applied.size() == base && c.checkpoint(*l) && c.checkpoint(*f), "the leader and the replica checkpoint at the same base");
+	c.commit("b");
+	const NodeId fid = f->id, lid = l->id;
+	const int needed = l->sink.needed;
+	bool blocking = true;
+	c.drop = [&](const Packet& p) {
+		if (!blocking || p.from != lid || p.to != fid) { return false; }
+		if (std::holds_alternative<std::string>(p.body)) { return true; }
+		return std::holds_alternative<InstallRequestResponse>(std::get<Message>(p.body));
+	};
+	auto first_call = c.finish(c.reinstall(*f), 3000);
+	check(first_call->reason == RejectReason::NotLeader, "the unanswered call fails NotLeader: reason " + name(first_call->reason));
+	blocking = false;
+	c.until([&] { return l->sink.needed >= needed + 2; }, 4000);
+	c.until([&] { return false; }, 400);
+	check(f->activations == 0, "the retry image, with no request pending, is not installed");
+	auto again = c.finish(c.reinstall(*f));
+	check(c.leader() == l, "the leader stays");
+	check(again->result && again->result->boundary.index == base, "the next call still gets the image at the leader's base: reason " + name(again->reason));
+	int refused = 0;
+	for (int k = 0; k < 5; ++k) { refused += c.finish(c.reinstall(*f), 200)->reason == RejectReason::Current; }
+	check(refused == 5 && f->activations == 1, "then it has its one image: " + std::to_string(refused) + " Current, " + std::to_string(f->activations) + " activations");
+}
+
 const std::map<std::string, void (*)()> cases{
 	{"lost_state", &lost_state},
 	{"behind", &behind},
 	{"current", &current},
 	{"after_install", &after_install},
+	{"lost_record", &lost_record},
 	{"unrequested", &unrequested},
 	{"leader_lost", &leader_lost},
 	{"second_request", &second_request},

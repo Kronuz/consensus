@@ -8,7 +8,8 @@ The runner records every command netlab issues and answers ping from the shapes 
 fake cluster is a small model of a Raft group on the lab's cuts (a majority component elects after
 an election timeout; a leader commits only with a majority) on a simulated clock. The clean model
 passes every check at 3 and 5 nodes, through a host stall that makes the guest's timer wake
-STALL_MS later during the 1ms shape's ping to node 2 and its lateness samples, and each mutant
+STALL_MS later from the first lateness samples after the 1ms shape's ping to node 2 until a ping
+to another node (a drift the alternating rounds see in both), and each mutant
 fails the check that guards it:
 
   rtt-off         ping sees 1.5x the round trip netlab set          -> round trip
@@ -78,7 +79,8 @@ class FakeRunner:
         self.mutant = mutant
         self.commands: list[tuple[list[str], str | None]] = []
         self.lab: Any = None
-        self.stall = 0.0  # extra timer lateness from now to the next ping
+        self.stall = 0.0  # extra timer lateness until a ping to another node
+        self.armed = False  # the stall starts at the next lateness sample
         self.stalled = False
 
     def __call__(self, argv: Sequence[str], stdin: str | None = None) -> str:
@@ -90,9 +92,10 @@ class FakeRunner:
                 self.mutant == "link-off" and target == 2
             )
             rtt = 2 * shape.ms * (1.5 if off else 1.0) + 0.05
-            stall = shape.ms == 1.0 and target == 2 and not self.stalled
-            self.stalled |= stall
-            self.stall = STALL_MS if stall else 0.0
+            if shape.ms == 1.0 and target == 2 and not self.stalled:
+                self.armed = self.stalled = True
+            elif target != 2:
+                self.stall = 0.0
             rtt += 2 * (LATE_MS + self.stall) if shape.ms >= 0.01 else 0.0
             return "".join(
                 f"64 bytes from {argv[-1]}: icmp_seq={i} ttl=64 time={rtt + 0.001 * (i % 3):.3f} ms\n"
@@ -371,9 +374,11 @@ def run(
     cluster = FakeCluster(lab, nodes, mutant)
     plan = bench.Plan.quick()
 
-    def late(ms: float) -> list[float]:
+    def late(ms: float, samples: int = bench.TIMER_SAMPLES) -> list[float]:
+        if runner.armed:
+            runner.stall, runner.armed = STALL_MS, False
         wake = 0.0 if mutant == "late-unmeasured" else LATE_MS + runner.stall
-        return [wake + 0.01 * (i % 3) for i in range(9)]
+        return [wake + 0.01 * (i % 3) for i in range(samples)]
 
     b = bench.Bench(lab, cluster, nodes, plan, out, runner, history, late)
     return bench.measure(b, bench.SHAPES), runner

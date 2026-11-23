@@ -57,11 +57,13 @@ THINK_SECONDS = (
 )
 # A1: each peer's ping median within 10% of the set round trip past the guest's floor at that delay:
 # the unshaped path's round trip plus two timer wakes (netem holds each packet once per direction),
-# each as late as an hrtimer sleep of the same delay wakes, sampled right after that peer's ping;
-# jitter is the spread of those wakes, at least JITTER_MS.
+# each as late as an hrtimer sleep of the same delay wakes, sampled in RTT_ROUNDS rounds that
+# alternate with that peer's pings so both see the same drift; jitter is the spread of those wakes,
+# at least JITTER_MS.
 RTT_TOLERANCE = 0.10
 JITTER_MS = 0.1
 TIMER_SAMPLES = 30
+RTT_ROUNDS = 5
 
 
 @dataclass(frozen=True)
@@ -333,7 +335,7 @@ class Bench:
         out: Path,
         run: Callable[[Sequence[str]], str],
         history: Any,
-        late: Callable[[float], list[float]] = timer_late,
+        late: Callable[[float, int], list[float]] = timer_late,
     ) -> None:
         self.lab, self.cluster, self.nodes, self.plan, self.out = (
             lab,
@@ -496,10 +498,11 @@ class Bench:
     def peers(self) -> range:
         return range(2, self.nodes + 1)
 
-    def ping(self, peer: int) -> list[float]:
-        """Node 1's round trips to `peer`, in ms."""
+    def ping(self, peer: int, count: int = 0) -> list[float]:
+        """Node 1's round trips to `peer`, in ms: `count` pings, or the plan's."""
         host = self.lab.address(1, peer).rsplit(":", 1)[0]
-        argv = ["ping", "-n", "-c", str(self.plan.pings), "-i", "0.02", "-W", "2", host]
+        count = count or self.plan.pings
+        argv = ["ping", "-n", "-c", str(count), "-i", "0.02", "-W", "2", host]
         try:
             output = self.run(self.lab.command(1, argv))
         except Exception as error:  # noqa: BLE001 - a ping that loses every reply exits 1
@@ -509,12 +512,16 @@ class Bench:
     # A1: the network is what netlab set, and only a majority acknowledges.
 
     def check_rtt(self, shape: Shape, row: dict[str, Any]) -> None:
-        """Each peer's ping against its own floor, its timer lateness sampled right after its ping:
-        a loaded host's wakes drift by tenths of a ms within a second."""
+        """Each peer's ping against its own floor, its timer lateness sampled in rounds alternating
+        with its pings: a loaded host's wakes drift by tenths of a ms within a second."""
         medians, lates, within, details, peers = [], [], [], [], []
+        count = max(1, self.plan.pings // RTT_ROUNDS)
+        samples = TIMER_SAMPLES // RTT_ROUNDS
         for peer in self.peers():
-            rtts = self.ping(peer)
-            late = self.late(shape.ms) if shape.ms else [0.0]
+            rtts, late = [], []
+            for _ in range(RTT_ROUNDS):
+                rtts += self.ping(peer, count)
+                late += self.late(shape.ms, samples) if shape.ms else [0.0]
             late_ms = statistics.median(late)
             lates += late
             floor = self.unshaped_ms + 2 * late_ms
@@ -539,7 +546,7 @@ class Bench:
         self.check(
             f"{shape.name}: round trip",
             all(within),
-            f"set {shape.rtt_ms:g} ms + unshaped {self.unshaped_ms:.3f} + 2 timer wakes sampled after each peer's ping; "
+            f"set {shape.rtt_ms:g} ms + unshaped {self.unshaped_ms:.3f} + 2 timer wakes sampled in rounds alternating with each peer's pings; "
             f"peer: ping median vs expected ms: {', '.join(details)}",
         )
 

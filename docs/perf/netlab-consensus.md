@@ -67,9 +67,9 @@ pinned at faultlab:b64102f, as three `exclusive` campaign jobs: nothing else ran
 - **Floor at a delay.** netem holds each packet on an hrtimer, once per direction, and the guest
   wakes that timer late, so a delayed shape reads above its setting. The floor at a delay `d` is
   the unshaped round trip plus two timer wakes, each as late as a sleep of `d` wakes in the same
-  guest (`timer_late`: 30 sleeps with timer slack 1 ns, their median), measured right after each
-  peer's ping, so each peer has its own floor: the wakes drift by tenths of a ms within a second
-  (Calibration 5). The jitter allowed is twice the wakes' spread (p90 less median), at least 0.1 ms.
+  guest (`timer_late`: 30 sleeps with timer slack 1 ns, their median), sampled in 5 rounds that
+  alternate with that peer's pings (2 pings, then 6 sleeps), so each peer has its own floor and
+  both see the same drift: the wakes drift by tenths of a ms within a second (Calibration 5, 6). The jitter allowed is twice the wakes' spread (p90 less median), at least 0.1 ms.
   `bench.py calibrate` checks the model: ping under netem holds of 1 us to 80 ms beside the
   sleep lateness at each (Calibration, below).
 - **Hunt rows** compare with ping's measured round trip plus A1's 10%: a commit at one in flight
@@ -129,6 +129,13 @@ What it shows:
    0.6 s after them. The same row's events reached the harness up to 27 ms late, a stall of the
    guest. The floor is now sampled after each peer's ping, and each row keeps every peer's ping
    median and lateness p50 and p90 (`pings`).
+6. Sampling after each peer's ping still left a residual (ping median less set less floor) of
+   -0.26 to +0.05 ms at 3 nodes (261121-155544-5ff2fd) and -0.19 to +0.71 ms at 5 nodes
+   (261121-155547-b1b79f) in the 1 ms shapes, with lateness 0.37 to 0.99 ms per wake. Peer 3 at
+   5 nodes read 4.135 ms against 3.461 ± 0.517 and failed; peer 4 in the partition shape, +0.635,
+   passed on its wider spread. The peers that missed differ between runs, so the floor still
+   moves between the 200 ms of pings and the 50 ms of sleeps after them: the samples now
+   alternate with the pings in 5 rounds.
 
 ### Results
 

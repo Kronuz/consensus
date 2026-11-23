@@ -9,11 +9,12 @@
 //            its links close, its dials are refused (removed), and no other call is lost
 //   epoch    TLS completes, the node is removed, then its hellos run: a dial, and an accept moved
 //            to its owner loop, become no link (the removal epoch)
-//   issue    a node with no key or certificate joins with the token (D150): the issuer signs its
-//            key, the CA policy pins it at its first call; a wrong, a missing and another
-//            cluster's token, a node the hook refuses, and an impostor replaying the CA
-//            certificate, are refused by name
-//   save     a joined node's files: the key created owner-only, a failed write throws naming its file
+//   issue    token v2 and the DTJN0002 exchange: a node with a saved key joins (D150), the
+//            asynchronous hook names it, and two joins and a retry with the key get one
+//            certificate; a version 1 token, another cluster's, another CA key's, a wrong and a
+//            missing secret, a node the hook refuses and an impostor are refused by name
+//   save     a joined node's files: the key owner-only, a failed write throws naming its file,
+//            and a save killed at any file leaves every file whole
 //   consensus_transport_admission_nodes_test <fixture dir> case [ca|pins]
 #include "consensus/transport/admission_join.h"
 #include "consensus/transport/host_transport.h"
@@ -22,6 +23,7 @@
 #include <cassert>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <mutex>
 #include <csignal>
@@ -603,7 +605,7 @@ template <class T> std::future<T> start(Loop &loop, task::task<T> t) {
 }
 // Runs `t` on `loop` and waits for its value, or rethrows what it threw.
 template <class T> T run(Loop &loop, task::task<T> t) { return start(loop, std::move(t)).get(); }
-// A host presenting `tls`'s leaf that sends `ca` as an issuer does, then counts what the joiner sends.
+// A host presenting `tls`'s leaf that offers `ca` as a member does, then counts what the joiner sends.
 task::task<std::size_t> impostor(tcp::acceptor &listener, std::shared_ptr<asio::ssl::context> tls, X509 *ca, task::scheduler_ref loop) {
 	auto [error, socket] = co_await task::await_asio<void(asio::error_code, tcp::socket)>(
 		[&](auto h) { listener.async_accept(std::move(h)); });
@@ -614,8 +616,11 @@ task::task<std::size_t> impostor(tcp::acceptor &listener, std::shared_ptr<asio::
 	join_detail::Bounded bound(loop, 3000ms, stream);
 	std::size_t received = 0;
 	try {
+		(void)co_await join_detail::read_bytes(stream.next_layer(), join_magic.size());
 		co_await join_detail::handshake(stream, asio::ssl::stream_base::server);
-		co_await join_detail::write_frame(stream, join_detail::der(ca));
+		Identity cluster{};
+		cluster.fill('K');
+		co_await join_detail::write_frame(stream, encode_join_offer({cluster, {join_detail::der(ca)}}));
 		char buffer[512];
 		auto [ended, n] = co_await task::await_asio<void(asio::error_code, std::size_t)>(
 			[&](auto h) { stream.async_read_some(asio::buffer(buffer), std::move(h)); });
@@ -631,63 +636,111 @@ std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> key_of(const std::string &na
 	assert(k);
 	return k;
 }
+template <class F> std::optional<JoinFault> fault_of(F f) {
+	try {
+		f();
+	} catch (const JoinRefused &e) {
+		std::printf("  %s\n", e.what());
+		return e.fault;
+	}
+	return std::nullopt;
+}
 
+// Token v2 and the DTJN0002 exchange (A1, A2): the member serves joins on its own acceptor here.
 void issue_case() {
 	Host one(1, "n1", 2);
 	one.start();
 	const auto ca = certificate("ca");
-	auto token = fresh_join_token(ca.get());
+	Identity cluster{};
+	cluster.fill('K');  // Host's
+	const auto token = fresh_join_token(cluster, ca.get());
 	const auto text = encode_join_token(token);
-	check(decode_join_token(text) == token && text.size() == 132 && !decode_join_token(text.substr(1)),
-		  "the token prints as 132 characters and reads back");
-	std::atomic<std::uint64_t> issued{0};
-	Issuer issuer(one.tls, ca.get(), key_of("ca").get(), ClusterCa(one.tls->native_handle(), 1).prefix(), token.secret,
-				  {.assign = [](NodeId requested) { return requested >= 5 && requested <= 9 ? requested : NodeId{0}; },
-				   .issued = [&](NodeId, X509 *) { ++issued; }});
-	// The issuer serves on its own acceptor on node 1's loop 0.
+	check(decode_join_token(text) == token && text.size() == join_token_size && join_token_size == 168,
+		  "the token prints as 168 characters and reads back");
+	const std::string v1 = "DTJT" + text.substr(8 + 32, 128);  // version 1's shape: DTJT, the CA and the secret in hex
+	check(fault_of([&] { decode_join_token(v1); }) == JoinFault::version, "a version 1 token is refused: version");
+	check(fault_of([&] { decode_join_token("DTJT0003" + text.substr(8)); }) == JoinFault::version,
+		  "a token of another version is refused: version");
+	check(fault_of([&] { decode_join_token(text.substr(1)); }) == JoinFault::malformed &&
+			  fault_of([&] { decode_join_token(text.substr(0, 20) + "zz" + text.substr(22)); }) == JoinFault::malformed,
+		  "a cut or non-hex token is refused: malformed");
+
+	// The root's side: the secret's digest, a node per key (idempotent), asynchronous.
+	auto loop0 = task::scheduler_ref::of(one.loops[0]->scheduler);
+	const auto digest = join_secret_digest(token.secret);
+	std::mutex assigned_mutex;
+	std::map<Fingerprint, NodeId> assigned;
+	std::atomic<int> assigns{0};
+	Issuer issuer(ca.get(), key_of("ca").get(), ClusterCa(one.tls->native_handle(), 1).prefix(),
+				  [&](const JoinRequest &r) -> task::task<Issuer::Assignment> {
+					  ++assigns;
+					  late_deadline relay(loop0, 20ms);  // the relay to the root's leader
+					  co_await relay.wait();
+					  if (!join_secret_matches(digest, r.secret))
+						  co_return Issuer::Assignment{0, JoinFault::token, {}};
+					  if (r.requested == 1)
+						  co_return Issuer::Assignment{0, JoinFault::refused, "name"};
+					  std::lock_guard hold(assigned_mutex);
+					  const auto [it, fresh] = assigned.try_emplace(r.key, NodeId(5 + assigned.size()));
+					  co_return Issuer::Assignment{it->second, JoinFault::refused, {}};
+				  });
+	JoinService service(one.tls, cluster, [&](JoinRequest r) { return issuer.issue(std::move(r)); });
 	auto &at = *one.loops[0];
 	tcp::acceptor acceptor(at.io, {asio::ip::address_v4::loopback(), 0});
 	const tcp::endpoint endpoint = acceptor.local_endpoint();
-	auto loop0 = task::scheduler_ref::of(at.scheduler);
 	asio::post(at.io, [&] {
-		task::spawn(loop0, [](tcp::acceptor &acceptor, Issuer &issuer, task::scheduler_ref loop) -> task::task<void> {
+		task::spawn(loop0, [](tcp::acceptor &acceptor, JoinService &service, task::scheduler_ref loop) -> task::task<void> {
 			for (;;) {
 				auto [error, socket] = co_await task::await_asio<void(asio::error_code, tcp::socket)>(
 					[&](auto h) { acceptor.async_accept(std::move(h)); });
 				if (error || !socket)
 					co_return;
-				task::spawn(loop, issuer.serve(std::move(*socket), loop), [](std::exception_ptr, std::optional<NodeId>) {});
+				task::spawn(loop, service.serve(std::move(*socket), loop), [](std::exception_ptr, std::optional<NodeId>) {});
 			}
-		}(acceptor, issuer, loop0));
+		}(acceptor, service, loop0));
 	});
 
 	Loop joiner;
 	joiner.thread = std::thread([&] { joiner.io.run(); });
-	auto attempt = [&](JoinToken t, NodeId requested) -> std::optional<JoinFault> {
-		try {
-			run(joiner, join(joiner.io.get_executor(), task::scheduler_ref::of(joiner.scheduler), endpoint, std::move(t), requested));
-		} catch (const JoinRefused &e) {
-			std::printf("  %s\n", e.what());
-			return e.fault;
-		}
-		return std::nullopt;
+	const auto key = fresh_join_key();
+	const auto dir = fixture / "joined5";
+	std::filesystem::remove_all(dir);
+	save_join_key(dir, key);
+	auto joining = [&](JoinToken t, std::string k, NodeId requested = 0) {
+		return join(joiner.io.get_executor(), task::scheduler_ref::of(joiner.scheduler), endpoint, std::move(t), std::move(k),
+					"detail", requested);
+	};
+	auto attempt = [&](JoinToken t, NodeId requested = 0) {
+		return fault_of([&] { run(joiner, joining(std::move(t), key, requested)); });
 	};
 	auto wrong = token;
 	wrong.secret[0] ^= 1;
-	check(attempt(wrong, 5) == JoinFault::token && issuer.refused(JoinFault::token) == 1, "a wrong token is refused: token");
-	check(attempt({token.ca, ""}, 5) == JoinFault::token && issuer.refused(JoinFault::token) == 2, "a missing token is refused: token");
-	check(attempt({pin_of("rogue"), token.secret}, 5) == JoinFault::ca && issuer.refused(JoinFault::token) == 2,
-		  "a token of another CA is refused by the joiner before its secret goes out: ca");
-	check(attempt(token, 1) == JoinFault::node && issuer.refused(JoinFault::node) == 1, "a node the hook refuses: node");
+	check(attempt(wrong) == JoinFault::token && service.refused(JoinFault::token) == 1, "a wrong secret is refused: token");
+	check(attempt({cluster, token.ca, ""}) == JoinFault::token && service.refused(JoinFault::token) == 2,
+		  "a missing secret is refused: token");
+	auto elsewhere = token;
+	elsewhere.cluster.fill('X');
+	check(attempt(elsewhere) == JoinFault::cluster && service.refused(JoinFault::token) == 2 && assigns == 2,
+		  "a token of another cluster is refused by the joiner before its secret goes out: cluster");
+	check(attempt({cluster, key_pin(certificate("rogue").get()), token.secret}) == JoinFault::ca && assigns == 2,
+		  "a token pinning another CA key is refused by the joiner before its secret goes out: ca");
+	std::string reason;
+	try {
+		run(joiner, joining(token, key, 1));
+	} catch (const JoinRefused &e) {
+		std::printf("  %s\n", e.what());
+		reason = e.fault == JoinFault::refused ? e.reason : "";
+	}
+	check(reason == "name" && service.refused(JoinFault::refused) == 1, "a node the hook refuses: refused, with its reason");
 	{
-		// The CA certificate is public: a host with another CA's leaf (rogue3) replays it.
+		// The CA certificate is public: a host with another CA's leaf (rogue3) offers it.
 		Loop fake;
 		fake.thread = std::thread([&] { fake.io.run(); });
 		tcp::acceptor listener(fake.io, {asio::ip::address_v4::loopback(), 0});
 		auto received = start(fake, impostor(listener, context("rogue3"), ca.get(), task::scheduler_ref::of(fake.scheduler)));
 		std::optional<JoinFault> fault;
 		try {
-			run(joiner, join(joiner.io.get_executor(), task::scheduler_ref::of(joiner.scheduler), listener.local_endpoint(), token, 5));
+			run(joiner, join(joiner.io.get_executor(), task::scheduler_ref::of(joiner.scheduler), listener.local_endpoint(), token, key));
 		} catch (const JoinRefused &e) {
 			std::printf("  %s\n", e.what());
 			fault = e.fault;
@@ -696,15 +749,27 @@ void issue_case() {
 		}
 		const auto bytes = received.get();
 		std::printf("  the impostor received %zu bytes\n", bytes);
-		check(fault == JoinFault::ca && !bytes, "an impostor replaying the CA certificate is refused before the secret goes out: ca");
+		check(fault == JoinFault::ca && !bytes, "an impostor offering the CA certificate is refused before the secret goes out: ca");
 		fake.join();
 	}
-	check(!issued, "nothing was issued");
+	check(!issuer.signatures(), "nothing was signed");
 
-	const auto joined = run(joiner, join(joiner.io.get_executor(), task::scheduler_ref::of(joiner.scheduler), endpoint, token, 5));
-	check(joined.node == 5 && issued == 1, "the token's holder is issued node 5's certificate");
-	const auto files = joined.save(fixture / "joined5");
-	check(files.certificate_authority == (fixture / "joined5" / "ca.pem").string(), "it keeps the key, certificate and CA it was handed");
+	// Two joins with the saved key at once, then a retry with it: one node, one certificate.
+	auto first = start(joiner, joining(token, key));
+	auto second = start(joiner, joining(token, key));
+	const auto a = first.get(), b = second.get();
+	const auto retried = run(joiner, joining(token, key));
+	std::printf("  nodes %llu %llu %llu, %llu signatures\n", (unsigned long long)a.node, (unsigned long long)b.node,
+				(unsigned long long)retried.node, (unsigned long long)issuer.signatures());
+	check(a.node == 5 && b.node == 5 && retried.node == 5 && a.certificate == b.certificate &&
+			  a.certificate == retried.certificate && issuer.signatures() == 1,
+		  "two joins with the same saved key and a retry get node 5 and one certificate");
+	const auto six = run(joiner, joining(token, fresh_join_key()));
+	check(six.node == 6 && issuer.signatures() == 2, "another key is another node");
+	check(a.key == key, "the joined node keeps the key its caller saved");
+	const auto files = a.save(dir);
+	check(files.certificate_authority == (dir / "ca.pem").string() && files.private_key == (dir / "node.key").string(),
+		  "it keeps the key, certificate and CA it was handed");
 	{
 		Host five(5, "joined5/node", 2);
 		five.start();
@@ -798,6 +863,43 @@ void save_case() {
 		  "a failed write throws, naming the key");
 	check(!std::filesystem::exists(dir / "node.key") && !staged(), "and leaves no key behind");
 
+	// A save over a whole one, the process killed (SIGXFSZ) while writing one file: every file
+	// reads whole, the old bytes or the new, and the one being written reads old.
+	const auto read = [&](const char *name) {
+		std::ifstream in(dir / name, std::ios::binary);
+		return std::string(std::istreambuf_iterator<char>(in), {});
+	};
+	const auto killed = [&](const Joined &next) {
+		std::fflush(stdout);
+		const pid_t child = ::fork();
+		if (!child) {
+			::signal(SIGXFSZ, SIG_DFL);
+			const rlimit none{0, 0}, small{1024, 1024};
+			::setrlimit(RLIMIT_CORE, &none);
+			::setrlimit(RLIMIT_FSIZE, &small);
+			try {
+				next.save(dir);
+			} catch (...) {
+				::_exit(1);
+			}
+			::_exit(0);
+		}
+		int status = 0;
+		::waitpid(child, &status, 0);
+		return WIFSIGNALED(status) && WTERMSIG(status) == SIGXFSZ;
+	};
+	const Joined old{5, "old key\n", "old certificate\n", "old ca\n"};
+	fresh();
+	old.save(dir);
+	check(killed({5, std::string(4096, 'k'), "new certificate\n", "new ca\n"}) && read("node.key") == old.key &&
+			  read("ca.pem") == old.ca && read("node.pem") == old.certificate,
+		  "killed writing the key: the old key, CA and certificate read whole");
+	fresh();
+	old.save(dir);
+	check(killed({5, "new key\n", std::string(4096, 'c'), "new ca\n"}) && read("node.key") == "new key\n" &&
+			  read("ca.pem") == "new ca\n" && read("node.pem") == old.certificate,
+		  "killed writing the certificate, the last: the new key and CA, the old certificate whole");
+
 	// A directory it cannot write: the first file's creation fails.
 	if (::geteuid() == 0) {
 		std::printf("  as root, every directory is writable: the unwritable directory is skipped\n");
@@ -813,7 +915,7 @@ void save_case() {
 	}
 	std::filesystem::permissions(dir, std::filesystem::perms::owner_all);
 	std::printf("  an unwritable directory: %s\n", what.empty() ? "returned" : what.c_str());
-	check(what.find("node.pem") != std::string::npos, "an unwritable directory throws, naming node.pem");
+	check(what.find("node.key") != std::string::npos, "an unwritable directory throws, naming node.key, the first");
 	std::filesystem::remove_all(dir);
 }
 } // namespace

@@ -9,8 +9,8 @@
 //   lane-only   two nodes that share no group: a streamed call dials Bulk alone, completes, and
 //               no group's counter moves
 //   stream      a 32 MiB request streams under the lane's credit (the sender's queued bytes within
-//               one window) while heartbeats on Control keep every gap under 1,000 ms (control:
-//               rpc-past-credit)
+//               one window) while heartbeats on Control keep every gap under 1,000 ms plus the
+//               host's lag (control: rpc-past-credit)
 //   local-throw a handler and a body consumer that throw fail their own call handler_failed; the
 //               Bulk connection, a group's frames on it and the next call go on (control:
 //               local-throw-closes)
@@ -308,7 +308,8 @@ bool group_full() {
 		std::this_thread::sleep_for(50ms);
 	}
 	const auto stalled = delivered.load();
-	const auto bound = 250 + lag.worst.load();
+	const auto lagged = lag.stop();
+	const auto bound = 250 + lagged;
 	held = false;
 	until([&] { return delivered == 100; }, 30s);
 	one.stop();
@@ -316,7 +317,7 @@ bool group_full() {
 	const bool ok = full && done == 15 && stalled == 0 && worst < bound && delivered == 100;
 	std::printf("group-full: group 1's credit full (%s, %llu bytes uncredited as the calls began); %llu of 15 calls, largest latency %llu ms of %llu allowed (250 plus the host's %llu ms of lag); group 1 delivered %llu as the calls ended, %llu of 100 after %s\n",
 				full ? "yes" : "no", (unsigned long long)uncredited, (unsigned long long)done, (unsigned long long)worst,
-				(unsigned long long)bound, (unsigned long long)lag.worst.load(), (unsigned long long)stalled,
+				(unsigned long long)bound, (unsigned long long)lagged, (unsigned long long)stalled,
 				(unsigned long long)delivered.load(), ok ? "ok" : "FAILED");
 	return ok;
 }
@@ -348,12 +349,14 @@ bool call_full() {
 	const bool full = until([&] { return two.transport->serving_pool().used() >= 4u << 20 && one.at(2, [&] { return one.transport->sendable(c->out.call); }) == 0; }, 5s);
 	const auto before = beats.count.load();
 	beats.worst = 0;
+	Lag lag;
 	const auto start = steady::now();
 	for (std::int64_t tick = 0; ms_since(start) < 3000; ++tick) {
 		heartbeat();
 		std::this_thread::sleep_until(start + (tick + 1) * 100ms);
 	}
 	std::this_thread::sleep_for(150ms);
+	const auto lagged = lag.stop();
 	const std::size_t held = two.transport->serving_pool().used();
 	const std::uint64_t sent = one.at(2, [&] { return c->out.sent; });
 	one.at(2, [&] {
@@ -363,9 +366,11 @@ bool call_full() {
 	const bool freed = until([&] { return pools_empty(two); }, 2s);
 	one.stop();
 	two.stop();
-	const bool ok = full && beats.worst < 1000 && beats.count - before >= 25 && freed;
-	std::printf("call-full: the unread call sent %llu bytes, its server holds %zu bytes of serving pool; group 2 got %llu heartbeats, longest gap %llu ms; pool freed after the cancel: %s %s\n",
-				(unsigned long long)sent, held, (unsigned long long)(beats.count - before), (unsigned long long)beats.worst,
+	const auto bound = 1000 + lagged;
+	const bool ok = full && beats.worst < bound && beats.count - before >= 25 && freed;
+	std::printf("call-full: the unread call sent %llu bytes, its server holds %zu bytes of serving pool; group 2 got %llu heartbeats, longest gap %llu ms of %llu allowed (1000 plus the host's %llu ms of lag); pool freed after the cancel: %s %s\n",
+				(unsigned long long)sent, held, (unsigned long long)(beats.count - before), (unsigned long long)beats.worst, (unsigned long long)bound,
+				(unsigned long long)lagged,
 				freed ? "yes" : "no", ok ? "ok" : "FAILED");
 	return ok;
 }
@@ -416,10 +421,12 @@ bool stream() {
 	one.start();
 	two.start();
 	const auto hb = one.transport->loop_of_group(g);
-	auto heartbeat = [&] { one.post(hb, [&] { one.transport->send(hb, LinkLane::Control, FrameKind::control, {g, 1, 2}, 2, "beat"); }); };
+	std::uint64_t posted = 0;
+	auto heartbeat = [&] { ++posted; one.post(hb, [&] { one.transport->send(hb, LinkLane::Control, FrameKind::control, {g, 1, 2}, 2, "beat"); }); };
 	if (!until([&] { heartbeat(); return beats.count > 0; }, 10s))
 		return false;
 	beats.worst = 0;
+	Lag lag;
 	const auto start = steady::now();
 	auto c = start_call(one, 2, sink, body, 60s);
 	for (std::int64_t tick = 0; !c->done && ms_since(start) < 60'000; ++tick) {
@@ -427,15 +434,21 @@ bool stream() {
 		std::this_thread::sleep_until(start + (tick + 1) * 100ms);
 	}
 	const auto elapsed = std::max<std::uint64_t>(1, ms_since(start));
+	// Control is in order: once a heartbeat posted after the stream arrives, every delayed one has.
+	heartbeat();
+	const bool arrived = until([&] { return beats.count >= posted; }, 10s);
+	const auto lagged = lag.stop();
 	const auto served = server.last();
 	const auto window = HostTransportOptions{}.rpc.lane.window;
 	const auto serving = two.transport->serving_pool().high_water(), outgoing = one.transport->outgoing_pool().high_water();
+	const auto bound = 1000 + lagged;
 	const bool ok = c->done && c->status.outcome == rpc::Outcome::ok && !c->out.failed && served && served->received == body &&
-					!served->mismatched && beats.worst < 1000 && serving <= window && outgoing <= window;  // queued within one credit
-	std::printf("stream: %llu MiB in %llu ms (%.1f MB/s), outcome %d, the server read %llu bytes, %llu mismatched; heartbeats' longest gap %llu ms; serving high water %zu (window %zu), outgoing %zu %s\n",
+					!served->mismatched && arrived && beats.worst < bound && serving <= window && outgoing <= window;  // queued within one credit
+	std::printf("stream: %llu MiB in %llu ms (%.1f MB/s), outcome %d, the server read %llu bytes, %llu mismatched; heartbeats' longest gap %llu ms of %llu allowed (1000 plus the host's %llu ms of lag), the last %s; serving high water %zu (window %zu), outgoing %zu %s\n",
 				(unsigned long long)(body >> 20), (unsigned long long)elapsed, double(body) / 1e3 / double(elapsed),
 				int(c->status.outcome), (unsigned long long)(served ? served->received.load() : 0),
-				(unsigned long long)(served ? served->mismatched.load() : 0), (unsigned long long)beats.worst, serving, window, outgoing,
+				(unsigned long long)(served ? served->mismatched.load() : 0), (unsigned long long)beats.worst, (unsigned long long)bound,
+				(unsigned long long)lagged, arrived ? "arrived" : "LOST", serving, window, outgoing,
 				ok ? "ok" : "FAILED");
 	one.stop();
 	two.stop();
@@ -880,7 +893,8 @@ bool fetch() {
 	}
 	const bool table = ended && !missing->error && !missing->bytes && throws->error == std::errc::io_error &&
 					   huge->error == std::errc::message_size && busy >= 1 && busy + slow_ok == 5;
-	const auto bound = 1000 + lag.worst.load();
+	const auto lagged = lag.stop();
+	const auto bound = 1000 + lagged;
 	const bool ok = exact && beside > 0 && beats.worst < bound && table;
 	const auto big_error = !big || !big->done ? std::string("not done") : big->error ? big->error.message() : std::string("ok");
 	std::printf("fetch: 16 MiB arrived exact %s (%s) in %llu ms beside %llu MiB of group uploads on Bulk; links %llu+%llu, "
@@ -890,7 +904,7 @@ bool fetch() {
 				(unsigned long long)one.total(&HostTransportStats::links), (unsigned long long)two.total(&HostTransportStats::links),
 				(unsigned long long)(one.total(&HostTransportStats::dropped) + two.total(&HostTransportStats::dropped)),
 				(unsigned long long)(one.total(&HostTransportStats::overrun) + two.total(&HostTransportStats::overrun)),
-				(unsigned long long)beats.worst, (unsigned long long)bound, (unsigned long long)lag.worst.load(),
+				(unsigned long long)beats.worst, (unsigned long long)bound, (unsigned long long)lagged,
 				!missing->error && !missing->bytes ? "nullopt" : "WRONG", throws->error.message().c_str(), huge->error.message().c_str(), slow_ok,
 				busy, ok ? "ok" : "FAILED");
 	one.stop();

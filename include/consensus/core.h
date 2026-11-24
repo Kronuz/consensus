@@ -287,14 +287,12 @@ public:
 	}
 	// D3: the removal of a committed replacement's leaving member, which the leader's next
 	// admitted Tick proposes; the Worker plans that Tick as this change (one configuration append).
-	// None while its entry does not fit the retained log.
 	std::optional<Membership> removal() const {
 		const auto& committed = committed_membership();
 		if (!started_ || role_ != Role::Leader || busy() || !committed.leaving || committed != membership() || log_term(durable_.commit_index) != hard_.term) { return std::nullopt; }
 		Membership next = committed;
 		std::erase_if(next.members, [&](const Member& x) { return x.incarnation == committed.leaving; });
 		next.leaving = 0;
-		if (!configuration_fits(encode_membership(next).size())) { return std::nullopt; }
 		return next;
 	}
 	// A member's matched index, as the leader knows it (D8).
@@ -343,7 +341,10 @@ public:
 		if (entries_.retired_entries()) { return now_; }  // each step retires a slice of erased entries
 		if (resting_) { return maximum; }
 		if (role_ != Role::Leader) { return std::min({is_voter(configuration_.local) && hard_.term != maximum ? election_deadline_ : maximum, acknowledge_at_, install_deadline(), forwarded_deadline()}); }
-		if (removal() || (!transfer_ && witness_self() && handoff_target())) { return now_; }  // D3, D9: no clock, only a drive
+		// D3, D9: no clock, only a drive. A removal is due once its entry fits: nothing is left to
+		// retire here, so the Tick's step frees no more room than this sees.
+		if (auto next = removal(); next && configuration_fits(encode_membership(*next).size())) { return now_; }
+		if (!transfer_ && witness_self() && handoff_target()) { return now_; }
 		auto at = peers_.empty() ? maximum : heartbeat_deadline_;  // a leader with nobody to heartbeat sleeps
 		auto later = [&](std::uint64_t base, std::uint64_t delay) {
 			const auto due = delay > maximum - base ? maximum : base + delay;
@@ -405,9 +406,9 @@ public:
 
 	Actions step(Event event) {
 		if (retiring_) { return {}; }
-		retire_log();
 		Actions output;
 		if (role_ == Role::Fenced) { return output; }
+		retire_log();
 		try {
 			const bool rested = resting_; const auto followed = std::pair{hard_.term, leader_}; const auto held = std::pair{last_index(), hard_.commit_index};
 			if (resting_ && wakes(event)) { wake(output); }

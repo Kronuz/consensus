@@ -364,6 +364,9 @@ struct HostTransportStats {
 	std::atomic<std::uint64_t> gone{0};
 	// The receive bound: connections ended for data past a group's window, control frames refused.
 	std::atomic<std::uint64_t> overrun{0}, flooded{0};
+	// Links ended by a dead_after rule: the peer sent nothing (dead), or a write waited with no
+	// drain (stuck); and by any other failure (a socket, TLS or framing error, or an abort).
+	std::atomic<std::uint64_t> dead{0}, stuck{0}, failed{0};
 };
 
 // A loop of the host: where its tasks run and its sockets wait.
@@ -1148,6 +1151,11 @@ class HostTransport {
 		feed(k, lane);
 	}
 	void ended(std::uint32_t k, const Link &link) {
+		auto &stats = loops_[k].stats;
+		const auto end = link.connection->end();
+		stats.dead += end == ConnectionEnd::dead;
+		stats.stuck += link.connection->stuck();
+		stats.failed += end == ConnectionEnd::failed && !link.connection->stuck();
 		auto &lane = loops_[k].lanes[{link.peer, link.lane}];
 		if (lane.link != &link)
 			return;

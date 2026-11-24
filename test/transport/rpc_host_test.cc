@@ -898,10 +898,13 @@ bool fetch() {
 	const bool ok = exact && beside > 0 && beats.worst < bound && table;
 	const auto big_error = !big || !big->done ? std::string("not done") : big->error ? big->error.message() : std::string("ok");
 	std::printf("fetch: 16 MiB arrived exact %s (%s) in %llu ms beside %llu MiB of group uploads on Bulk; links %llu+%llu, "
-				"dropped %llu, overrun %llu; heartbeats' longest gap %llu ms of %llu allowed (1000 plus the host's %llu ms of lag); missing %s, "
+				"ended dead %llu, stuck %llu, failed %llu; dropped %llu, overrun %llu; heartbeats' longest gap %llu ms of %llu allowed (1000 plus the host's %llu ms of lag); missing %s, "
 				"a throwing reader %s, 48 MiB over 32 MiB %s, five 4 MiB at once: %d ok, %d refused %s\n",
 				exact ? "yes" : "NO", big_error.c_str(), (unsigned long long)fetched_ms, (unsigned long long)(beside >> 20),
 				(unsigned long long)one.total(&HostTransportStats::links), (unsigned long long)two.total(&HostTransportStats::links),
+				(unsigned long long)(one.total(&HostTransportStats::dead) + two.total(&HostTransportStats::dead)),
+				(unsigned long long)(one.total(&HostTransportStats::stuck) + two.total(&HostTransportStats::stuck)),
+				(unsigned long long)(one.total(&HostTransportStats::failed) + two.total(&HostTransportStats::failed)),
 				(unsigned long long)(one.total(&HostTransportStats::dropped) + two.total(&HostTransportStats::dropped)),
 				(unsigned long long)(one.total(&HostTransportStats::overrun) + two.total(&HostTransportStats::overrun)),
 				(unsigned long long)beats.worst, (unsigned long long)bound, (unsigned long long)lagged,

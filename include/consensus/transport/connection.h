@@ -98,6 +98,8 @@ class Connection {
 	std::uint64_t keepalives_received() const noexcept { return keepalives_received_; }
 	// Write waits that reached dead_after with the send queue drained: a slow reader, kept.
 	std::uint64_t drained_expiries() const noexcept { return drained_expiries_; }
+	// The stuck rule ended it: a write waited dead_after and the send queue did not drain.
+	bool stuck() const noexcept { return stuck_; }
 	const asio::ip::tcp::socket &socket() const noexcept { return socket_; }
 	// Its TLS session, for checks of the peer's certificate on the connection's loop.
 	SSL *native_handle() const noexcept { return ssl_.get(); }
@@ -264,8 +266,12 @@ class Connection {
 		try {
 			co_await want(error, stuck.token(), what);
 		} catch (...) {
-			if (stuck.state() != late_deadline::outcome::expired || end_ != ConnectionEnd::open || !drained(before))
+			if (stuck.state() != late_deadline::outcome::expired || end_ != ConnectionEnd::open)
 				throw;
+			if (!drained(before)) {
+				stuck_ = true;
+				throw;
+			}
 			++drained_expiries_;
 		}
 	}
@@ -392,7 +398,8 @@ class Connection {
 	late_deadline *writer_wake_ = nullptr;
 	std::uint64_t keepalives_sent_ = 0, keepalives_received_ = 0, drained_expiries_ = 0;
 	ConnectionEnd end_ = ConnectionEnd::open;
-	// dead_: the reader failed at its dead-peer deadline, nothing arrived within dead_after.
-	bool dialer_, closing_ = false, reading_done_ = false, writing_done_ = false, dead_ = false;
+	// dead_: the reader failed at its dead-peer deadline, nothing arrived within dead_after;
+	// stuck_: the writer failed at the stuck rule's.
+	bool dialer_, closing_ = false, reading_done_ = false, writing_done_ = false, dead_ = false, stuck_ = false;
 };
 } // namespace kronuz::consensus::transport

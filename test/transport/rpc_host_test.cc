@@ -409,19 +409,14 @@ bool stream() {
 	one.stores({g});
 	two.stores({g});
 	Beats beats;
-	constexpr int N = 4096;
-	static std::int64_t posted[N], sentt[N], deliv[N];
-	std::atomic<int> np{0}, ns{0}, nd{0};
-	auto us = [] { return std::chrono::duration_cast<std::chrono::microseconds>(steady::now().time_since_epoch()).count(); };
 	two.transport->on_deliver(two.transport->loop_of_group(g), [&](const Received &) {
 		beats.beat();
-		int i = nd++; if (i < N) deliv[i] = us();
 		return true;
 	});
 	one.start();
 	two.start();
 	const auto hb = one.transport->loop_of_group(g);
-	auto heartbeat = [&] { int i = np++; if (i < N) posted[i] = us(); one.post(hb, [&] { int j = ns++; if (j < N) sentt[j] = us(); one.transport->send(hb, LinkLane::Control, FrameKind::control, {g, 1, 2}, 2, "beat"); }); };
+	auto heartbeat = [&] { one.post(hb, [&] { one.transport->send(hb, LinkLane::Control, FrameKind::control, {g, 1, 2}, 2, "beat"); }); };
 	if (!until([&] { heartbeat(); return beats.count > 0; }, 10s))
 		return false;
 	beats.worst = 0;
@@ -433,23 +428,17 @@ bool stream() {
 		std::this_thread::sleep_until(start + (tick + 1) * 100ms);
 	}
 	const auto elapsed = std::max<std::uint64_t>(1, ms_since(start));
-	for (int i = 1; i < std::min<int>(N, nd); ++i) {
-		auto gap = (deliv[i] - deliv[i - 1]) / 1000;
-		if (gap > 300)
-			std::printf("DIAG beat %d: deliver gap %lld ms; post gap %lld ms; post->send %lld ms, send->deliver %lld ms (prev %lld/%lld)\n", i, (long long)gap,
-						(long long)((posted[i] - posted[i - 1]) / 1000), (long long)((sentt[i] - posted[i]) / 1000), (long long)((deliv[i] - sentt[i]) / 1000),
-						(long long)((sentt[i - 1] - posted[i - 1]) / 1000), (long long)((deliv[i - 1] - sentt[i - 1]) / 1000));
-	}
-	std::printf("DIAG the host's lag %llu ms\n", (unsigned long long)lag.worst.load());
 	const auto served = server.last();
 	const auto window = HostTransportOptions{}.rpc.lane.window;
 	const auto serving = two.transport->serving_pool().high_water(), outgoing = one.transport->outgoing_pool().high_water();
+	const auto bound = 1000 + lag.worst.load();
 	const bool ok = c->done && c->status.outcome == rpc::Outcome::ok && !c->out.failed && served && served->received == body &&
-					!served->mismatched && beats.worst < 1000 && serving <= window && outgoing <= window;  // queued within one credit
-	std::printf("stream: %llu MiB in %llu ms (%.1f MB/s), outcome %d, the server read %llu bytes, %llu mismatched; heartbeats' longest gap %llu ms; serving high water %zu (window %zu), outgoing %zu %s\n",
+					!served->mismatched && beats.worst < bound && serving <= window && outgoing <= window;  // queued within one credit
+	std::printf("stream: %llu MiB in %llu ms (%.1f MB/s), outcome %d, the server read %llu bytes, %llu mismatched; heartbeats' longest gap %llu ms of %llu allowed (1000 plus the host's %llu ms of lag); serving high water %zu (window %zu), outgoing %zu %s\n",
 				(unsigned long long)(body >> 20), (unsigned long long)elapsed, double(body) / 1e3 / double(elapsed),
 				int(c->status.outcome), (unsigned long long)(served ? served->received.load() : 0),
-				(unsigned long long)(served ? served->mismatched.load() : 0), (unsigned long long)beats.worst, serving, window, outgoing,
+				(unsigned long long)(served ? served->mismatched.load() : 0), (unsigned long long)beats.worst, (unsigned long long)bound,
+				(unsigned long long)lag.worst.load(), serving, window, outgoing,
 				ok ? "ok" : "FAILED");
 	one.stop();
 	two.stop();

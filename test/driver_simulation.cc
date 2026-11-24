@@ -381,7 +381,7 @@ struct Simulation {
 	std::map<GroupId, std::uint64_t> snapshots_needed;
 	std::uint64_t transfer_frames = 0, validations = 0, refusals = 0, activations = 0, installs = 0;
 	std::uint64_t appends_sent = 0, appends_pipelined = 0, appends_reordered = 0, in_flight_max = 0;  // appends with entries
-	bool seed_pipelined = false;                                                                      // a second append went out before the first's answer
+	bool seed_pipelined = false;                                                                      // an append extended a flight still unanswered
 	Replication replication_;
 
 	void on_send(Node& n, GroupId g, Send notice) {
@@ -389,18 +389,28 @@ struct Simulation {
 		network_.push_back({n.id, notice.peer, g, std::move(notice.message), now_ + random_() % 6});
 		if (random_() % 50 == 0) { network_.push_back({n.id, notice.peer, g, network_.back().body, now_ + random_() % 30}); }  // duplicated
 	}
-	// A leader's appends with entries to one peer that are sent and not yet answered, in the
-	// same term; one older than a heartbeat's worth of silence is a lost answer, not a flight.
+	// A leader's flights to one peer: its appends with entries, sent and not yet answered, in one
+	// term. An append is pipelined when it extends an outstanding flight (its previous entry is
+	// that flight's last); any other append is a first flight or a resend, and starts the chain
+	// over, as the leader's reset does. A flight unanswered for a heartbeat is a lost answer.
 	void on_append_sent(Node& n, GroupId g, NodeId peer, const AppendRequest& a) {
 		auto& out = in_flight_[{n.id, peer, g}];
 		for (auto it = out.begin(); it != out.end();) { it = it->second.term != a.term || now_ > it->second.at + timing.heartbeat ? out.erase(it) : std::next(it); }
 		++appends_sent;
-		if (!out.empty()) { ++appends_pipelined; seed_pipelined = true; }
-		out[a.rpc] = {a.term, now_};
-		in_flight_max = std::max<std::uint64_t>(in_flight_max, out.size());
+		std::uint32_t depth = 1;
+		for (const auto& [rpc, f] : out) { if (f.through == a.previous) { depth = f.depth + 1; } }
+		if (depth > 1) { ++appends_pipelined; seed_pipelined = true; } else { out.clear(); }
+		if (depth > replication_.flow.pipeline) { fail("node " + std::to_string(n.id) + " has " + std::to_string(depth) + " appends of group " + std::to_string(g) + " in flight to node " + std::to_string(peer) + " at pipeline " + std::to_string(replication_.flow.pipeline)); }
+		out[a.rpc] = {a.term, now_, a.previous + a.entries.size(), depth};
+		in_flight_max = std::max<std::uint64_t>(in_flight_max, depth);
 	}
+	// The leader drops what a success covers, and every flight on a rejection (its reset).
 	void on_append_answered(NodeId leader, NodeId peer, GroupId g, const AppendResponse& r) {
-		if (auto it = in_flight_.find({leader, peer, g}); it != in_flight_.end()) { it->second.erase(r.rpc); }
+		auto it = in_flight_.find({leader, peer, g});
+		if (it == in_flight_.end() || !it->second.count(r.rpc)) { return; }
+		auto& out = it->second;
+		if (!r.success) { out.clear(); return; }
+		for (auto f = out.begin(); f != out.end();) { f = f->second.through <= r.matched ? out.erase(f) : std::next(f); }
 	}
 	// A follower's append that arrives after a later one of its leader's term.
 	void on_append_delivered(const Envelope& e, const AppendRequest& a) {
@@ -886,7 +896,7 @@ private:
 	std::vector<GroupId> groups_;
 	std::set<GroupId> witnessed_;  // groups whose third member is a witness
 	std::map<NodeId, Node> nodes_;
-	struct Sent { Term term; std::uint64_t at; };
+	struct Sent { Term term; std::uint64_t at; Index through; std::uint32_t depth; };
 	struct Delivered { Term term = 0; Token rpc = 0; };
 	std::map<std::tuple<NodeId, NodeId, GroupId>, std::map<Token, Sent>> in_flight_;  // leader, peer, group
 	std::map<std::tuple<NodeId, NodeId, GroupId>, Delivered> delivered_;              // leader, follower, group
@@ -954,7 +964,7 @@ bool run(std::uint64_t seeds, std::uint64_t steps, std::uint64_t first) {
 		(unsigned long long)repairs_cancelled, (unsigned long long)pending, repaired ? double(wait_total) / double(repaired) : 0.0, (unsigned long long)wait_max);
 	std::printf("  %llu SnapshotNeeded, %llu transfer frames, %llu images validated (%llu refused), %llu activated, %llu installs acknowledged\n",
 		(unsigned long long)needed, (unsigned long long)frames, (unsigned long long)validations, (unsigned long long)refusals, (unsigned long long)activations, (unsigned long long)installs);
-	std::printf("  %llu appends with entries sent, %llu of them with another in flight to the same peer (at most %llu); %llu delivered after a later one; %llu of %llu seeds at pipeline depth above 1 had a second append in flight\n",
+	std::printf("  %llu appends with entries sent, %llu of them extending a flight still unanswered to the same peer (at most %llu in flight); %llu delivered after a later one; %llu of %llu seeds at pipeline depth above 1 had a pipelined append\n",
 		(unsigned long long)sent, (unsigned long long)pipelined, (unsigned long long)deepest, (unsigned long long)reordered, (unsigned long long)deep_seeds_pipelined, (unsigned long long)deep_seeds);
 	return failures == 0;
 }

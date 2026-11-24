@@ -69,11 +69,15 @@ Follower batching (`follower_batch_entries` and `_bytes` at the simulation's `rp
 `rpc_bytes`) makes a follower hold the appends that arrive while its batch persists and step them
 as one `Receive`, so a Worker's merged-append path runs through a Driver.
 
-The summary's last line counts appends with entries: those sent while another to the same peer
-(same term, within a heartbeat) was unanswered, the most in flight, those delivered after a later
-one, and how many seeds at depth above 1 had a second append in flight.
+The summary's last line counts appends with entries: those that extend a flight to the same peer
+still unanswered (their previous entry is that flight's last; a resend or a first flight does not
+count, and a rejection or a covering success clears the flights as the leader does), the most in
+flight, those delivered after a later one, and how many seeds at depth above 1 had a pipelined
+append. A chain deeper than the seed's pipeline fails the seed, so a depth-1 run counts none.
 
-Two mutants of the follower's append handling (an overlapping append no longer skipped, an append
-accepted whatever its previous entry's term) fail this run within its first seeds; the follower's
-batching bounds and its held chain's contiguity are each also checked again by Core, so a mutant of
-only one of them is not observable.
+Mutants of append handling that this run kills: an overlapping append no longer skipped, and an
+append accepted whatever its previous entry's term (both also at depth 1); and, only when appends
+pipeline, a leader that takes a success for the pipeline's last flight instead of the answered one
+(a follower is then left behind its leader's count: the heal fails; depth 1 cannot tell it apart).
+The follower's batching bounds and its held chain's contiguity are each also checked again by Core,
+so a mutant of only one of them is not observable.

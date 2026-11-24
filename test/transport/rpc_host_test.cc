@@ -848,7 +848,7 @@ bool fetch() {
 	const auto probe_start = steady::now();
 	std::vector<std::string> samples;
 	LoopProbe loops{&one, &two};
-	KernelProbe kernel;
+	KernelProbe kernel, whole;
 	std::atomic<bool> sampling{true};
 	std::thread sampler([&] {
 		while (sampling) {
@@ -922,8 +922,8 @@ bool fetch() {
 	const bool ok = exact && beside > 0 && beats.worst < bound && table;
 	sampling = false;
 	sampler.join();
-	std::printf("probe: one's loop of node 2 is %u, two's of node 1 is %u, the beat's on two %u, uploads on two %u; worst stalls:%s\n",
-				one.transport->loop_of_node(2), two.transport->loop_of_node(1), hb, up, loops.summary().c_str());
+	std::printf("probe: one's loop of node 2 is %u, two's of node 1 is %u, the beat's on two %u, uploads on two %u; worst stalls:%s; kernel over the run:%s; sockets at the end:%s\n",
+				one.transport->loop_of_node(2), two.transport->loop_of_node(1), hb, up, loops.summary().c_str(), whole.sample().c_str(), sockets({one.port(), two.port()}).c_str());
 	if (!ok) {
 		for (auto &line : samples)
 			std::printf("%s\n", line.c_str());

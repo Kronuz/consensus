@@ -137,12 +137,10 @@ groups' snapshot frames:
   that call alone, so the connection stays and every other call on it goes on; past `fetches`
   (4) awaiting the node a fetch ends `resource_unavailable_try_again`, as does one a drain refused
   (`not_processed`); `timed_out` and `not_connected` pass through. A fetch is a read, so one whose
-  connection ends under it (`connection_aborted`: the peer silent for `dead_after`, a stuck write,
-  a socket or TLS failure, an abort, a new Bulk connection replacing it, a frame that breaks a
-  rule) is asked once more on the next connection, with the same deadline and `fetches` slot, and
-  ends as that call does; `connection_aborted` reaches `done` only when both connections end
-  (`fetches_asked_again` counts them). The oversize refusal so costs no other fetch even when
-  the connection ends meanwhile. Its reply
+  connection ends under it is asked once more, on a connection that is up, with the same deadline
+  and `fetches` slot; when none comes up it ends `connection_aborted` at once
+  ([A fetch whose connection ends](#a-fetch-whose-connection-ends)). The oversize refusal so
+  costs no other fetch even when the connection ends meanwhile. Its reply
   shares the lane's pools and Bulk's alternation with groups' data frames, so heartbeats on Control
   keep their gaps (`fetch`). `Peers` and `DTFT0001` stay until worker-pump-removal deletes them.
 - **Holds and lane_idle (T3, D7).** `hold(node)` dials Bulk to `node` and keeps it, sharing a
@@ -158,6 +156,31 @@ groups' snapshot frames:
   still live at `drain_deadline` (5 s) aborts the connection. `drain()` drains every lane for a
   shutdown before `stop()`: new calls end `not_processed`, and `lanes_drained(loop)` says when the
   loop's lanes are closed. `LaneStats::drains` and `retired` count them.
+
+### A fetch whose connection ends
+
+A connection ends under a fetch in one of these ways; the first row asks it again, and the
+second table gives what that ask ends with. A fetch is asked at most twice, and every row ends
+within `fetch_deadline`.
+
+| The connection ends | The fetch |
+|---|---|
+| The peer is silent for `dead_after`, a write is stuck, a socket or TLS failure, the peer's process is gone, a frame breaks a rule, a new Bulk connection replaces it, or a `reload` whose CAs no longer verify the peer's chain | asked again: the second table (`fetches_asked_again` counts it) |
+| This host drains past `drain_deadline` | `connection_aborted` at `drain_deadline`; not asked again |
+| `remove_node` | `connection_aborted` at once; not asked again |
+| `stop()` | `connection_aborted` at once; not asked again (a first ask still waiting for its connection ends `not_connected`) |
+| The fetcher's oversize refusal | not an end: a `Cancel` of that call alone, `message_size` |
+| The second connection ends too | `connection_aborted` at its end |
+
+| The second ask | The fetch |
+|---|---|
+| A Bulk connection is up, or the redial or the peer's dial brings one up | asked on it, and ends as that call ends: bytes, nullopt, `io_error`, `message_size`, `timed_out`, `resource_unavailable_try_again` (the peer drains), or `connection_aborted` |
+| The redial makes no connection: refused, unreachable (within `dial`, 5 s), or the TLS handshake fails, verification included | `connection_aborted` when that dial fails |
+| The redial loses the tie-break, or an incoming connection wins | waits for that connection: the first row |
+| The redial's hellos fail | `connection_aborted` at the next redial, `redial` (200 ms) later, when it makes no connection |
+| The peer refuses this node's boot or wire version | redials every `redial` and ends `timed_out` at `fetch_deadline`: the peer answers, so the connection is not what failed |
+| `remove_node`, `drain()` or `stop()` while it waits | `connection_aborted` at once |
+| `fetch_deadline` passes while it waits | `timed_out` |
 
 ## Evidence
 

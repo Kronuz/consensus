@@ -120,9 +120,9 @@ public:
 			const bool queued = !events_.empty() && std::pair{events_.top().at, events_.top().order} < std::pair{ticking->second->tick_at, ticking->second->tick_order};
 			if ((queued ? events_.top().at : ticking->second->tick_at) > until) { break; }
 			if (queued) {
-				auto event = std::move(const_cast<Scheduled&>(events_.top())); events_.pop();
+				const auto event = events_.top(); events_.pop();
 				now_ = event.at;
-				event.run();
+				run(event);
 			} else {
 				now_ = ticking->second->tick_at;
 				tick(ticking->first, *ticking->second);
@@ -133,8 +133,8 @@ public:
 		now_ = until;
 	}
 	// Links are directional: cut(a, b) drops what a sends to b.
-	void cut(NodeId from, NodeId to) { cut_.insert({from, to}); }
-	void heal() { cut_.clear(); }
+	void cut(NodeId from, NodeId to) { cut_ |= link(from, to); }
+	void heal() { cut_ = 0; }
 	void isolate(const std::set<NodeId>& side) {
 		for (auto& [a, x] : nodes_) {
 			for (auto& [b, y] : nodes_) { if (a != b && side.contains(a) != side.contains(b)) { cut(a, b); } }
@@ -196,12 +196,40 @@ private:
 		std::optional<std::uint64_t> hold_until;  // Core::next_deadline() since the core's last step, when holdable; 0 when not
 		std::uint64_t tick_at = 0, tick_order = 0;  // its one scheduled Tick, ordered with the queue's events
 	};
+	// A delivery (its message in messages_[value]), a persistence completing (its token), or an
+	// application (through its index).
+	enum class Kind : std::uint8_t { Deliver, Persisted, Applied };
 	struct Scheduled {
 		std::uint64_t at, order;
-		std::function<void()> run;
+		Kind kind; NodeId from, to; std::uint64_t value;
 		bool operator<(const Scheduled& o) const { return at != o.at ? at > o.at : order > o.order; }
 	};
-	void at(std::uint64_t when, std::function<void()> run) { events_.push({when, ++order_, std::move(run)}); }
+	void at(std::uint64_t when, Kind kind, NodeId from, NodeId to, std::uint64_t value) { events_.push({when, ++order_, kind, from, to, value}); }
+	static std::uint64_t link(NodeId from, NodeId to) { return std::uint64_t{1} << (from * 8 + to); }  // ids 1-5
+	std::uint64_t stash(Message message) {
+		if (spare_.empty()) { messages_.push_back(std::move(message)); return messages_.size() - 1; }
+		const auto slot = spare_.back(); spare_.pop_back(); messages_[slot] = std::move(message); return slot;
+	}
+	void run(const Scheduled& event) {
+		const NodeId id = event.to;
+		if (event.kind == Kind::Deliver) {
+			auto message = std::move(messages_[event.value]); spare_.push_back(event.value);
+			if (cut_ & link(event.from, id)) { return; }
+			step(id, Tick{now_, delay()});
+			auto& n = nodes_.at(id);
+			if (n.core->busy() || !n.inbox.empty()) { n.inbox.emplace_back(event.from, std::move(message)); return; }
+			step(id, Receive{event.from, std::move(message)});
+		} else if (event.kind == Kind::Persisted) {
+			step(id, Tick{now_, delay()}); step(id, Persisted{event.value});
+			auto& n = nodes_.at(id);
+			while (!n.inbox.empty() && !n.core->busy()) {
+				auto [from, message] = std::move(n.inbox.front()); n.inbox.erase(n.inbox.begin());
+				step(id, Receive{from, std::move(message)});
+			}
+		} else {
+			step(id, Applied{event.value});
+		}
+	}
 	void at_tick(std::uint64_t when, NodeId id) {
 		auto& n = nodes_.at(id);
 		if (!n.tick_order) { ticking_.emplace_back(id, &n); }
@@ -250,30 +278,16 @@ private:
 	void consume(NodeId id, Actions& actions) {
 		for (auto& action : actions) {
 			if (auto persist = std::get_if<Persist>(&action)) {
-				const Token token = persist->token;
-				at(now_ + barrier(), [this, id, token] {
-					step(id, Tick{now_, delay()}); step(id, Persisted{token});
-					auto& n = nodes_.at(id);
-					while (!n.inbox.empty() && !n.core->busy()) {
-						auto [from, message] = std::move(n.inbox.front()); n.inbox.erase(n.inbox.begin());
-						step(id, Receive{from, std::move(message)});
-					}
-				});
+				at(now_ + barrier(), Kind::Persisted, 0, id, persist->token);
 			} else if (auto send = std::get_if<Send>(&action)) {
 				const NodeId to = send->peer;
-				if (cut_.contains({id, to})) { continue; }
-				at(now_ + one_way(), [this, id, to, message = std::move(send->message)]() mutable {
-					if (cut_.contains({id, to})) { return; }
-					step(to, Tick{now_, delay()});
-					auto& n = nodes_.at(to);
-					if (n.core->busy() || !n.inbox.empty()) { n.inbox.emplace_back(id, std::move(message)); return; }
-					step(to, Receive{id, std::move(message)});
-				});
+				if (cut_ & link(id, to)) { continue; }
+				const auto when = now_ + one_way();
+				at(when, Kind::Deliver, id, to, stash(std::move(send->message)));
 			} else if (auto p = std::get_if<ProposalPlaced>(&action)) {
 				placed_[p->request] = p->index;
 			} else if (auto committed = std::get_if<Committed>(&action)) {
-				const Index through = committed->entries.back().index;
-				at(now_, [this, id, through] { step(id, Applied{through}); });
+				at(now_, Kind::Applied, 0, id, committed->entries.back().index);
 			} else if (std::holds_alternative<Fenced>(action)) {
 				check(false, "a node fenced");
 			}
@@ -285,7 +299,9 @@ private:
 	std::map<NodeId, Node> nodes_;
 	std::priority_queue<Scheduled> events_;
 	std::vector<std::pair<NodeId, Node*>> ticking_;  // each node with its Tick scheduled
-	std::set<std::pair<NodeId, NodeId>> cut_;
+	std::uint64_t cut_ = 0;  // link(from, to) bits: what from sends to to is dropped
+	std::vector<Message> messages_;  // messages in flight, by slot
+	std::vector<std::uint64_t> spare_;  // free slots of messages_
 	std::map<RequestId, Index> placed_;
 	std::uint64_t now_ = 0, order_ = 0, tick_ = 1;
 	RequestId request_ = 0;

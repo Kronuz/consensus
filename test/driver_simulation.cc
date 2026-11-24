@@ -394,25 +394,30 @@ struct Simulation {
 	// that flight's last); any other append is a first flight or a resend, and starts the chain
 	// over, as the leader's reset does. A flight unanswered for a heartbeat is a lost answer.
 	void on_append_sent(Node& n, GroupId g, NodeId peer, const AppendRequest& a) {
-		auto& out = in_flight_[{n.id, peer, g}];
-		for (auto it = out.begin(); it != out.end();) { it = it->second.term != a.term || now_ > it->second.at + timing.heartbeat ? out.erase(it) : std::next(it); }
+		auto& chain = chains_[{n.id, peer, g}];
+		if (chain.term != a.term) { chain = {a.term}; }
+		auto& out = chain.flights;
+		for (auto it = out.begin(); it != out.end();) { it = now_ > it->second.at + timing.heartbeat ? out.erase(it) : std::next(it); }
 		++appends_sent;
 		std::uint32_t depth = 1;
 		for (const auto& [rpc, f] : out) { if (f.through == a.previous) { depth = f.depth + 1; } }
 		if (depth > 1) { ++appends_pipelined; seed_pipelined = true; } else { out.clear(); }
 		if (depth > replication_.flow.pipeline) { fail("node " + std::to_string(n.id) + " has " + std::to_string(depth) + " appends of group " + std::to_string(g) + " in flight to node " + std::to_string(peer) + " at pipeline " + std::to_string(replication_.flow.pipeline)); }
-		out[a.rpc] = {a.term, now_, a.previous + a.entries.size(), depth};
+		out[a.rpc] = {now_, a.previous + a.entries.size(), depth};
 		in_flight_max = std::max<std::uint64_t>(in_flight_max, depth);
 	}
-	// The leader drops what any success covers (a heartbeat's too), and every flight on a
-	// rejection, as its reset does; an answer that is stale to the leader drops no more than that.
+	// The leader pops the flights up to the most any success has matched (a heartbeat's too), and
+	// drops every flight on a rejection, as its reset does; an answer stale to the leader pops no more.
 	void on_append_answered(NodeId leader, NodeId peer, GroupId g, const AppendResponse& r) {
-		auto it = in_flight_.find({leader, peer, g});
-		if (it == in_flight_.end()) { return; }
-		auto& out = it->second;
-		if (!r.success) { out.clear(); return; }
-		for (auto f = out.begin(); f != out.end();) { f = f->second.through <= r.matched ? out.erase(f) : std::next(f); }
+		auto it = chains_.find({leader, peer, g});
+		if (it == chains_.end() || it->second.term != r.term) { return; }
+		auto& chain = it->second;
+		if (!r.success) { chain.flights.clear(); return; }
+		chain.matched = std::max(chain.matched, r.matched);
+		for (auto f = chain.flights.begin(); f != chain.flights.end();) { f = f->second.through <= chain.matched ? chain.flights.erase(f) : std::next(f); }
 	}
+	// An installed image clears the leader's flights to that peer.
+	void on_snapshot_answered(NodeId leader, NodeId peer, GroupId g) { chains_.erase({leader, peer, g}); }
 	// A follower's append that arrives after a later one of its leader's term.
 	void on_append_delivered(const Envelope& e, const AppendRequest& a) {
 		if (a.entries.empty()) { return; }
@@ -651,6 +656,7 @@ private:
 		auto& l = to.loop_of(e.group);
 		if (auto* m = std::get_if<Message>(&e.body)) {
 			if (const auto* r = std::get_if<AppendResponse>(m)) { on_append_answered(e.to, e.from, e.group, *r); }
+			else if (std::holds_alternative<SnapshotResponse>(*m)) { on_snapshot_answered(e.to, e.from, e.group); }
 			else if (const auto* a = std::get_if<AppendRequest>(m)) { on_append_delivered(e, *a); }
 			l.driver->receive(e.group, Receive{e.from, *m});
 		}
@@ -897,9 +903,10 @@ private:
 	std::vector<GroupId> groups_;
 	std::set<GroupId> witnessed_;  // groups whose third member is a witness
 	std::map<NodeId, Node> nodes_;
-	struct Sent { Term term; std::uint64_t at; Index through; std::uint32_t depth; };
+	struct Sent { std::uint64_t at; Index through; std::uint32_t depth; };
+	struct Chain { Term term = 0; Index matched = 0; std::map<Token, Sent> flights; };
 	struct Delivered { Term term = 0; Token rpc = 0; };
-	std::map<std::tuple<NodeId, NodeId, GroupId>, std::map<Token, Sent>> in_flight_;  // leader, peer, group
+	std::map<std::tuple<NodeId, NodeId, GroupId>, Chain> chains_;  // leader, peer, group
 	std::map<std::tuple<NodeId, NodeId, GroupId>, Delivered> delivered_;              // leader, follower, group
 	std::deque<Envelope> network_;
 	std::set<NodeId> isolated_;

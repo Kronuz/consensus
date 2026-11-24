@@ -235,13 +235,12 @@ private:
 			} else if (auto send = std::get_if<Send>(&action)) {
 				const NodeId to = send->peer;
 				if (cut_.contains({id, to})) { continue; }
-				auto message = send->message;
-				at(now_ + one_way(), [this, id, to, message] {
+				at(now_ + one_way(), [this, id, to, message = std::move(send->message)]() mutable {
 					if (cut_.contains({id, to})) { return; }
 					step(to, Tick{now_, delay()});
 					auto& n = nodes_.at(to);
-					if (n.core->busy() || !n.inbox.empty()) { n.inbox.emplace_back(id, message); return; }
-					step(to, Receive{id, message});
+					if (n.core->busy() || !n.inbox.empty()) { n.inbox.emplace_back(id, std::move(message)); return; }
+					step(to, Receive{id, std::move(message)});
 				});
 			} else if (auto p = std::get_if<ProposalPlaced>(&action)) {
 				placed_[p->request] = p->index;

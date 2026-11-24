@@ -48,6 +48,10 @@ inline std::string encode(const kronuz::consensus::Message &message,
 				number(8);
 			else if constexpr (std::is_same_v<T, Gone>)
 				number(9);
+			else if constexpr (std::is_same_v<T, InstallRequest>)
+				number(10);
+			else if constexpr (std::is_same_v<T, InstallRequestResponse>)
+				number(11);
 			else
 				static_assert(!sizeof(T), "missing control wire tag");
 			number(value.term);
@@ -111,6 +115,16 @@ inline std::string encode(const kronuz::consensus::Message &message,
 				number(value.key.boundary.index);
 				number(value.key.boundary.term);
 				number(static_cast<unsigned>(value.result));
+			} else if constexpr (std::is_same_v<T, InstallRequest>) {
+				number(value.request);
+				number(value.base.index);
+				number(value.base.term);
+			} else if constexpr (std::is_same_v<T, InstallRequestResponse>) {
+				if (static_cast<unsigned>(value.result) > static_cast<unsigned>(InstallRequestReply::NotMember))
+					throw std::invalid_argument("invalid install request reply");
+				number(value.request);
+				number(static_cast<unsigned>(value.result));
+				number(value.leader);
 			}
 		},
 		message);
@@ -209,6 +223,20 @@ inline kronuz::consensus::Message decode(std::string_view bytes, kronuz::consens
 		if (!valid_snapshot_response(value))
 			throw Corruption("invalid snapshot correlation");
 		result = value;
+		break;
+	}
+	case 10: {
+		auto request = get64(bytes);
+		auto index = get64(bytes);
+		result = InstallRequest{term, request, {index, get64(bytes)}};
+		break;
+	}
+	case 11: {
+		auto request = get64(bytes);
+		auto outcome = get64(bytes);
+		if (outcome > static_cast<unsigned>(InstallRequestReply::NotMember))
+			throw Corruption("invalid install request reply");
+		result = InstallRequestResponse{term, request, static_cast<InstallRequestReply>(outcome), get64(bytes)};
 		break;
 	}
 	default:

@@ -39,6 +39,7 @@ struct WorkerLimits {
 	std::size_t foreground_burst = 16, scan_entries = 128; bool async_appends = false, async_storage = false;
 	std::size_t follower_batch_bytes = 0, follower_batch_entries = 0;
 	RetainedStatePolicy retained{};
+	Flow flow{};  // every Core's replication flow (pipeline depth, window, frame cap)
 };
 // epoch: Worker::epoch() when the application state was captured; a repair since then makes
 // the capture stale, and the core rejects it.
@@ -147,7 +148,7 @@ public:
 			// A new directory has only the bounded bootstrap names; a tiny
 			// configured scan budget can require several startup slices.
 			initialization_ = initial_record();
-			core_ = std::make_unique<Core>(configuration_, initial_state(), limits_, timing_, Flow{}, scheduling_.retained);
+			core_ = std::make_unique<Core>(configuration_, initial_state(), limits_, timing_, scheduling_.flow, scheduling_.retained);
 		} catch (const std::exception& error) { fail(error.what()); throw; }
 	}
 	template <class Restore> void recover(Restore restore_application) {
@@ -175,8 +176,8 @@ public:
 				// Generic bootstrap is already durable; typed initialization may
 				// have been queued when the previous process exited.
 				initialization_ = initial_record();
-				core_ = std::make_unique<Core>(configuration_, initial_state(), limits_, timing_, Flow{}, scheduling_.retained);
-			} else { core_ = std::make_unique<Core>(configuration_, recovery.finish(frontier.sequence), limits_, timing_, Flow{}, scheduling_.retained); }
+				core_ = std::make_unique<Core>(configuration_, initial_state(), limits_, timing_, scheduling_.flow, scheduling_.retained);
+			} else { core_ = std::make_unique<Core>(configuration_, recovery.finish(frontier.sequence), limits_, timing_, scheduling_.flow, scheduling_.retained); }
 		} catch (const std::exception& error) { fail(error.what()); throw; }
 	}
 	bool ready() const noexcept { return !closing_ && core_ && initialization_.empty() && store_.accounting().has_value() && !fenced(); }
@@ -206,6 +207,8 @@ public:
 	bool resting() const noexcept { return core_ && core_->resting(); }
 	bool transferring() const noexcept { return core_ && core_->transferring(); }
 	Index last_index() const noexcept { return core_ ? core_->last_index() : 0; }
+	// The index a witness may truncate its log through (Core::witness_bound).
+	Index witness_bound() const noexcept { return core_ ? core_->witness_bound() : 0; }
 	std::optional<Term> term_at(Index index) const { return core_ ? core_->term_at(index) : std::nullopt; }
 	// The closed state, when this replica can close now (Core::closed_state): open, not fenced.
 	std::optional<ClosedState> closed_state() const { return core_ && !closing_ && !fenced() ? core_->closed_state() : std::nullopt; }
@@ -708,7 +711,7 @@ private:
 	}
 	void validate_configuration(const kronuz::journal::AdmissionLimits& admission) {
 		replacement_pool_ = admission.replacement_pool;
-		Core validate(configuration_, initial_state(), limits_, timing_, Flow{}, scheduling_.retained);
+		Core validate(configuration_, initial_state(), limits_, timing_, scheduling_.flow, scheduling_.retained);
 		if (!scheduling_.foreground_burst || scheduling_.foreground_burst > 1048576 || !scheduling_.scan_entries || scheduling_.scan_entries > 4096 ||
 			admission.control_slots < 3 || admission.maximum_tickets < 5) { throw std::invalid_argument("invalid worker scheduling or control slots"); }
 		auto tick = plan_event(Tick{}, false, limits_, scheduling_.retained);
@@ -741,8 +744,9 @@ private:
 		if (fenced()) { return SubmitResult::Fenced; }
 		if (!maintenance_tick && hold(event)) { return SubmitResult::Accepted; }
 		if (!ready() || !output_.empty() || ((maintenance_due() || timer_blocked_) && !maintenance_tick) || cutover_debt_ || core_->busy() || completion_ || application_) { return SubmitResult::Busy; }
-		// A repair waits for a checkpoint in flight, whose capture predates it.
-		if (std::holds_alternative<Repair>(event) && (checkpoint_ || delivered_)) { return SubmitResult::Busy; }
+		// A repair or an install request waits for a checkpoint or image in flight, and for a
+		// delivered range: the capture predates it, and the request stops delivery.
+		if ((std::holds_alternative<Repair>(event) || std::holds_alternative<RequestInstall>(event)) && (checkpoint_ || delivered_)) { return SubmitResult::Busy; }
 		try {
 			std::array<std::optional<kronuz::journal::AppendReservation>, 3> acquired;
 			for (std::size_t i = 0; i < plan.count; ++i) {

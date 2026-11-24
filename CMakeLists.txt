@@ -48,7 +48,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/.scratch")  # the tests' state
 	# faultlab's faultfs, the crash model the journal tests run on; test-only. It reuses the
 	# completion target declared above.
-	FetchContent_Declare(faultlab GIT_REPOSITORY https://github.com/Kronuz/faultlab.git GIT_TAG a3b71d1b9bdcfa3664dbce8725f14c07bb14845f)
+	FetchContent_Declare(faultlab GIT_REPOSITORY https://github.com/Kronuz/faultlab.git GIT_TAG 5d4df9b04d7064fc978c84d29e7db8e6789bb10c)
 	FetchContent_MakeAvailable(faultlab)
 	foreach(t consensus checkpoint_encoder retained_log retirement simulation membership pipeline retained_state)
 		add_executable(consensus_${t}_test test/${t}_test.cc)
@@ -122,6 +122,13 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	foreach(c lagging rejected stale restart orphan)
 		add_test(NAME consensus_driver_install_${c} COMMAND consensus_driver_install_test ${c})
 		set_tests_properties(consensus_driver_install_${c} PROPERTIES TIMEOUT 120)
+	endforeach()
+	# A follower's install request (docs/mechanisms/install-request.md), a ctest entry per case.
+	add_executable(consensus_driver_install_request_test test/driver_install_request_test.cc)
+	target_link_libraries(consensus_driver_install_request_test PRIVATE consensus::consensus)
+	foreach(c lost_state behind current after_install lost_record unrequested leader_lost second_request non_leader witness_bound)
+		add_test(NAME consensus_install_request_${c} COMMAND consensus_driver_install_request_test ${c})
+		set_tests_properties(consensus_install_request_${c} PROPERTIES TIMEOUT 300)
 	endforeach()
 	# D3 through the Driver: a replacement, add, promote and the core's removal, over seeds.
 	add_executable(consensus_driver_replace_test test/driver_replace_test.cc)
@@ -267,7 +274,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	endif()
 
 	# The tests that build a journal run it on faultfs.
-	foreach(t simulation shared_worker shared_cluster wave_open waiter blocking_entry driver driver_close driver_replace worker)
+	foreach(t simulation shared_worker shared_cluster wave_open waiter blocking_entry driver driver_close driver_replace driver_install worker)
 		target_link_libraries(consensus_${t}_test PRIVATE faultlab::faultlab)
 	endforeach()
 

@@ -32,9 +32,10 @@ every other turn, twice as far apart as it can.
 
 ## Node identity
 
-A host has one TLS context and one `NodePins`: a certificate per node, pinned once per host
-(async-drivers Q7 (a)). Construction refuses node 0, a repeated certificate, and a local pin
-that is not the context's certificate. A handshake authenticates a verified leaf that is pinned
+A host has one TLS context and one `NodePins`: a key per node, pinned once per host by its
+`key_pin` (async-drivers Q7 (a); admission.md, Keys, renewal and reload). Construction refuses
+node 0, a repeated pin, and a local pin that is not the context's certificate's key. A handshake
+authenticates a verified leaf, still verifying against the CAs trusted now, whose key is pinned
 to a node other than this one, and, on a dial, to the dialed node. Another node's certificate,
 this node's own, an unpinned one or none is refused before any hello or frame. Per-group checks
 (cluster, group, epoch, profile) belong to the group-open exchange, not to the connection
@@ -87,25 +88,11 @@ when `run()` returns, or with the connection. Until then the number stays this s
 socket opened elsewhere can take it while the reader or writer still holds it, and no SSL call
 follows the end. No frame reaches the handler after it either.
 
-## The hello, DTHL0002
+## The hello, DTHL0003
 
-After the TLS handshake the dialer sends its hello and the acceptor replies with its own. Both
-are 64 bytes, little-endian:
-
-| Offset | Bytes | Field | Rule |
-|---|---|---|---|
-| 0 | 8 | magic | `DTHL0002` |
-| 8 | 8 | node | nonzero; the authenticated node |
-| 16 | 4 | lane | 1 Control, 2 Bulk; the dialer's choice, echoed |
-| 20 | 4 | flags | bit 0 `refused`, from the acceptor only; other bits zero |
-| 24 | 16 | cluster | nonzero; equal at both ends |
-| 40 | 16 | connection | nonzero, random per connection; differs from the peer's |
-| 56 | 4 | rpc_min | at least 1 |
-| 60 | 4 | rpc_max | at least rpc_min, at most 9,999 |
-
-A hello that breaks a rule ends the connection. The RPC lane's version on the connection is
-`min(max_a, max_b)` when that is at least `max(min_a, min_b)`, else 0, and the lane is off on it
-(rpc-lane T1). DTHL0001 is `Peers`' hello and is not read here.
+After the TLS handshake the dialer sends its hello and the acceptor replies with its own; its
+bytes, rules, versions and boot check are in [hello.md](hello.md). A hello that breaks a rule
+ends the connection. DTHL0001 is `Peers`' hello and is not read here.
 
 ## Dial, accept and the tie-break
 
@@ -135,7 +122,9 @@ refuses the retiring end's redial, and the caller redials.
 ### Before authentication
 
 An incoming connection is unauthenticated until its TLS handshake passes the pins, so `Links`
-bounds those: at most `handshakes` (4) at once, and at most `handshakes_per_source` (2) from one
+bounds those. With a join service (admission.md, The join pool), its first byte is peeked first,
+in the same slot: the join magic's leaves the pool for the join service's, a TLS record's goes
+on as a node's, within one `handshake` deadline for the byte, the handshake and the pins: at most `handshakes` (4) at once, and at most `handshakes_per_source` (2) from one
 address, since a node dials each lane once at a time. A newcomer replaces the oldest instead of
 being refused: the source's oldest when the source is at its cap, else, when the pool is full, its
 oldest from an address no route names. A newcomer from a peer's address (a literal one, or a
@@ -161,7 +150,7 @@ belongs to the network (an allowlist of the cluster's addresses).
 |---|---|
 | The rule, a mutant per part | `deadline_test`; mutants `no-extension`, `uncapped`, `twice`, `wake-ignores-extension`, `entry-left-armed`, `late-always-extends` |
 | Node identity | `connection_test` `authenticate`, `wrong_node`, `unpinned`, `no_certificate`, `pins`; mutants `pin-any-node`, `pin-self`, `pin-unpinned` |
-| DTHL0002 | `node_hello_test`; `fuzz_decoders` case 9 |
+| DTHL0003 | `node_hello_test`; `hello_fuzz`, `fuzz_decoders` case 9 |
 | Frames, keepalive, dead peer, close | `connection_test` `frames`, `keepalive`, `dead_peer`, `graceful_close`, `abort_truncates`, `busy_reader`; mutants `no-keepalive`, `keepalive-extends`, `close-drops-queue`, `no-close-notify` |
 | The fd kept until `run()` returns, no SSL call after the end | `connection_test` `fd_reuse_reader`, `fd_reuse_writer`; mutants `fail-closes-fd`, `ssl-after-end` |
 | Each write wait has its own stuck deadline | `connection_test` `slow_reader` (a failed run the host stalled 100 ms or more runs again, at most twice); mutant `stuck-spans-flush`; `slow_reader_stops.py` forces the stalls with `SIGSTOP` |

@@ -325,6 +325,10 @@ struct LaneStats {
 struct HostTransportOptions {
 	LinkOptions links;
 	RpcOptions rpc;
+	// The issuer hook for joins on this host's port (docs/mechanisms/admission.md, Joining), and
+	// their pool; without a hook the port takes nodes only.
+	JoinHook join;
+	JoinOptions joins;
 	std::uint64_t window = 4 << 20;     // data bytes a group may have sent and not yet credited, per connection
 	std::size_t control_queue = 64;     // control frames a group queues per connection; more are dropped
 	std::uint64_t data_queue = 8 << 20; // data bytes a group queues per connection; more are dropped
@@ -414,6 +418,11 @@ class HostTransport {
 			loop.links->on_ended = [this, k](const Link &link) { ended(k, link); };
 			loop.links->on_frame = [this, k](const Link &link, std::string_view frame) { arrived(k, link, frame); };
 		}
+		if (options_.join) {
+			joins_ = std::make_shared<JoinService>(tls, cluster, options_.join, options_.joins);
+			for (auto &loop : loops_)
+				loop.links->joins = joins_;
+		}
 		if (options_.rpc.reader)
 			serves_[fetch_method] = [this](RpcCall c, const rpc::Incoming &in) { return serve_fetch(c, in); };
 	}
@@ -480,7 +489,29 @@ class HostTransport {
 			fail(it->second, rpc::Outcome::not_connected);
 	}
 
-	// Accepts on `acceptor`, a socket of loop 0, until stop().
+	// From any thread: `tls`, a context with this node's renewed certificate (the same key) or a
+	// new CA bundle, replaces the host's. New connections use it, every check verifies against
+	// its CAs, and each loop then aborts the links whose peer's chain no longer verifies. Throws
+	// std::invalid_argument when its certificate is not this node's key.
+	void reload(std::shared_ptr<asio::ssl::context> tls) {
+		if (!tls)
+			throw std::invalid_argument("host transport: reload without a context");
+		cache_certificates(*tls);  // before any loop handshakes with it
+		loops_[0].links->pins().reload(tls->native_handle());
+		if (joins_)
+			joins_->reload(tls);
+		for (auto &loop : loops_)
+			asio::post(loop.at.executor, [links = loop.links.get(), tls] { links->reload(tls); });
+	}
+	// From any thread: the boot this host's hellos carry, and the directory version that admitted
+	// it (0 before admission, M7), on every loop from its next connection on.
+	void boot(kronuz::consensus::Identity id, std::uint64_t directory) {
+		for (auto &loop : loops_)
+			asio::post(loop.at.executor, [links = loop.links.get(), id, directory] { links->boot(id, directory); });
+	}
+	// The joins this host serves on its port, or null without HostTransportOptions::join.
+	const JoinService *joins() const noexcept { return joins_.get(); }
+	// Accepts on `acceptor`, a socket of loop 0, until stop(); each listening address its own.
 	void serve(asio::ip::tcp::acceptor &acceptor) { task::spawn(loops_[0].at.scheduler, loops_[0].links->serve(acceptor)); }
 
 	// On `loop`, the group's: queues a message for the member on `node`. A loop's frames go to
@@ -979,8 +1010,17 @@ class HostTransport {
 			feed(k, lane);
 			return;
 		}
-		if (lane.dialing || here.stopping || here.at.scheduler.now() < lane.dial_after)
+		if (lane.dialing || here.stopping)
 			return;
+		if (const auto now = here.at.scheduler.now(); now < lane.dial_after) {
+			// Calls or a hold waiting on Bulk dial once the spacing passes, not at their deadlines.
+			if (auto it = here.rpc.find(node); which == LinkLane::Bulk && it != here.rpc.end() &&
+											   (!it->second.pending.empty() || it->second.holds) && !it->second.redial) {
+				it->second.redial = rpc::Clock::now() + std::chrono::nanoseconds(lane.dial_after - now);
+				arm(k, node);
+			}
+			return;
+		}
 		lane.dialing = true;
 		task::spawn(here.at.scheduler, here.links->dial(node, which),
 					[this, k, node, which](std::exception_ptr, std::optional<bool> ok) {
@@ -1597,6 +1637,7 @@ class HostTransport {
 	HostTransportOptions options_;
 	rpc::ByteBudget serving_, calling_, outgoing_;  // the lane's pools, shared by every loop (D5); outlive every Lane
 	std::vector<Loop> loops_;
+	std::shared_ptr<JoinService> joins_;  // shared by every loop's Links
 	std::map<rpc::MethodId, Serve> serves_;          // set before serve(), then only read
 };
 

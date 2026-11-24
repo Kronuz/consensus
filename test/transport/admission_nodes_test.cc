@@ -1028,12 +1028,13 @@ task::task<std::size_t> impostor(tcp::acceptor &listener, std::shared_ptr<asio::
 		co_await join_detail::handshake(stream, asio::ssl::stream_base::server);
 		Identity cluster{};
 		cluster.fill('K');
-		co_await join_detail::write_frame(stream, encode_join_offer({cluster, {join_detail::der(ca)}}));
+		// A named offer: GCC ICEs on this braced temporary held across the co_await.
+		const auto offer = encode_join_offer({cluster, {join_detail::der(ca)}});
+		co_await join_detail::write_frame(stream, offer);
 		char buffer[512];
-		// No structured binding here: GCC ICEs on one inside a try block in a coroutine.
-		const auto read = co_await task::await_asio<void(asio::error_code, std::size_t)>(
+		auto [ended, n] = co_await task::await_asio<void(asio::error_code, std::size_t)>(
 			[&](auto h) { stream.async_read_some(asio::buffer(buffer), std::move(h)); });
-		received = std::get<0>(read) ? 0 : std::get<1>(read);
+		received = ended ? 0 : n;
 	} catch (...) {
 	}
 	co_return received;

@@ -196,8 +196,12 @@ struct Lag {
 			last = now;
 		}
 	}};
-	~Lag() {
+	// Stops the sampler and returns its worst: read it once the measured work is over.
+	std::uint64_t stop() {
 		stopped = true;
-		sampler.join();
+		if (sampler.joinable())
+			sampler.join();
+		return worst;
 	}
+	~Lag() { stop(); }
 };

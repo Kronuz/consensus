@@ -39,6 +39,7 @@ struct WorkerLimits {
 	std::size_t foreground_burst = 16, scan_entries = 128; bool async_appends = false, async_storage = false;
 	std::size_t follower_batch_bytes = 0, follower_batch_entries = 0;
 	RetainedStatePolicy retained{};
+	Flow flow{};  // every Core's replication flow (pipeline depth, window, frame cap)
 };
 // epoch: Worker::epoch() when the application state was captured; a repair since then makes
 // the capture stale, and the core rejects it.
@@ -147,7 +148,7 @@ public:
 			// A new directory has only the bounded bootstrap names; a tiny
 			// configured scan budget can require several startup slices.
 			initialization_ = initial_record();
-			core_ = std::make_unique<Core>(configuration_, initial_state(), limits_, timing_, Flow{}, scheduling_.retained);
+			core_ = std::make_unique<Core>(configuration_, initial_state(), limits_, timing_, scheduling_.flow, scheduling_.retained);
 		} catch (const std::exception& error) { fail(error.what()); throw; }
 	}
 	template <class Restore> void recover(Restore restore_application) {
@@ -175,8 +176,8 @@ public:
 				// Generic bootstrap is already durable; typed initialization may
 				// have been queued when the previous process exited.
 				initialization_ = initial_record();
-				core_ = std::make_unique<Core>(configuration_, initial_state(), limits_, timing_, Flow{}, scheduling_.retained);
-			} else { core_ = std::make_unique<Core>(configuration_, recovery.finish(frontier.sequence), limits_, timing_, Flow{}, scheduling_.retained); }
+				core_ = std::make_unique<Core>(configuration_, initial_state(), limits_, timing_, scheduling_.flow, scheduling_.retained);
+			} else { core_ = std::make_unique<Core>(configuration_, recovery.finish(frontier.sequence), limits_, timing_, scheduling_.flow, scheduling_.retained); }
 		} catch (const std::exception& error) { fail(error.what()); throw; }
 	}
 	bool ready() const noexcept { return !closing_ && core_ && initialization_.empty() && store_.accounting().has_value() && !fenced(); }
@@ -710,7 +711,7 @@ private:
 	}
 	void validate_configuration(const kronuz::journal::AdmissionLimits& admission) {
 		replacement_pool_ = admission.replacement_pool;
-		Core validate(configuration_, initial_state(), limits_, timing_, Flow{}, scheduling_.retained);
+		Core validate(configuration_, initial_state(), limits_, timing_, scheduling_.flow, scheduling_.retained);
 		if (!scheduling_.foreground_burst || scheduling_.foreground_burst > 1048576 || !scheduling_.scan_entries || scheduling_.scan_entries > 4096 ||
 			admission.control_slots < 3 || admission.maximum_tickets < 5) { throw std::invalid_argument("invalid worker scheduling or control slots"); }
 		auto tick = plan_event(Tick{}, false, limits_, scheduling_.retained);

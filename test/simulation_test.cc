@@ -236,9 +236,10 @@ public:
 		for (auto& [id, n] : nodes_) {
 			if (!n.up) { restart(n); }  // the forced crash's node returns with the rest
 		}
-		for (int round = 0; round < 4000 && !failures; ++round) {
+		// Until a majority applies a new entry, proposed every 50 rounds, within 2,000 (docs/mechanisms/simulation.md).
+		for (int round = 0; round < 2000 && !failures && applied_healed() < healed_quorum(); ++round) {
 			quiet_round();
-			if (round >= 2000 && round % 50 == 0 && applied_healed() < healed_quorum()) {  // until a majority applies it
+			if (round % 50 == 0) {
 				for (auto& [id, n] : nodes_) {
 					if (n.up && n.core->role() == Role::Leader) { act(n, n.core->step(Propose{++request_, "healed"})); }
 				}
@@ -1389,6 +1390,7 @@ bool run() {
 namespace kronuz::consensus::driver_simulation { bool run(std::uint64_t seeds, std::uint64_t steps, std::uint64_t first); }
 
 int main(int argc, char** argv) {
+	std::setvbuf(stdout, nullptr, _IOLBF, 0);  // each phase's summary shows even if a later one times out
 	const std::uint64_t seeds = argc > 1 ? std::strtoull(argv[1], nullptr, 10) : 200;
 	const std::uint64_t steps = argc > 2 ? std::strtoull(argv[2], nullptr, 10) : 10000;
 	const std::uint64_t first = argc > 3 ? std::strtoull(argv[3], nullptr, 10) : 1;

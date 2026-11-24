@@ -33,8 +33,8 @@ in flight it committed steadily.
 
 Each step of the cause, with the code as it stood at consensus:8801b99:
 
-1. **The batch bound was `rpc_bytes`** (`core.h:1183`). A Driver group's `Core` is built with
-   `Flow{}` (`worker.h:150`), so `frame_bytes` is 0 and an append carries up to 2 MiB. Thirty-two
+1. **The batch bound was `rpc_bytes`** (`core.h:1183`). A Driver group's `Core` was built with
+   `Flow{}` (`worker.h:150`; `WorkerLimits::flow` now sets it, default `Flow{}`), so `frame_bytes` is 0 and an append carries up to 2 MiB. Thirty-two
    64 KiB commands fill exactly one such append.
 2. **One frame held the connection for seconds.** Under netem loss or reordering, TCP cubic at
    40 ms round trip moves about 0.5 MB/s, so a 2 MiB frame took about 4 s to cross. Every Raft

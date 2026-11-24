@@ -171,6 +171,7 @@ public:
 			auto early = n.core->step(*held); consume(id, early);
 		}
 		auto actions = n.core->step(std::move(event));
+		n.hold_until = holdable(id) ? n.core->next_deadline() : 0;
 		consume(id, actions);
 		return actions;
 	}
@@ -179,7 +180,8 @@ private:
 	struct Node {
 		std::unique_ptr<Core> core;
 		std::vector<std::pair<NodeId, Message>> inbox;  // held while the core persists, as a Worker's caller holds them
-		std::optional<Tick> held;  // the last Tick before the core's next deadline, not yet delivered
+		std::optional<Tick> held;  // the last Tick before hold_until, not yet delivered
+		std::uint64_t hold_until = 0;  // Core::next_deadline() after the core's last step, when holdable
 	};
 	struct Scheduled {
 		std::uint64_t at, order;
@@ -203,16 +205,25 @@ private:
 		std::uniform_real_distribution<double> d(profile_.r / 4, profile_.r / 2);
 		return std::max<std::uint64_t>(1, std::uint64_t(std::ceil(d(random_))));
 	}
-	// A follower's or candidate's Tick before Core::next_deadline() changes nothing but the
-	// core's clock, so it is held rather than stepped (its delay is still drawn). A leader's is
-	// always stepped: a due D3 removal waits for a Tick, not a deadline. LIVENESS_VERIFY steps
-	// each held Tick and fails one that acts or moves the deadline.
+	// A voter's Tick before Core::next_deadline() changes nothing but the core's clock, so it is
+	// held rather than stepped (its delay is still drawn). A leader's is held only with its
+	// membership settled: a D3 removal, a witness's or a removed leader's hand-off waits for a
+	// Tick, not a deadline. LIVENESS_VERIFY steps each held Tick and fails one that acts or
+	// moves the deadline.
+	bool holdable(NodeId id) {
+		const Core& core = *nodes_.at(id).core;
+		const auto& m = core.membership();
+		if (!votes_in(m, id)) { return false; }
+		if (core.role() != Role::Leader) { return true; }
+		const auto* self = find_member(m, id);
+		return self->role != MemberRole::Witness && !m.leaving && core.committed_membership() == m;
+	}
 	void tick(NodeId id) {
 		const Tick tick{now_, delay()};
 		auto& n = nodes_.at(id);
-		const auto deadline = n.core->next_deadline();
-		if (tick.now < deadline && n.core->role() != Role::Leader && votes_in(n.core->membership(), id)) {
+		if (tick.now < n.hold_until) {
 			if (!verify) { n.held = tick; at_tick(now_ + tick_, id); return; }
+			const auto deadline = n.hold_until;
 			auto actions = step(id, tick);
 			check(actions.empty() && n.core->next_deadline() == deadline, "a held Tick changes nothing");
 		} else {

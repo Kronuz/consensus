@@ -41,6 +41,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace kronuz::consensus;
@@ -48,6 +49,7 @@ using namespace kronuz::consensus;
 namespace {
 
 int failures = 0;
+const bool verify = std::getenv("LIVENESS_VERIFY") != nullptr;
 void check(bool value, const std::string& what) {
 	if (!value && failures++ < 20) { std::fprintf(stderr, "FAIL: %s\n", what.c_str()); }
 }
@@ -68,11 +70,6 @@ Profile derive(const char* name, double b, double r) {
 	return {name, b, r, t};
 }
 
-// Idle windows (an isolation, a settling wait) are written in milliseconds of the default
-// profile, whose election_max is 2 s, and scale with each profile's election_max: a window is
-// the same number of election timeouts in every profile (docs/mechanisms/liveness.md).
-std::uint64_t window(const Profile& profile, std::uint64_t ms) { return ms * profile.timing.election_max / 2000; }
-
 class Cluster {
 public:
 	// witness: the last voter founds the group as a witness (2 + witness, D9).
@@ -90,7 +87,7 @@ public:
 			step(id, Tick{0, delay()});
 			step(id, Start{});
 		}
-		for (auto& [id, n] : nodes_) { at(tick_ + random_() % tick_, [this, id] { tick(id); }); }
+		for (auto& [id, n] : nodes_) { at_tick(tick_ + random_() % tick_, id); }
 	}
 	std::uint64_t now() const { return now_; }
 	std::function<void()> observe;  // called after every event
@@ -101,7 +98,7 @@ public:
 		nodes_[id].core = std::make_unique<Core>(c, std::move(state), Limits{}, profile_.timing);
 		step(id, Tick{now_, delay()});
 		step(id, Start{});
-		at(now_ + tick_, [this, id] { tick(id); });
+		at_tick(now_ + tick_, id);
 	}
 	// Proposes a membership change on `leader` until it is placed; true once placed.
 	bool change(NodeId leader, const Membership& next, std::uint64_t until) {
@@ -115,9 +112,9 @@ public:
 	}
 	void run_until(std::uint64_t until, const std::function<bool()>& done = {}) {
 		while (!events_.empty() && events_.top().at <= until) {
-			auto event = events_.top(); events_.pop();
+			auto event = std::move(const_cast<Scheduled&>(events_.top())); events_.pop();
 			now_ = event.at;
-			event.run();
+			if (event.tick) { tick(event.tick); } else { event.run(); }
 			if (observe) { observe(); }
 			if (done && done()) { return; }
 		}
@@ -168,7 +165,12 @@ public:
 		return false;
 	}
 	Actions step(NodeId id, Event event) {
-		auto actions = nodes_.at(id).core->step(std::move(event));
+		auto& n = nodes_.at(id);
+		// A held Tick reaches the core before its next event, so that event sees the same clock.
+		if (auto held = std::exchange(n.held, std::nullopt); held && !std::holds_alternative<Tick>(event)) {
+			auto early = n.core->step(*held); consume(id, early);
+		}
+		auto actions = n.core->step(std::move(event));
 		consume(id, actions);
 		return actions;
 	}
@@ -177,13 +179,16 @@ private:
 	struct Node {
 		std::unique_ptr<Core> core;
 		std::vector<std::pair<NodeId, Message>> inbox;  // held while the core persists, as a Worker's caller holds them
+		std::optional<Tick> held;  // the last Tick before the core's next deadline, not yet delivered
 	};
 	struct Scheduled {
 		std::uint64_t at, order;
+		NodeId tick;  // a node's Tick, or 0 for `run`
 		std::function<void()> run;
 		bool operator<(const Scheduled& o) const { return at != o.at ? at > o.at : order > o.order; }
 	};
-	void at(std::uint64_t when, std::function<void()> run) { events_.push({when, ++order_, std::move(run)}); }
+	void at(std::uint64_t when, std::function<void()> run) { events_.push({when, ++order_, 0, std::move(run)}); }
+	void at_tick(std::uint64_t when, NodeId id) { events_.push({when, ++order_, id, {}}); }
 	std::uint64_t delay() {
 		const auto& t = profile_.timing;
 		return t.election_min + random_() % (t.election_max - t.election_min + 1);
@@ -198,9 +203,22 @@ private:
 		std::uniform_real_distribution<double> d(profile_.r / 4, profile_.r / 2);
 		return std::max<std::uint64_t>(1, std::uint64_t(std::ceil(d(random_))));
 	}
+	// A follower's or candidate's Tick before Core::next_deadline() changes nothing but the
+	// core's clock, so it is held rather than stepped (its delay is still drawn). A leader's is
+	// always stepped: a due D3 removal waits for a Tick, not a deadline. LIVENESS_VERIFY steps
+	// each held Tick and fails one that acts or moves the deadline.
 	void tick(NodeId id) {
-		step(id, Tick{now_, delay()});
-		at(now_ + tick_, [this, id] { tick(id); });
+		const Tick tick{now_, delay()};
+		auto& n = nodes_.at(id);
+		const auto deadline = n.core->next_deadline();
+		if (tick.now < deadline && n.core->role() != Role::Leader && votes_in(n.core->membership(), id)) {
+			if (!verify) { n.held = tick; at_tick(now_ + tick_, id); return; }
+			auto actions = step(id, tick);
+			check(actions.empty() && n.core->next_deadline() == deadline, "a held Tick changes nothing");
+		} else {
+			step(id, tick);
+		}
+		at_tick(now_ + tick_, id);
 	}
 	void consume(NodeId id, Actions& actions) {
 		for (auto& action : actions) {
@@ -273,7 +291,7 @@ void run(const Profile& profile, std::uint64_t seeds) {
 			if (l && pick() % 2) { side.insert(*l); }
 			while (side.size() < size) { side.insert(1 + NodeId(pick() % voters)); }
 			c.isolate(side);
-			c.run_until(c.now() + window(profile, 2000 + pick() % 8000));
+			c.run_until(c.now() + 2000 + pick() % 8000);
 			c.heal();
 			const auto healed = c.now();
 			if (c.commit_one(all, healed + 30000)) { heal.push_back(double(c.now() - healed)); } else { ++unhealed; }
@@ -289,9 +307,9 @@ void run(const Profile& profile, std::uint64_t seeds) {
 			std::set<NodeId> healthy = all; healthy.erase(lone);
 			const Term before = c.max_term(healthy);
 			c.isolate({lone});
-			c.run_until(c.now() + window(profile, 20000));
+			c.run_until(c.now() + 20000);
 			c.heal();
-			c.run_until(c.now() + window(profile, 5000));
+			c.run_until(c.now() + 5000);
 			if (c.max_term(healthy) != before) { ++raised; if (std::getenv("LIVENESS_DEBUG")) { std::fprintf(stderr, "%s raised: seed %llu voters %zu lone %llu term %llu -> %llu\n", profile.name, (unsigned long long)seed, voters, (unsigned long long)lone, (unsigned long long)before, (unsigned long long)c.max_term(healthy)); } }
 			if (c.core(lone).term() != before) { ++lone_raised; }
 		}
@@ -332,7 +350,7 @@ void run(const Profile& profile, std::uint64_t seeds) {
 				std::set<NodeId> rest = three; rest.erase(failed);
 				// The witness refuses proposals, so a commit means a data voter leads.
 				if (c.commit_one(rest, started + 30000)) { survive.push_back(double(c.now() - started)); } else { ++unsurvived; }
-				c.run_until(c.now() + window(profile, 5000));
+				c.run_until(c.now() + 5000);
 				if (led) { ++unhanded; }
 			}
 		}
@@ -387,7 +405,7 @@ void run(const Profile& profile, std::uint64_t seeds) {
 					++removed_runs;
 					const Term before = c.max_term(kept);
 					c.heal();
-					c.run_until(c.now() + window(profile, 20000));
+					c.run_until(c.now() + 20000);
 					removed_raised += c.max_term(kept) != before;
 				}
 			}

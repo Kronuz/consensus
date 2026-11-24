@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
@@ -41,6 +42,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -48,10 +50,20 @@ using namespace kronuz::consensus;
 
 namespace {
 
-int failures = 0;
 const bool verify = std::getenv("LIVENESS_VERIFY") != nullptr;
+// Each profile runs on its own thread into its own report: lines in order (true for stderr),
+// printed once it and every profile before it finish, so the output is the serial run's.
+struct Report { std::vector<std::pair<bool, std::string>> lines; int failures = 0; };
+thread_local Report* report = nullptr;
+void say(const char* format, ...) {
+	va_list args, again; va_start(args, format); va_copy(again, args);
+	std::string line(std::size_t(std::vsnprintf(nullptr, 0, format, args)), '\0');
+	std::vsnprintf(line.data(), line.size() + 1, format, again);
+	va_end(again); va_end(args);
+	report->lines.emplace_back(false, std::move(line));
+}
 void check(bool value, const std::string& what) {
-	if (!value && failures++ < 20) { std::fprintf(stderr, "FAIL: %s\n", what.c_str()); }
+	if (!value) { ++report->failures; report->lines.emplace_back(true, "FAIL: " + what + "\n"); }
 }
 
 struct Profile {
@@ -469,10 +481,10 @@ void run(const Profile& profile, std::uint64_t seeds) {
 	}
 	const auto heal99 = percentile(heal, 0.99), heal_max = percentile(heal, 1.0);
 	const auto transfer99 = percentile(transfer, 0.99), down_max = percentile(stepdown, 1.0), recover99 = percentile(recover, 0.99);
-	std::printf("%-26s b=%3.0f r=%2.0f hb=%4llu rpc=%4llu elect=%llu-%llu  heal p99 %6.0f max %6.0f  transfer p99 %5.0f  step-down max %5.0f  recover p99 %6.0f  term raised %llu\n",
+	say("%-26s b=%3.0f r=%2.0f hb=%4llu rpc=%4llu elect=%llu-%llu  heal p99 %6.0f max %6.0f  transfer p99 %5.0f  step-down max %5.0f  recover p99 %6.0f  term raised %llu\n",
 		profile.name, profile.b, profile.r, (unsigned long long)t.heartbeat, (unsigned long long)t.rpc_timeout,
 		(unsigned long long)t.election_min, (unsigned long long)t.election_max, heal99, heal_max, transfer99, down_max, recover99, (unsigned long long)raised);
-	std::printf("%26s samples: heal %zu (%llu failed), transfer %zu (%llu failed), recover %zu (%llu failed), isolated node's own term raised %llu\n", "", heal.size(), (unsigned long long)unhealed,
+	say("%26s samples: heal %zu (%llu failed), transfer %zu (%llu failed), recover %zu (%llu failed), isolated node's own term raised %llu\n", "", heal.size(), (unsigned long long)unhealed,
 		transfer.size(), (unsigned long long)untransferred, recover.size(), (unsigned long long)unrecovered, (unsigned long long)lone_raised);
 	check(!unhealed && heal99 <= 5000 && heal_max <= 10000, std::string(profile.name) + ": a healed partition commits within 5 s at p99, 10 s worst");
 	check(!raised, std::string(profile.name) + ": a partitioned node never raises the healthy group's term");
@@ -480,12 +492,12 @@ void run(const Profile& profile, std::uint64_t seeds) {
 	check(down_max <= double(t.election_max) + double(t.heartbeat), std::string(profile.name) + ": a deaf leader steps down within election_max");
 	check(!unrecovered && recover99 <= 5000, std::string(profile.name) + ": a new leader commits within 5 s of a deaf leader");
 	const auto survive99 = percentile(survive, 0.99), handoff_max = percentile(handoff, 1.0);
-	std::printf("%26s 2 + witness: single failure recovered p99 %6.0f (%zu, %llu failed); witness hand-offs %zu, max %5.0f, unfinished %llu\n", "",
+	say("%26s 2 + witness: single failure recovered p99 %6.0f (%zu, %llu failed); witness hand-offs %zu, max %5.0f, unfinished %llu\n", "",
 		survive99, survive.size(), (unsigned long long)unsurvived, handoff.size(), handoff_max, (unsigned long long)unhanded);
 	check(!unsurvived && survive99 <= 5000, std::string(profile.name) + ": 2 + witness survives any single failure");
 	check(!unhanded && handoff_max <= double(t.election_max), std::string(profile.name) + ": a witness leader hands off within election_max");
 	const auto promotion99 = percentile(promotion, 0.99), replacement99 = percentile(replacement, 0.99);
-	std::printf("%26s membership: leader fails in a promotion's window, new leader commits p99 %6.0f (%zu, %llu failed); in a replacement's window p99 %6.0f (%zu, %llu failed); removed voter raised the term %llu of %llu\n", "",
+	say("%26s membership: leader fails in a promotion's window, new leader commits p99 %6.0f (%zu, %llu failed); in a replacement's window p99 %6.0f (%zu, %llu failed); removed voter raised the term %llu of %llu\n", "",
 		promotion99, promotion.size(), (unsigned long long)unpromoted, replacement99, replacement.size(), (unsigned long long)unreplaced, (unsigned long long)removed_raised, (unsigned long long)removed_runs);
 	check(!unpromoted && promotion99 <= 5000, std::string(profile.name) + ": a leader failing in a promotion's window is replaced within 5 s");
 	check(!unreplaced && replacement99 <= 5000, std::string(profile.name) + ": a leader failing in a replacement's window is replaced within 5 s");
@@ -507,7 +519,16 @@ int main(int argc, char** argv) {
 		derive("Linux ext4", 30, 2),
 		derive("FreeBSD UFS", 15, 2),
 	};
-	for (const auto& p : profiles) { run(p, seeds); }
+	std::vector<Report> reports(std::size(profiles));
+	std::vector<std::thread> threads;
+	for (std::size_t i = 0; i < std::size(profiles); ++i) { threads.emplace_back([&, i] { report = &reports[i]; run(profiles[i], seeds); }); }
+	int failures = 0;  // the first 20 are printed
+	for (std::size_t i = 0; i < std::size(profiles); ++i) {
+		threads[i].join();
+		for (const auto& [error, line] : reports[i].lines) {
+			if (!error) { std::fputs(line.c_str(), stdout); } else if (failures++ < 20) { std::fputs(line.c_str(), stderr); }
+		}
+	}
 	std::printf("%d failures\n", failures);
 	return failures ? 1 : 0;
 }

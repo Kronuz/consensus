@@ -130,13 +130,13 @@ public:
 	void propose(NodeId leader, std::string command) { step(leader, Propose{++request, std::move(command)}); }
 };
 
-// The invariant every case ends on: a Tick before next_deadline() changes nothing.
+// The invariant every case ends on: the deadline is ahead of the clock, and a Tick before it
+// changes nothing.
 void quiet_before(Core& core, std::uint64_t at, std::uint64_t delay, const char* what) {
 	const auto deadline = core.next_deadline();
-	if (deadline <= at) { return; }
 	const auto retired = core.retired_log_entries();
 	auto actions = core.step(Tick{at, delay});
-	check(actions.empty() && core.next_deadline() == deadline && core.retired_log_entries() == retired, what);
+	check(deadline > at && actions.empty() && core.next_deadline() == deadline && core.retired_log_entries() == retired, what);
 }
 
 // Leader 1 of voters 1-3 with learner 4 caught up.
@@ -174,8 +174,8 @@ void d3_removal() {
 	quiet_before(leader, n.now, 100, "after the removal, a Tick before the deadline changes nothing");
 }
 
-// D3, at a full log: a removal that cannot be appended is not due (no Tick would place it); a
-// compaction frees room, and the removal is due at once.
+// D3, at a full log: a removal that cannot be appended is not due (no Tick would place it), though
+// removal() names it for the Worker's plan; a compaction frees room, and the removal is due at once.
 void d3_removal_at_full_log() {
 	Limits small; small.log_entries = 24; small.control_entries = 2;
 	Net n;
@@ -194,7 +194,7 @@ void d3_removal_at_full_log() {
 	check(n.change(1, replace), "the leader replaces 3 by 4 with its last entry");
 	n.deliver();
 	check(leader.committed_membership() == replace && leader.last_index() == 24, "the replacement commits and fills the log");
-	check(!leader.removal() && leader.next_deadline() > n.now, "a removal the log cannot take is not due");
+	check(leader.removal() && leader.next_deadline() > n.now, "a removal the log cannot take is not due");
 	quiet_before(leader, n.now, 100, "a Tick at a full log changes nothing");
 	n.step(1, LocalCheckpoint{++n.request, 7, leader.applied(), leader.term(), config(1, 3).cluster, config(1, 3).configuration});
 	check(leader.retired_log_entries() > 0 && leader.next_deadline() == n.now, "after the compaction a Tick is due at once");
@@ -202,6 +202,40 @@ void d3_removal_at_full_log() {
 	auto persist = first<Persist>(actions);
 	check(persist && persist->batch.log && persist->batch.log->entries.size() == 1 && persist->batch.log->entries[0].kind == EntryKind::Configuration &&
 		!find_member(decode_membership(persist->batch.log->entries[0].payload), 3), "that Tick retires the compacted entries and proposes the removal");
+}
+
+// A Worker plans a leader's Tick from removal() after its turn retires a slice, and the Tick's
+// own step retires another before it proposes: whatever the retirement, a Tick appends a removal
+// only when removal() named it at plan time (the plan reserves the append). The replacement
+// lowers the group's log_entries below its usage, and a compaction leaves over 256 to retire.
+void removal_plan_matches_tick() {
+	auto n = with_learner();
+	auto& leader = n.core(1);
+	for (int i = 0; i < 1300; ++i) { n.propose(1, "c"); n.deliver(); }
+	Membership replace = leader.membership();
+	for (auto& x : replace.members) { if (x.incarnation == 4) { x.role = MemberRole::Voter; } }
+	replace.leaving = 3;
+	Limits lowered; lowered.log_entries = 1000; replace.limits = lowered;
+	check(n.change(1, replace), "the replacement lowers log_entries to 1000");
+	n.deliver();
+	check(leader.committed_membership() == replace && leader.retired_log_entries() == 0, "it commits over 1300 retained entries");
+	for (NodeId id = 1; id <= 4; ++id) {  // every member compacts below the lowered limit
+		auto& c = n.core(id);
+		n.step(id, LocalCheckpoint{++n.request, 7, c.applied(), c.term(), config(1, 3).cluster, config(1, 3).configuration});
+	}
+	check(leader.retired_log_entries() > 256, "the compaction leaves more than a step's retirement");
+	bool appended = false, unplanned = false;
+	for (int turn = 0; turn < 64 && !appended; ++turn) {
+		leader.retire_log();                   // Worker::run_one
+		const bool planned = leader.removal().has_value();  // Worker::submit_retained's plan
+		auto actions = n.tick(1, n.now);
+		auto persist = first<Persist>(actions);
+		appended = persist && persist->batch.log && persist->batch.log->entries.size() == 1 && persist->batch.log->entries[0].kind == EntryKind::Configuration;
+		unplanned |= appended && !planned;
+	}
+	check(appended && !unplanned, "the Tick appends the removal, and its plan named it");
+	n.deliver();
+	check(!find_member(leader.committed_membership(), 3), "the removal commits");
 }
 
 // D9: a witness that leads hands off once a data voter answers after it took office. The
@@ -289,6 +323,7 @@ void retirement() {
 int main() {
 	d3_removal();
 	d3_removal_at_full_log();
+	removal_plan_matches_tick();
 	d9_witness_handoff();
 	d4_handoff_flights();
 	retirement();

@@ -241,6 +241,7 @@ struct Host {
 	static inline std::vector<Host *> hosts;
 };
 
+void print_stacks();
 // What a case that hangs leaves: its step, each host's loops (turning, blocked or stopped) with
 // their counters, and every thread's stack.
 void report_hang() {
@@ -270,6 +271,10 @@ void report_hang() {
 				std::printf("\n");
 			}
 	}
+	print_stacks();
+}
+// Every thread's stack, to stdout.
+void print_stacks() {
 	const auto pid = std::to_string(::getpid());
 #ifdef __APPLE__
 	const std::string stacks = "sample " + pid + " 1 -file /dev/stdout 2>&1";
@@ -1040,9 +1045,24 @@ task::task<void> changing(Driver<GroupSink> *d, GroupId g, Membership next) {
 }
 task::task<void> transferring(Driver<GroupSink> *d, GroupId g, NodeId target) { co_await d->transfer_leadership(g, target); }
 
+// The journal's I/O on the calling loop (InlineCompletion), with the longest one operation held
+// it, in ms: a slow sync blocks every connection that loop serves. `delay` makes the next
+// operation that much slower, as a runner's slow sync.
+struct TimedInline {
+	j::InlineCompletion inline_io;
+	std::atomic<std::uint64_t> longest{0}, delay{0};
+	task::task<void> run(std::shared_ptr<j::IOOperation> operation, task::cancel_token token = {}) {
+		const auto t = steady::now();
+		if (const auto ms = delay.exchange(0))
+			std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+		co_await inline_io.run(std::move(operation), std::move(token));
+		longest = std::max<std::uint64_t>(longest, ms_since(t));
+	}
+};
+
 struct Node {
 	struct PerLoop {
-		j::InlineCompletion io;
+		TimedInline io;
 		GroupSink sink;
 		std::unique_ptr<Driver<GroupSink>> driver;
 		task::cancel_source stop;
@@ -2449,10 +2469,65 @@ void owe_order() {
 	assert(one.credits_at_control == 0 && "control frames go before credit");
 }
 
-// fetch-alongside-consensus (D102, Peers' F2 on the lane's fetch): three nodes of 2 loops, a
+// The longest each loop of each node went without turning while it runs: a 10 ms probe posted to
+// every loop, its wait counted until it runs. One loop late while the rest turn is a call that
+// blocked that loop; every loop late at once is the host stopping the process. The first loop
+// 1.5 s late prints every thread's stack.
+struct LoopLags {
+	struct Probe {
+		std::atomic<std::int64_t> posted{-1};  // ms since `began`, -1 when none waits
+		std::atomic<std::uint64_t> worst{0};
+	};
+	std::vector<Node *> nodes;
+	std::uint32_t L;
+	std::shared_ptr<std::vector<Probe>> probes;
+	std::atomic<bool> done{false};
+	bool dumped = false;  // the sampler's own
+	std::thread thread;
+	LoopLags(std::vector<Node *> of, std::uint32_t loops)
+		: nodes(std::move(of)), L(loops), probes(std::make_shared<std::vector<Probe>>(nodes.size() * L)) {
+		thread = std::thread([this] {
+			while (!done) {
+				for (std::size_t i = 0; i != probes->size(); ++i) {
+					auto &p = (*probes)[i];
+					const auto now = std::int64_t(ms_since(began));
+					if (const auto at = p.posted.load(); at >= 0) {
+						p.worst = std::max<std::uint64_t>(p.worst, std::uint64_t(now - at));
+						if (now - at >= 1'500 && !std::exchange(dumped, true)) {
+							std::printf("node %llu loop %zu has not turned for %lld ms; every thread's stack:\n",
+										(unsigned long long)nodes[i / L]->host.node, i % L, (long long)(now - at));
+							print_stacks();
+						}
+						continue;
+					}
+					p.posted = now;
+					nodes[i / L]->host.post(std::uint32_t(i % L), [probes = probes, i] {
+						auto &q = (*probes)[i];
+						q.worst = std::max<std::uint64_t>(q.worst, ms_since(began) - std::uint64_t(q.posted.load()));
+						q.posted = -1;
+					});
+				}
+				std::this_thread::sleep_for(10ms);
+			}
+		});
+	}
+	std::uint64_t worst(std::size_t node, std::uint32_t loop) const { return (*probes)[node * L + loop].worst; }
+	void stop() {
+		if (!done.exchange(true))
+			thread.join();
+	}
+	~LoopLags() { stop(); }
+};
+
+// fetch-alongside-consensus (D102, Peers' F2 on the lane's fetch): three nodes of 4 loops, a
 // group's Drivers over the transport; rounds of four 8 MiB fetches (method 1), both ways between
 // nodes, through 1 MiB lane budgets, while a command commits every 50 ms. Every fetch arrives
-// exact, every commit lands on all three within 2 s, and the leader keeps its term.
+// exact, every commit lands on all three within 2 s, and the leader keeps its term. The group
+// sits on a loop that serves no connection, since its journal syncs inline on its loop: a
+// runner's slow sync holds the Driver, never the links. The 2 s and the term allow what the
+// host took: the longest journal operation plus the longest process stall, and the term only
+// while that stays under the 1,000 ms election timeout. FETCH_ALONGSIDE_SLOW_SYNC=ms makes one
+// follower's next sync that slow.
 std::string pattern(std::size_t n, unsigned seed) {
 	std::string s(n, '\0');
 	for (std::size_t i = 0; i != n; ++i)
@@ -2461,7 +2536,19 @@ std::string pattern(std::size_t n, unsigned seed) {
 }
 void fetch_alongside() {
 	constexpr std::size_t size = 8 << 20, budget = 1 << 20;
-	const GroupId g = groups_on(2, 0, 1)[0];
+	// Nodes 1, 2 and 3 place their links on loops 1, 3 and 0 of 4: the group takes the free one.
+	constexpr std::uint32_t L = 4;
+	auto links_on = [&](std::uint32_t k) {
+		for (NodeId n = 1; n <= 3; ++n)
+			if (j::host_detail::loop(j::host_detail::slot(n), L) == k)
+				return true;
+		return false;
+	};
+	std::uint32_t group_loop = 0;
+	while (group_loop != L && links_on(group_loop))
+		++group_loop;
+	assert(group_loop != L && "a loop serves no node's links");
+	const GroupId g = groups_on(L, group_loop, 1)[0];
 	Cluster c("fetch-alongside", {g});
 	c.options_of = [](NodeId n) {
 		HostTransportOptions o;
@@ -2475,7 +2562,10 @@ void fetch_alongside() {
 		return o;
 	};
 	for (NodeId n = 1; n <= 3; ++n)
-		c.start(n, 2);
+		c.start(n, L);
+	for (NodeId n = 1; n <= 3; ++n)
+		for (NodeId m = 1; m <= 3; ++m)
+			assert(c.nodes[n]->host.transport->loop_of_node(m) != c.nodes[n]->host.transport->loop_of_group(g) && "the links' loop is not the group's");
 	auto all = c.of({1, 2, 3});
 	step("fetch-alongside: the group elects and commits");
 	assert(commit_everywhere(all, g, "before", 30'000));
@@ -2487,14 +2577,17 @@ void fetch_alongside() {
 		std::atomic<bool> done{false};
 		std::error_code error;
 		std::optional<std::string> bytes;
+		std::uint64_t ended = 0;  // ms into the rounds
 	};
+	steady::time_point start;
 	auto fetch = [&](NodeId from, NodeId peer) {
 		auto got = std::make_shared<Fetched>();
 		auto &h = c.nodes[from]->host;
 		h.loops[h.transport->loop_of_node(peer)]->at([&] {
-			h.transport->fetch(peer, "history/table", [got](std::error_code e, std::optional<std::string> b) {
+			h.transport->fetch(peer, "history/table", [got, &start](std::error_code e, std::optional<std::string> b) {
 				got->error = e;
 				got->bytes = std::move(b);
+				got->ended = ms_since(start);
 				got->done = true;
 			});
 			return 0;
@@ -2514,12 +2607,45 @@ void fetch_alongside() {
 	std::uint64_t slowest = 0;
 	bool committed = true;
 	std::vector<std::shared_ptr<Fetched>> fetches;
+	std::vector<std::string> misses;  // each inexact fetch, each commit past 2 s, the first term change
+	// Each inexact fetch: its error, or its first byte that differs from the pattern.
+	auto check = [&](const Fetched &f, std::pair<NodeId, NodeId> pair) {
+		const auto want = pattern(size, unsigned(pair.second));
+		if (!f.error && f.bytes && *f.bytes == want)
+			return true;
+		std::string what = f.error ? "error " + f.error.message() : !f.bytes ? std::string("nullopt") : "";
+		if (what.empty()) {
+			const auto &got = *f.bytes;
+			std::size_t at = 0;
+			while (at != std::min(got.size(), want.size()) && got[at] == want[at])
+				++at;
+			char text[160];
+			std::snprintf(text, sizeof text, "%zu bytes of %zu, first differing byte %zu (got %d, want %d)", got.size(), want.size(), at,
+						  at < got.size() ? int(static_cast<unsigned char>(got[at])) : -1, int(static_cast<unsigned char>(want[at])));
+			what = text;
+		}
+		misses.push_back("round " + std::to_string(round) + ": node " + std::to_string(pair.first) + "'s fetch from node " +
+						 std::to_string(pair.second) + " ended at " + std::to_string(f.ended) + " ms: " + what);
+		return false;
+	};
+	for (auto *n : all)
+		for (auto &p : n->per)
+			p->io.longest = 0;
+	// FETCH_ALONGSIDE_SLOW_SYNC=ms: a follower's next journal operation takes that much longer.
+	if (const char *ms = std::getenv("FETCH_ALONGSIDE_SLOW_SYNC")) {
+		const NodeId slow = leader == 2 ? 3 : 2;
+		c.nodes[slow]->per[c.nodes[slow]->host.transport->loop_of_group(g)]->io.delay = std::strtoull(ms, nullptr, 10);
+		std::printf("fetch-alongside: node %llu's next journal operation takes %s ms longer\n", (unsigned long long)slow, ms);
+	}
+	Stalls stalls;
+	LoopLags lags(all, L);
+	bool changed = false;
 	step("fetch-alongside: " + std::to_string(rounds) + " rounds of four 8 MiB fetches beside commits");
-	const auto start = steady::now();
+	start = steady::now();
 	while (ms_since(start) < 60'000) {
 		if (std::all_of(fetches.begin(), fetches.end(), [](auto &f) { return f->done.load(); })) {
 			for (std::size_t i = 0; i != fetches.size(); ++i)
-				exact += !fetches[i]->error && fetches[i]->bytes && *fetches[i]->bytes == pattern(size, unsigned(pairs[i].second));
+				exact += check(*fetches[i], pairs[i]);
 			fetches.clear();
 			if (round == rounds)
 				break;
@@ -2527,20 +2653,66 @@ void fetch_alongside() {
 			for (auto [from, peer] : pairs)
 				fetches.push_back(fetch(from, peer));
 		}
-		const auto begun = steady::now();
-		committed &= commit_everywhere(all, g, "command " + std::to_string(++commits), 2'000);
-		slowest = std::max(slowest, ms_since(begun));
+		const auto begun = ms_since(start);
+		const bool ok = commit_everywhere(all, g, "command " + std::to_string(++commits), 30'000);
+		const auto took = ms_since(start) - begun;
+		committed &= ok;
+		slowest = std::max(slowest, took);
+		if (!ok || took > 2'000)
+			misses.push_back("command " + std::to_string(commits) + " began at " + std::to_string(begun) + " ms: " +
+							 (ok ? "on all three in " + std::to_string(took) + " ms" : "not on all three within 30 s"));
+		if (auto s = c.nodes[leader]->state(g); !changed && !(s && s->role == Role::Leader && s->term == term)) {
+			changed = true;
+			misses.push_back("node " + std::to_string(leader) + " no longer leads term " + std::to_string(term) + " at " +
+							 std::to_string(ms_since(start)) + " ms");
+		}
 		std::this_thread::sleep_for(50ms);
 	}
 	const auto elapsed = ms_since(start);
+	const auto stalled = stalls.stop();
+	lags.stop();
 	auto s = c.nodes[leader]->state(g);
 	const bool kept = s && s->role == Role::Leader && s->term == term;
+	std::uint64_t held = 0;
+	for (auto *n : all)
+		for (auto &p : n->per)
+			held = std::max<std::uint64_t>(held, p->io.longest);
+	const auto host = held + stalled, bound = 2'000 + host;
+	const bool timely = committed && slowest < bound, leads = kept || host >= 1'000;
+	for (auto &m : misses)
+		std::printf("fetch-alongside: %s\n", m.c_str());
+	std::printf("fetch-alongside: links to nodes 1, 2 and 3 on loops %u, %u and %u of %u; the group on loop %u\n",
+				j::host_detail::loop(j::host_detail::slot(1), L), j::host_detail::loop(j::host_detail::slot(2), L),
+				j::host_detail::loop(j::host_detail::slot(3), L), L, group_loop);
+	for (NodeId n = 1; n <= 3; ++n) {
+		auto &h = c.nodes[n]->host;
+		std::uint64_t gone = 0, links = 0, aborted = 0, timed_out = 0;
+		std::string turned, held_by;  // per loop, "a/b/c/d"
+		for (std::uint32_t k = 0; k != h.loops.size(); ++k) {
+			turned += (k ? "/" : "") + std::to_string(lags.worst(n - 1, k));
+			held_by += (k ? "/" : "") + std::to_string(c.nodes[n]->per[k]->io.longest.load());
+			gone += h.transport->stats(k).gone;
+			links += h.loops[k]->at([&] { return h.transport->link_stats(k).established; });
+			aborted += h.transport->lane_stats(k).ended(rpc::Outcome::connection_aborted);
+			timed_out += h.transport->lane_stats(k).ended(rpc::Outcome::timed_out);
+		}
+		auto t = c.nodes[n]->state(g);
+		std::printf("fetch-alongside: node %llu: %llu links established, %llu peers gone, calls ended connection_aborted %llu, "
+					"timed_out %llu; %s in term %llu; its loops went at most %s ms without turning, their journal I/O held them at "
+					"most %s ms at once\n",
+					(unsigned long long)n, (unsigned long long)links, (unsigned long long)gone, (unsigned long long)aborted,
+					(unsigned long long)timed_out, !t ? "no state" : t->role == Role::Leader ? "leader" : "not leader",
+					(unsigned long long)(t ? t->term : 0), turned.c_str(), held_by.c_str());
+	}
+	std::printf("fetch-alongside: the host stalled this process at most %llu ms\n", (unsigned long long)stalled);
 	std::printf("fetch-alongside: %u rounds of %zu x 8 MiB fetched through 1 MiB lane budgets in %llu ms, %u of %u exact; %u commits "
-				"beside them, each on all three within 2 s: %s (slowest %llu ms; 4 quiet ones before, slowest %llu ms); node %llu leads in "
-				"term %llu throughout: %s\n",
-				round, pairs.size(), (unsigned long long)elapsed, exact, rounds * unsigned(pairs.size()), commits, committed ? "yes" : "NO",
-				(unsigned long long)slowest, (unsigned long long)quiet, (unsigned long long)leader, (unsigned long long)term, kept ? "yes" : "NO");
-	assert(round == rounds && exact == rounds * pairs.size() && committed && kept);
+				"beside them, each on all three within %llu ms (2,000 plus the host's %llu: a journal operation's %llu, a stall's %llu): %s "
+				"(slowest %llu ms; 4 quiet ones before, slowest %llu ms); node %llu leads in term %llu throughout: %s\n",
+				round, pairs.size(), (unsigned long long)elapsed, exact, rounds * unsigned(pairs.size()), commits, (unsigned long long)bound,
+				(unsigned long long)host, (unsigned long long)held, (unsigned long long)stalled, timely ? "yes" : "NO", (unsigned long long)slowest,
+				(unsigned long long)quiet, (unsigned long long)leader, (unsigned long long)term,
+				kept ? "yes" : leads ? "no, allowed: the host held it past the election timeout" : "NO");
+	assert(round == rounds && exact == rounds * pairs.size() && timely && leads);
 }
 
 // receive-bound: what a connection's frames for one group may hold on the receiver before its

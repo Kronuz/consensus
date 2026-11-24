@@ -103,7 +103,9 @@ const j::TurnLogOptions turn_options{16 * 1024, 1024, 1, 4, 4096};
 // application cap): a smaller one never admits a checkpoint, which then blocks the group's calls.
 const j::AdmissionLimits admission{{8u << 20, 4096}, {64 * 1024, 3}, {4u << 20, 4}, 16, 3};
 constexpr std::uint64_t application_cap = 64 * 1024;
-constexpr Timing timing{20, 40, 100, 200, 60000};
+// snapshot_timeout scales with the rest (5x election_max): healing waits out a stalled transfer,
+// so it sets the heal's idle rounds (docs/mechanisms/simulation.md).
+constexpr Timing timing{20, 40, 100, 200, 1000};
 constexpr std::uint32_t image_format = 5;
 
 Limits limits() {

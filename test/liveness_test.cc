@@ -183,7 +183,7 @@ public:
 			auto early = n.core->step(*held); consume(id, early);
 		}
 		auto actions = n.core->step(std::move(event));
-		n.hold_until = holdable(id) ? n.core->next_deadline() : 0;
+		n.hold_until.reset();
 		consume(id, actions);
 		return actions;
 	}
@@ -193,7 +193,7 @@ private:
 		std::unique_ptr<Core> core;
 		std::vector<std::pair<NodeId, Message>> inbox;  // held while the core persists, as a Worker's caller holds them
 		std::optional<Tick> held;  // the last Tick before hold_until, not yet delivered
-		std::uint64_t hold_until = 0;  // Core::next_deadline() after the core's last step, when holdable
+		std::optional<std::uint64_t> hold_until;  // Core::next_deadline() since the core's last step, when holdable; 0 when not
 		std::uint64_t tick_at = 0, tick_order = 0;  // its one scheduled Tick, ordered with the queue's events
 	};
 	struct Scheduled {
@@ -236,9 +236,10 @@ private:
 	}
 	void tick(NodeId id, Node& n) {
 		const Tick tick{now_, delay()};
-		if (tick.now < n.hold_until) {
+		if (!n.hold_until) { n.hold_until = holdable(id) ? n.core->next_deadline() : 0; }
+		if (tick.now < *n.hold_until) {
 			if (!verify) { n.held = tick; at_tick(now_ + tick_, id); return; }
-			const auto deadline = n.hold_until;
+			const auto deadline = *n.hold_until;
 			auto actions = step(id, tick);
 			check(actions.empty() && n.core->next_deadline() == deadline, "a held Tick changes nothing");
 		} else {

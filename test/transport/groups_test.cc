@@ -2479,11 +2479,13 @@ struct LoopLags {
 		std::atomic<std::uint64_t> worst{0};
 	};
 	std::vector<Node *> nodes;
+	std::uint32_t L;
 	std::shared_ptr<std::vector<Probe>> probes;
 	std::atomic<bool> done{false};
 	bool dumped = false;  // the sampler's own
 	std::thread thread;
-	explicit LoopLags(std::vector<Node *> of) : nodes(std::move(of)), probes(std::make_shared<std::vector<Probe>>(nodes.size() * 2)) {
+	LoopLags(std::vector<Node *> of, std::uint32_t loops)
+		: nodes(std::move(of)), L(loops), probes(std::make_shared<std::vector<Probe>>(nodes.size() * L)) {
 		thread = std::thread([this] {
 			while (!done) {
 				for (std::size_t i = 0; i != probes->size(); ++i) {
@@ -2493,13 +2495,13 @@ struct LoopLags {
 						p.worst = std::max<std::uint64_t>(p.worst, std::uint64_t(now - at));
 						if (now - at >= 1'500 && !std::exchange(dumped, true)) {
 							std::printf("node %llu loop %zu has not turned for %lld ms; every thread's stack:\n",
-										(unsigned long long)nodes[i / 2]->host.node, i % 2, (long long)(now - at));
+										(unsigned long long)nodes[i / L]->host.node, i % L, (long long)(now - at));
 							print_stacks();
 						}
 						continue;
 					}
 					p.posted = now;
-					nodes[i / 2]->host.post(std::uint32_t(i % 2), [probes = probes, i] {
+					nodes[i / L]->host.post(std::uint32_t(i % L), [probes = probes, i] {
 						auto &q = (*probes)[i];
 						q.worst = std::max<std::uint64_t>(q.worst, ms_since(began) - std::uint64_t(q.posted.load()));
 						q.posted = -1;
@@ -2509,7 +2511,7 @@ struct LoopLags {
 			}
 		});
 	}
-	std::uint64_t worst(std::size_t node, std::uint32_t loop) const { return (*probes)[node * 2 + loop].worst; }
+	std::uint64_t worst(std::size_t node, std::uint32_t loop) const { return (*probes)[node * L + loop].worst; }
 	void stop() {
 		if (!done.exchange(true))
 			thread.join();
@@ -2517,11 +2519,11 @@ struct LoopLags {
 	~LoopLags() { stop(); }
 };
 
-// fetch-alongside-consensus (D102, Peers' F2 on the lane's fetch): three nodes of 2 loops, a
+// fetch-alongside-consensus (D102, Peers' F2 on the lane's fetch): three nodes of 4 loops, a
 // group's Drivers over the transport; rounds of four 8 MiB fetches (method 1), both ways between
 // nodes, through 1 MiB lane budgets, while a command commits every 50 ms. Every fetch arrives
 // exact, every commit lands on all three within 2 s, and the leader keeps its term. The group
-// sits on the loop that serves no connection, since its journal syncs inline on its loop: a
+// sits on a loop that serves no connection, since its journal syncs inline on its loop: a
 // runner's slow sync holds the Driver, never the links. The 2 s and the term allow what the
 // host took: the longest journal operation plus the longest process stall, and the term only
 // while that stays under the 1,000 ms election timeout. FETCH_ALONGSIDE_SLOW_SYNC=ms makes one
@@ -2534,7 +2536,19 @@ std::string pattern(std::size_t n, unsigned seed) {
 }
 void fetch_alongside() {
 	constexpr std::size_t size = 8 << 20, budget = 1 << 20;
-	const GroupId g = groups_on(2, 1, 1)[0];
+	// Nodes 1, 2 and 3 place their links on loops 1, 3 and 0 of 4: the group takes the free one.
+	constexpr std::uint32_t L = 4;
+	auto links_on = [&](std::uint32_t k) {
+		for (NodeId n = 1; n <= 3; ++n)
+			if (j::host_detail::loop(j::host_detail::slot(n), L) == k)
+				return true;
+		return false;
+	};
+	std::uint32_t group_loop = 0;
+	while (group_loop != L && links_on(group_loop))
+		++group_loop;
+	assert(group_loop != L && "a loop serves no node's links");
+	const GroupId g = groups_on(L, group_loop, 1)[0];
 	Cluster c("fetch-alongside", {g});
 	c.options_of = [](NodeId n) {
 		HostTransportOptions o;
@@ -2548,7 +2562,7 @@ void fetch_alongside() {
 		return o;
 	};
 	for (NodeId n = 1; n <= 3; ++n)
-		c.start(n, 2);
+		c.start(n, L);
 	for (NodeId n = 1; n <= 3; ++n)
 		for (NodeId m = 1; m <= 3; ++m)
 			assert(c.nodes[n]->host.transport->loop_of_node(m) != c.nodes[n]->host.transport->loop_of_group(g) && "the links' loop is not the group's");
@@ -2624,7 +2638,7 @@ void fetch_alongside() {
 		std::printf("fetch-alongside: node %llu's next journal operation takes %s ms longer\n", (unsigned long long)slow, ms);
 	}
 	Stalls stalls;
-	LoopLags lags(all);
+	LoopLags lags(all, L);
 	bool changed = false;
 	step("fetch-alongside: " + std::to_string(rounds) + " rounds of four 8 MiB fetches beside commits");
 	start = steady::now();
@@ -2667,10 +2681,16 @@ void fetch_alongside() {
 	const bool timely = committed && slowest < bound, leads = kept || host >= 1'000;
 	for (auto &m : misses)
 		std::printf("fetch-alongside: %s\n", m.c_str());
+	std::printf("fetch-alongside: links to nodes 1, 2 and 3 on loops %u, %u and %u of %u; the group on loop %u\n",
+				j::host_detail::loop(j::host_detail::slot(1), L), j::host_detail::loop(j::host_detail::slot(2), L),
+				j::host_detail::loop(j::host_detail::slot(3), L), L, group_loop);
 	for (NodeId n = 1; n <= 3; ++n) {
 		auto &h = c.nodes[n]->host;
 		std::uint64_t gone = 0, links = 0, aborted = 0, timed_out = 0;
+		std::string turned, held_by;  // per loop, "a/b/c/d"
 		for (std::uint32_t k = 0; k != h.loops.size(); ++k) {
+			turned += (k ? "/" : "") + std::to_string(lags.worst(n - 1, k));
+			held_by += (k ? "/" : "") + std::to_string(c.nodes[n]->per[k]->io.longest.load());
 			gone += h.transport->stats(k).gone;
 			links += h.loops[k]->at([&] { return h.transport->link_stats(k).established; });
 			aborted += h.transport->lane_stats(k).ended(rpc::Outcome::connection_aborted);
@@ -2678,12 +2698,11 @@ void fetch_alongside() {
 		}
 		auto t = c.nodes[n]->state(g);
 		std::printf("fetch-alongside: node %llu: %llu links established, %llu peers gone, calls ended connection_aborted %llu, "
-					"timed_out %llu; %s in term %llu; its loops went at most %llu and %llu ms without turning, their journal I/O "
-					"held them at most %llu and %llu ms at once\n",
+					"timed_out %llu; %s in term %llu; its loops went at most %s ms without turning, their journal I/O held them at "
+					"most %s ms at once\n",
 					(unsigned long long)n, (unsigned long long)links, (unsigned long long)gone, (unsigned long long)aborted,
 					(unsigned long long)timed_out, !t ? "no state" : t->role == Role::Leader ? "leader" : "not leader",
-					(unsigned long long)(t ? t->term : 0), (unsigned long long)lags.worst(n - 1, 0), (unsigned long long)lags.worst(n - 1, 1),
-					(unsigned long long)c.nodes[n]->per[0]->io.longest.load(), (unsigned long long)c.nodes[n]->per[1]->io.longest.load());
+					(unsigned long long)(t ? t->term : 0), turned.c_str(), held_by.c_str());
 	}
 	std::printf("fetch-alongside: the host stalled this process at most %llu ms\n", (unsigned long long)stalled);
 	std::printf("fetch-alongside: %u rounds of %zu x 8 MiB fetched through 1 MiB lane budgets in %llu ms, %u of %u exact; %u commits "

@@ -34,18 +34,20 @@ limit never reaches a leader). The connection then closes before any frame.
 
 ## The boot check
 
-Every process start is a boot (Xapiand's M7), and the root's directory records the one it
-admitted per node. A hello carries the sender's boot and the directory version that admitted it
+Every process start is a boot (Xapiand's M7), and the root's directory records the one it admitted
+per node. A hello carries the sender's boot and the directory version that admitted it
 (`LinkOptions::boot`, `directory`; `HostTransport::boot()` changes them while running, as
 admission completes). Each end checks the peer's hello with `LinkOptions::check_boot`, which
 answers 0 to admit or a nonzero code to refuse; it is asynchronous and gets the loop, so it may
-fetch the directory first when the hello names a version newer than its own, within the
-handshake deadline. The acceptor checks before the tie-break and replies with the refusal flag
-and the code in `reason`; the dialer calls `LinkOptions::boot_refused(peer, reason)`, so a copy
-or a stale restart learns why (`duplicate`, `stale`: the caller's codes) and nothing links.
-The dialer also checks the acceptor's accepting hello and aborts on a refusal, since a copy may
-be the one accepting. `LinkStats::boot_refused` counts both. With no `check_boot` every boot
-is admitted, and a zero boot is none.
+fetch the directory first when the hello names a version newer than its own, within the handshake
+deadline. The acceptor checks before the tie-break and replies with the refusal flag and the code
+in `reason`; the dialer calls `LinkOptions::boot_refused(peer, reason)`, so a copy or a stale
+restart learns why (`duplicate`, `stale`: the caller's codes) and nothing links. The dialer also
+checks the acceptor's accepting hello and aborts on a refusal, since a copy may be the one
+accepting. The acceptor started its link at the reply, so a call it bound there before the abort
+ends with the link (`connection_aborted`, or `not_processed` if it never left), as on any lost
+connection; the transport does not send it again. `LinkStats::boot_refused` counts both. With no
+`check_boot` every boot is admitted, and a zero boot is none.
 
 The cost is 28 bytes a hello and one call of the caller's check per connection, none per frame.
 
@@ -85,7 +87,9 @@ once a checkpoint covers it (Core's `peer_wire_limits`, M8).
 | `version` | a host speaking only wire version 2 never connects to one speaking 1: refusals counted, no link, no frame; a 1 MiB `maximum_frame` for 2 MiB `rpc_bytes` refused | |
 
 `test/transport/node_hello_test.cc` checks the bytes field by field and each malformed field;
-`fuzz/hello_fuzz.cc` decodes and re-encodes arbitrary hellos (as does `fuzz/fuzz_decoders.cc`
-case 9). `admission_nodes_test boot` checks the boot: a copy's boot refused both ways with its
-reason heard by the dialer, the admitted boot linking, and a hello naming a newer directory
-checked after the fetch (mutant `skip-boot-check`, `test/transport/admission_mutants.py`).
+`fuzz/hello_fuzz.cc` decodes and re-encodes arbitrary hellos (as does `fuzz/fuzz_decoders.cc` case
+9). `admission_nodes_test boot` checks the boot: a copy's boot refused both ways with its reason
+heard by the dialer, a dial held in its check across the peer's boot change (the call bound to the
+refused link ends at once, the redial links), the admitted boot linking, and a hello naming a
+newer directory checked after the fetch (mutant `skip-boot-check`,
+`test/transport/admission_mutants.py`).

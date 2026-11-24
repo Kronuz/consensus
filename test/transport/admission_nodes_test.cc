@@ -631,8 +631,10 @@ void redial_case() {
 // The boot check (A5, M7): node 1 admits a peer's hello only for the boot its directory admitted,
 // fetching first when the hello names a newer directory version; the refusal names the reason.
 // Node 2 starts as a copy (boot C, while the directory admitted B): node 1 refuses it both ways,
-// and node 2 hears why; node 2 as boot B links. Node 3's hello names directory version 8 while
-// node 1 holds 5: node 1 fetches, finds boot D admitted, and links.
+// and node 2 hears why. Node 1's dial, held in its check of boot C, crosses node 2's change to B:
+// the link node 2 started at its reply ends with node 1's refusal, and so does the call node 2
+// bound to it; node 2 as boot B then links. Node 3's hello names directory version 8 while node
+// 1 holds 5: node 1 fetches, finds boot D admitted, and links.
 constexpr std::uint32_t duplicate = 1;
 void boot_case() {
 	const auto boot = [](char c) {
@@ -644,7 +646,15 @@ void boot_case() {
 	std::uint64_t version = 5;
 	std::map<NodeId, Identity> admitted{{2, boot('B')}};
 	std::atomic<int> fetches{0};
+	std::atomic<bool> gate{false}, holding{false}, released{false};
 	const auto admits = [&](const NodeHello &peer, task::scheduler_ref loop) -> task::task<std::uint32_t> {
+		if (gate && peer.node == 2 && peer.boot == boot('C')) {  // node 1's dial across node 2's boot change
+			holding = true;
+			while (!released) {
+				late_deadline wait(loop, 5ms);
+				co_await wait.wait();
+			}
+		}
 		bool behind = false;
 		{
 			std::lock_guard hold(directory_mutex);
@@ -702,7 +712,25 @@ void boot_case() {
 	// closes on reading node 2's boot.
 	check(!one.established(), "node 1 links to node 2 neither way");
 	check(named, "node 2 hears node 1's refusal and its reason: duplicate");
+	// A call is bound to its connection: one node 2 places on the link node 1's held check is
+	// about to refuse ends with that link, at once, and is not sent again (rpc-lane.md).
+	gate = true;
+	auto e = one.call(2, echo, "dialed across the change", 6000ms);
+	const auto linked_here = [&] {
+		return two.at(1, [&] { return two.transport->linked(two.transport->loop_of_node(1), 1, LinkLane::Bulk); });
+	};
+	check(until([&] { return holding.load() && linked_here(); }, 4000ms),
+		  "node 1's dial holds its check of boot C on a link node 2 started at its reply");
 	two.transport->boot(boot('B'), 5);
+	auto f = two.call(1, echo, "on the refused link", 6000ms);
+	gate = false;
+	released = true;
+	check(until([&] { return f->done.load(); }, 4000ms) &&
+			  (f->status.outcome == rpc::Outcome::connection_aborted || f->status.outcome == rpc::Outcome::not_processed) &&
+			  f->finished - f->started < 2000ms,
+		  "a call bound to the link node 1 refuses ends with it, not at its deadline");
+	check(until([&] { return e->done.load(); }, 8000ms) && e->status.outcome == rpc::Outcome::ok,
+		  "node 1's call links on its redial, to node 2's boot B");
 	check(two.echoes(1, 8000ms) && one.echoes(2), "as the admitted boot, node 2 links and calls");
 
 	Host three(3, "n3", 2, {}, {}, [&](HostTransportOptions &o) {

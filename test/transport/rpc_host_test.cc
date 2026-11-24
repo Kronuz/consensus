@@ -38,6 +38,7 @@
 //               forget-is-violation, the never-drain mutant)
 //   consensus_transport_rpc_host_test <fixture dir> case
 #include "rpc_hosts.h"
+#include "fetch_probe.h"
 #include <csignal>
 #include <cstring>
 #include <spawn.h>
@@ -843,6 +844,26 @@ bool fetch() {
 		return false;
 	beats.worst = 0;
 	Lag lag;
+	// Probe: every 100 ms the sockets, each loop's stall, state and stack, and the kernel's counters.
+	const auto probe_start = steady::now();
+	std::vector<std::string> samples;
+	LoopProbe loops{&one, &two};
+	KernelProbe kernel;
+	std::atomic<bool> sampling{true};
+	std::thread sampler([&] {
+		while (sampling) {
+			std::this_thread::sleep_for(100ms);
+			char line[192];
+			std::snprintf(line, sizeof line, "probe: %5llu ms links %llu/%llu dead %llu stuck %llu failed %llu uploaded %llu MiB beats %llu;",
+						  (unsigned long long)ms_since(probe_start), (unsigned long long)one.total(&HostTransportStats::links),
+						  (unsigned long long)two.total(&HostTransportStats::links),
+						  (unsigned long long)(one.total(&HostTransportStats::dead) + two.total(&HostTransportStats::dead)),
+						  (unsigned long long)(one.total(&HostTransportStats::stuck) + two.total(&HostTransportStats::stuck)),
+						  (unsigned long long)(one.total(&HostTransportStats::failed) + two.total(&HostTransportStats::failed)),
+						  (unsigned long long)(uploaded.load() >> 20), (unsigned long long)beats.count.load());
+			samples.push_back(line + sockets({one.port(), two.port()}) + loops.sample() + kernel.sample());
+		}
+	});
 	struct Got {
 		std::atomic<bool> done{false};
 		std::error_code error;
@@ -899,6 +920,15 @@ bool fetch() {
 	const auto lagged = lag.stop();
 	const auto bound = 1000 + lagged;
 	const bool ok = exact && beside > 0 && beats.worst < bound && table;
+	sampling = false;
+	sampler.join();
+	std::printf("probe: one's loop of node 2 is %u, two's of node 1 is %u, the beat's on two %u, uploads on two %u; worst stalls:%s\n",
+				one.transport->loop_of_node(2), two.transport->loop_of_node(1), hb, up, loops.summary().c_str());
+	if (!ok) {
+		for (auto &line : samples)
+			std::printf("%s\n", line.c_str());
+		loops.spindump().print();
+	}
 	const auto big_error = !big || !big->done ? std::string("not done") : big->error ? big->error.message() : std::string("ok");
 	std::printf("fetch: 16 MiB arrived exact %s (%s) in %llu ms beside %llu MiB of group uploads on Bulk; links %llu+%llu, "
 				"ended dead %llu, stuck %llu, failed %llu; dropped %llu, overrun %llu; heartbeats' longest gap %llu ms of %llu allowed (1000 plus the host's %llu ms of lag); missing %s, "

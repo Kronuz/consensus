@@ -1,0 +1,61 @@
+# Probe only (probe/detent/fetch-stall, never lands): rpc_host_fetch in CI's pairing, many rounds.
+name: probe-fetch
+on:
+  push:
+    branches: ['probe/detent/fetch-stall']
+  workflow_dispatch:
+env:
+  CMAKE_GENERATOR: Ninja
+jobs:
+  fetch:
+    name: ${{ matrix.name }} shard ${{ matrix.shard }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macos-x86_64, os: macos-15-intel, shard: 1, rounds: 25 }
+          - { name: macos-x86_64, os: macos-15-intel, shard: 2, rounds: 25 }
+          - { name: macos-x86_64, os: macos-15-intel, shard: 3, rounds: 25 }
+          - { name: macos-x86_64, os: macos-15-intel, shard: 4, rounds: 25 }
+          - { name: macos-arm64, os: macos-15, shard: 1, rounds: 10 }
+    steps:
+      - uses: actions/checkout@v5
+      - name: Tools
+        run: brew install ninja
+      - name: Configure
+        env: { CC: clang, CXX: clang++ }
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo "-DCMAKE_C_FLAGS_RELWITHDEBINFO=-O2 -g" "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=-O2 -g -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE"
+      - name: Build
+        run: cmake --build build --parallel 4 --target consensus_transport_rpc_host_test
+      - name: Rounds
+        # Each round: every rpc_host case, ctest --parallel 2 as CI runs them (fetch beside stalled-peer).
+        run: |
+          sysctl hw.ncpu hw.memsize kern.ipc.nmbclusters kern.ipc.mb_uses_mcache 2>/dev/null || true
+          failed=0
+          for i in $(seq 1 ${{ matrix.rounds }}); do
+            ctest --test-dir build -R 'consensus_tls_certificates|rpc_host_' --parallel 2 > round.log 2>&1 || true
+            log=build/Testing/Temporary/LastTest.log
+            line=$(grep -m1 '^fetch: ' "$log" || echo 'fetch: NO LINE')
+            echo "round $i: $(grep -o 'rpc_host_fetch .*sec' round.log | tr -s ' .' ' ') | $line"
+            grep -m1 "^probe: one's loop" "$log" || true
+            if grep -q 'rpc_host_fetch .*Failed\|rpc_host_fetch .*Timeout\|rpc_host_fetch .*Exception' round.log; then
+              failed=$((failed + 1))
+              echo "::group::round $i fetch output"
+              awk '/rpc_host_test.*fetch/{p=1} p&&/^----------------------------------------------------------$/{c++} p&&c>=2{exit} p' "$log" | head -400
+              grep -h 'Failed\|Passed' round.log | grep -v '100%' | tail -20
+              echo "::endgroup::"
+            fi
+            grep -E 'Failed|Timeout' round.log | grep -v rpc_host_fetch | sed "s/^/round $i other: /" || true
+          done
+          echo "fetch failed in $failed of ${{ matrix.rounds }} rounds"
+          [ "$failed" = 0 ]
+      - name: Spindumps
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spindump-${{ matrix.name }}-${{ matrix.shard }}
+          path: build/**/spindump-fetch-*
+          if-no-files-found: ignore
+          retention-days: 14

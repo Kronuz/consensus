@@ -109,16 +109,22 @@ constexpr std::uint64_t application_cap = 64 * 1024;
 constexpr Timing timing{20, 40, 100, 200, 1000};
 constexpr std::uint32_t image_format = 5;
 
-// Every group's replication flow (docs/mechanisms/simulation.md): SIM_DRIVER_PIPELINE=N fixes
-// every seed at depth N; otherwise the seeds cycle through depths 1, 4 and 16, and 4 again
-// under a window and a frame cap that bind (4 x 2 KiB frames against a 16 KiB window).
-Flow flow_for(std::uint64_t seed) {
-	if (const auto* depth = std::getenv("SIM_DRIVER_PIPELINE")) { return Flow{std::uint32_t(std::strtoul(depth, nullptr, 10)), 4u << 20, 0}; }
+// Every group's replication flow and follower batching (docs/mechanisms/simulation.md):
+// SIM_DRIVER_PIPELINE=N fixes every seed at depth N; otherwise the seeds cycle through depth 1,
+// depth 4 under a window and frame cap that bind (4 x 2 KiB frames against 16 KiB), depth 16
+// and depth 4. A pipelined seed's followers hold appends that arrive while a batch persists,
+// except the last cycle's.
+struct Replication { Flow flow; bool follower_batching; };
+Replication replication_for(std::uint64_t seed) {
+	if (const auto* depth = std::getenv("SIM_DRIVER_PIPELINE")) {
+		const auto pipeline = std::uint32_t(std::strtoul(depth, nullptr, 10));
+		return {Flow{pipeline, 4u << 20, 0}, pipeline > 1};
+	}
 	switch (seed % 4) {
-	case 0: return Flow{1, 4u << 20, 0};
-	case 1: return Flow{4, 16 * 1024, 2048};
-	case 2: return Flow{16, 4u << 20, 0};
-	default: return Flow{4, 4u << 20, 0};
+	case 0: return {Flow{1, 4u << 20, 0}, false};
+	case 1: return {Flow{4, 16 * 1024, 2048}, true};
+	case 2: return {Flow{16, 4u << 20, 0}, true};
+	default: return {Flow{4, 4u << 20, 0}, false};
 	}
 }
 
@@ -260,7 +266,7 @@ struct Node {
 struct Envelope { NodeId from, to; GroupId group; std::variant<Message, std::string> body; std::uint64_t at; };
 
 struct Simulation {
-	Simulation(std::uint64_t seed) : flow_(flow_for(seed)), random_(seed) {
+	Simulation(std::uint64_t seed) : replication_(replication_for(seed)), random_(seed) {
 		place_groups();
 		for (NodeId id = 1; id <= 3; ++id) {
 			auto& n = nodes_[id];
@@ -376,7 +382,7 @@ struct Simulation {
 	std::uint64_t transfer_frames = 0, validations = 0, refusals = 0, activations = 0, installs = 0;
 	std::uint64_t appends_sent = 0, appends_pipelined = 0, appends_reordered = 0, in_flight_max = 0;  // appends with entries
 	bool seed_pipelined = false;                                                                      // a second append went out before the first's answer
-	Flow flow_;
+	Replication replication_;
 
 	void on_send(Node& n, GroupId g, Send notice) {
 		if (const auto* a = std::get_if<AppendRequest>(&notice.message); a && !a->entries.empty()) { on_append_sent(n, g, notice.peer, *a); }
@@ -549,7 +555,8 @@ private:
 			o.configuration.local = n.id; o.configuration.voters = {1, 2, 3};
 			o.configuration.cluster[0] = 'D'; o.configuration.configuration[0] = 'S';
 			if (witnessed_.count(g)) { o.founding = Membership{{{1, 1, MemberRole::Voter}, {2, 2, MemberRole::Voter}, {3, 3, MemberRole::Witness}}, 4, 0}; }
-			o.admission = admission; o.limits = limits(); o.timing = timing; o.scheduling = WorkerLimits{16, 128}; o.scheduling.flow = flow_;
+			o.admission = admission; o.limits = limits(); o.timing = timing; o.scheduling = WorkerLimits{16, 128}; o.scheduling.flow = replication_.flow;
+			if (replication_.follower_batching) { o.scheduling.follower_batch_entries = limits().rpc_entries; o.scheduling.follower_batch_bytes = limits().rpc_bytes; }
 			o.snapshots = SnapshotLimits{image_format, application_cap, 1 + std::uint32_t(random_() % 3)};
 			auto& d = n.driver(g);
 			d.open(g, std::move(o));
@@ -929,7 +936,7 @@ bool run(std::uint64_t seeds, std::uint64_t steps, std::uint64_t first) {
 		for (int l = 0; l < 5; ++l) { boots[l] += sim.boots_by_loops[l]; }
 		for (auto [g, k] : sim.snapshots_needed) { needed += k; }
 		sent += sim.appends_sent; pipelined += sim.appends_pipelined; reordered += sim.appends_reordered; deepest = std::max(deepest, sim.in_flight_max);
-		if (sim.flow_.pipeline > 1) { ++deep_seeds; deep_seeds_pipelined += sim.seed_pipelined; }
+		if (sim.replication_.flow.pipeline > 1) { ++deep_seeds; deep_seeds_pipelined += sim.seed_pipelined; }
 		frames += sim.transfer_frames; validations += sim.validations; refusals += sim.refusals; activations += sim.activations; installs += sim.installs;
 	};
 	for (std::uint64_t seed = first; seed < first + seeds && !failures; ++seed) { one(seed, steps); }

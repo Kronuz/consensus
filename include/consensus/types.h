@@ -188,9 +188,19 @@ struct InstallRequest { Term term; Token request; LogBoundary base; };
 // (a witness or a removed incarnation).
 enum class InstallRequestReply : std::uint8_t { Started, InFlight, Current, NotLeader, NotMember };
 struct InstallRequestResponse { Term term; Token request; InstallRequestReply result; NodeId leader = 0; };
-using Message = std::variant<VoteRequest, VoteResponse, AppendRequest, AppendResponse, SnapshotResponse, PreVoteRequest, PreVoteResponse, TimeoutNow, Gone, InstallRequest, InstallRequestResponse>;
+// A follower's read forwarded to its leader in `term` (docs/mechanisms/follower-read.md):
+// `start` names the follower's Core start (Start::nonce), `token` the read within it.
+struct ReadIndexRequest { Term term; Token start; Token token; };
+// Ready: `index` is the leader's commit index at the request's arrival, confirmed by a quorum
+// that answered a probe sent after it. Otherwise the leader refused the read, as a local Read.
+enum class ReadIndexReply : std::uint8_t { Ready, NotReady, Busy, NotLeader };
+struct ReadIndexResponse { Term term; Token start; Token token; ReadIndexReply result; Index index = 0; };
+using Message = std::variant<VoteRequest, VoteResponse, AppendRequest, AppendResponse, SnapshotResponse, PreVoteRequest, PreVoteResponse, TimeoutNow, Gone, InstallRequest, InstallRequestResponse, ReadIndexRequest, ReadIndexResponse>;
 
-struct Start {};
+// nonce: a random value the host draws at each start, never 0 (the Driver does); it keeps a
+// restarted follower from matching a read answered for its previous start. 0 leaves a
+// follower's Read refused NotLeader.
+struct Start { Token nonce = 0; };
 // The host supplies absolute monotonic time and a fresh randomized election
 // delay within Timing's bounds. Deliver a Tick before completions after I/O.
 struct Tick { std::uint64_t now; std::uint64_t election_delay; };
@@ -199,6 +209,8 @@ struct Tick { std::uint64_t now; std::uint64_t election_delay; };
 // is answered with its own token once it is durable.
 struct Receive { NodeId authenticated_peer; Message message; std::vector<AppendRequest> more{}; };
 struct Propose { RequestId request; std::string command; };
+// At a leader, ReadReady once a quorum confirms its leadership and the index is applied; at a
+// follower, forwarded to its leader (ReadIndexRequest) and ReadReady once its answer is applied.
 struct Read { RequestId request; };
 struct Persisted { Token token; };
 struct Applied { Index through; };

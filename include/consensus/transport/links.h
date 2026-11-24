@@ -1,4 +1,5 @@
 #pragma once
+#include "admission_join.h"
 #include "connection.h"
 #include "resolve.h"
 #include <algorithm>
@@ -10,8 +11,9 @@
 
 // A host's connections on one loop, at most one per peer node and lane, and how they start
 // (docs/mechanisms/host-connection.md): a dial resolves the peer's name and races its addresses
-// (RFC 8305), an accept takes any pinned node, and the DTHL0002 hellos settle duplicate dials
-// before any frame. Nodes are routed and removed while it runs (docs/mechanisms/admission.md).
+// (RFC 8305), an accept takes any pinned node, and the DTHL0003 hellos settle duplicate dials
+// before any frame. Nodes are routed and removed while it runs, and an accept whose first byte is
+// the join magic goes to the join service (docs/mechanisms/admission.md).
 // Everything runs on the loop.
 namespace kronuz::consensus::transport {
 struct LinkOptions {
@@ -27,10 +29,24 @@ struct LinkOptions {
 	std::uint32_t rpc_min = 1, rpc_max = 1;
 	std::uint32_t wire_min = wire_version, wire_max = wire_version;
 	kronuz::consensus::Limits limits{};  // the node's own, in its hellos (docs/mechanisms/hello.md)
+	// This process's boot (M7) and the directory version that admitted it (0 before), in its
+	// hellos; Links::boot() changes them while it runs. A zero boot is none.
+	kronuz::consensus::Identity boot{};
+	std::uint64_t directory = 0;
+	// Each end's check of the peer's hello against the directory's admitted boot, on `loop`:
+	// 0 admits it, any other value refuses the connection with that code, which an acceptor's
+	// reply carries to the dialer. Asynchronous, so it may fetch the directory first when behind
+	// the hello's version, within the handshake deadline. None admits every boot.
+	std::function<task::task<std::uint32_t>(const NodeHello &peer, task::scheduler_ref loop)> check_boot;
+	// On the dialer's loop: the peer's acceptor refused this node's boot with `reason`.
+	std::function<void(kronuz::consensus::NodeId peer, std::uint32_t reason)> boot_refused;
 };
 struct LinkStats {
 	std::uint64_t established = 0, refused = 0, abandoned = 0, rejected = 0, evicted = 0;
 	std::uint64_t version_refused = 0;  // hellos whose wire versions shared none with this node's
+	std::uint64_t unverified = 0;       // links a reload closed: their peer's chain no longer verifies
+	std::uint64_t joins = 0;            // accepts whose first byte was the join magic's
+	std::uint64_t boot_refused = 0;     // hellos whose boot a check here, or the peer's, refused
 	std::uint64_t lookups = 0, lookup_failures = 0, lookup_timeouts = 0;
 };
 // An established connection and the hellos that made it.
@@ -75,6 +91,8 @@ class Links {
 	// The Links that keeps `peer`'s connections when a host runs one per loop; null keeps them here.
 	// An accept authenticated here moves to it for its hellos (Connection::rehome).
 	std::function<Links *(kronuz::consensus::NodeId)> owner;
+	// Before serve(): the joins this host serves on its port, or none (every accept is a node's).
+	std::shared_ptr<JoinService> joins;
 
 	const LinkStats &stats() const noexcept { return stats_; }
 	// The pins every connection authenticates against, shared with every copy (node_pins.h).
@@ -110,6 +128,22 @@ class Links {
 				for (const auto *link : {it->second.link.get(), it->second.offered.get()})
 					if (link)
 						link->connection->abort();
+	}
+	// Takes `tls` for new connections (HostTransport::reload, after NodePins::reload) and aborts
+	// every link, established or offered, whose peer's chain no longer verifies.
+	void reload(std::shared_ptr<asio::ssl::context> tls) {
+		tls_ = std::move(tls);
+		for (auto &[key, slot] : slots_)
+			for (const auto *link : {slot.link.get(), slot.offered.get()})
+				if (link && !pins_.verifies(link->connection->native_handle())) {
+					++stats_.unverified;
+					link->connection->abort();
+				}
+	}
+	// The boot and directory version this host's hellos carry from now on.
+	void boot(kronuz::consensus::Identity id, std::uint64_t directory) {
+		options_.boot = id;
+		options_.directory = directory;
 	}
 	bool drained() const noexcept { return !tasks_ && !incoming_.load(std::memory_order_acquire); }
 	// The established, undrained link to `peer` on `lane`, or null.
@@ -172,8 +206,15 @@ class Links {
 			co_await connection->write_hello(link->local, deadline.token());
 			link->remote = co_await connection->read_hello(deadline.token());
 			check_node_hello(link->remote, link->local, peer, true);
+			std::uint32_t reason = 0;
+			if (!link->remote.refused && options_.check_boot)
+				reason = co_await options_.check_boot(link->remote, loop_);  // the acceptor's boot, as every end checks its peer's
 			auto &now = slots_[{peer, lane}];
-			if (link->remote.refused || now.offered != link) {
+			if (link->remote.reason || reason) {
+				++stats_.boot_refused;
+				if (link->remote.reason && options_.boot_refused)
+					options_.boot_refused(peer, link->remote.reason);
+			} else if (link->remote.refused || now.offered != link) {
 				++stats_.refused;  // the peer's dial won: its link arrives as an accept
 			} else {
 				now.offered = nullptr;
@@ -204,17 +245,38 @@ class Links {
 			co_return false;
 		}
 		Task running(*this);
+		late_deadline deadline(loop_, options_.connection.handshake);  // the first byte, TLS and the pins
+		if (joins) {
+			// In the handshakes' pool until its first byte: the join magic's leaves it for the
+			// join service's pool; a TLS record's goes on as a node's, in the same place.
+			socket.non_blocking(true, error);
+			admit(source, &socket, [&socket] {
+				asio::error_code ignored;
+				socket.shutdown(asio::socket_base::shutdown_both, ignored);
+				socket.cancel(ignored);
+			});
+			const int first = co_await first_byte(socket, deadline.token());
+			authenticated(&socket);
+			if (first < 0 || stopping_) {
+				++stats_.rejected;
+				co_return false;
+			}
+			if (char(first) == join_magic[0]) {
+				++stats_.joins;
+				co_await joins->serve(std::move(socket), loop_, stop_.token());
+				co_return false;
+			}
+		}
 		auto connection = std::make_shared<Connection>(loop_, std::move(socket), tls_, false, options_.connection);
 		const auto since = pins_.epoch();
 		live(connection, since);
-		admit(source, connection);
+		admit(source, connection.get(), [connection] { connection->abort(); });
 		kronuz::consensus::NodeId peer = 0;
 		try {
-			late_deadline deadline(loop_, options_.connection.handshake);
 			peer = co_await connection->handshake(pins_, 0, deadline.token());
 		} catch (...) {
 		}
-		authenticated(connection);
+		authenticated(connection.get());
 		if (!peer || stopping_) {
 			connection->abort();
 			forget(connection);
@@ -250,10 +312,16 @@ class Links {
 			auto remote = co_await connection->read_hello(deadline.token());
 			auto link = std::make_shared<Link>(Link{peer, remote.lane, connection, hello(remote.lane), remote, false, 0});
 			check_node_hello(remote, link->local, peer, false);
+			std::uint32_t reason = 0;
+			if (options_.check_boot)
+				reason = co_await options_.check_boot(remote, loop_);  // the dialer's boot against the directory's (M7)
 			if (!current(*link))
 				throw std::runtime_error("links: the peer was removed");
-			link->local.refused = !wins(peer, remote.lane);
-			if (link->local.refused) {
+			link->local.reason = reason;
+			link->local.refused = reason || !wins(peer, remote.lane);
+			if (reason) {
+				++stats_.boot_refused;
+			} else if (link->local.refused) {
 				++stats_.refused;
 			} else {
 				slots_[{peer, remote.lane}].offered = nullptr;  // this host's own dial lost, if any
@@ -277,10 +345,10 @@ class Links {
 		}
 		co_return established;
 	}
-	// Accepts on `acceptor` until stop().
+	// Accepts on `acceptor` until stop(); a host may serve several (an IPv4 and an IPv6 address).
 	task::task<void> serve(asio::ip::tcp::acceptor &acceptor) {
 		Task running(*this);
-		acceptor_ = &acceptor;
+		acceptors_.push_back(&acceptor);
 		while (!stopping_) {
 			auto [error, socket] = co_await task::await_asio<void(asio::error_code, asio::ip::tcp::socket)>(
 				[&](auto h) { acceptor.async_accept(std::move(h)); });
@@ -288,7 +356,7 @@ class Links {
 				continue;
 			task::spawn(loop_, accept(std::move(*socket)), [](std::exception_ptr, std::optional<bool>) {});
 		}
-		acceptor_ = nullptr;
+		std::erase(acceptors_, &acceptor);
 	}
 	// Starts draining the link: its queued frames, then close_notify. It stops counting at once.
 	void retire(kronuz::consensus::NodeId peer, LinkLane lane) {
@@ -299,9 +367,15 @@ class Links {
 	// then runs until drained().
 	void stop() noexcept {
 		stopping_ = true;
+		stop_.request();  // the joins being served
+		std::vector<std::function<void()>> pending;
+		for (auto &h : handshaking_)
+			pending.push_back(h.abort);
+		for (auto &abort : pending)
+			abort();
 		asio::error_code ignored;
-		if (acceptor_)
-			acceptor_->close(ignored);
+		for (auto *acceptor : acceptors_)
+			acceptor->close(ignored);
 		for (auto &[node, route] : state_->routes) {
 			if (route.lookup)
 				route.lookup->abandon();
@@ -348,8 +422,9 @@ class Links {
 	// An incoming connection not yet authenticated, oldest first.
 	struct Handshake {
 		asio::ip::address source;
-		std::shared_ptr<Connection> connection;
-		bool peer = false;  // from an address a route names
+		const void *key = nullptr;    // the connection, or an accepted socket before its first byte
+		std::function<void()> abort;  // ends it: its handshake or its wait fails
+		bool peer = false;            // from an address a route names
 	};
 	struct Task {
 		Links &links;
@@ -359,7 +434,7 @@ class Links {
 
 	NodeHello hello(LinkLane lane) const {
 		return {pins_.local(), lane, false, cluster_, fresh_connection_identity(), options_.rpc_min, options_.rpc_max,
-				options_.wire_min, options_.wire_max, options_.limits};
+				options_.wire_min, options_.wire_max, options_.limits, options_.boot, options_.directory, 0};
 	}
 	// The tie-break (T6) for an incoming hello from `peer`: an undrained link of the lane wins;
 	// else, when this host's own dial already offered its hello, the dial of the lower node wins.
@@ -370,8 +445,11 @@ class Links {
 		const bool offered = it != slots_.end() && it->second.offered;
 		return !offered || peer < pins_.local();
 	}
-	// Whether the link's peer is pinned and was not removed since its connection began authenticating.
+	// Whether the link's peer's chain verifies against the CAs trusted now, and the peer is pinned
+	// and was not removed since its connection began authenticating.
 	bool current(const Link &link) const {
+		if (!pins_.verifies(link.connection->native_handle()))
+			return false;
 		const auto it = since_.find(link.connection.get());
 		return it != since_.end() && pins_.current(link.peer, it->second);
 	}
@@ -420,7 +498,7 @@ class Links {
 	// its oldest ends at once; when the pool is, its oldest from an unknown address, else, for a
 	// newcomer from a peer's address, its oldest, else the newcomer (host-connection.md, Before
 	// authentication).
-	void admit(asio::ip::address source, std::shared_ptr<Connection> connection) {
+	void admit(asio::ip::address source, const void *key, std::function<void()> abort) {
 		if (source.is_v6() && source.to_v6().is_v4_mapped())
 			source = asio::ip::make_address_v4(asio::ip::v4_mapped, source.to_v6());
 		const bool peer = routed(source);
@@ -435,15 +513,16 @@ class Links {
 		}
 		if (drop == handshaking_.end() && handshaking_.size() >= options_.handshakes) {
 			++stats_.evicted;
-			connection->abort();
+			abort();
 			return;
 		}
 		if (drop != handshaking_.end()) {
 			++stats_.evicted;
-			drop->connection->abort();
+			const auto evicted = std::move(drop->abort);
 			handshaking_.erase(drop);
+			evicted();
 		}
-		handshaking_.push_back({source, std::move(connection), peer});
+		handshaking_.push_back({source, key, std::move(abort), peer});
 	}
 	// Whether a route names `source`: a literal address, or a name's cached answer.
 	bool routed(const asio::ip::address &source) const {
@@ -453,8 +532,23 @@ class Links {
 					return true;
 		return false;
 	}
-	void authenticated(const std::shared_ptr<Connection> &connection) {
-		std::erase_if(handshaking_, [&](const Handshake &h) { return h.connection == connection; });
+	void authenticated(const void *key) {
+		std::erase_if(handshaking_, [&](const Handshake &h) { return h.key == key; });
+	}
+	// The first byte an accepted socket sends, peeked within `deadline`: -1 when none came.
+	static task::task<int> first_byte(asio::ip::tcp::socket &socket, task::cancel_token deadline) {
+		for (;;) {
+			unsigned char byte = 0;
+			const auto n = ::recv(socket.native_handle(), &byte, 1, MSG_PEEK);
+			if (n == 1)
+				co_return byte;
+			if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
+				co_return -1;
+			const auto ec = co_await task::await_asio<void(asio::error_code)>(
+				[&](auto h) { socket.async_wait(asio::socket_base::wait_read, std::move(h)); }, deadline);
+			if (ec || deadline.requested())
+				co_return -1;
+		}
 	}
 
 	// The peer's endpoints: a literal's, the cache's (a lookup refreshes it behind the dial), or
@@ -560,8 +654,9 @@ class Links {
 	std::vector<std::shared_ptr<Connection>> live_;
 	std::map<const Connection *, std::uint64_t> since_;  // the pins epoch each live connection began authenticating at
 	std::vector<std::shared_ptr<Race>> races_;
+	task::cancel_source stop_;  // requested by stop(): the joins being served end
 	std::vector<Handshake> handshaking_;
-	asio::ip::tcp::acceptor *acceptor_ = nullptr;
+	std::vector<asio::ip::tcp::acceptor *> acceptors_;  // serve()'s, one per listening address
 	LinkStats stats_;
 	std::size_t tasks_ = 0;
 	std::atomic<std::size_t> incoming_{0};  // accepts moving here from another loop's Links

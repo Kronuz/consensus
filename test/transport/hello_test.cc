@@ -41,16 +41,16 @@ bool codec() {
 	NodeHello hello{2, LinkLane::Control, false, id('K'), id('c'), 1, 1, 1, 3, low()};
 	const auto bytes = encode_node_hello(hello);
 	bool ok = bytes.size() == node_hello_size && decode_node_hello(bytes) == hello;
-	// rpc_entries (the seventh limit, at 72 + 6 * 8) set to 0: validate_limits refuses it.
+	// rpc_entries (the seventh limit, at 100 + 6 * 8) set to 0: validate_limits refuses it.
 	auto zero = bytes;
-	zero.replace(72 + 6 * 8, 8, std::string(8, '\0'));
+	zero.replace(100 + 6 * 8, 8, std::string(8, '\0'));
 	ok &= refuses<kronuz::journal::Corruption>([&] { (void)decode_node_hello(zero); }, "invalid limits");
 	auto inverted = bytes;  // command_bytes above rpc_bytes
-	inverted.replace(72 + 8, 8, inverted.substr(72 + 5 * 8, 8));
-	inverted[72 + 8] = char(inverted[72 + 8] + 1);
+	inverted.replace(100 + 8, 8, inverted.substr(100 + 5 * 8, 8));
+	inverted[100 + 8] = char(inverted[100 + 8] + 1);
 	ok &= refuses<kronuz::journal::Corruption>([&] { (void)decode_node_hello(inverted); }, "invalid limits");
 	auto wire = bytes;  // wire_min 0
-	wire.replace(64, 4, std::string(4, '\0'));
+	wire.replace(92, 4, std::string(4, '\0'));
 	ok &= refuses<kronuz::journal::Corruption>([&] { (void)decode_node_hello(wire); }, "invalid wire version range");
 	auto bad = hello;
 	bad.limits.members = 0;

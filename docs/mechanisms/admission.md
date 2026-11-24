@@ -83,38 +83,104 @@ connections but leaves established links up; the transport's `remove_node` is th
 ## Joining with a token
 
 Every node speaks TLS under the cluster CA; there is no unauthenticated mode (D150). A node with
-no key and no certificate gets both by joining (`admission_join.h`): it holds only the cluster's
-join token, `DTJT` and two hex fields, 132 characters: the CA certificate's SHA-256 fingerprint
-and a 32-byte secret (`fresh_join_token`, `encode_join_token`, `decode_join_token`). Creating the
-CA on first start and printing the token are the caller's (Xapiand's cluster A7).
+no certificate gets one by joining (`admission_join.h`) with the cluster's token, version 2:
+`DTJT0002` and three hex fields, 168 characters: the 16-byte cluster id, the CA key's pin
+(`key_pin`, the SHA-256 of its SubjectPublicKeyInfo, as kubeadm pins) and a 32-byte secret
+(`fresh_join_token`, `encode_join_token`, `decode_join_token`). A version 1 token (`DTJT` and 128
+hex digits) or another version's magic is refused as `version`, anything else as `malformed`.
+The cluster keeps only the secret's SHA-256 (`join_secret_digest`), compared in constant time
+(`join_secret_matches`). Creating the CA and the token, and checking the token's life and uses,
+are the caller's (Xapiand's M4).
 
-`join(executor, loop, endpoint, token, requested)` connects to an `Issuer`, a node holding the CA
-key, over TLS that authenticates neither end yet. The DTJN0001 exchange, length-prefixed frames
-of at most 64 KiB, within one deadline:
+The joiner makes its key once and saves it before its first request (`fresh_join_key`,
+`save_join_key`), so a retry after a lost answer or its own crash is the same key, and the same
+node. `join(executor, loop, endpoint, token, key, detail, requested)` reaches any member on the
+transport's own port. The exchange, DTJN0002, within one deadline at the joiner (10 s):
 
 ```
-issuer -> joiner   the CA certificate                      joiner: its fingerprint is the token's,
-                                                           and the issuer's leaf chains to it (ca)
-joiner -> issuer   the secret, the node it asks for, a CSR  issuer: the secret (token), the CSR's
-                   for a P-256 key it made just now        signature (malformed), the hook (node)
-issuer -> joiner   a fault, or the node and its certificate joiner: the key and the CA (issued)
+joiner -> member   "DTJN0002" in the clear, then TLS that authenticates neither end
+member -> joiner   the offer: its cluster id and the CAs   joiner: the cluster is the token's
+                   it trusts (at most 16)                  (cluster), a CA's key is the pin and
+                                                           the member's leaf chains to it (ca)
+joiner -> member   the request: cluster id, secret,        member: a P-256 CSR key, then its
+                   requested node, the caller's detail,    signature (malformed); its cluster
+                   a CSR for the saved key                 (cluster); then the hook
+member -> joiner   the answer: a fault and the hook's      joiner: the certificate is its key's,
+                   reason, or the node and its certificate chains to the CA, names the node (issued)
 ```
 
-The joiner sends its secret only after it pinned the CA by the token, so a host that is not the
-cluster's never sees it. The issuer compares the secret in constant time; a wrong or empty one is
-`token`. Its `assign` hook names the node a joiner becomes, or refuses it (`node`); `issued` may
-record the certificate. The certificate names the node under the CA policy's prefix
-(`URI:<prefix><node>`), CA:FALSE, server and client auth, signed with SHA-256 for a year by
-default. `Joined::save(directory)` writes the certificate, the key and the CA, and returns the
-options a Peer context loads: each file is written whole to `<name>.new`, synced and renamed into
-place, the key created 0600 so no other user ever reads its bytes, and a failed create, write,
-sync, close or rename throws `std::system_error` naming the file; the joined node then connects as any node does, and the
-cluster CA policy records its pin at its first connection. Refusals are `JoinRefused` with a
-`JoinFault`, counted at the issuer in `refused(fault)`.
+Frames are a 4-byte little-endian length and at most 64 KiB (`join_frame_limit`): a request
+holds a CSR (about 300 bytes) and the caller's detail, a name and, for a cluster of one carrying
+its indexes (Xapiand's M3), their paths, so at most about 63 KiB of them. The joiner sends its
+secret only after the cluster and the CA's key match its token, so a host of another cluster, or
+one replaying the CA certificate with another CA's leaf, never sees it.
 
-The exchange runs on whatever socket the caller accepts for it, not on the transport's own
-listener: the transport's handshake requires a client certificate, which a joiner does not have
-yet.
+A CSR's key must be EC P-256, the type `fresh_join_key` makes (`join_detail::csr_of`), decided
+from its encoding before any signature work: a request costs the member at most one P-256
+verification (about 0.26 ms), where a forged RSA-16384 CSR, made with no private key, would cost
+about 10 ms (security review S1). `JoinService::verified()` and `Issuer::verified()` count the
+verifications.
+
+The member's side is `JoinService`, which asks the issuer hook (`JoinHook`) for the answer:
+asynchronous, since in Xapiand it relays to the root's leader, which checks the secret, names
+the node by one command and signs. The hook must be idempotent per key (`JoinRequest::key`, the
+CSR key's pin): a retry gets the same node. Its refusals carry a fault (`token`, or `refused`
+with its own reason: expired, used, name) that the joiner reads as `JoinRefused::fault` and
+`reason`. `Issuer`, for the node holding the CA key, is one: its `assign` hook checks the
+secret and names the node before the issuer verifies the CSR (P-256 only, as above), so a wrong
+secret costs no verification; it signs once per key and node within a retry window (10 minutes, in memory), so two joins
+with the same key at once, and a retry, get one certificate. The certificate names the node under
+the CA policy's prefix (`URI:<prefix><node>`), CA:FALSE, server and client auth, SHA-256, a year
+by default.
+
+`Joined::save(directory)` writes the key, the CA and the certificate, in that order, each whole
+to `<name>.new`, synced and renamed over the old one, the key created 0600 so no other user ever
+reads its bytes; the certificate goes last, so a crash before it leaves the saved key and the old
+certificate (or none), and the next start joins again with the key. A failed create, write,
+sync, close or rename throws `std::system_error` naming the file. The joined node then connects
+as any node does, and the cluster CA policy records its key's pin at its first connection.
+Refusals are `JoinRefused` with a `JoinFault`, counted at the member in `refused(fault)`.
+
+### The join pool
+
+Joins share the transport's port (`HostTransportOptions::join`, the hook). An accepted
+connection stays in the handshakes' pool (host-connection.md, Before authentication) only until
+its first byte, peeked: a TLS record (0x16) goes on as a node's, in the same place; the join
+magic's `D` leaves it for the join service's own pool, so joiners never take a node's handshake
+slot, and a node's handshake keeps the peer priority it had. The join pool (`JoinOptions`):
+
+| Limit | Default | What it costs |
+|---|---|---|
+| `pool` | 64 joins at once | past it a joiner is refused, never a slot evicted: 64 sockets and their TLS sessions |
+| `per_source` | 8 from one address | one address cannot fill the pool; an IPv6 /64 can, as for handshakes |
+| `rate` | 10 a second per address, 10 at once | past it a joiner waits for its turn in its slot (`delayed()`), so a flood costs at most 10 TLS handshakes and 10 P-256 verifications a second per address on loop 0 |
+| `slot` | 10 s | from the pool's taking it until the request arrived: a joiner that stalls is cut (`cut()`), so 64 idle sockets free their slots within 10 s |
+| `answer` | 10 s | the hook and the answer's write; a hook that fails answers `refused` |
+
+The pool's counters are `busy()` (refused at a cap), `delayed()`, `cut()` and `serving()`;
+`LinkStats::joins` counts the accepts handed to it. A reload (below) gives the service the new
+context, so its offer names the new CAs.
+
+## Keys, renewal and reload
+
+Pins are key pins: `key_pin(certificate)` hashes the certificate's SubjectPublicKeyInfo, so every
+certificate for the key has it. A renewed certificate for a pinned key is the node's with no
+operator step, and a new key under a pinned node's name is refused (`repinned`, or `unpinned`
+under pre-approved pins). The pin costs one SHA-256 of about 91 bytes per handshake.
+
+`NodePins` keeps the CAs it verifies against. At authentication, and again when a connection's
+hellos are done, before it becomes a link, the peer's leaf and the chain it sent are verified
+against them at that moment (`verifies`): an expired certificate, or one a reload no longer
+trusts, is refused (`unverified`), whatever the handshake saw. That is one more chain verification
+per connection, none per frame.
+
+`HostTransport::reload(context)` takes a context with this node's renewed certificate (the same
+key, or it throws) or a new CA bundle: NodePins and the cluster CA policy take its CAs, the join
+service its offer, new connections the context, and each loop then aborts every link, established
+or offered, whose peer's chain no longer verifies (`LinkStats::unverified`). The peer redials,
+and is refused until its own certificate chains to a trusted CA again. Pins do not change. Peers
+(the transport `Peers` replaces) still pins the certificate's DER (`certificate_fingerprint`),
+as Detent's configuration names it.
 
 ## Refusals
 
@@ -145,18 +211,52 @@ node). The messages of the faults that existed before keep their text.
   node 3 finishes TLS, node 3 is removed, then the hellos run; and node 1 accepts node 3 on one
   loop, moves it to its owner loop, which waits while node 3 is removed, then reads its hello.
   Neither becomes a link.
-- `issue` (the CA policy alone): the token's round trip; a wrong token and a missing one refused
-  (`token`), a token of another CA refused by the joiner before its secret goes out (`ca`), a node
-  the hook refuses (`node`), nothing issued for them, and an impostor presenting another CA's leaf
-  that replays the token's CA certificate (`ca`, it receives 0 bytes); then a node with no key or
-  certificate joins, calls node 1, and node 1 pins its issued certificate at its first join.
+- `renew`: node 3 with a renewed certificate (`n3r`, its key, a new certificate) calls and
+  answers, its pin unchanged and nothing refused.
+- `issue` (the CA policy alone, on node 1's transport port): token v2's round trip; a version 1
+  token and another version's refused (`version`), a cut or non-hex one (`malformed`); a wrong
+  and a missing secret refused by the hook (`token`); a token of another cluster (`cluster`) and
+  one pinning another CA key (`ca`) refused by the joiner before its secret goes out; a node the
+  hook refuses (`refused`, with its reason); an impostor presenting another CA's leaf that offers
+  the token's CA certificate (`ca`, it receives 0 bytes); nothing signed for any of them. Then two
+  joins with one saved key at once and a retry get node 5 and one certificate, another key node
+  6; node 5 calls node 1, which pins its key at its first join.
 - `save`: under umask 022 the key is 0600 and the certificates 0644; a child stopped by
   `SIGXFSZ` at the key's write left only owner-readable key bytes; a write failing with `EFBIG`
-  throws naming the key and leaves none; an unwritable directory throws naming `node.pem`.
+  throws naming the key and leaves none; a save over a whole one killed while writing the key
+  leaves the old three files whole, and killed while writing the certificate, the last, leaves
+  the new key and CA and the old certificate whole; an unwritable directory throws naming
+  `node.key`.
+- `expired` (CA): a certificate that expired an hour ago neither calls nor answers; no pin is
+  recorded.
+- `reload` (CA): a reload with another key's certificate throws; node 1 reloaded to trust only a
+  second CA closes its links to node 2 (`unverified`), neither calls the other, and node 2
+  renewed under the second CA links again, both pins unchanged.
+- `flood` (CA; joiners from ::1, nodes from 127.0.0.1): 12 joiners stall after the magic: 8 are
+  served and 4 refused at the address's cap; the 8 are cut within the 1 s slot deadline set for
+  the test. Then 8 joiners join back to back for about 3 s while node 2's links are removed and
+  admitted 12 times: node 2 answers each time within the handshake deadline, and joins past the
+  rate wait.
+- `boot` (CA): hello.md, The boot check.
+- `forged` (CA): a forged RSA-16384 CSR (no private key) is refused `malformed` with no
+  verification at the member or the issuer and no `assign`; a P-256 CSR with a bad signature costs
+  the member one verification; the issuer refuses a wrong secret (`token`) before verifying, and
+  with the secret verifies once and refuses the bad signature, signing nothing.
+- `redial` (CA): a call made within the redial spacing after a failed dial, with no other call
+  waiting, dials once the spacing passes rather than waiting for its deadline, as the relink after
+  a reload needs (the spacing 1500 ms, a silent peer failing each dial at its 300 ms handshake
+  deadline).
 
 Mutants (`test/transport/admission_mutants.py`): `no-pin-check` (a dial takes any certificate as
 the node it meant) fails `refused_pins`; `no-repin-check` (a first join re-pins a pinned node)
 fails `refused_ca`; `remove-keeps-links` fails `remove_*`; `links-no-epoch` (a connection
-authenticated before the removal becomes a link) fails `epoch_*`; `any-token` (an issuer takes any
-secret) and `join-unchained-issuer` (the joiner skips the issuer leaf's chain) fail `issue`;
-`save-chmod-after` (the key written through an ofstream, then chmodded) fails `save`.
+authenticated before the removal becomes a link) fails `epoch_*`; `any-token` (a secret matches
+any digest), `join-any-cluster`, `join-unpinned-ca`, `token-no-version`, `join-unchained-issuer`
+(the joiner skips the member leaf's chain) and `sign-each-time` (two joins with one key get two
+certificates) fail `issue`; `save-chmod-after` (the key written through an ofstream, then
+chmodded) and `save-in-place` (each file written over the old one) fail `save`; `pin-der` (pins
+over the certificate's DER) fails `renew_*`; `reload-keeps-links` and `reload-keeps-trust` fail
+`reload`; `join-no-cap`, `join-no-slot-deadline` and `join-no-rate` fail `flood`;
+`skip-boot-check` (the acceptor skips the boot check) fails `boot`; `redial-at-deadline` (such a
+call waits for its deadline) fails `redial`; `csr-any-key` (any CSR key reaches verification) and
+`issue-verify-first` (the issuer verifies before the secret) fail `forged`.

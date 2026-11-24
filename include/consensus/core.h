@@ -197,6 +197,10 @@ public:
 			if (!budget.consume()) { return false; }
 			reads_.pop_back();
 		}
+		while (!forwarded_.empty()) {
+			if (!budget.consume()) { return false; }
+			forwarded_.pop_back();
+		}
 		while (!peers_.empty()) {
 			if (!budget.consume()) { return false; }
 			peers_.erase(peers_.begin());
@@ -209,7 +213,7 @@ public:
 		return retirement_drained();
 	}
 	bool retirement_drained() const noexcept {
-		return retiring_ && !pending_ && !install_ && !captured_ && reads_.empty() &&
+		return retiring_ && !pending_ && !install_ && !captured_ && reads_.empty() && forwarded_.empty() &&
 			peers_.empty() && grants_.empty() && !entries_.charged_entries();
 	}
 	Index last_index() const noexcept { return base_index_ + static_cast<Index>(entries_.size()); }
@@ -333,7 +337,7 @@ public:
 	// now or past; every other deadline counts only while ahead of the clock.
 	std::uint64_t next_deadline() const {
 		if (!started_ || retiring_ || role_ == Role::Fenced || busy() || resting_) { return maximum; }
-		if (role_ != Role::Leader) { return std::min({is_voter(configuration_.local) && hard_.term != maximum ? election_deadline_ : maximum, acknowledge_at_, install_deadline()}); }
+		if (role_ != Role::Leader) { return std::min({is_voter(configuration_.local) && hard_.term != maximum ? election_deadline_ : maximum, acknowledge_at_, install_deadline(), forwarded_deadline()}); }
 		auto at = peers_.empty() ? maximum : heartbeat_deadline_;  // a leader with nobody to heartbeat sleeps
 		auto later = [&](std::uint64_t base, std::uint64_t delay) {
 			const auto due = delay > maximum - base ? maximum : base + delay;
@@ -447,7 +451,11 @@ private:
 		// started is owed; `imaged`, the base of the last image the peer installed or rejected.
 		bool requested = false; Index imaged = 0;
 	};
-	struct PendingRead { RequestId request; Token probe; Term term; Index index; std::set<NodeId> acknowledgements; };
+	// A leader's read; `from` a follower's forwarded one, answered by ReadIndexResponse{start, token}.
+	struct PendingRead { RequestId request; Token probe; Term term; Index index; std::set<NodeId> acknowledgements; NodeId from = 0; Token start = 0, token = 0; };
+	// A follower's read forwarded to `leader` in `term` at `sent`; `index` the leader's answer,
+	// 0 until it arrives (docs/mechanisms/follower-read.md).
+	struct ForwardedRead { RequestId request; Token token; Term term; NodeId leader; std::uint64_t sent; Index index = 0; };
 	struct Transfer { NodeId target; Token token; std::uint64_t until; bool sent = false; };
 	// wire_limits' caps, valid for its key: the membership version (from 1) and the committed
 	// membership's index; a zero key holds none.
@@ -656,7 +664,7 @@ private:
 	}
 	void fence(std::string reason, Actions& output) {
 		output.clear(); release_snapshots(SnapshotReleaseReason::Fenced, output);
-		role_ = Role::Fenced; pending_.reset(); install_.reset(); reinstall_.reset(); peers_.clear(); reads_.clear();
+		role_ = Role::Fenced; pending_.reset(); install_.reset(); reinstall_.reset(); peers_.clear(); reads_.clear(); forwarded_.clear();
 		output.emplace_back(Fenced{std::move(reason)});
 	}
 	void follower(NodeId leader, Actions& deferred) {
@@ -664,8 +672,18 @@ private:
 		if (reinstall_ && (reinstall_->leader != leader || reinstall_->term != hard_.term)) { drop_install(RejectReason::NotLeader, deferred); }
 		release_snapshots(SnapshotReleaseReason::LeadershipLost, deferred);
 		role_ = Role::Follower; leader_ = leader; peers_.clear(); grants_.clear(); prevote_ = 0; prevotes_.clear(); answered_.clear(); transfer_.reset(); resting_ = false;
-		for (const auto& read : reads_) { deferred.emplace_back(Reject{read.request, RejectReason::NotLeader}); }
+		for (const auto& read : reads_) { refuse(read, ReadIndexReply::NotLeader, deferred); }
 		reads_.clear(); reset_election();
+		// A forwarded read stands only while its term and leader do.
+		std::erase_if(forwarded_, [&](const ForwardedRead& read) {
+			if (read.term == hard_.term && read.leader == leader) { return false; }
+			deferred.emplace_back(Reject{read.request, RejectReason::NotLeader}); return true;
+		});
+	}
+	// A leader's read refused: a local one by Reject, a forwarded one by its answer.
+	void refuse(const PendingRead& read, ReadIndexReply reason, Actions& output) {
+		if (read.from) { output.emplace_back(Send{read.from, ReadIndexResponse{hard_.term, read.start, read.token, reason, 0}}); return; }
+		output.emplace_back(Reject{read.request, reason == ReadIndexReply::Busy ? RejectReason::Busy : reason == ReadIndexReply::NotReady ? RejectReason::NotReady : RejectReason::NotLeader});
 	}
 	void persist(StorageBatch batch, Actions deferred, Actions& output, bool elected = false) {
 		if (busy()) { throw std::logic_error("overlapping persistence"); }
@@ -674,9 +692,9 @@ private:
 		pending_.emplace(Pending{id, hard_, std::move(deferred), elected, std::nullopt});
 		output.emplace_back(Persist{id, std::move(batch)});
 	}
-	void handle(Start, Actions& output) {
+	void handle(Start start, Actions& output) {
 		if (started_) { return; }
-		started_ = true; reset_election();
+		started_ = true; start_ = start.nonce; reset_election();
 		// A reopen resumes its closed term: as its leader, or following the leader it knew.
 		if (resume_ == configuration_.local) { lead(); output.emplace_back(RoleChanged{role_, hard_.term, leader_}); }
 		else if (resume_) { follower(resume_, output); leader_contact_ = now_; }
@@ -1046,16 +1064,20 @@ private:
 	}
 	void handle(Read read, Actions& output) {
 		if (busy()) { output.emplace_back(Reject{read.request, RejectReason::Busy}); return; }
-		if (!started_ || role_ != Role::Leader || witness_self()) { output.emplace_back(Reject{read.request, RejectReason::NotLeader}); return; }
-		if (durable_.commit_index == 0 || log_term(durable_.commit_index) != hard_.term) {
-			output.emplace_back(Reject{read.request, RejectReason::NotReady}); return;
-		}
-		if (reads_.size() >= limits_in_force().reads) { output.emplace_back(Reject{read.request, RejectReason::Busy}); return; }
+		if (!started_ || witness_self()) { output.emplace_back(Reject{read.request, RejectReason::NotLeader}); return; }
+		if (role_ != Role::Leader) { forward(read, output); return; }
 		for (const auto& pending : reads_) {
-			if (pending.request == read.request) { output.emplace_back(Reject{read.request, RejectReason::DuplicateRequest}); return; }
+			if (!pending.from && pending.request == read.request) { output.emplace_back(Reject{read.request, RejectReason::DuplicateRequest}); return; }
 		}
-		auto probe = token();
-		reads_.push_back(PendingRead{read.request, probe, hard_.term, durable_.commit_index, {configuration_.local}});  // counted while a voter
+		admit_read(PendingRead{read.request, 0, hard_.term, durable_.commit_index, {configuration_.local}}, output);
+	}
+	// A leader's read, local or forwarded: refused before an entry of its term commits and at
+	// limits.reads; else confirmed by a probe sent after its admission.
+	void admit_read(PendingRead read, Actions& output) {
+		if (durable_.commit_index == 0 || log_term(durable_.commit_index) != hard_.term) { refuse(read, ReadIndexReply::NotReady, output); return; }
+		if (reads_.size() >= limits_in_force().reads) { refuse(read, ReadIndexReply::Busy, output); return; }
+		read.probe = token();
+		reads_.push_back(std::move(read));  // counted while a voter
 		// Preserve data/probe correlation. Later reads queue behind the oldest
 		// pending probe; each quorum observation must follow its admission.
 		for (auto& [id, peer] : peers_) {
@@ -1063,6 +1085,30 @@ private:
 			if (peer.flights.empty() && needed) { replicate(id, peer, output, needed); }
 		}
 		ready_reads(output);
+	}
+	// A follower's read goes to its leader (docs/mechanisms/follower-read.md); a host that
+	// gave no start nonce keeps the follower's reads refused.
+	void forward(const Read& read, Actions& output) {
+		if (role_ != Role::Follower || !leader_ || !start_) { output.emplace_back(Reject{read.request, RejectReason::NotLeader}); return; }
+		for (const auto& pending : forwarded_) {
+			if (pending.request == read.request) { output.emplace_back(Reject{read.request, RejectReason::DuplicateRequest}); return; }
+		}
+		if (forwarded_.size() >= limits_in_force().reads) { output.emplace_back(Reject{read.request, RejectReason::Busy}); return; }
+		if (resting_) { wake(output); }
+		forwarded_.push_back(ForwardedRead{read.request, token(), hard_.term, leader_, now_});
+		output.emplace_back(Send{leader_, ReadIndexRequest{hard_.term, start_, forwarded_.back().token}});
+	}
+	// One deadline from the send to the apply: election_max (review V4).
+	std::uint64_t forwarded_deadline() const {
+		auto at = maximum;
+		for (const auto& read : forwarded_) { at = std::min(at, read.sent > maximum - timing_.election_max ? maximum : read.sent + timing_.election_max); }
+		return at;
+	}
+	void expire_reads(Actions& output) {
+		std::erase_if(forwarded_, [&](const ForwardedRead& read) {
+			if (now_ - read.sent < timing_.election_max) { return false; }
+			output.emplace_back(Reject{read.request, RejectReason::NotLeader}); return true;
+		});
 	}
 	void handle(Receive receive, Actions& output) {
 		// Any authenticated incarnation of the group (D5): a follower can lag the membership
@@ -1114,6 +1160,11 @@ private:
 	bool valid(const Gone& gone) const { return gone.term > 0; }
 	bool valid(const InstallRequest& request) const {
 		return request.term > 0 && request.request > 0 && request.base.index < maximum && request.base.term <= request.term && ((request.base.index == 0) == (request.base.term == 0));
+	}
+	bool valid(const ReadIndexRequest& request) const { return request.term > 0 && request.start > 0 && request.token > 0; }
+	bool valid(const ReadIndexResponse& response) const {
+		return response.term > 0 && response.start > 0 && response.token > 0 && static_cast<unsigned>(response.result) <= static_cast<unsigned>(ReadIndexReply::NotLeader) &&
+			(response.result == ReadIndexReply::Ready) == (response.index > 0) && response.index < maximum;
 	}
 	bool valid(const InstallRequestResponse& response) const {
 		return response.term > 0 && response.request > 0 && static_cast<unsigned>(response.result) <= static_cast<unsigned>(InstallRequestReply::NotMember);
@@ -1188,6 +1239,29 @@ private:
 		case InstallRequestReply::NotLeader: drop_install(RejectReason::NotLeader, output); return;
 		case InstallRequestReply::NotMember: drop_install(RejectReason::InvalidRepair, output); return;
 		}
+	}
+	// A forwarded read is one more PendingRead; a resend of one pending is answered once.
+	void receive_message(NodeId source, ReadIndexRequest request, StorageBatch&, Actions& output) {
+		PendingRead read{0, 0, hard_.term, durable_.commit_index, {configuration_.local}, source, request.start, request.token};
+		if (role_ != Role::Leader || request.term != hard_.term || witness_self()) { refuse(read, ReadIndexReply::NotLeader, output); return; }
+		for (const auto& pending : reads_) {
+			if (pending.from == source && pending.start == request.start && pending.token == request.token) { return; }
+		}
+		admit_read(std::move(read), output);
+	}
+	// Only the answer to a pending read of this start counts: from the leader asked, in the
+	// read's term, while that term and leader stand (review V1).
+	void receive_message(NodeId source, ReadIndexResponse response, StorageBatch&, Actions& output) {
+		if (response.start != start_ || role_ != Role::Follower) { return; }
+		auto read = std::find_if(forwarded_.begin(), forwarded_.end(), [&](const ForwardedRead& r) { return r.token == response.token; });
+		if (read == forwarded_.end() || read->index || source != read->leader || response.term != read->term || hard_.term != read->term || leader_ != read->leader) { return; }
+		switch (response.result) {
+		case ReadIndexReply::Ready: read->index = response.index; return;  // ready_reads completes it once applied
+		case ReadIndexReply::NotReady: output.emplace_back(Reject{read->request, RejectReason::NotReady}); break;
+		case ReadIndexReply::Busy: output.emplace_back(Reject{read->request, RejectReason::Busy}); break;
+		case ReadIndexReply::NotLeader: output.emplace_back(Reject{read->request, RejectReason::NotLeader}); break;
+		}
+		forwarded_.erase(read);
 	}
 	void receive_message(NodeId source, PreVoteResponse response, StorageBatch&, Actions& output) {
 		if (!prevote_ || response.request_term != prevote_ || !response.granted || role_ == Role::Leader || !is_voter(source)) { return; }
@@ -1272,7 +1346,7 @@ private:
 		// never under a leader whose removal is in force or pending, which steps down unheard.
 		const auto& committed = committed_membership();
 		resting_ = timing_.quiesce && request.commit >= verified && verified == last_index() && committed == membership() &&
-			votes_in(committed, source) && committed.leaving != source && !reinstall_;
+			votes_in(committed, source) && committed.leaving != source && !reinstall_ && forwarded_.empty();
 		output.emplace_back(Send{source, AppendResponse{hard_.term, request.rpc, true, verified, verified + 1, request.read_probe}});
 	}
 	// Adds a log mutation to a step's batch: a later one starts within or right after the
@@ -1378,6 +1452,7 @@ private:
 	void drive(Actions& output, bool tick) {
 		if (!started_ || busy() || resting_) { return; }
 		if (role_ != Role::Leader) {
+			expire_reads(output);
 			if (tick) { ask_install(output); }
 			// Campaigns require a separately admitted Tick. Slow persistence
 			// must not start another election from its completion callback.
@@ -1449,6 +1524,8 @@ private:
 		role_ = Role::Candidate; leader_ = 0; grants_ = {configuration_.local}; resting_ = false; reset_election();
 		Actions deferred; deferred.emplace_back(RoleChanged{role_, hard_.term, 0});
 		if (reinstall_) { drop_install(RejectReason::NotLeader, deferred); }
+		for (const auto& read : forwarded_) { deferred.emplace_back(Reject{read.request, RejectReason::NotLeader}); }
+		forwarded_.clear();
 		for (NodeId voter : voters()) {
 			if (voter != configuration_.local) { deferred.emplace_back(Send{voter, VoteRequest{hard_.term, last_index(), log_term(last_index()), transfer}}); }
 		}
@@ -1563,12 +1640,22 @@ private:
 		delivered_through_ = batch.back().index;
 		output.emplace_back(Committed{applied_ + 1, std::move(batch)});
 	}
+	// A leader's read completes once confirmed and, if local, applied; a forwarded one is
+	// answered once confirmed. A follower's completes once its leader's index is applied.
 	void ready_reads(Actions& output) {
-		if (busy() || role_ != Role::Leader) { return; }
+		if (busy()) { return; }
+		if (role_ != Role::Leader) {
+			std::erase_if(forwarded_, [&](const ForwardedRead& read) {
+				if (!read.index || applied_ < read.index) { return false; }
+				output.emplace_back(ReadReady{read.request, read.index}); return true;
+			});
+			return;
+		}
 		for (auto read = reads_.begin(); read != reads_.end();) {
-			if (read->term == hard_.term && acknowledged(*read) >= quorum() && applied_ >= read->index) {
-				output.emplace_back(ReadReady{read->request, read->index}); read = reads_.erase(read);
-			} else { ++read; }
+			if (read->term != hard_.term || acknowledged(*read) < quorum()) { ++read; }
+			else if (read->from) { output.emplace_back(Send{read->from, ReadIndexResponse{hard_.term, read->start, read->token, ReadIndexReply::Ready, read->index}}); read = reads_.erase(read); }
+			else if (applied_ >= read->index) { output.emplace_back(ReadReady{read->request, read->index}); read = reads_.erase(read); }
+			else { ++read; }
 		}
 	}
 
@@ -1607,6 +1694,8 @@ private:
 	std::uint64_t leader_contact_ = 0;
 	std::uint64_t acknowledge_at_ = maximum;  // a follower that left rest: its next re-acknowledgement
 	std::vector<PendingRead> reads_;
+	std::vector<ForwardedRead> forwarded_;  // a follower's reads at its leader
+	Token start_ = 0;  // Start::nonce, naming this start in forwarded reads
 	std::unique_ptr<Transfer> transfer_;  // a leader's transfer in progress (D6), off the idle object
 	std::pair<NodeId, Token> acted_timeout_{};  // the last TimeoutNow this node acted on
 	std::uint64_t leadership_start_ = 0;  // when this node last became leader

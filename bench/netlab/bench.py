@@ -1,0 +1,1360 @@
+#!/usr/bin/env python3
+# Copyright © 2026 Germán Méndez Bravo (Kronuz)
+# SPDX-License-Identifier: MIT
+
+"""consensus on a realistic network: N nodes, one per faultlab netlab namespace, at each shape.
+
+Each shape starts a fresh cluster of `consensus_netlab_node` processes (node.cc), one per namespace,
+and measures: the round trip netlab set against what ping sees (A1), that a leader cut off with a
+minority acknowledges nothing while the majority commits (A1), commit latency at one in flight and
+throughput at many for small and 64 KiB entries, RPC-lane echo latency, and election time after the
+leader is SIGKILLed and restarted on its journal. The partition shape isolates the leader under a
+client workload, heals, and checks the event log with faultlab's history checker (A2). Every node's
+event carries CLOCK_MONOTONIC microseconds, the clock this process reads, so cross-node times compare.
+
+Needs Linux and root (netlab). selftest.py runs it without either, on a fake runner and cluster.
+
+python3 -I bench.py run --faultlab DIR --node BIN --nodes 3 [--shapes a,b] [--quick] --out DIR
+python3 -I bench.py table RESULTS.json... > rows.md
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import ctypes
+import dataclasses
+import json
+import os
+import random
+import re
+import selectors
+import shutil
+import signal
+import statistics
+import subprocess
+import sys
+import time
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Protocol
+
+PORT = 7400
+SMALL = 64  # bytes of a small entry
+LARGE = 64 << 10
+ELECTION_MIN_MS, ELECTION_MAX_MS = (
+    1000,
+    2000,
+)  # consensus::Timing's defaults, which node.cc keeps
+HEARTBEAT_MS = 100
+CLIENTS = 3  # history clients per node
+OP_SECONDS = (
+    1.0  # a history operation unanswered this long is unknown, and its client moves on
+)
+THINK_SECONDS = (
+    0.025  # between a client's operations, which bounds the history the checker reads
+)
+# A1: each peer's ping median within 10% of the set round trip past the guest's floor at that delay:
+# the unshaped path's round trip plus two timer wakes (netem holds each packet once per direction),
+# each as late as an hrtimer sleep of the same delay wakes, sampled in RTT_ROUNDS rounds that
+# alternate with that peer's pings so both see the same drift; jitter is the spread of those wakes,
+# at least JITTER_MS.
+RTT_TOLERANCE = 0.10
+JITTER_MS = 0.1
+TIMER_SAMPLES = 30
+RTT_ROUNDS = 5
+
+
+@dataclass(frozen=True)
+class Shape:
+    """One network shape: netlab's one-way delay on every link, loss and reorder, and whether the
+    leader is partitioned and healed under load."""
+
+    name: str
+    ms: float = 0.0
+    loss: float = 0.0
+    reorder: float = 0.0
+    partition: bool = False
+
+    @property
+    def rtt_ms(self) -> float:
+        return 2 * self.ms
+
+
+SHAPES = (
+    Shape("loopback"),
+    Shape("1ms", ms=1),
+    Shape("20ms", ms=20),
+    Shape("80ms", ms=80),
+    Shape("loss1%-20ms", ms=20, loss=0.01),
+    Shape("reorder5%-20ms", ms=20, reorder=0.05),
+    Shape("partition-1ms", ms=1, partition=True),
+)
+
+
+@dataclass(frozen=True)
+class Plan:
+    """How long each measurement runs; --quick shrinks it for the dry run."""
+
+    load_seconds: float = 2.0
+    inflight: int = (
+        256  # small entries; 64 KiB ones run an eighth as many, 2 MiB in flight
+    )
+    rpc_seconds: float = 1.5
+    rpc_max: int = 400
+    elections: int = 4
+    load_wait: float = (
+        30.0  # past a load's own seconds, before its answer is "no answer"
+    )
+    large_bytes: int = LARGE  # the large entries' size
+    large_inflight: int = (
+        0  # large entries in flight; 0 is inflight // 8 (2 MiB at 64 KiB)
+    )
+    large_seconds: float = 0.0  # the large throughput load's seconds; 0 is load_seconds
+    partition_seconds: float = 4.0
+    healed_seconds: float = 3.0
+    pings: int = 10
+
+    @staticmethod
+    def quick() -> Plan:
+        return Plan(
+            load_seconds=0.6,
+            inflight=64,
+            rpc_seconds=0.5,
+            rpc_max=50,
+            elections=1,
+            partition_seconds=3.0,
+            healed_seconds=2.0,
+            pings=5,
+        )
+
+
+class Lab(Protocol):
+    """The part of faultlab's Netlab the bench drives."""
+
+    log: Any  # history.Recorder or None
+
+    def open(self, peer_ports: dict[int, int]) -> None: ...
+    def teardown(self) -> None: ...
+    def address(self, source: int, target: int) -> str: ...
+    def command(self, node: int, argv: Sequence[str]) -> list[str]: ...
+    def delay(self, ms: float, a: int | None = None, b: int | None = None) -> None: ...
+    def loss(self, p: float, a: int | None = None, b: int | None = None) -> None: ...
+    def reorder(self, p: float, a: int | None = None, b: int | None = None) -> None: ...
+    def partition(self, a: int, b: int) -> None: ...
+    def isolate(self, node: int) -> None: ...
+    def heal(self, a: int | None = None, b: int | None = None) -> None: ...
+
+
+type Event = dict[str, Any]  # a node's decoded JSON line
+
+
+class Cluster(Protocol):
+    """The node processes: started, fed command lines, polled for their events, killed."""
+
+    def now(self) -> float: ...  # CLOCK_MONOTONIC seconds, the nodes' clock
+    def start(self, node: int, fresh: bool) -> None: ...
+    def send(self, node: int, line: str) -> None: ...
+    def poll(self, timeout: float) -> list[tuple[int, Event]]: ...
+    def kill(self, node: int) -> None: ...
+    def stop(self) -> None: ...
+    def alive(self, node: int) -> bool: ...
+
+
+class Processes:
+    """The real cluster: node.cc processes, each in its namespace, its journal under `root`."""
+
+    def __init__(
+        self,
+        lab: Lab,
+        binary: Path,
+        fixture: Path,
+        root: Path,
+        nodes: int,
+        options: Sequence[str] = (),
+    ) -> None:
+        self.lab, self.binary, self.fixture, self.root, self.nodes = (
+            lab,
+            binary,
+            fixture,
+            root,
+            nodes,
+        )
+        self.options = list(options)  # node.cc's leading options, as --rpc-timeout MS
+        self.procs: dict[int, subprocess.Popen[bytes]] = {}
+        self.buffers: dict[int, bytes] = {}
+        self.selector = selectors.DefaultSelector()
+        self.logs = root / "stderr"
+
+    def now(self) -> float:
+        return time.monotonic()
+
+    def start(self, node: int, fresh: bool) -> None:
+        directory = self.root / f"node{node}"
+        if fresh:
+            shutil.rmtree(directory, ignore_errors=True)
+        self.logs.mkdir(parents=True, exist_ok=True)
+        peers = [
+            f"{peer}={self.lab.address(node, peer)}"
+            for peer in range(1, self.nodes + 1)
+            if peer != node
+        ]
+        argv = [
+            str(self.binary),
+            *self.options,
+            str(self.fixture),
+            str(directory),
+            str(node),
+            str(self.nodes),
+            str(PORT),
+            *peers,
+        ]
+        with (self.logs / f"node{node}.log").open("ab") as errors:
+            proc = subprocess.Popen(
+                self.lab.command(node, argv),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=errors,
+            )
+        assert proc.stdout is not None
+        os.set_blocking(proc.stdout.fileno(), False)
+        self.procs[node] = proc
+        self.buffers[node] = b""
+        self.selector.register(proc.stdout, selectors.EVENT_READ, node)
+
+    def send(self, node: int, line: str) -> None:
+        proc = self.procs.get(node)
+        if proc is None or proc.poll() is not None or proc.stdin is None:
+            return
+        with contextlib.suppress(BrokenPipeError):
+            proc.stdin.write(line.encode() + b"\n")
+            proc.stdin.flush()
+
+    def poll(self, timeout: float) -> list[tuple[int, Event]]:
+        events: list[tuple[int, Event]] = []
+        for key, _ in self.selector.select(max(timeout, 0)):
+            node = int(key.data)
+            try:
+                chunk = os.read(key.fd, 1 << 16)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                self.selector.unregister(key.fileobj)
+                continue
+            data = self.buffers[node] + chunk
+            *lines, self.buffers[node] = data.split(b"\n")
+            for line in lines:
+                with contextlib.suppress(json.JSONDecodeError):
+                    events.append((node, json.loads(line)))
+        return events
+
+    def _forget(self, node: int) -> None:
+        proc = self.procs.pop(node, None)
+        if proc is not None and proc.stdout is not None:
+            with contextlib.suppress(KeyError, ValueError):
+                self.selector.unregister(proc.stdout)
+
+    def kill(self, node: int) -> None:
+        proc = self.procs.get(node)
+        if proc is not None:
+            proc.send_signal(signal.SIGKILL)
+            proc.wait()
+            self._forget(node)
+
+    def alive(self, node: int) -> bool:
+        proc = self.procs.get(node)
+        return proc is not None and proc.poll() is None
+
+    def stop(self) -> None:
+        for node in list(self.procs):
+            self.send(node, "quit")
+        until = time.monotonic() + 5
+        for node, proc in list(self.procs.items()):
+            try:
+                proc.wait(max(0.1, until - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            self._forget(node)
+
+
+def percentile(values: Sequence[float], q: float) -> float:
+    """The q-quantile by nearest rank, as node.cc computes its own."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    return ordered[int(q * (len(ordered) - 1))]
+
+
+def timer_late(ms: float, samples: int = TIMER_SAMPLES) -> list[float]:
+    """How late, in ms, a sleep of `ms` wakes in this kernel, with the timer slack netem's own
+    hrtimer has (1 ns): each sample is one hold's lateness."""
+    with contextlib.suppress(OSError, AttributeError):
+        ctypes.CDLL(None, use_errno=True).prctl(29, 1, 0, 0, 0)  # PR_SET_TIMERSLACK
+    late = []
+    for _ in range(samples):
+        start = time.perf_counter_ns()
+        time.sleep(ms / 1000)
+        late.append((time.perf_counter_ns() - start) / 1e6 - ms)
+    return late
+
+
+def ping_rtts(output: str) -> list[float]:
+    """Each reply's round trip in ms from ping's output."""
+    return [float(m) for m in re.findall(r"time[=<]([0-9.]+) ?ms", output)]
+
+
+@dataclass
+class Check:
+    name: str
+    ok: bool
+    detail: str
+
+
+@dataclass
+class Client:
+    """One history client: at most one operation open, on its node."""
+
+    name: str
+    node: int
+    pending: tuple[str, str, str, float] | None = None  # id, op, key, deadline
+    generation: int = 0
+    ready: float = 0.0  # when it issues its next operation
+
+
+class Bench:
+    """Drives one node count across shapes; `run_shape` returns its row and records its checks."""
+
+    def __init__(
+        self,
+        lab: Lab,
+        cluster: Cluster,
+        nodes: int,
+        plan: Plan,
+        out: Path,
+        run: Callable[[Sequence[str]], str],
+        history: Any,
+        late: Callable[[float, int], list[float]] = timer_late,
+    ) -> None:
+        self.lab, self.cluster, self.nodes, self.plan, self.out = (
+            lab,
+            cluster,
+            nodes,
+            plan,
+            out,
+        )
+        self.run = run  # runs a command, returns its output (netlab's runner)
+        self.late = late  # a timer's lateness samples at a delay (timer_late)
+        self.diag: Path | None = None  # where a load's progress samples go, when set
+        self.sampling: tuple[str, int, Any] | None = None  # label, leader, open file
+        self.next_sample = 0.0
+        self.status: dict[int, str] = {}  # node: the request id of its last status call
+        self.history = history  # faultlab.history
+        self.checks: list[Check] = []
+        self.role: dict[int, tuple[str, int, float]] = {}  # node: (role, term, t)
+        self.replies: dict[str, Event] = {}  # by request id
+        self.ids = 0
+        self.recorder: Any = None
+        self.clients: list[Client] = []
+        self.ops: dict[
+            str, tuple[Client, str, str, str, float]
+        ] = {}  # request id: client, op, key, value, invoked
+        self.minority: set[int] = (
+            set()
+        )  # nodes cut off with a minority while the partition holds
+        self.minority_acks: list[str] = []
+        self.values = 0
+        self.started_cut = 0.0
+        self.unshaped_ms = 0.0
+        self.roles: list[
+            tuple[float, int, str, int, int]
+        ] = []  # t, node, role, term, leader
+        self.skew = (
+            0.0  # the largest gap between a node's clock and ours at its ready event
+        )
+
+    # Events.
+
+    def check(self, name: str, ok: bool, detail: str) -> bool:
+        self.checks.append(Check(name, ok, detail))
+        print(f"  {'ok  ' if ok else 'FAIL'} {name}: {detail}", flush=True)
+        return ok
+
+    def next_id(self) -> str:
+        self.ids += 1
+        return str(self.ids)
+
+    def pump(self, seconds: float, until: Callable[[], bool] | None = None) -> bool:
+        """Polls events for up to `seconds`, ticking the clients; True once `until` holds."""
+        deadline = self.cluster.now() + seconds
+        while True:
+            if until is not None and until():
+                return True
+            left = deadline - self.cluster.now()
+            if left <= 0:
+                return False
+            for node, event in self.cluster.poll(min(left, 0.02)):
+                self.dispatch(node, event)
+            self.tick()
+            if self.sampling is not None:
+                self.sample()
+
+    def dispatch(self, node: int, event: Event) -> None:
+        kind = event.get("ev")
+        if kind == "ready":
+            self.skew = max(
+                self.skew, abs(float(event["t"]) / 1e6 - self.cluster.now())
+            )
+        elif kind == "role":
+            self.role[node] = (
+                str(event["role"]),
+                int(event["term"]),
+                float(event["t"]) / 1e6,
+            )
+            self.roles.append(
+                (
+                    float(event["t"]) / 1e6,
+                    node,
+                    str(event["role"]),
+                    int(event["term"]),
+                    int(event.get("leader", 0)),
+                )
+            )
+        elif kind == "error":
+            print(f"  node {node}: {event.get('why')}", flush=True)
+        elif "id" in event:
+            request = str(event["id"])
+            self.replies[request] = event | {"node": node}
+            if request in self.ops:
+                self.complete(request, event)
+
+    def leader(self, among: Sequence[int] | None = None, above: int = -1) -> int:
+        """The live node that last said it leads, in the highest term above `above`, or 0."""
+        best, term = 0, above
+        for node, (role, t, _) in self.role.items():
+            if (
+                role == "leader"
+                and t > term
+                and self.cluster.alive(node)
+                and (among is None or node in among)
+            ):
+                best, term = node, t
+        return best
+
+    def call(self, node: int, line: str, seconds: float) -> Event | None:
+        """Sends `line` with a fresh id after its verb to `node`, waits for its reply."""
+        request = self.next_id()
+        verb, _, rest = line.partition(" ")
+        self.cluster.send(node, f"{verb} {request} {rest}".rstrip())
+        self.pump(seconds, lambda: request in self.replies)
+        return self.replies.get(request)
+
+    # The cluster's life.
+
+    def start(self) -> int:
+        self.role.clear()
+        self.roles.clear()  # this cluster's role changes only
+        for node in range(1, self.nodes + 1):
+            self.cluster.start(node, fresh=True)
+        led = self.pump(30, lambda: self.leader() != 0)
+        self.check("elects at start", led, f"leader {self.leader()} of {self.nodes}")
+        self.check(
+            "one clock",
+            self.skew < 0.5,
+            f"nodes' clocks within {self.skew * 1000:.1f} ms of the harness's",
+        )
+        # The leader's first write commits its term's no-op too: then every later number is steady.
+        leader = self.leader()
+        if leader:
+            reply = self.call(leader, f"w warm {self.next_value()} {SMALL}", 10)
+            self.check(
+                "first write commits", bool(reply and reply.get("ok")), f"{reply}"
+            )
+        return leader
+
+    def next_value(self) -> str:
+        self.values += 1
+        return f"v{self.values}"
+
+    def shape(self, shape: Shape) -> None:
+        """Sets every link to the shape; a reorder needs its delay set first and lifted last."""
+        self.lab.reorder(0)
+        self.lab.loss(0)
+        self.lab.delay(shape.ms)
+        self.lab.loss(shape.loss)
+        self.lab.reorder(shape.reorder)
+
+    def measure_floor(self) -> None:
+        """The unshaped path's round trip, which every shape pays beside its delay."""
+        self.shape(SHAPES[0])
+        samples = self.ping_all()
+        self.unshaped_ms = statistics.median(samples) if samples else 0.0
+        print(f"  round trip unshaped {self.unshaped_ms:.3f} ms", flush=True)
+
+    def ping_all(self) -> list[float]:
+        return [statistics.median(r) for r in map(self.ping, self.peers()) if r]
+
+    def peers(self) -> range:
+        return range(2, self.nodes + 1)
+
+    def ping(self, peer: int, count: int = 0) -> list[float]:
+        """Node 1's round trips to `peer`, in ms: `count` pings, or the plan's."""
+        host = self.lab.address(1, peer).rsplit(":", 1)[0]
+        count = count or self.plan.pings
+        argv = ["ping", "-n", "-c", str(count), "-i", "0.02", "-W", "2", host]
+        try:
+            output = self.run(self.lab.command(1, argv))
+        except Exception as error:  # noqa: BLE001 - a ping that loses every reply exits 1
+            output = str(error)
+        return ping_rtts(output)
+
+    # A1: the network is what netlab set, and only a majority acknowledges.
+
+    def check_rtt(self, shape: Shape, row: dict[str, Any]) -> None:
+        """Each peer's ping against its own floor, its timer lateness sampled in rounds alternating
+        with its pings: a loaded host's wakes drift by tenths of a ms within a second."""
+        medians, lates, within, details, peers = [], [], [], [], []
+        count = max(1, self.plan.pings // RTT_ROUNDS)
+        samples = TIMER_SAMPLES // RTT_ROUNDS
+        for peer in self.peers():
+            rtts, late = [], []
+            for _ in range(RTT_ROUNDS):
+                rtts += self.ping(peer, count)
+                late += self.late(shape.ms, samples) if shape.ms else [0.0]
+            late_ms = statistics.median(late)
+            lates += late
+            floor = self.unshaped_ms + 2 * late_ms
+            margin = RTT_TOLERANCE * shape.rtt_ms + max(
+                JITTER_MS, 2 * (percentile(late, 0.9) - late_ms)
+            )
+            if not rtts:
+                within.append(False)
+                details.append(f"{peer}: no reply")
+                continue
+            median = statistics.median(rtts)
+            medians.append(median)
+            within.append(abs(median - shape.rtt_ms - floor) <= margin)
+            peers.append({"peer": peer, "ping_ms": round(median, 3), "late_p50": round(late_ms, 3),
+                          "late_p90": round(percentile(late, 0.9), 3)})  # fmt: skip
+            details.append(
+                f"{peer}: {median:.3f} vs {shape.rtt_ms + floor:.3f}±{margin:.3f}"
+            )
+        row["rtt_ms"] = round(statistics.median(medians), 3) if medians else None
+        row["timer_late_ms"] = round(statistics.median(lates), 3)
+        row["pings"] = peers
+        self.check(
+            f"{shape.name}: round trip",
+            all(within),
+            f"set {shape.rtt_ms:g} ms + unshaped {self.unshaped_ms:.3f} + 2 timer wakes sampled in rounds alternating with each peer's pings; "
+            f"peer: ping median vs expected ms: {', '.join(details)}",
+        )
+
+    def cut(self, side: set[int]) -> None:
+        for a in side:
+            for b in range(1, self.nodes + 1):
+                if b not in side:
+                    self.lab.partition(a, b)
+
+    def check_majority(self, shape: Shape, row: dict[str, Any]) -> None:
+        """The leader and as many followers as keep it a minority are cut off: a write there is
+        never acknowledged, one on the majority's new leader is, and after heal it stays unacknowledged."""
+        leader = self.leader()
+        if not leader:
+            self.check(f"{shape.name}: majority only", False, "no leader")
+            return
+        followers = [n for n in range(1, self.nodes + 1) if n != leader]
+        side = {leader, *followers[: (self.nodes - 1) // 2 - 1]}
+        majority = [n for n in range(1, self.nodes + 1) if n not in side]
+        term = self.role[leader][1]
+        self.started_cut = self.cluster.now()
+        self.cut(side)
+        request = self.next_id()
+        self.cluster.send(leader, f"w {request} probe {self.next_value()} {SMALL}")
+        elected = self.pump(
+            10 + 4 * shape.rtt_ms / 1000, lambda: self.leader(majority, term) != 0
+        )
+        new = self.leader(majority, term)
+        reply = (
+            self.call(new, f"w probe {self.next_value()} {SMALL}", 10) if new else None
+        )
+        early = self.replies.get(request)
+        self.lab.heal()
+        self.pump(2 * HEARTBEAT_MS / 1000 + 4 * shape.rtt_ms / 1000 + 0.5)
+        late = self.replies.get(request)
+        row["probe_election_ms"] = (
+            round((self.role[new][2] - self.started_cut) * 1000, 1) if new else None
+        )
+        acked = bool(late and late.get("ok"))
+        self.check(
+            f"{shape.name}: majority only",
+            elected and bool(reply and reply.get("ok")) and not acked,
+            f"cut {sorted(side)} of {self.nodes}: its write {'ACKNOWLEDGED' if acked else 'unacknowledged'} "
+            f"({(early or late or {}).get('why', 'no answer')}); majority leader {new} {'committed' if reply and reply.get('ok') else 'did not commit'}",
+        )
+
+    # Numbers.
+
+    def load(
+        self, leader: int, size: int, inflight: int, seconds: float = 0.0
+    ) -> dict[str, Any]:
+        seconds = seconds or self.plan.load_seconds
+        began, seen = self.cluster.now(), len(self.roles)
+        # 128 MiB of 64 KiB entries per node, which the guest holds twice
+        cap = (128 << 20) // size if size > SMALL else 1_000_000
+        label = f"{size}B-{inflight}"
+        self.begin_sampling(label, leader)
+        try:
+            reply = self.call(
+                leader,
+                f"load {seconds} {size} {inflight} {cap}",
+                seconds + self.plan.load_wait,
+            )
+        finally:
+            self.end_sampling()
+        roles = [  # role changes during the load: s after it began, node, role, term
+            [round(when - began, 3), n, role, t]
+            for when, n, role, t, _ in self.roles[seen:]
+        ]
+        if not reply:
+            return {
+                "error": f"no answer in {seconds + self.plan.load_wait:g} s",
+                "seconds": seconds,
+                "roles": roles,
+            }
+        commits, took = int(reply["commits"]), float(reply["seconds"]) or 1.0
+        return {
+            "seconds": seconds,
+            "roles": roles,
+            "commits": commits,
+            "per_s": round(commits / took, 1),
+            "mb_s": round(int(reply["bytes"]) / took / 1e6, 2),
+            "p50_ms": reply["p50"] / 1000,
+            "p99_ms": reply["p99"] / 1000,
+            "failures": reply.get("failures", {}),
+        }
+
+    # --diag: each node's status and the leader's TCP sockets, every half second of a load.
+
+    def begin_sampling(self, label: str, leader: int) -> None:
+        if self.diag is None:
+            return
+        self.status.clear()
+        self.next_sample = 0.0
+        self.sampling = (label, leader, self.diag.open("a"))
+
+    def end_sampling(self) -> None:
+        if self.sampling is not None:
+            self.sample(force=True)
+            self.sampling[2].close()
+            self.sampling = None
+
+    def sample(self, force: bool = False) -> None:
+        assert self.sampling is not None
+        label, leader, out = self.sampling
+        now = self.cluster.now()
+        if now < self.next_sample and not force:
+            return
+        self.next_sample = now + 0.5
+        status = {  # each node's last status: applied index and the appends it sent and answered
+            node: {
+                k: v
+                for k, v in self.replies.get(request, {}).items()
+                if k not in ("ev", "t", "id", "node")
+            }
+            for node, request in self.status.items()
+        }
+        try:
+            sockets = self.run(self.lab.command(leader, ["ss", "-tinH"]))
+        except Exception as error:  # noqa: BLE001 - a sample is best effort
+            sockets = str(error)
+        out.write(
+            json.dumps(
+                {
+                    "t": round(now, 3),
+                    "load": label,
+                    "leader": leader,
+                    "status": status,
+                    "ss": sockets,
+                }
+            )
+            + "\n"
+        )
+        out.flush()
+        for node in range(1, self.nodes + 1):
+            if self.cluster.alive(node):
+                self.status[node] = self.next_id()
+                self.cluster.send(node, f"s {self.status[node]}")
+
+    def rpc(self, leader: int) -> dict[str, Any]:
+        """One call opens the lane's Bulk link (its dial, TLS and hellos): its latency is the cold
+        call's; then calls one at a time on the open link."""
+        peer = next(n for n in range(1, self.nodes + 1) if n != leader)
+        cold = self.call(leader, f"rpc {peer} {SMALL} 30 1", 40)
+        reply = self.call(
+            leader,
+            f"rpc {peer} {SMALL} {self.plan.rpc_seconds} {self.plan.rpc_max}",
+            self.plan.rpc_seconds + 30,
+        )
+        if not reply:
+            return {"error": "no answer"}
+        return {
+            "cold_ms": cold["p50"] / 1000 if cold and cold.get("n") else None,
+            "calls": reply["n"],
+            "failed": reply["failed"],
+            "p50_ms": reply["p50"] / 1000,
+            "p99_ms": reply["p99"] / 1000,
+        }
+
+    def elections(self, shape: Shape) -> list[float]:
+        """Kills the leader, times the first survivor to lead a later term, restarts the dead node."""
+        times: list[float] = []
+        for _ in range(self.plan.elections):
+            leader = self.leader()
+            if not leader:
+                break
+            term = self.role[leader][1]
+            survivors = [n for n in range(1, self.nodes + 1) if n != leader]
+            killed = self.cluster.now()
+            self.cluster.kill(leader)
+            if not self.pump(
+                10 * ELECTION_MAX_MS / 1000,
+                lambda survivors=survivors, term=term: (
+                    self.leader(survivors, term) != 0
+                ),
+            ):
+                self.check(
+                    f"{shape.name}: election after kill",
+                    False,
+                    f"no leader within {10 * ELECTION_MAX_MS} ms",
+                )
+                break
+            new = self.leader(survivors, term)
+            times.append((self.role[new][2] - killed) * 1000)
+            self.role.pop(leader, None)
+            self.cluster.start(leader, fresh=False)  # recovers its journal
+            reply = self.call(new, f"w warm {self.next_value()} {SMALL}", 10)
+            self.pump(2 * HEARTBEAT_MS / 1000 + 2 * shape.rtt_ms / 1000 + 0.3)
+            if not (reply and reply.get("ok")):
+                self.check(f"{shape.name}: commits after election", False, f"{reply}")
+                break
+        return times
+
+    def bound_ms(self, shape: Shape) -> float:
+        """One election: a follower's timeout after the last heartbeat it heard, a vote round trip,
+        and slack for the persists and the scheduler."""
+        return ELECTION_MAX_MS + HEARTBEAT_MS + 2 * shape.rtt_ms + 200
+
+    # A2: the partition of the leader, healed, under clients; the history decides.
+
+    def begin_history(self, shape: Shape) -> Path:
+        path = self.out / f"history-{self.nodes}-{shape.name}.jsonl"
+        path.unlink(missing_ok=True)
+        self.recorder = self.history.Recorder(
+            path, scenario=f"netlab-consensus {self.nodes} {shape.name}"
+        )
+        self.lab.log = self.recorder
+        self.clients = [
+            Client(f"c{node}-{i}", node)
+            for node in range(1, self.nodes + 1)
+            for i in range(CLIENTS)
+        ]
+        self.ops.clear()
+        return path
+
+    def tick(self) -> None:
+        if self.recorder is None:
+            return
+        now = self.cluster.now()
+        for client in self.clients:
+            if client.pending is not None:
+                request, op, key, deadline = client.pending
+                if now < deadline:
+                    continue
+                self.ops.pop(
+                    request, None
+                )  # unknown: a later client name takes the node
+                client.generation += 1
+                client.name = f"{client.name.split('.')[0]}.{client.generation}"
+                client.pending = None
+            if not self.cluster.alive(client.node) or now < client.ready:
+                continue
+            key = f"k{random.randrange(4)}"
+            request = self.next_id()
+            op, level = (
+                ("write", "quorum")
+                if random.random() < 0.6
+                else ("read", "linearizable")
+            )
+            value = self.next_value() if op == "write" else ""
+            self.recorder.record(
+                client.name,
+                op,
+                key,
+                value or None,
+                level,
+                "invoke",
+                node=f"node{client.node}",
+            )
+            self.ops[request] = (client, op, key, value, now)
+            client.pending = (request, op, key, now + OP_SECONDS)
+            client.ready = now + THINK_SECONDS
+            self.cluster.send(
+                client.node,
+                f"w {request} {key} {value} {SMALL}"
+                if op == "write"
+                else f"r {request} {key}",
+            )
+
+    def complete(self, request: str, event: Event) -> None:
+        client, op, key, value, invoked = self.ops.pop(request)
+        if client.pending is None or client.pending[0] != request:
+            return
+        client.pending = None
+        node = f"node{client.node}"
+        if event.get("ok"):
+            if (
+                op == "write"
+                and client.node in self.minority
+                and invoked > self.started_cut
+            ):
+                self.minority_acks.append(f"{client.name} {key}={value}")
+            self.recorder.record(
+                client.name,
+                op,
+                key,
+                value if op == "write" else event.get("value"),
+                "quorum" if op == "write" else "linearizable",
+                "ok",
+                node=node,
+            )
+        elif str(event.get("why", "")).startswith(("rejected", "superseded")):
+            self.recorder.record(
+                client.name,
+                op,
+                key,
+                value if op == "write" else None,
+                "quorum" if op == "write" else "linearizable",
+                "fail",
+                node=node,
+            )
+        else:  # unknown: left open, so the checker completes it at infinity
+            client.generation += 1
+            client.name = f"{client.name.split('.')[0]}.{client.generation}"
+
+    def end_history(self) -> None:
+        self.recorder.close()
+        self.recorder = None
+        self.lab.log = None
+        self.clients = []
+
+    def final_reads(self, leader: int) -> list[str | None]:
+        values: list[str | None] = []
+        for key in (f"k{i}" for i in range(4)):
+            client = f"final{key}"
+            self.recorder.record(
+                client,
+                "read",
+                key,
+                None,
+                "linearizable",
+                "invoke",
+                node=f"node{leader}",
+            )
+            reply = self.call(leader, f"r {key}", 10)
+            if reply and reply.get("ok"):
+                self.recorder.record(
+                    client,
+                    "read",
+                    key,
+                    reply.get("value"),
+                    "linearizable",
+                    "ok",
+                    node=f"node{leader}",
+                )
+                values.append(reply.get("value"))
+        return values
+
+    def partition(self, shape: Shape, row: dict[str, Any]) -> None:
+        path = self.begin_history(shape)
+        self.pump(1.0)  # the clients' steady state
+        leader = self.leader()
+        term = self.role[leader][1] if leader else 0
+        majority = [n for n in range(1, self.nodes + 1) if n != leader]
+        self.started_cut = self.cluster.now()
+        self.minority = {leader}
+        self.lab.isolate(leader)
+        elected = self.pump(
+            self.plan.partition_seconds + 10, lambda: self.leader(majority, term) != 0
+        )
+        new = self.leader(majority, term)
+        election_ms = (
+            (self.role[new][2] - self.started_cut) * 1000 if new else float("inf")
+        )
+        self.pump(
+            max(
+                0.0,
+                self.plan.partition_seconds - (self.cluster.now() - self.started_cut),
+            )
+        )
+        healed = self.cluster.now()
+        self.lab.heal()
+        self.minority = set()
+        isolated_term = max(
+            (t for when, n, _, t, _ in self.roles if n == leader and when < healed),
+            default=term,
+        )
+
+        def rejoined() -> list[tuple[float, int, str, int, int]]:
+            return [
+                r
+                for r in self.roles
+                if r[1] == leader and r[0] >= healed - 1e-3 and r[4] not in (0, leader)
+            ]
+
+        self.pump(5, lambda: bool(rejoined()))
+        rejoin_ms = (
+            max(0.0, rejoined()[0][0] - healed) * 1000 if rejoined() else float("inf")
+        )
+        self.pump(self.plan.healed_seconds)
+        after = [
+            (n, t)
+            for when, n, role, t, _ in self.roles
+            if when >= healed and role == "leader"
+        ]
+        current = self.leader()
+        final = self.final_reads(current) if current else []
+        self.end_history()
+        log = self.history.load_log(path.read_text().splitlines())
+        violations = self.history.check(log.ops, faults=log.faults)
+        writes = [op for op in log.ops if op.op == "write" and op.outcome == "ok"]
+        row["partition"] = {
+            "election_ms": round(election_ms, 1),
+            "bound_ms": self.bound_ms(shape),
+            "rejoin_ms": round(rejoin_ms, 1),
+            "terms": {
+                "before": term,
+                "new_leader": self.role[new][1] if new else None,
+                "isolated_leader": isolated_term,
+            },
+            "elected_after_heal": after,
+            "roles": [  # every role change from the cut on: ms after the cut, node, role, term, leader
+                (round((when - self.started_cut) * 1000, 1), n, role, t, named)
+                for when, n, role, t, named in self.roles
+                if when >= self.started_cut
+            ],
+            "operations": len(log.ops),
+            "acknowledged_writes": len(writes),
+            "violations": len(violations),
+            "history": path.name,
+        }
+        for violation in violations[:5]:
+            print(f"    violation: {violation}", flush=True)
+        self.check(
+            f"{shape.name}: elects after the cut",
+            elected and election_ms <= self.bound_ms(shape),
+            f"{election_ms:.0f} ms, bound {self.bound_ms(shape):.0f} ms",
+        )
+        self.check(
+            f"{shape.name}: the cut leader rejoins after heal",
+            rejoin_ms <= 5000,
+            f"{rejoin_ms:.0f} ms",
+        )
+        self.check(
+            f"{shape.name}: no acknowledgement from the cut leader",
+            not self.minority_acks,
+            f"{self.minority_acks[:3]}",
+        )
+        self.check(
+            f"{shape.name}: history linearizable",
+            not violations and len(final) == 4 and len(writes) > 0,
+            f"{len(log.ops)} operations, {len(writes)} acknowledged writes, {len(log.faults)} faults, final reads {final}: {len(violations)} violations",
+        )
+
+    def run_shape(self, shape: Shape) -> dict[str, Any]:
+        print(f"== {self.nodes} nodes, {shape.name}", flush=True)
+        row: dict[str, Any] = {
+            "shape": shape.name,
+            "nodes": self.nodes,
+            "set_rtt_ms": shape.rtt_ms,
+        }
+        self.shape(shape)
+        self.check_rtt(shape, row)
+        try:
+            leader = self.start()
+            if not leader:
+                return row
+            if shape.partition:
+                self.partition(shape, row)
+                return row
+            self.check_majority(shape, row)
+            leader = self.leader()
+            row["small_latency"] = self.load(leader, SMALL, 1)
+            row["small_throughput"] = self.load(leader, SMALL, self.plan.inflight)
+            large = self.plan.large_bytes
+            row["large_latency"] = self.load(leader, large, 1)
+            row["large_throughput"] = self.load(
+                leader,
+                large,
+                self.plan.large_inflight or max(1, self.plan.inflight // 8),
+                self.plan.large_seconds,
+            )
+            row["rpc"] = self.rpc(leader)
+            times = self.elections(shape)
+            row["elections_ms"] = [round(t, 1) for t in times]
+            if times:
+                self.check(
+                    f"{shape.name}: elections",
+                    max(times) <= 3 * ELECTION_MAX_MS,
+                    f"{[round(t) for t in times]} ms, 3 timeouts {3 * ELECTION_MAX_MS} ms",
+                )
+            for name in (
+                "small_latency",
+                "small_throughput",
+                "large_latency",
+                "large_throughput",
+            ):
+                if row[name].get("error") or not row[name].get("commits"):
+                    self.check(f"{shape.name}: {name}", False, f"{row[name]}")
+            return row
+        finally:
+            self.cluster.stop()
+
+
+def fixture(directory: Path, run: Callable[[Sequence[str]], str]) -> Path:
+    """The test fixture's certificates (test/transport/tls_certificates.cmake), for five nodes."""
+    directory.mkdir(parents=True, exist_ok=True)
+    if (directory / "five.pem").exists():
+        return directory
+    ossl = ["openssl"]
+    run([*ossl, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2", "-subj", "/CN=Consensus-Test-CA", "-keyout", f"{directory}/ca.key",
+         "-out", f"{directory}/ca.pem", "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+         "-addext", "subjectKeyIdentifier=hash"])  # fmt: skip
+    (directory / "leaf.ext").write_text(
+        "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth,clientAuth\n"
+        "subjectAltName=DNS:localhost\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n"
+    )
+    for name in ("one", "two", "three", "four", "five"):
+        run(
+            [
+                *ossl,
+                "req",
+                "-new",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-subj",
+                f"/CN={name}",
+                "-keyout",
+                f"{directory}/{name}.key",
+                "-out",
+                f"{directory}/{name}.csr",
+            ]
+        )
+        run([*ossl, "x509", "-req", "-in", f"{directory}/{name}.csr", "-CA", f"{directory}/ca.pem", "-CAkey", f"{directory}/ca.key", "-CAcreateserial",
+             "-days", "2", "-extfile", f"{directory}/leaf.ext", "-out", f"{directory}/{name}.pem"])  # fmt: skip
+    return directory
+
+
+def measure(bench: Bench, shapes: Sequence[Shape]) -> dict[str, Any]:
+    """Runs each shape; the result holds every row and check, and ok when every check passed."""
+    bench.lab.open({node: PORT for node in range(1, bench.nodes + 1)})
+    try:
+        bench.measure_floor()
+        rows = [bench.run_shape(shape) for shape in shapes]
+    finally:
+        bench.lab.teardown()
+    failed = [c for c in bench.checks if not c.ok]
+    return {
+        "nodes": bench.nodes,
+        "unshaped_rtt_ms": bench.unshaped_ms,
+        "plan": bench.plan.__dict__,
+        "rows": rows,
+        "checks": [c.__dict__ for c in bench.checks],
+        "ok": not failed and bool(bench.checks),
+    }
+
+
+# The table: one row per shape and node count, each against its run's loopback row.
+
+
+def _ms(value: Any) -> str:
+    return "-" if value is None else f"{float(value):.2f}"
+
+
+def _cell(measured: dict[str, Any], text: Callable[[dict[str, Any]], str]) -> str:
+    """A measurement's cell, or its error: a row that failed is reported, never dropped."""
+    if "error" in measured:
+        return f"error: {measured['error']}"
+    return text(measured)
+
+
+def _latency(m: dict[str, Any]) -> str:
+    return f"{_ms(m.get('p50_ms'))} / {_ms(m.get('p99_ms'))}"
+
+
+def _ratio(row: dict[str, Any], base: dict[str, Any], name: str, key: str) -> str:
+    """row's `name.key` over loopback's, or "-" when either side has no number."""
+    a, b = row.get(name, {}).get(key), base.get(name, {}).get(key)
+    return "-" if a is None or b is None else f"{a / max(b, 1e-9):.2f}x"
+
+
+def table(results: Sequence[dict[str, Any]], jobs: dict[int, str]) -> str:
+    head = (
+        "| Nodes | Shape | RTT set / ping ms | Commit p50 / p99 ms (64 B) | (64 KiB) | Commits/s (64 B) | MB/s (64 KiB) "
+        "| RPC p50 / p99 ms (cold) | Election ms (median, max) | vs loopback | Job |\n"
+        "|---|---|---|---|---|---|---|---|---|---|---|\n"
+    )
+    lines = []
+    for result in results:
+        base = next((r for r in result["rows"] if r["shape"] == "loopback"), None)
+        for row in result["rows"]:
+            if "partition" in row:
+                p = row["partition"]
+                lines.append(
+                    f"| {row['nodes']} | {row['shape']} | {row['set_rtt_ms']:g} / {_ms(row.get('rtt_ms'))} | - | - | - | - | - "
+                    f"| {p['election_ms']:.0f} (bound {p['bound_ms']:.0f}); rejoin {p['rejoin_ms']:.0f} "
+                    f"| {p['operations']} ops, {p['acknowledged_writes']} acked writes, {p['violations']} violations | {jobs.get(row['nodes'], '-')} |"
+                )
+                continue
+            if "small_latency" not in row:  # no leader at start: its checks say why
+                lines.append(
+                    f"| {row['nodes']} | {row['shape']} | {row['set_rtt_ms']:g} / {_ms(row.get('rtt_ms'))} "
+                    f"| error: not measured | - | - | - | - | - | - | {jobs.get(row['nodes'], '-')} |"
+                )
+                continue
+            sl, ll, st, lt, rpc = (
+                row["small_latency"],
+                row["large_latency"],
+                row["small_throughput"],
+                row["large_throughput"],
+                row["rpc"],
+            )
+            el = row.get("elections_ms") or []
+            versus = "-"
+            if base is not None and base is not row and "small_latency" in base:
+                p50, b50 = sl.get("p50_ms"), base["small_latency"].get("p50_ms")
+                versus = (
+                    f"p50 {'-' if p50 is None or b50 is None else f'+{p50 - b50:.2f} ms'}; "
+                    f"{_ratio(row, base, 'small_throughput', 'per_s')} commits/s; "
+                    f"{_ratio(row, base, 'large_throughput', 'mb_s')} MB/s"
+                )
+
+            cells = (
+                _cell(sl, _latency),
+                _cell(ll, _latency),
+                _cell(st, lambda m: f"{m['per_s']:,.0f}"),
+                _cell(lt, lambda m: f"{m['mb_s']:.1f}"),
+                _cell(rpc, lambda m: f"{_latency(m)} (cold {_ms(m.get('cold_ms'))})"),
+            )
+            lines.append(
+                f"| {row['nodes']} | {row['shape']} | {row['set_rtt_ms']:g} / {_ms(row.get('rtt_ms'))} | "
+                + " | ".join(cells)
+                + " "
+                f"| {f'{statistics.median(el):.0f}, {max(el):.0f}' if el else '-'} | {versus} | {jobs.get(row['nodes'], '-')} |"
+            )
+    return head + "\n".join(lines) + "\n"
+
+
+def hunts(results: Sequence[dict[str, Any]]) -> list[str]:
+    """What degrades past what the delay explains, by the round trip ping measured: a commit at one
+    in flight is one round trip, so p50 over a round trip plus loopback's p99, or p99 over two; an
+    RPC p99 over a round trip plus loopback's; an election past 3 timeouts. Each round trip carries
+    A1's 10% margin."""
+    found = []
+    for result in results:
+        base = next(
+            (
+                r
+                for r in result["rows"]
+                if r["shape"] == "loopback" and "small_latency" in r
+            ),
+            None,
+        )
+        for row in result["rows"]:
+            if "small_latency" not in row or base is None:
+                continue
+            rtt = (1 + RTT_TOLERANCE) * (
+                row.get("rtt_ms") or row["set_rtt_ms"]
+            )  # A1's own margin
+            where = f"{result['nodes']} nodes, {row['shape']}"
+            for name in ("small_latency", "large_latency"):
+                if "p50_ms" not in row[name] or "p99_ms" not in base[name]:
+                    continue
+                limit = rtt + base[name]["p99_ms"]
+                if row[name]["p50_ms"] > limit:
+                    found.append(
+                        f"{where}: {name} p50 {row[name]['p50_ms']:.2f} ms > RTT + loopback p99 = {limit:.2f} ms"
+                    )
+                limit = 2 * rtt + base[name]["p99_ms"]
+                if row[name]["p99_ms"] > limit:
+                    found.append(
+                        f"{where}: {name} p99 {row[name]['p99_ms']:.2f} ms > 2 RTT + loopback p99 = {limit:.2f} ms"
+                    )
+            limit = rtt + base["rpc"].get("p99_ms", 0)
+            if row["rpc"].get("p99_ms", 0) > limit:
+                found.append(
+                    f"{result['nodes']} nodes, {row['shape']}: RPC p99 {row['rpc']['p99_ms']:.2f} ms > RTT + loopback p99 = {limit:.2f} ms"
+                )
+            for t in row.get("elections_ms") or []:
+                if t > 3 * ELECTION_MAX_MS:
+                    found.append(
+                        f"{result['nodes']} nodes, {row['shape']}: election {t:.0f} ms > 3 timeouts"
+                    )
+    return found
+
+
+CALIBRATION_MS = (0.001, 0.01, 0.1, 0.5, 1, 2, 5, 20, 80)
+
+
+def calibrate(
+    lab: Lab, run: Callable[[Sequence[str]], str], pings: int = 40
+) -> list[dict[str, Any]]:
+    """ping between two namespaces with netem holding each packet `ms` each way, beside a sleep of
+    `ms`'s lateness: whether the round trip past the delay is the unshaped path plus two such wakes."""
+    lab.open({1: PORT, 2: PORT})
+    rows = []
+    try:
+        host = lab.address(1, 2).rsplit(":", 1)[0]
+        for ms in CALIBRATION_MS:
+            lab.delay(ms)
+            argv = ["ping", "-n", "-c", str(pings), "-i", "0.02", "-W", "2", host]
+            rtts = ping_rtts(run(lab.command(1, argv)))
+            late = timer_late(ms)
+            rows.append(
+                {
+                    "ms": ms,
+                    "ping_p50": round(statistics.median(rtts), 3),
+                    "ping_p10": round(percentile(rtts, 0.1), 3),
+                    "ping_p90": round(percentile(rtts, 0.9), 3),
+                    "excess": round(statistics.median(rtts) - 2 * ms, 3),
+                    "late_p50": round(statistics.median(late), 3),
+                    "late_p90": round(percentile(late, 0.9), 3),
+                }
+            )
+            print(json.dumps(rows[-1]), flush=True)
+        lab.delay(0)
+        rtts = ping_rtts(
+            run(lab.command(1, ["ping", "-n", "-c", str(pings), "-i", "0.02", host]))
+        )
+        rows.append({"ms": 0, "ping_p50": round(statistics.median(rtts), 3)})
+        print(json.dumps(rows[-1]), flush=True)
+    finally:
+        lab.teardown()
+    return rows
+
+
+def load_faultlab(directory: Path) -> tuple[Any, Any]:
+    """faultlab's netlab and history modules from the pinned checkout's python/ directory."""
+    sys.path.insert(0, str(directory / "python"))
+    from faultlab import (
+        history,
+        netlab,
+    )
+
+    return netlab, history
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="bench.py", description=__doc__.split("\n\n")[0]
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+    p = sub.add_parser(
+        "run", help="measure every shape at one node count (Linux, root)"
+    )
+    p.add_argument(
+        "--faultlab",
+        type=Path,
+        required=True,
+        help="faultlab checkout at bench/netlab/FAULTLAB_REV",
+    )
+    p.add_argument(
+        "--node", type=Path, required=True, help="the consensus_netlab_node binary"
+    )
+    p.add_argument("--nodes", type=int, default=3, choices=(3, 5))
+    p.add_argument("--shapes", default=",".join(s.name for s in SHAPES))
+    p.add_argument("--quick", action="store_true", help="the dry run's short plan")
+    p.add_argument("--data", type=Path, default=Path("/dev/shm/netlab-consensus"))
+    p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--rpc-timeout", type=int, help="the nodes' Timing::rpc_timeout, ms")
+    p.add_argument(
+        "--load-wait", type=float, help="seconds past a load's own to wait for it"
+    )
+    p.add_argument("--large-bytes", type=int, help="the large entries' size")
+    p.add_argument("--large-inflight", type=int, help="large entries in flight")
+    p.add_argument(
+        "--large-seconds", type=float, help="the large throughput load's seconds"
+    )
+    p.add_argument(
+        "--diag",
+        action="store_true",
+        help="sample each load's progress to diag-N.jsonl",
+    )
+    p = sub.add_parser(
+        "calibrate", help="netem holds against timer lateness (Linux, root)"
+    )
+    p.add_argument("--faultlab", type=Path, required=True)
+    p.add_argument("--out", type=Path, required=True)
+    p = sub.add_parser("table", help="the markdown table and hunt rows of result files")
+    p.add_argument("results", nargs="+", type=Path)
+    p.add_argument(
+        "--job",
+        action="append",
+        default=[],
+        help="N=JOB: the job id of the N-node result",
+    )
+    args = parser.parse_args(argv)
+    if args.command == "table":
+        results = [json.loads(path.read_text()) for path in args.results]
+        jobs = {int(k): v for k, _, v in (j.partition("=") for j in args.job)}
+        print(table(results, jobs))
+        for hunt in hunts(results):
+            print(f"- hunt: {hunt}")
+        return 0
+    netlab, history = load_faultlab(args.faultlab)
+    if (reason := netlab.unavailable()) is not None:
+        print(f"bench.py: {reason}", file=sys.stderr)
+        return 2
+    args.out.mkdir(parents=True, exist_ok=True)
+    if args.command == "calibrate":
+        rows = calibrate(netlab.Netlab(prefix="nlc"), netlab.run)
+        (args.out / "calibrate.json").write_text(json.dumps(rows, indent=1) + "\n")
+        return 0
+    chosen = [s for s in SHAPES if s.name in args.shapes.split(",")]
+    random.seed(args.seed)
+    shutil.rmtree(args.data, ignore_errors=True)
+    lab = netlab.Netlab(prefix="nlc")
+    certs = fixture(args.data / "fixture", netlab.run)
+    options = ["--rpc-timeout", str(args.rpc_timeout)] if args.rpc_timeout else []
+    cluster = Processes(lab, args.node, certs, args.data, args.nodes, options)
+    plan = Plan.quick() if args.quick else Plan()
+    if args.load_wait is not None:
+        plan = dataclasses.replace(plan, load_wait=args.load_wait)
+    if args.large_bytes:
+        plan = dataclasses.replace(plan, large_bytes=args.large_bytes)
+    if args.large_inflight:
+        plan = dataclasses.replace(plan, large_inflight=args.large_inflight)
+    if args.large_seconds:
+        plan = dataclasses.replace(plan, large_seconds=args.large_seconds)
+    bench = Bench(lab, cluster, args.nodes, plan, args.out, netlab.run, history)
+    if args.diag:
+        bench.diag = args.out / f"diag-{args.nodes}.jsonl"
+        bench.diag.unlink(missing_ok=True)
+    result = measure(bench, chosen)
+    (args.out / f"result-{args.nodes}.json").write_text(
+        json.dumps(result, indent=1) + "\n"
+    )
+    print(table([result], {}))
+    for hunt in hunts([result]):
+        print(f"- hunt: {hunt}")
+    failed = [c for c in result["checks"] if not c["ok"]]
+    print(
+        f"netlab-consensus {args.nodes} nodes: {len(result['checks']) - len(failed)} of {len(result['checks'])} checks passed: {'ok' if result['ok'] else 'FAIL'}"
+    )
+    return 0 if result["ok"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

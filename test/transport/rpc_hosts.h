@@ -2,6 +2,7 @@
 // of rpc_host_test and hello_test.
 #pragma once
 #include "consensus/transport/host_transport.h"
+#include "lag.h"
 #include <asio/executor_work_guard.hpp>
 #include <asio/io_context.hpp>
 #include <cassert>
@@ -27,7 +28,7 @@ inline Fingerprint pin_of(const std::string &name) {
 	std::unique_ptr<BIO, decltype(&BIO_free)> input(BIO_new_file((fixture / (name + ".pem")).c_str(), "r"), BIO_free);
 	std::unique_ptr<X509, decltype(&X509_free)> leaf(PEM_read_bio_X509(input.get(), nullptr, nullptr, nullptr), X509_free);
 	assert(leaf);
-	return certificate_fingerprint(leaf.get());
+	return key_pin(leaf.get());
 }
 inline std::shared_ptr<asio::ssl::context> context(const std::string &name) {
 	auto c = std::make_shared<asio::ssl::context>(asio::ssl::context::tls);
@@ -180,24 +181,5 @@ struct Beats {
 			worst = std::max<std::uint64_t>(worst, std::uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(now - last).count()));
 		last = now;
 		++count;
-	}
-};
-// The longest a thread that only sleeps 1 ms went without running, in ms: a runner that pauses or
-// starves the process delays every thread, which no transport rule can, so a latency bound adds it.
-struct Lag {
-	std::atomic<bool> stopped{false};
-	std::atomic<std::uint64_t> worst{0};
-	std::thread sampler{[this] {
-		auto last = steady::now();
-		while (!stopped) {
-			std::this_thread::sleep_for(1ms);
-			const auto now = steady::now();
-			worst = std::max<std::uint64_t>(worst, std::uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(now - last).count()));
-			last = now;
-		}
-	}};
-	~Lag() {
-		stopped = true;
-		sampler.join();
 	}
 };

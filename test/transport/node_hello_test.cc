@@ -1,4 +1,4 @@
-// DTHL0002, the host connection's hello: its bytes, each malformed field refused, the checks
+// DTHL0003, the host connection's hello: its bytes, each malformed field refused, the checks
 // against this end's hello, and T1's version negotiation.
 #include "consensus/transport/node_hello.h"
 #include <cassert>
@@ -46,10 +46,11 @@ void decode_refuses(std::string bytes, std::string_view expect) {
 int main() {
 	// The bytes, field by field.
 	const auto bytes = encode_node_hello(sample());
-	std::string expect = "DTHL0002";
+	std::string expect = "DTHL0003";
 	expect += std::string("\x08\x07\x06\x05\x04\x03\x02\x01", 8);
 	expect += std::string("\x02\0\0\0", 4) + std::string(4, '\0');
 	expect += std::string(16, 'K') + std::string(16, 'c');
+	expect += std::string(16, '\0') + std::string(8, '\0') + std::string(4, '\0');  // no boot, directory 0, no reason
 	expect += std::string("\x01\0\0\0\x03\0\0\0", 8);
 	expect += std::string("\x01\0\0\0\x01\0\0\0", 8);  // wire versions 1-1; the default limits follow
 	kronuz::consensus::Limits limits;
@@ -60,6 +61,16 @@ int main() {
 	auto refusal = sample();
 	refusal.refused = true;
 	assert(encode_node_hello(refusal)[20] == 1 && decode_node_hello(encode_node_hello(refusal)) == refusal);
+	auto booted = sample();
+	booted.boot = id('b');
+	booted.directory = 0x1122334455667788;
+	const auto booted_bytes = encode_node_hello(booted);
+	assert(booted_bytes.substr(56, 16) == std::string(16, 'b') && booted_bytes[72] == '\x88' && booted_bytes[79] == '\x11');
+	assert(decode_node_hello(booted_bytes) == booted);
+	auto boot_refusal = booted;
+	boot_refusal.refused = true;
+	boot_refusal.reason = 7;
+	assert(encode_node_hello(boot_refusal)[80] == 7 && decode_node_hello(encode_node_hello(boot_refusal)) == boot_refusal);
 
 	// Each malformed field.
 	decode_refuses(bytes.substr(0, 63), "wrong size");
@@ -67,7 +78,10 @@ int main() {
 	decode_refuses({}, "wrong size");
 	auto v1 = bytes;
 	v1.replace(0, 8, "DTHL0001");
-	decode_refuses(v1, "not DTHL0002");
+	decode_refuses(v1, "not DTHL0003");
+	auto v2 = bytes;
+	v2.replace(0, 8, "DTHL0002");
+	decode_refuses(v2, "not DTHL0003");
 	decode_refuses(std::string("DTHL0001") + std::string(112, 'x'), "wrong size");  // a whole DTHL0001 hello
 	auto patched = [&](auto patch) {
 		auto b = bytes;
@@ -81,10 +95,11 @@ int main() {
 	decode_refuses(patched([](auto &b) { put32(b, 20, 0x80000001u); }), "reserved flags");
 	decode_refuses(patched([](auto &b) { b.replace(24, 16, std::string(16, '\0')); }), "zero cluster");
 	decode_refuses(patched([](auto &b) { b.replace(40, 16, std::string(16, '\0')); }), "zero connection");
-	decode_refuses(patched([](auto &b) { put32(b, 56, 0); }), "invalid RPC version range");
-	decode_refuses(patched([](auto &b) { put32(b, 56, 4); }), "invalid RPC version range");  // min 4 > max 3
-	decode_refuses(patched([](auto &b) { put32(b, 60, 10000); }), "invalid RPC version range");
-	assert(decode_node_hello(patched([](auto &b) { put32(b, 60, 9999); })).rpc_max == 9999);
+	decode_refuses(patched([](auto &b) { put32(b, 80, 3); }), "a reason without a refusal");
+	decode_refuses(patched([](auto &b) { put32(b, 84, 0); }), "invalid RPC version range");
+	decode_refuses(patched([](auto &b) { put32(b, 84, 4); }), "invalid RPC version range");  // min 4 > max 3
+	decode_refuses(patched([](auto &b) { put32(b, 88, 10000); }), "invalid RPC version range");
+	assert(decode_node_hello(patched([](auto &b) { put32(b, 88, 9999); })).rpc_max == 9999);
 	auto bad = sample();
 	bad.node = 0;
 	refused<std::invalid_argument>([&] { (void)encode_node_hello(bad); }, "node 0");
@@ -119,6 +134,6 @@ int main() {
 	assert(negotiate_rpc(range(1, 1), range(2, 2)) == 0);
 	assert(negotiate_rpc(range(2, 4), range(1, 2)) == 2);
 	assert(negotiate_rpc(range(5, 9), range(1, 4)) == 0);
-	std::printf("node_hello: DTHL0002 bytes, 14 malformed inputs refused, 7 checks, negotiation passed\n");
+	std::printf("node_hello: DTHL0003 bytes, 16 malformed inputs refused, 7 checks, negotiation passed\n");
 	return 0;
 }

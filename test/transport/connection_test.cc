@@ -43,7 +43,7 @@ Fingerprint pin_of(const std::string &name) {
 	assert(input);
 	std::unique_ptr<X509, decltype(&X509_free)> leaf(PEM_read_bio_X509(input.get(), nullptr, nullptr, nullptr), X509_free);
 	assert(leaf);
-	return certificate_fingerprint(leaf.get());
+	return key_pin(leaf.get());
 }
 // A node's context; `ca` is the authority it trusts. An empty name presents no certificate.
 std::shared_ptr<asio::ssl::context> context(const std::string &name, const std::string &ca = "ca") {
@@ -281,7 +281,7 @@ void pins() {
 	p.emplace(3, pin_of("two"));
 	refused(1, p, "node pins: node 0 or a repeated certificate");
 	refused(3, pins12(), "node pins: no pin for the local node");
-	refused(2, pins12(), "node pins: the local certificate is not the local node's pin");
+	refused(2, pins12(), "node pins: the local certificate is not the local node's key");
 	std::printf("pins: node 0, a repeated pin, a missing and a mismatched local pin refused\n");
 }
 

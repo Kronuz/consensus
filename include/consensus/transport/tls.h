@@ -42,6 +42,25 @@ inline Fingerprint certificate_fingerprint(X509 *certificate) {
 		throw std::runtime_error("certificate fingerprint");
 	return digest;
 }
+// A key's pin: the SHA-256 of its DER SubjectPublicKeyInfo, as kubeadm and HPKP pin. Every
+// certificate for the key has it, so a renewal keeps its pin (docs/mechanisms/admission.md).
+inline Fingerprint key_pin(EVP_PKEY *key) {
+	unsigned char *der = nullptr;
+	const int n = key ? i2d_PUBKEY(key, &der) : 0;
+	Fingerprint digest{};
+	unsigned length = 0;
+	const bool ok = n > 0 && EVP_Digest(der, std::size_t(n), digest.data(), &length, EVP_sha256(), nullptr) == 1 &&
+					length == digest.size();
+	OPENSSL_free(der);
+	if (!ok)
+		throw std::invalid_argument("key pin: no key, or its encoding failed");
+	return digest;
+}
+inline Fingerprint key_pin(X509 *certificate) {
+	if (!certificate)
+		throw std::invalid_argument("missing certificate");
+	return key_pin(X509_get0_pubkey(certificate));
+}
 inline void validate_peer_identity(asio::ssl::context &context,
 								   const kronuz::consensus::FixedConfiguration &configuration,
 								   const std::map<kronuz::consensus::NodeId, Fingerprint> &pins) {

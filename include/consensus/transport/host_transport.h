@@ -556,31 +556,7 @@ class HostTransport {
 	// not. Its events run on this loop; `done` runs once, at once when the node has no address.
 	RpcCall call(kronuz::consensus::NodeId node, rpc::MethodId method, rpc::CallOptions options, std::string request,
 				 rpc::Events events) {
-		const auto total = options.total.value_or(request.size());
-		if (!method || request.size() > rpc::chunk_bytes || !options.window || request.size() > total)
-			throw std::invalid_argument("host transport: rpc call");
-		const auto k = loop_of_node(node);
-		auto &here = loops_[k];
-		const RpcCall c{node, ++here.rpc_ids};
-		++here.lane_stats.calls;
-		events.done = ending(k, c, std::move(events.done));
-		if (here.stopping || !here.links->routed(node)) {
-			events.done({rpc::Outcome::not_connected});
-			return c;
-		}
-		if (here.draining) {
-			events.done({rpc::Outcome::not_processed});
-			return c;
-		}
-		auto &peer = here.rpc[node];
-		peer.calls[c.id] = 0;
-		if (peer.lane && !peer.lane->draining())
-			begin(peer, c.id, {method, std::move(options), std::move(request), std::move(events)});
-		else
-			peer.pending.push_back({c.id, {method, options, std::move(request), std::move(events)}, options.deadline - rpc::Clock::now()});
-		pump(k, node, LinkLane::Bulk);
-		arm(k, node);
-		return c;
+		return place(node, method, std::move(options), std::move(request), std::move(events), false);
 	}
 	// On the call's loop, each as rpc::Lane's own; a call that ended, or waits for its connection,
 	// takes nothing (sendable 0).
@@ -621,9 +597,12 @@ class HostTransport {
 	// on this loop and never within this call: the bytes, nullopt when the node holds none, or an
 	// error (io_error: the reader failed or the file is over its fetch_bytes; message_size: over
 	// this host's; timed_out; resource_unavailable_try_again: `fetches` already await the node,
-	// or a drain refused it; connection_aborted: its connection ended twice; not_connected). A
-	// fetch is a read: when its connection ends under it, it asks once more on the next one,
-	// within the same fetch_deadline.
+	// or a drain refused it; connection_aborted: its connection ended and no next one took it;
+	// not_connected). A fetch is a read: when its connection ends under it, it asks once more,
+	// within the same fetch_deadline, on a connection that is up or comes up. It ends
+	// connection_aborted when the redial makes no connection, and, never asked again, when this
+	// host drains, stops or removes the node (docs/mechanisms/rpc-lane.md, A fetch whose
+	// connection ends).
 	void fetch(kronuz::consensus::NodeId node, std::string name, FetchDone done) {
 		if (!done || name.empty() || name.size() > rpc::chunk_bytes)
 			throw std::invalid_argument("host transport: fetch");
@@ -804,6 +783,7 @@ class HostTransport {
 		Made call;
 		rpc::Clock::duration timeout{};  // its deadline's span, for the late rule
 		bool extended = false;
+		bool again = false;  // a fetch's second ask (place)
 	};
 	// T7: deadline.h's rule, for call deadlines.
 	static rpc::Clock::duration late_rule(rpc::Clock::duration late, rpc::Clock::duration timeout) {
@@ -986,20 +966,34 @@ class HostTransport {
 			return;
 		}
 		lane.dialing = true;
-		task::spawn(here.at.scheduler, here.links->dial(node, which),
-					[this, k, node, which](std::exception_ptr, std::optional<bool> ok) {
+		task::spawn(here.at.scheduler, dial(*here.links, node, which),
+					[this, k, node, which](std::exception_ptr, std::optional<Dialed> dialed) {
 						auto &lane = loops_[k].lanes[{node, which}];
 						lane.dialing = false;
-						if (!lane.link && !(ok && *ok)) {
-							lane.dial_after = loops_[k].at.scheduler.now() +
-											  std::uint64_t(std::chrono::nanoseconds(options_.redial).count());
-							if (auto it = loops_[k].rpc.find(node); which == LinkLane::Bulk && it != loops_[k].rpc.end() &&
-																	 (!it->second.pending.empty() || it->second.holds)) {
-								it->second.redial = rpc::Clock::now() + options_.redial;  // calls wait to their deadlines
-								arm(k, node);
-							}
+						if (lane.link || dialed == Dialed::up)
+							return;
+						lane.dial_after = loops_[k].at.scheduler.now() +
+										  std::uint64_t(std::chrono::nanoseconds(options_.redial).count());
+						const auto it = loops_[k].rpc.find(node);
+						if (which != LinkLane::Bulk || it == loops_[k].rpc.end())
+							return;
+						if (dialed != Dialed::lost)
+							fail_again(it->second);
+						if (!it->second.pending.empty() || it->second.holds) {
+							it->second.redial = rpc::Clock::now() + options_.redial;  // calls wait to their deadlines
+							arm(k, node);
 						}
 					});
+	}
+	// Links::dial in its halves: failed when it made no connection (refused, unreachable, or the
+	// TLS handshake failed), lost when the hellos did not make it the link (the peer's dial won,
+	// or they failed).
+	enum class Dialed { up, lost, failed };
+	static task::task<Dialed> dial(Links &links, kronuz::consensus::NodeId node, LinkLane which) {
+		auto connection = co_await links.connect(node, which);
+		if (!connection)
+			co_return links.find(node, which) ? Dialed::lost : Dialed::failed;
+		co_return co_await links.offer(node, which, std::move(connection)) ? Dialed::up : Dialed::lost;
 	}
 	std::size_t put(std::uint32_t k, Lane &lane, std::string_view frame) {
 		lane.link->connection->send(frame);
@@ -1367,18 +1361,60 @@ class HostTransport {
 			arm(k, c.node);  // the last call's end starts lane_idle
 		};
 	}
+	// call(); with `again`, a fetch's second ask, which only a connection that comes up takes: a
+	// dial that makes none, or the end of its wait, ends it connection_aborted.
+	RpcCall place(kronuz::consensus::NodeId node, rpc::MethodId method, rpc::CallOptions options, std::string request,
+				  rpc::Events events, bool again) {
+		const auto total = options.total.value_or(request.size());
+		if (!method || request.size() > rpc::chunk_bytes || !options.window || request.size() > total)
+			throw std::invalid_argument("host transport: rpc call");
+		const auto k = loop_of_node(node);
+		auto &here = loops_[k];
+		const RpcCall c{node, ++here.rpc_ids};
+		++here.lane_stats.calls;
+		events.done = ending(k, c, std::move(events.done));
+		if (here.stopping || !here.links->routed(node)) {
+			events.done({rpc::Outcome::not_connected});
+			return c;
+		}
+		if (here.draining) {
+			events.done({rpc::Outcome::not_processed});
+			return c;
+		}
+		auto &peer = here.rpc[node];
+		peer.calls[c.id] = 0;
+		if (peer.lane && !peer.lane->draining())
+			begin(peer, c.id, {method, std::move(options), std::move(request), std::move(events)});
+		else
+			peer.pending.push_back({c.id, {method, options, std::move(request), std::move(events)},
+									options.deadline - rpc::Clock::now(), false, again});
+		pump(k, node, LinkLane::Bulk);
+		arm(k, node);
+		return c;
+	}
 	// Hands a call to the peer's lane; its done may run within, and leaves no handle behind.
 	static void begin(RpcPeer &peer, std::uint64_t id, Made made) {
 		const auto h = peer.lane->call(made.method, std::move(made.options), std::move(made.request), std::move(made.events));
 		if (auto it = peer.calls.find(id); it != peer.calls.end())
 			it->second = h;
 	}
-	// Ends every call still waiting for a connection.
+	// Ends every call still waiting for a connection; a fetch's second ask connection_aborted.
 	static void fail(RpcPeer &peer, rpc::Outcome outcome) {
 		auto pending = std::move(peer.pending);
 		peer.pending.clear();
 		for (auto &p : pending)
-			p.call.events.done({outcome});
+			p.call.events.done({p.again ? rpc::Outcome::connection_aborted : outcome});
+	}
+	// A dial made no connection: each fetch's second ask waiting for one ends connection_aborted.
+	static void fail_again(RpcPeer &peer) {
+		std::vector<rpc::Events> ended;
+		std::erase_if(peer.pending, [&](Pending &p) {
+			if (p.again)
+				ended.push_back(std::move(p.call.events));
+			return p.again;
+		});
+		for (auto &events : ended)
+			events.done({rpc::Outcome::connection_aborted});
 	}
 	// A Bulk link is up: its call table, at the version the hellos agreed (T1), takes the calls
 	// that waited for it. A link with the lane off ends them protocol_not_supported.
@@ -1451,40 +1487,48 @@ class HostTransport {
 			consume(state->call, bytes.size());
 		};
 		events.done = [this, k, state](const rpc::Status &status) {
-			using std::errc;
-			auto &here = loops_[k];
-			if (status.outcome == rpc::Outcome::connection_aborted && !state->asked_again && !here.stopping &&
-				rpc::Clock::now() < state->deadline) {
-				state->asked_again = true;  // a read is safe to ask again: the next connection serves it
-				state->bytes.clear();
+			if (status.outcome != rpc::Outcome::connection_aborted || state->asked_again || rpc::Clock::now() >= state->deadline)
+				return end(k, *state, status);
+			state->asked_again = true;  // a read is safe to ask again: the next connection serves it
+			state->bytes.clear();
+			on(k, [this, k, state] {
+				auto &here = loops_[k];
+				if (here.stopping || here.draining || !here.links->routed(state->node))
+					return end(k, *state, {rpc::Outcome::connection_aborted});
 				++here.lane_stats.fetches_asked_again;
-				return on(k, [this, k, state] { ask(k, state); });
-			}
-			if (auto it = here.rpc.find(state->node); it != here.rpc.end() && it->second.fetching)
-				--it->second.fetching;
-			switch (status.outcome) {
-			case rpc::Outcome::ok:
-				return fetched(k, *state, {}, std::move(state->bytes));
-			case rpc::Outcome::error:
-				if (status.code == std::uint32_t(fetch_missing))
-					return fetched(k, *state, {}, std::nullopt);
-				return fetched(k, *state, std::make_error_code(errc::io_error), std::nullopt);
-			case rpc::Outcome::cancel:  // this end's stop: past fetch_bytes, or the deadline after the Call left
-				if (status.code == std::uint32_t(rpc::Code::deadline_exceeded))
-					return fetched(k, *state, std::make_error_code(errc::timed_out), std::nullopt);
-				return fetched(k, *state, std::make_error_code(state->over ? errc::message_size : errc::io_error), std::nullopt);
-			case rpc::Outcome::timed_out:
-				return fetched(k, *state, std::make_error_code(errc::timed_out), std::nullopt);
-			case rpc::Outcome::not_processed:
-				return fetched(k, *state, std::make_error_code(errc::resource_unavailable_try_again), std::nullopt);
-			case rpc::Outcome::connection_aborted:
-				return fetched(k, *state, std::make_error_code(errc::connection_aborted), std::nullopt);
-			default:
-				return fetched(k, *state, std::make_error_code(errc::not_connected), std::nullopt);
-			}
+				ask(k, state);
+			});
 		};
 		const auto size = state->name.size();
-		state->call = call(state->node, fetch_method, {.deadline = state->deadline, .total = size}, state->name, std::move(events));
+		state->call = place(state->node, fetch_method, {.deadline = state->deadline, .total = size}, state->name,
+							std::move(events), state->asked_again);
+	}
+	// A fetch's last call ended: it frees its `fetches` slot, and `done` gets the outcome.
+	void end(std::uint32_t k, Fetch &state, const rpc::Status &status) {
+		using std::errc;
+		auto &here = loops_[k];
+		if (auto it = here.rpc.find(state.node); it != here.rpc.end() && it->second.fetching)
+			--it->second.fetching;
+		switch (status.outcome) {
+		case rpc::Outcome::ok:
+			return fetched(k, state, {}, std::move(state.bytes));
+		case rpc::Outcome::error:
+			if (status.code == std::uint32_t(fetch_missing))
+				return fetched(k, state, {}, std::nullopt);
+			return fetched(k, state, std::make_error_code(errc::io_error), std::nullopt);
+		case rpc::Outcome::cancel:  // this end's stop: past fetch_bytes, or the deadline after the Call left
+			if (status.code == std::uint32_t(rpc::Code::deadline_exceeded))
+				return fetched(k, state, std::make_error_code(errc::timed_out), std::nullopt);
+			return fetched(k, state, std::make_error_code(state.over ? errc::message_size : errc::io_error), std::nullopt);
+		case rpc::Outcome::timed_out:
+			return fetched(k, state, std::make_error_code(errc::timed_out), std::nullopt);
+		case rpc::Outcome::not_processed:
+			return fetched(k, state, std::make_error_code(errc::resource_unavailable_try_again), std::nullopt);
+		case rpc::Outcome::connection_aborted:
+			return fetched(k, state, std::make_error_code(errc::connection_aborted), std::nullopt);
+		default:
+			return fetched(k, state, std::make_error_code(errc::not_connected), std::nullopt);
+		}
 	}
 	// A fetch's end: its done runs on the loop, never within the call that ended it.
 	void fetched(std::uint32_t k, Fetch &state, std::error_code e, std::optional<std::string> bytes) {

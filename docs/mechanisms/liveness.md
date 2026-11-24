@@ -26,7 +26,8 @@ node only in a long heal window (Linux, seed 7).
 ## Held Ticks
 
 `Core::next_deadline()` is the earliest Tick time at which a Tick may change anything. The
-harness reads it after each core step, and a node's Tick before it is held rather than stepped:
+harness reads it at a node's first Tick after a core step, and a Tick before it is held rather
+than stepped:
 its delay is still drawn, so the random stream and every schedule stay the same, and the held
 Tick reaches the core just before the node's next event, so that event sees the clock it would
 have. A leader's Tick is held only while its membership is settled and it is not a witness: a
@@ -36,6 +37,25 @@ D3 removal and a hand-off wait for a Tick, which `next_deadline()` does not repo
 the deadline. With it, and with a hash of every action each core returns (time, node, kind, a
 message's kind and term), main's harness and this one produce the same output and the same hash
 in every profile.
+
+Each node's one scheduled Tick lives on the node, beside the queue, ordered with the queue's
+events by time and then by the same order counter; the queue holds deliveries, persistences and
+applications as small records, a message in flight in a slot vector.
+
+## Cost
+
+ASan, 20 seeds, main's harness and this one on the same host, one after the other (job
+261124-061757-8fb9aa): 129.7 s and 64.8 s. On CI's linux-asan-ubsan, against
+`consensus_shared_worker` in the same job:
+
+| Run | consensus_liveness | consensus_shared_worker | Ratio |
+|---|---|---|---|
+| main 54c6599 (typical runner) | 82.09 s | 139.12 s | 0.590 |
+| main 512e3ef (slow runner) | 173.49 s | 238.35 s | 0.728 |
+| held Ticks, 8511ff1 | 40.79 s | 143.55 s | 0.284 |
+
+What is left is the cores' own work on the events main also delivers: a profile of the ASan run
+(job 261124-062325-f25d84) puts 54% in `Core::step`, and no single harness cost above 9%.
 
 ## Output
 

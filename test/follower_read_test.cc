@@ -185,7 +185,12 @@ struct Network {
 			for (auto& [id, h] : hosts) { at = std::min(at, std::max(now, h->core->next_deadline())); }
 			if (at > until) { now = until; return; }
 			now = at;
-			for (auto& [id, h] : hosts) { if (h->core->next_deadline() <= now) { tick(id); } }
+			std::set<NodeId> ticked;
+			for (auto& [id, h] : hosts) { if (h->core->next_deadline() <= now) { tick(id); ticked.insert(id); } }
+			// A Tick at its deadline moves the deadline past it, or the host would spin.
+			for (NodeId id : ticked) {
+				if (core(id).next_deadline() <= now) { check(false, "a deadline stays due after its Tick"); now = until; return; }
+			}
 		}
 	}
 	// Ticks every host each `step` through `until`, delivering as it goes.

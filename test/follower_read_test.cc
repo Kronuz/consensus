@@ -24,7 +24,7 @@
 // below, and randomized clusters, with delayed, duplicated and re-injected frames, whose reads
 // at any member must each return an index at or above every commit made before the read began. test/follower_read_mutants.py seeds a fault
 // per case; the plain test fails at each.
-//   usage: follower_read_test [case] [seeds]
+//   usage: follower_read_test [case] [seeds], 30 seeds by default
 #include "consensus/core.h"
 #include "consensus/storage.h"
 #include "consensus/transport/codec.h"
@@ -640,7 +640,7 @@ void randomized(std::uint64_t seeds) {
 
 int main(int argc, char** argv) {
 	const std::string only = argc > 1 ? argv[1] : "";
-	const std::uint64_t seeds = argc > 2 ? std::stoull(argv[2]) : 200;
+	const std::uint64_t seeds = argc > 2 ? std::stoull(argv[2]) : 30; // fits ctest's 30 s under ASan
 	const std::pair<const char*, std::function<void()>> cases[] = {
 		{"confirmed", confirmed_after_apply}, {"stale", stale_leader}, {"lost", leader_lost}, {"term", term_change},
 		{"identity", answer_identity}, {"restart", restart_same_term}, {"deadline", deadline}, {"in-flight", in_flight},

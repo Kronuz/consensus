@@ -425,6 +425,7 @@ bool stream() {
 	if (!until([&] { heartbeat(); return beats.count > 0; }, 10s))
 		return false;
 	beats.worst = 0;
+	Lag lag;
 	const auto start = steady::now();
 	auto c = start_call(one, 2, sink, body, 60s);
 	for (std::int64_t tick = 0; !c->done && ms_since(start) < 60'000; ++tick) {
@@ -439,6 +440,7 @@ bool stream() {
 						(long long)((posted[i] - posted[i - 1]) / 1000), (long long)((sentt[i] - posted[i]) / 1000), (long long)((deliv[i] - sentt[i]) / 1000),
 						(long long)((sentt[i - 1] - posted[i - 1]) / 1000), (long long)((deliv[i - 1] - sentt[i - 1]) / 1000));
 	}
+	std::printf("DIAG the host's lag %llu ms\n", (unsigned long long)lag.worst.load());
 	const auto served = server.last();
 	const auto window = HostTransportOptions{}.rpc.lane.window;
 	const auto serving = two.transport->serving_pool().high_water(), outgoing = one.transport->outgoing_pool().high_water();

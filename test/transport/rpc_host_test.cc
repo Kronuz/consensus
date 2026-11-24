@@ -9,8 +9,8 @@
 //   lane-only   two nodes that share no group: a streamed call dials Bulk alone, completes, and
 //               no group's counter moves
 //   stream      a 32 MiB request streams under the lane's credit (the sender's queued bytes within
-//               one window) while heartbeats on Control keep every gap under 1,000 ms (control:
-//               rpc-past-credit)
+//               one window) while heartbeats on Control keep every gap under 1,000 ms plus the
+//               host's lag (control: rpc-past-credit)
 //   local-throw a handler and a body consumer that throw fail their own call handler_failed; the
 //               Bulk connection, a group's frames on it and the next call go on (control:
 //               local-throw-closes)

@@ -97,7 +97,7 @@ Fingerprint pin_of(const std::string &name) {
 	std::unique_ptr<X509, decltype(&X509_free)> leaf(PEM_read_bio_X509(input.get(), nullptr, nullptr, nullptr), X509_free);
 	if (!leaf)
 		throw std::runtime_error("no certificate " + name);
-	return certificate_fingerprint(leaf.get());
+	return key_pin(leaf.get());
 }
 std::shared_ptr<asio::ssl::context> context(const std::string &name) {
 	auto c = std::make_shared<asio::ssl::context>(asio::ssl::context::tls);

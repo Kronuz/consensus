@@ -127,8 +127,8 @@ struct Loop {
 	std::unique_ptr<Driver<Sink>> driver;
 	task::cancel_source stop;
 	bool turns_done = false, driver_done = false;
-	explicit Loop(fl::filesystem& d, bool hold_turns = false, bool hold_io = false, std::uint64_t seed = 7) : disk(d) {
-		host = std::make_unique<j::Host>(host_io(disk), host_identity, j::HostOptions{1, turn_options});
+	explicit Loop(fl::filesystem& d, bool hold_turns = false, bool hold_io = false, std::uint64_t seed = 7, j::TurnLogOptions log_options = turn_options) : disk(d) {
+		host = std::make_unique<j::Host>(host_io(disk), host_identity, j::HostOptions{1, log_options});
 		auto io = hold_io ? j::completion_ref::of(held) : j::completion_ref::of(inline_io);
 		auto turns = hold_turns ? j::completion_ref::of(held) : j::completion_ref::of(inline_io);
 		driver = std::make_unique<Driver<Sink>>(Seams{task::scheduler_ref::of(scheduler), io, *host, 0, seed}, sink);
@@ -778,7 +778,121 @@ void fence_tells_peers() {
 	check(campaigned, "and it campaigns within its election timeout");
 }
 
+// A group's Flow reaches its Core, on create and on recover. A three-voter leader whose peers
+// have answered once (verified) and then fall silent keeps up to Flow::pipeline appends of at most
+// Flow::frame_bytes in flight to each; the default Flow keeps one, up to rpc_bytes.
+namespace flow_case {
+constexpr std::size_t entry_bytes = 16 << 10, entries = 200;
+const j::TurnLogOptions turns{8 << 20, 4096, 1, 4, 1 << 20};
+GroupOptions group_options(Flow flow) {
+	auto o = options({1, 2, 3});
+	o.limits.command_bytes = 128 << 10; o.limits.rpc_bytes = 1 << 20; o.limits.log_bytes = 64 << 20; o.limits.log_entries = 1024; o.limits.rpc_entries = 64;
+	o.scheduling.flow = flow;
+	return o;
+}
+// The peers answer every vote and append at once, until silenced; each round applies what committed.
+struct Peers {
+	Loop& loop; GroupId g; std::size_t seen = 0; bool silent = false;
+	void pump() {
+		for (;;) {
+			loop.release();
+			const auto from = seen; seen = loop.sink.sent.size();
+			if (from == seen) { return; }
+			for (auto i = from; i < seen; ++i) {
+				const auto& send = loop.sink.sent[i].second;
+				std::optional<Message> reply;
+				if (auto r = std::get_if<PreVoteRequest>(&send.message)) { reply = PreVoteResponse{r->term - 1, r->term, true}; }
+				else if (auto r = std::get_if<VoteRequest>(&send.message)) { reply = VoteResponse{r->term, true}; }
+				else if (auto r = std::get_if<AppendRequest>(&send.message); r && !silent) {
+					const Index through = r->previous + r->entries.size();
+					reply = AppendResponse{r->term, r->rpc, true, through, through + 1, r->read_probe};
+				}
+				if (reply) { loop.driver->receive(g, Receive{send.peer, std::move(*reply)}); }
+			}
+			loop.apply(g);
+		}
+	}
+	void lead() {
+		for (int n = 0; n < 1000; ++n) {
+			auto s = loop.driver->state(g);
+			if (s && s->role == Role::Leader && s->committed >= 1) { return; }
+			loop.scheduler.advance(1'000'000); loop.run(); pump();
+		}
+		check(false, "the group leads");
+	}
+};
+// The appends to peer 2 sent from `from`: how many, and the most bytes one carries.
+struct Flights { std::size_t flights = 0, largest = 0; };
+Flights appends(const Loop& loop, GroupId g, std::size_t from) {
+	Flights out;
+	for (auto i = from; i < loop.sink.sent.size(); ++i) {
+		const auto& [id, send] = loop.sink.sent[i];
+		auto r = std::get_if<AppendRequest>(&send.message);
+		if (id != g || send.peer != 2 || !r || r->entries.empty()) { continue; }
+		std::size_t bytes = 0; for (const auto& e : r->entries) { bytes += e.payload.size(); }
+		++out.flights; out.largest = std::max(out.largest, bytes);
+	}
+	return out;
+}
+// With the peers silent, a backlog of proposals fills the pipeline; once they answer, the
+// backlog goes in frames of up to the frame cap (rpc_bytes when it is 0, paced up to it).
+void burst(Loop& loop, GroupId g, Flow flow, const std::string& when) {
+	Peers peers{loop, g};
+	peers.lead();
+	std::exception_ptr error;
+	std::optional<Placement> placed;
+	check(loop.settle(loop.driver->propose(g, "warm"), placed, error) && !error && placed, when + ": a warm-up proposal is placed");
+	peers.pump();
+	peers.silent = true;
+	const auto mark = loop.sink.sent.size();
+	for (std::size_t i = 0; i < entries; ++i) {
+		check(loop.settle(loop.driver->propose(g, std::string(entry_bytes, char('a' + i % 26))), placed, error) && !error && placed, when + ": a proposal is placed");
+	}
+	const auto full = appends(loop, g, mark);
+	check(full.flights == flow.pipeline, when + ": " + std::to_string(flow.pipeline) + " appends in flight to a silent peer, not " + std::to_string(full.flights));
+	check(full.largest <= entry_bytes * 2, when + ": each carries what was proposed since: " + std::to_string(full.largest));
+	peers.silent = false; peers.seen = mark;
+	peers.pump();
+	const auto drained = appends(loop, g, mark);
+	const std::size_t cap = flow.frame_bytes ? flow.frame_bytes : std::size_t{1} << 20;
+	if (flow.frame_bytes) {
+		check(drained.largest <= cap && drained.largest + entry_bytes > cap, when + ": the backlog goes in frames of up to " + std::to_string(cap) + " bytes, the largest " + std::to_string(drained.largest));
+	} else {
+		check(drained.largest > std::size_t{256} << 10 && drained.largest <= cap, when + ": the backlog goes in frames above 256 KiB, up to " + std::to_string(cap) + ": the largest " + std::to_string(drained.largest));
+	}
+	auto s = loop.driver->state(g);
+	check(s && s->committed >= entries, when + ": the backlog commits");
+}
+}  // namespace flow_case
+
+void flow_reaches_core() {
+	const Flow piped{4, std::uint64_t{4} << 20, 256 << 10}, plain{};
+	for (const auto& [name, flow] : {std::pair<const char*, Flow>{"pipelined", piped}, {"default", plain}}) {
+		constexpr GroupId g = 111;
+		fl::filesystem disk;
+		{
+			Loop loop(disk, false, false, 7, flow_case::turns);
+			loop.current = g;
+			loop.driver->open(g, flow_case::group_options(flow));
+			std::exception_ptr error;
+			check(loop.settle(loop.driver->create(g, j::Identity{'F', 'L'}), error) && !error, std::string(name) + ": create");
+			flow_case::burst(loop, g, flow, std::string(name) + " on create");
+		}
+		Loop loop(disk, false, false, 7, flow_case::turns);
+		loop.current = g;
+		loop.driver->open(g, flow_case::group_options(flow));
+		std::exception_ptr error;
+		check(loop.settle(loop.driver->recover(g, [](j::ArtifactReader&) {}), error) && !error, std::string(name) + ": recover");
+		flow_case::burst(loop, g, flow, std::string(name) + " on recover");
+	}
+	// An invalid flow is refused when the group opens.
+	fl::filesystem disk; Loop loop(disk, false, false, 7, flow_case::turns);
+	auto o = flow_case::group_options(Flow{0});
+	check(throws_as([&] { loop.driver->open(1, o); }, [](std::exception_ptr e) { return is<std::invalid_argument>(e); }), "a Flow with no pipeline is refused");
+}
+
 const std::map<std::string, void (*)()> cases{
+	{"flow_reaches_core", &flow_reaches_core},
 	{"fence_tells_peers", &fence_tells_peers},
 	{"leader_gone", &leader_gone},
 	{"lone_voter", &lone_voter},

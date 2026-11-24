@@ -111,10 +111,22 @@ public:
 		return false;
 	}
 	void run_until(std::uint64_t until, const std::function<bool()>& done = {}) {
-		while (!events_.empty() && events_.top().at <= until) {
-			auto event = std::move(const_cast<Scheduled&>(events_.top())); events_.pop();
-			now_ = event.at;
-			if (event.tick) { tick(event.tick); } else { event.run(); }
+		while (true) {
+			// The next event is the earliest of the queue's and the nodes' Ticks, by time, then order.
+			const std::pair<NodeId, Node*>* ticking = nullptr;
+			for (const auto& entry : ticking_) {
+				if (!ticking || std::pair{entry.second->tick_at, entry.second->tick_order} < std::pair{ticking->second->tick_at, ticking->second->tick_order}) { ticking = &entry; }
+			}
+			const bool queued = !events_.empty() && std::pair{events_.top().at, events_.top().order} < std::pair{ticking->second->tick_at, ticking->second->tick_order};
+			if ((queued ? events_.top().at : ticking->second->tick_at) > until) { break; }
+			if (queued) {
+				auto event = std::move(const_cast<Scheduled&>(events_.top())); events_.pop();
+				now_ = event.at;
+				event.run();
+			} else {
+				now_ = ticking->second->tick_at;
+				tick(ticking->first, *ticking->second);
+			}
 			if (observe) { observe(); }
 			if (done && done()) { return; }
 		}
@@ -182,15 +194,19 @@ private:
 		std::vector<std::pair<NodeId, Message>> inbox;  // held while the core persists, as a Worker's caller holds them
 		std::optional<Tick> held;  // the last Tick before hold_until, not yet delivered
 		std::uint64_t hold_until = 0;  // Core::next_deadline() after the core's last step, when holdable
+		std::uint64_t tick_at = 0, tick_order = 0;  // its one scheduled Tick, ordered with the queue's events
 	};
 	struct Scheduled {
 		std::uint64_t at, order;
-		NodeId tick;  // a node's Tick, or 0 for `run`
 		std::function<void()> run;
 		bool operator<(const Scheduled& o) const { return at != o.at ? at > o.at : order > o.order; }
 	};
-	void at(std::uint64_t when, std::function<void()> run) { events_.push({when, ++order_, 0, std::move(run)}); }
-	void at_tick(std::uint64_t when, NodeId id) { events_.push({when, ++order_, id, {}}); }
+	void at(std::uint64_t when, std::function<void()> run) { events_.push({when, ++order_, std::move(run)}); }
+	void at_tick(std::uint64_t when, NodeId id) {
+		auto& n = nodes_.at(id);
+		if (!n.tick_order) { ticking_.emplace_back(id, &n); }
+		n.tick_at = when; n.tick_order = ++order_;
+	}
 	std::uint64_t delay() {
 		const auto& t = profile_.timing;
 		return t.election_min + random_() % (t.election_max - t.election_min + 1);
@@ -218,9 +234,8 @@ private:
 		const auto* self = find_member(m, id);
 		return self->role != MemberRole::Witness && !m.leaving && core.committed_membership() == m;
 	}
-	void tick(NodeId id) {
+	void tick(NodeId id, Node& n) {
 		const Tick tick{now_, delay()};
-		auto& n = nodes_.at(id);
 		if (tick.now < n.hold_until) {
 			if (!verify) { n.held = tick; at_tick(now_ + tick_, id); return; }
 			const auto deadline = n.hold_until;
@@ -268,6 +283,7 @@ private:
 	Profile profile_;
 	std::map<NodeId, Node> nodes_;
 	std::priority_queue<Scheduled> events_;
+	std::vector<std::pair<NodeId, Node*>> ticking_;  // each node with its Tick scheduled
 	std::set<std::pair<NodeId, NodeId>> cut_;
 	std::map<RequestId, Index> placed_;
 	std::uint64_t now_ = 0, order_ = 0, tick_ = 1;

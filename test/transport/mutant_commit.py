@@ -78,7 +78,7 @@ MUTANTS = {
     "abandon-keeps-dial": (T + "links.h", "handshook\n\t\t\tconnection->abort();\n\t\t\tforget(connection);\n\t\t\tco_return false;",
                            "handshook\n\t\t\tco_return false;"),
     "refuse-newest": (T + "links.h", "\t\telse if (handshaking_.size() >= options_.handshakes)\n\t\t\tdrop = handshaking_.begin();",
-                      "\t\telse if (handshaking_.size() >= options_.handshakes)\n\t\t\treturn connection->abort();"),
+                      "\t\telse if (handshaking_.size() >= options_.handshakes)\n\t\t\treturn abort();"),
     "no-source-cap": (T + "links.h", ">= options_.handshakes_per_source", ">= std::size_t(-1)"),
     # links.h: gcc (13, 16) miscompiles a co_await in the right operand of && (run with g++)
     "dial-one-expression": (T + "links.h", "\t\tif (!connection)\n\t\t\tco_return false;\n\t\tco_return co_await offer(",

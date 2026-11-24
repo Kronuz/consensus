@@ -6,22 +6,24 @@
 #include <optional>
 #include <set>
 
-// Node identity (async-drivers Q7 (a)): one certificate per node, pinned once per host. Every
-// connection of the host authenticates its peer's node against these pins, whatever groups the
-// two nodes share; per-group checks belong to the group-open exchange. Nodes are admitted and
-// removed while the host runs, and the caller's trust policy may pin a node at its first join
-// (docs/mechanisms/admission.md).
+// Node identity (async-drivers Q7 (a)): one key per node, pinned once per host by its key_pin, so
+// a renewed certificate keeps its pin. Every connection of the host authenticates its peer's node
+// against these pins, whatever groups the two nodes share; per-group checks belong to the
+// group-open exchange. Nodes are admitted and removed while the host runs, the caller's trust
+// policy may pin a node at its first join, and the trusted CAs reload (docs/mechanisms/admission.md).
 namespace kronuz::consensus::transport {
 // Copies share one directory: an admission through any copy holds for every copy, on every loop.
 // Every member is safe from any thread.
 class NodePins {
   public:
-	// Throws std::invalid_argument unless every node is nonzero, every fingerprint is distinct,
-	// and the local node's pin is the certificate `context` presents. The trust policy is the
+	// Throws std::invalid_argument unless every node is nonzero, every pin is distinct, and the
+	// local node's pin is the key of the certificate `context` presents. The trust policy is the
 	// cluster CA's (D149): `context`'s trusted certificates, and the cluster the local
-	// certificate names (ClusterCa).
+	// certificate names (ClusterCa); reload() rebuilds it.
 	NodePins(kronuz::consensus::NodeId local, std::map<kronuz::consensus::NodeId, Fingerprint> pins, SSL_CTX *context)
-		: NodePins(local, std::move(pins), context, ClusterCa(context, local)) {}
+		: NodePins(local, std::move(pins), context, ClusterCa(context, local)) {
+		directory_->cluster_ca = true;
+	}
 	// The same with the caller's trust policy: pre_approved_pins(), say. None admits only pins.
 	NodePins(kronuz::consensus::NodeId local, std::map<kronuz::consensus::NodeId, Fingerprint> pins, SSL_CTX *context,
 			 TrustPolicy policy)
@@ -36,9 +38,7 @@ class NodePins {
 		const auto mine = pins.find(local_);
 		if (!local_ || mine == pins.end())
 			throw std::invalid_argument("node pins: no pin for the local node");
-		const auto presented = certificate_fingerprint(SSL_CTX_get0_certificate(context));
-		if (CRYPTO_memcmp(presented.data(), mine->second.data(), presented.size()) != 0)
-			throw std::invalid_argument("node pins: the local certificate is not the local node's pin");
+		d.trust = trust_of(context, mine->second);
 	}
 	kronuz::consensus::NodeId local() const noexcept { return local_; }
 	// Whether `node` is pinned and not removed.
@@ -98,22 +98,55 @@ class NodePins {
 		const auto it = directory_->nodes.find(node);
 		return it != directory_->nodes.end() && it->second.pin && !it->second.removed && it->second.removed_at <= since;
 	}
+	// The local certificate and the CAs `context` trusts replace the ones every check uses from
+	// now on (the cluster CA policy's too): a renewed certificate or a new bundle. Throws
+	// std::invalid_argument when the local certificate is not the local node's key. Links whose
+	// chain no longer verifies are the transport's to close (HostTransport::reload).
+	void reload(SSL_CTX *context) {
+		auto trust = trust_of(context, *pin(local_));
+		auto &d = *directory_;
+		TrustPolicy policy;
+		if (d.cluster_ca)
+			policy = ClusterCa(context, local_);
+		std::lock_guard hold(d.mutex);
+		d.trust = std::move(trust);
+		if (d.cluster_ca)
+			d.policy = std::move(policy);
+	}
+	// Whether the peer's leaf and the chain it sent on `ssl` verify, now, against the CAs trusted
+	// since the last reload: false for an expired certificate, or one a reloaded bundle dropped.
+	bool verifies(SSL *ssl) const {
+		std::unique_ptr<X509, decltype(&X509_free)> leaf(ssl ? SSL_get1_peer_certificate(ssl) : nullptr, X509_free);
+		if (!leaf)
+			return false;
+		std::shared_ptr<X509_STORE> trust;
+		{
+			std::lock_guard hold(directory_->mutex);
+			trust = directory_->trust;
+		}
+		std::unique_ptr<X509_STORE_CTX, decltype(&X509_STORE_CTX_free)> context(X509_STORE_CTX_new(), X509_STORE_CTX_free);
+		return context && X509_STORE_CTX_init(context.get(), trust.get(), leaf.get(), SSL_get_peer_cert_chain(ssl)) == 1 &&
+			   X509_verify_cert(context.get()) == 1;
+	}
 	// Handshakes refused for `fault`, through any copy.
 	std::uint64_t refused(PinFault fault) const {
 		return directory_->refused[std::size_t(fault)].load(std::memory_order_relaxed);
 	}
 
-	// The node a completed handshake authenticated: a verified leaf pinned to a node other than
-	// this one, or one the trust policy admits at its first join (its pin is then recorded), and
-	// `expected` when nonzero (the node a dial meant to reach). Throws PinRefused otherwise,
-	// before any frame is read or written.
+	// The node a completed handshake authenticated: a leaf TLS verified, that verifies still
+	// against the CAs trusted now, whose key is pinned to a node other than this one or that the
+	// trust policy admits at its first join (its pin is then recorded), and `expected` when
+	// nonzero (the node a dial meant to reach). Throws PinRefused otherwise, before any frame is
+	// read or written.
 	kronuz::consensus::NodeId authenticate(SSL *ssl, kronuz::consensus::NodeId expected) const {
 		if (!ssl || !(SSL_get_verify_mode(ssl) & SSL_VERIFY_PEER) || SSL_get_verify_result(ssl) != X509_V_OK)
 			refuse(PinFault::unverified, "unverified peer certificate");
 		std::unique_ptr<X509, decltype(&X509_free)> leaf(SSL_get1_peer_certificate(ssl), X509_free);
 		if (!leaf)
 			refuse(PinFault::unverified, "no peer certificate");
-		const auto digest = certificate_fingerprint(leaf.get());
+		if (!verifies(ssl))
+			refuse(PinFault::unverified, "a peer certificate the CAs trusted now do not verify");
+		const auto digest = key_pin(leaf.get());
 		kronuz::consensus::NodeId found = 0;
 		TrustPolicy policy;
 		{
@@ -140,12 +173,33 @@ class NodePins {
 	};
 	struct Directory {
 		mutable std::mutex mutex;
+		std::shared_ptr<X509_STORE> trust;  // the CAs every check verifies against, replaced by reload()
+		bool cluster_ca = false;            // the policy is the default ClusterCa, rebuilt by reload()
 		std::map<kronuz::consensus::NodeId, Node> nodes;
 		std::map<Fingerprint, kronuz::consensus::NodeId> owners;  // every pin, removed nodes' included
 		std::uint64_t epoch = 0;
 		TrustPolicy policy;
 		std::atomic<std::uint64_t> refused[pin_faults] = {};
 	};
+	// The CAs `context` trusts, once its certificate is the key pinned `pin`.
+	static std::shared_ptr<X509_STORE> trust_of(SSL_CTX *context, const Fingerprint &pin) {
+		X509 *own = context ? SSL_CTX_get0_certificate(context) : nullptr;
+		if (!own || key_pin(own) != pin)
+			throw std::invalid_argument("node pins: the local certificate is not the local node's key");
+		std::shared_ptr<X509_STORE> store(X509_STORE_new(), X509_STORE_free);
+		std::unique_ptr<STACK_OF(X509), void (*)(STACK_OF(X509) *)> trusted(
+			X509_STORE_get1_all_certs(SSL_CTX_get_cert_store(context)),
+			[](STACK_OF(X509) *certificates) { sk_X509_pop_free(certificates, X509_free); });
+		for (int i = 0; store && trusted && i < sk_X509_num(trusted.get()); ++i) {
+			X509 *ca = sk_X509_value(trusted.get(), i);
+			(void)X509_check_purpose(ca, -1, 0);  // cached before loops verify against it (tls.h)
+			if (X509_STORE_add_cert(store.get(), ca) != 1)
+				throw std::runtime_error("node pins: X509_STORE_add_cert");
+		}
+		if (!store)
+			throw std::runtime_error("node pins: X509_STORE_new");
+		return store;
+	}
 	[[noreturn]] void refuse(PinFault fault, const std::string &what) const {
 		directory_->refused[std::size_t(fault)].fetch_add(1, std::memory_order_relaxed);
 		throw PinRefused(fault, what);

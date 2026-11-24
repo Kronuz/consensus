@@ -37,7 +37,6 @@
 //   witness_bound  Driver::witness_bound is Core's; a witness truncates through it, keeping the
 //                  records above, and not one past it (A4)
 #include "consensus/driver.h"
-#include "journal/memory_io.h"
 
 #include <cstring>
 #include <deque>

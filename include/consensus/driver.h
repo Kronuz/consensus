@@ -846,6 +846,13 @@ private:
 		if (at == never) { disarm(g); return; }
 		scheduler_.arm(g, at);
 	}
+	// Start::nonce, from the system's entropy rather than the seeded stream: a host restarted
+	// with the same seed still names a new start (docs/mechanisms/follower-read.md).
+	static Token start_nonce() {
+		std::random_device entropy;
+		const Token nonce = (Token(entropy()) << 32) ^ entropy();
+		return nonce ? nonce : 1;
+	}
 	bool unadmitted(const Group& g) const {
 		for (auto* w = g.head; w; w = w->next) { if (!w->admitted && w->kind != Kind::open) { return true; } }
 		return false;
@@ -875,7 +882,7 @@ private:
 		if (!g.started) {
 			if (!g.opened || !w.ready()) { return false; }
 			// D5/X5: a Tick first, so Start sees the loop's clock, then Start.
-			if (w.try_submit(tick(g)) != SubmitResult::Accepted || w.try_submit(Start{}) != SubmitResult::Accepted) { return false; }
+			if (w.try_submit(tick(g)) != SubmitResult::Accepted || w.try_submit(Start{start_nonce()}) != SubmitResult::Accepted) { return false; }
 			g.started = true;
 			for (auto* x = g.head; x;) { auto* next = x->next; if (x->kind == Kind::open) { complete(g, *x); } x = next; }
 			return true;

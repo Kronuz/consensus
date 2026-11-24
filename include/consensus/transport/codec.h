@@ -52,6 +52,10 @@ inline std::string encode(const kronuz::consensus::Message &message,
 				number(10);
 			else if constexpr (std::is_same_v<T, InstallRequestResponse>)
 				number(11);
+			else if constexpr (std::is_same_v<T, ReadIndexRequest>)
+				number(12);
+			else if constexpr (std::is_same_v<T, ReadIndexResponse>)
+				number(13);
 			else
 				static_assert(!sizeof(T), "missing control wire tag");
 			number(value.term);
@@ -125,6 +129,18 @@ inline std::string encode(const kronuz::consensus::Message &message,
 				number(value.request);
 				number(static_cast<unsigned>(value.result));
 				number(value.leader);
+			} else if constexpr (std::is_same_v<T, ReadIndexRequest>) {
+				number(value.start);
+				number(value.token);
+			} else if constexpr (std::is_same_v<T, ReadIndexResponse>) {
+				// An index only with Ready, and Ready only with one.
+				if (static_cast<unsigned>(value.result) > static_cast<unsigned>(ReadIndexReply::NotLeader) ||
+					(value.result == ReadIndexReply::Ready) != (value.index != 0))
+					throw std::invalid_argument("invalid read index reply");
+				number(value.start);
+				number(value.token);
+				number(static_cast<unsigned>(value.result));
+				number(value.index);
 			}
 		},
 		message);
@@ -237,6 +253,18 @@ inline kronuz::consensus::Message decode(std::string_view bytes, kronuz::consens
 		if (outcome > static_cast<unsigned>(InstallRequestReply::NotMember))
 			throw Corruption("invalid install request reply");
 		result = InstallRequestResponse{term, request, static_cast<InstallRequestReply>(outcome), get64(bytes)};
+		break;
+	}
+	case 12: {
+		auto start = get64(bytes);
+		result = ReadIndexRequest{term, start, get64(bytes)};
+		break;
+	}
+	case 13: {
+		auto start = get64(bytes), token = get64(bytes), outcome = get64(bytes), index = get64(bytes);
+		if (outcome > static_cast<unsigned>(ReadIndexReply::NotLeader) || (outcome == static_cast<unsigned>(ReadIndexReply::Ready)) != (index != 0))
+			throw Corruption("invalid read index reply");
+		result = ReadIndexResponse{term, start, token, static_cast<ReadIndexReply>(outcome), index};
 		break;
 	}
 	default:

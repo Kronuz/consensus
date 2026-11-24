@@ -236,8 +236,8 @@ public:
 		for (auto& [id, n] : nodes_) {
 			if (!n.up) { restart(n); }  // the forced crash's node returns with the rest
 		}
-		// Until a majority applies a new entry, proposed every 50 rounds (docs/mechanisms/simulation.md).
-		for (int round = 0; round < 4000 && !failures && applied_healed() < healed_quorum(); ++round) {
+		// Until a majority applies a new entry, proposed every 50 rounds, within 2,000 (docs/mechanisms/simulation.md).
+		for (int round = 0; round < 2000 && !failures && applied_healed() < healed_quorum(); ++round) {
 			quiet_round();
 			if (round % 50 == 0) {
 				for (auto& [id, n] : nodes_) {

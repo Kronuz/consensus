@@ -35,7 +35,9 @@ before them, sets most of the cost:
   exercise the timeout and the restart, and healing waits about 200 rounds for one.
 - **The core simulation's healing** proposes a new entry every 50 quiet rounds and ends once a
   majority of the voters in force applies it, within 713 rounds on seeds 1-200 (median 130),
-  instead of idling 2,000 rounds before the first proposal and 4,000 in all.
+  instead of idling 2,000 rounds before the first proposal and 4,000 in all. It fails a seed
+  whose majority has not applied within 2,000 rounds, the budget the old loop gave after its
+  first proposal.
 
 | ASan, one run, the same host and load | core seeds | Driver seeds | total |
 |---|---|---|---|

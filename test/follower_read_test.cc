@@ -21,8 +21,8 @@
  */
 
 // A follower's Read, forwarded to its leader (docs/mechanisms/follower-read.md): the cases
-// below, and a randomized cluster whose reads at any member must each return an index at or
-// above every commit made before the read began. test/follower_read_mutants.py seeds a fault
+// below, and randomized clusters, with delayed, duplicated and re-injected frames, whose reads
+// at any member must each return an index at or above every commit made before the read began. test/follower_read_mutants.py seeds a fault
 // per case; the plain test fails at each.
 //   usage: follower_read_test [case] [seeds]
 #include "consensus/core.h"
@@ -555,19 +555,23 @@ void codec() {
 	check(corrupt(request.substr(0, request.size() - 8)), "a request without its token is refused");
 }
 
-// A1: random partitions, drops, restarts and leader changes over 3 or 5 voters, with reads at
-// every member. Each completed read returns an index at or above every commit made anywhere
-// before it began, at a replica that applied it.
+// A1: random partitions, drops, crashes and restarts with new nonces over 3 or 5 voters, with
+// reads at every member. Faults by seed: none; ReadIndex frames delayed, duplicated and
+// re-injected out of order, across restarts and term changes; the same on every frame kind
+// (beyond the per-link FIFO transport). Each completed read returns an index at or above every
+// commit made anywhere before it began, at a replica that applied it.
 void randomized(std::uint64_t seeds) {
-	std::uint64_t reads = 0, refused = 0, forwarded = 0;  // completed, refused, completed at a follower
+	std::uint64_t reads = 0, refused = 0, forwarded = 0, reinjected = 0;  // completed, refused, completed at a follower
 	for (std::uint64_t seed = 1; seed <= seeds; ++seed) {
-		std::mt19937_64 random(seed);
+		const unsigned faults = seed % 3;  // 0 none, 1 ReadIndex frames, 2 every frame
+		std::mt19937_64 random(seed * 7919 + faults);
 		const std::size_t count = seed % 2 ? 3 : 5;
 		Network n(count);
 		n.start();
 		std::map<std::pair<NodeId, RequestId>, std::pair<Index, bool>> floors;  // the commit anywhere at each read's start; at a follower
+		std::vector<Envelope> stash;
 		Token nonce = 5000;
-		std::uint64_t ready_seen = 0;
+		auto faulted = [&](const Envelope& e) { return faults == 2 || (faults == 1 && (as<ReadIndexRequest>(e) || as<ReadIndexResponse>(e))); };
 		for (int step = 0; step < 1500; ++step) {
 			const auto pick = random() % 1000;
 			const NodeId id = 1 + random() % count;
@@ -588,37 +592,48 @@ void randomized(std::uint64_t seeds) {
 				if (random() % 2) { const NodeId c = 1 + random() % count; for (NodeId x = 1; x <= count; ++x) { if (x != c) { n.cut.insert({c, x}); n.cut.insert({x, c}); } } }
 			} else if (pick < 780) {
 				n.cut.clear();
-			} else if (pick < 795) {
+			} else if (pick < 800) {
 				if (!n.host(id).pending && !n.host(id).applying) {
-					for (const auto& [r, index] : n.host(id).ready) { floors.erase({id, r}); }
 					std::erase_if(floors, [&](const auto& f) { return f.first.first == id; });  // the crash abandons its reads
 					n.restart(id, ++nonce);
 				}
 			}
-			// Deliver part of the network, in order, dropping a few frames.
+			// Deliver part of the network, in order, dropping a few frames; faulted ones may be held
+			// back (delayed) or kept for a second delivery (duplicated).
 			for (std::size_t k = n.network.size() * (random() % 4) / 3; k && !n.network.empty(); --k) {
 				auto e = std::move(n.network.front()); n.network.pop_front();
 				if (n.blocked(e) || random() % 50 == 0) { continue; }
+				if (faulted(e)) {
+					const auto r = random() % 10;
+					if (r == 0) { if (stash.size() < 256) { stash.push_back(e); } continue; }
+					if (r == 1 && stash.size() < 256) { stash.push_back(e); }
+				}
 				n.deliver(std::move(e));
+			}
+			if (!stash.empty() && random() % 6 == 0) {
+				const auto at = random() % stash.size();
+				auto e = stash[at];
+				if (random() % 3) { stash.erase(stash.begin() + static_cast<std::ptrdiff_t>(at)); }
+				if (!n.blocked(e)) { ++reinjected; n.deliver(std::move(e)); }
 			}
 			for (auto& [i, h] : n.hosts) {
 				for (const auto& [r, index] : h->ready) {
 					auto found = floors.find({i, r});
 					if (found == floors.end()) { continue; }
-					++ready_seen; forwarded += found->second.second;
+					++reads; forwarded += found->second.second;
 					if (index < found->second.first) {
-						check(false, "seed " + std::to_string(seed) + ": a read at " + std::to_string(i) + " returned " + std::to_string(index) + " below commit " + std::to_string(found->second.first));
+						check(false, "seed " + std::to_string(seed) + ": a read at " + std::to_string(i) + (found->second.second ? " (follower)" : " (leader)") + " returned " +
+							std::to_string(index) + " below commit " + std::to_string(found->second.first));
 					}
 					floors.erase(found);
 				}
 				for (const auto& [r, reason] : h->rejected) { refused += floors.erase({i, r}); }
 			}
 		}
-		reads += ready_seen;
 	}
-	std::printf("randomized: %llu seeds, %llu reads completed (%llu at a follower), %llu refused\n", (unsigned long long)seeds, (unsigned long long)reads,
-		(unsigned long long)forwarded, (unsigned long long)refused);
-	check(reads > seeds && forwarded > seeds, "the randomized clusters complete reads at followers");
+	std::printf("randomized: %llu seeds, %llu reads completed (%llu at a follower), %llu refused, %llu frames re-injected\n", (unsigned long long)seeds,
+		(unsigned long long)reads, (unsigned long long)forwarded, (unsigned long long)refused, (unsigned long long)reinjected);
+	check(reads > seeds && forwarded > seeds && reinjected > seeds, "the randomized clusters complete reads at followers under re-injected frames");
 }
 
 } // namespace

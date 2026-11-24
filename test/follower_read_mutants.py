@@ -46,6 +46,9 @@ CASES = {
     "rests-with-read": ("rest", (C, "&& !reinstall_ && forwarded_.empty();", "&& !reinstall_;")),
     # A follower forwards with no start nonce.
     "nonce-unchecked": ("nonce", (C, "if (role_ != Role::Follower || !leader_ || !start_)", "if (role_ != Role::Follower || !leader_)")),
+    # A restart reuses the previous start nonce (a repeating std::random_device): a re-injected
+    # pre-restart answer completes a new read below an earlier commit (review N1's probe, mode 3).
+    "nonce-reused": ("randomized", ("test/follower_read_test.cc", "n.restart(id, ++nonce);", "n.restart(id, n.host(id).nonce); (void)nonce;")),
     # The decoder takes a refusal with an index, or Ready without one.
     "codec-unchecked": ("codec", (CODEC, "if (outcome > static_cast<unsigned>(ReadIndexReply::NotLeader) || (outcome == static_cast<unsigned>(ReadIndexReply::Ready)) != (index != 0))",
                                   "if (outcome > static_cast<unsigned>(ReadIndexReply::NotLeader))")),

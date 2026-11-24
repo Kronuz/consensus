@@ -62,6 +62,7 @@
 #include <set>
 #include <string>
 #include <system_error>
+#include <tuple>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -107,6 +108,19 @@ constexpr std::uint64_t application_cap = 64 * 1024;
 // so it sets the heal's idle rounds (docs/mechanisms/simulation.md).
 constexpr Timing timing{20, 40, 100, 200, 1000};
 constexpr std::uint32_t image_format = 5;
+
+// Every group's replication flow (docs/mechanisms/simulation.md): SIM_DRIVER_PIPELINE=N fixes
+// every seed at depth N; otherwise the seeds cycle through depths 1, 4 and 16, and 4 again
+// under a window and a frame cap that bind (4 x 2 KiB frames against a 16 KiB window).
+Flow flow_for(std::uint64_t seed) {
+	if (const auto* depth = std::getenv("SIM_DRIVER_PIPELINE")) { return Flow{std::uint32_t(std::strtoul(depth, nullptr, 10)), 4u << 20, 0}; }
+	switch (seed % 4) {
+	case 0: return Flow{1, 4u << 20, 0};
+	case 1: return Flow{4, 16 * 1024, 2048};
+	case 2: return Flow{16, 4u << 20, 0};
+	default: return Flow{4, 4u << 20, 0};
+	}
+}
 
 Limits limits() {
 	Limits l;
@@ -246,7 +260,7 @@ struct Node {
 struct Envelope { NodeId from, to; GroupId group; std::variant<Message, std::string> body; std::uint64_t at; };
 
 struct Simulation {
-	Simulation(std::uint64_t seed) : random_(seed) {
+	Simulation(std::uint64_t seed) : flow_(flow_for(seed)), random_(seed) {
 		place_groups();
 		for (NodeId id = 1; id <= 3; ++id) {
 			auto& n = nodes_[id];
@@ -360,10 +374,34 @@ struct Simulation {
 	std::uint64_t boots_by_loops[5] = {};
 	std::map<GroupId, std::uint64_t> snapshots_needed;
 	std::uint64_t transfer_frames = 0, validations = 0, refusals = 0, activations = 0, installs = 0;
+	std::uint64_t appends_sent = 0, appends_pipelined = 0, appends_reordered = 0, in_flight_max = 0;  // appends with entries
+	bool seed_pipelined = false;                                                                      // a second append went out before the first's answer
+	Flow flow_;
 
 	void on_send(Node& n, GroupId g, Send notice) {
+		if (const auto* a = std::get_if<AppendRequest>(&notice.message); a && !a->entries.empty()) { on_append_sent(n, g, notice.peer, *a); }
 		network_.push_back({n.id, notice.peer, g, std::move(notice.message), now_ + random_() % 6});
 		if (random_() % 50 == 0) { network_.push_back({n.id, notice.peer, g, network_.back().body, now_ + random_() % 30}); }  // duplicated
+	}
+	// A leader's appends with entries to one peer that are sent and not yet answered, in the
+	// same term; one older than a heartbeat's worth of silence is a lost answer, not a flight.
+	void on_append_sent(Node& n, GroupId g, NodeId peer, const AppendRequest& a) {
+		auto& out = in_flight_[{n.id, peer, g}];
+		for (auto it = out.begin(); it != out.end();) { it = it->second.term != a.term || now_ > it->second.at + timing.heartbeat ? out.erase(it) : std::next(it); }
+		++appends_sent;
+		if (!out.empty()) { ++appends_pipelined; seed_pipelined = true; }
+		out[a.rpc] = {a.term, now_};
+		in_flight_max = std::max<std::uint64_t>(in_flight_max, out.size());
+	}
+	void on_append_answered(NodeId leader, NodeId peer, GroupId g, const AppendResponse& r) {
+		if (auto it = in_flight_.find({leader, peer, g}); it != in_flight_.end()) { it->second.erase(r.rpc); }
+	}
+	// A follower's append that arrives after a later one of its leader's term.
+	void on_append_delivered(const Envelope& e, const AppendRequest& a) {
+		if (a.entries.empty()) { return; }
+		auto& seen = delivered_[{e.from, e.to, e.group}];
+		if (seen.term == a.term && seen.rpc > a.rpc) { ++appends_reordered; }
+		else { seen = {a.term, a.rpc}; }
 	}
 	void on_transfer(Node& n, GroupId g, SendTransfer notice) {
 		++transfer_frames;
@@ -511,7 +549,7 @@ private:
 			o.configuration.local = n.id; o.configuration.voters = {1, 2, 3};
 			o.configuration.cluster[0] = 'D'; o.configuration.configuration[0] = 'S';
 			if (witnessed_.count(g)) { o.founding = Membership{{{1, 1, MemberRole::Voter}, {2, 2, MemberRole::Voter}, {3, 3, MemberRole::Witness}}, 4, 0}; }
-			o.admission = admission; o.limits = limits(); o.timing = timing; o.scheduling = WorkerLimits{16, 128};
+			o.admission = admission; o.limits = limits(); o.timing = timing; o.scheduling = WorkerLimits{16, 128}; o.scheduling.flow = flow_;
 			o.snapshots = SnapshotLimits{image_format, application_cap, 1 + std::uint32_t(random_() % 3)};
 			auto& d = n.driver(g);
 			d.open(g, std::move(o));
@@ -593,7 +631,11 @@ private:
 		auto& to = nodes_.at(e.to);
 		if (!to.up || isolated_.count(e.from) || isolated_.count(e.to)) { return; }
 		auto& l = to.loop_of(e.group);
-		if (auto* m = std::get_if<Message>(&e.body)) { l.driver->receive(e.group, Receive{e.from, *m}); }
+		if (auto* m = std::get_if<Message>(&e.body)) {
+			if (const auto* r = std::get_if<AppendResponse>(m)) { on_append_answered(e.to, e.from, e.group, *r); }
+			else if (const auto* a = std::get_if<AppendRequest>(m)) { on_append_delivered(e, *a); }
+			l.driver->receive(e.group, Receive{e.from, *m});
+		}
 		else { l.driver->transfer(e.group, e.from, std::get<std::string>(e.body)); }
 		l.run(to.id);
 	}
@@ -837,6 +879,10 @@ private:
 	std::vector<GroupId> groups_;
 	std::set<GroupId> witnessed_;  // groups whose third member is a witness
 	std::map<NodeId, Node> nodes_;
+	struct Sent { Term term; std::uint64_t at; };
+	struct Delivered { Term term = 0; Token rpc = 0; };
+	std::map<std::tuple<NodeId, NodeId, GroupId>, std::map<Token, Sent>> in_flight_;  // leader, peer, group
+	std::map<std::tuple<NodeId, NodeId, GroupId>, Delivered> delivered_;              // leader, follower, group
 	std::deque<Envelope> network_;
 	std::set<NodeId> isolated_;
 	std::uint64_t now_ = 1;
@@ -870,6 +916,7 @@ bool run(std::uint64_t seeds, std::uint64_t steps, std::uint64_t first) {
 	std::uint64_t proposals = 0, placed = 0, commits = 0, superseded_count = 0, reads = 0, cancelled = 0, crashes = 0, transfers = 0, elections = 0, repartitions = 0;
 	std::uint64_t checkpoints = 0, restored = 0, repairs = 0, below = 0, repaired = 0, refused = 0, repairs_cancelled = 0, pending = 0, wait_total = 0, wait_max = 0, boots[5] = {};
 	std::uint64_t needed = 0, frames = 0, validations = 0, refusals = 0, activations = 0, installs = 0;
+	std::uint64_t sent = 0, pipelined = 0, reordered = 0, deepest = 0, deep_seeds = 0, deep_seeds_pipelined = 0;
 	auto one = [&](std::uint64_t seed, std::uint64_t length) {
 		current_seed = seed;
 		Simulation sim(seed);
@@ -881,6 +928,8 @@ bool run(std::uint64_t seeds, std::uint64_t steps, std::uint64_t first) {
 		repairs_cancelled += sim.repairs_cancelled; pending += sim.repairs_pending; wait_total += sim.repair_wait_total; wait_max = std::max(wait_max, sim.repair_wait_max);
 		for (int l = 0; l < 5; ++l) { boots[l] += sim.boots_by_loops[l]; }
 		for (auto [g, k] : sim.snapshots_needed) { needed += k; }
+		sent += sim.appends_sent; pipelined += sim.appends_pipelined; reordered += sim.appends_reordered; deepest = std::max(deepest, sim.in_flight_max);
+		if (sim.flow_.pipeline > 1) { ++deep_seeds; deep_seeds_pipelined += sim.seed_pipelined; }
 		frames += sim.transfer_frames; validations += sim.validations; refusals += sim.refusals; activations += sim.activations; installs += sim.installs;
 	};
 	for (std::uint64_t seed = first; seed < first + seeds && !failures; ++seed) { one(seed, steps); }
@@ -898,6 +947,8 @@ bool run(std::uint64_t seeds, std::uint64_t steps, std::uint64_t first) {
 		(unsigned long long)repairs_cancelled, (unsigned long long)pending, repaired ? double(wait_total) / double(repaired) : 0.0, (unsigned long long)wait_max);
 	std::printf("  %llu SnapshotNeeded, %llu transfer frames, %llu images validated (%llu refused), %llu activated, %llu installs acknowledged\n",
 		(unsigned long long)needed, (unsigned long long)frames, (unsigned long long)validations, (unsigned long long)refusals, (unsigned long long)activations, (unsigned long long)installs);
+	std::printf("  %llu appends with entries sent, %llu of them with another in flight to the same peer (at most %llu); %llu delivered after a later one; %llu of %llu seeds at pipeline depth above 1 had a second append in flight\n",
+		(unsigned long long)sent, (unsigned long long)pipelined, (unsigned long long)deepest, (unsigned long long)reordered, (unsigned long long)deep_seeds_pipelined, (unsigned long long)deep_seeds);
 	return failures == 0;
 }
 

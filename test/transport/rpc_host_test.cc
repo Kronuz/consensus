@@ -409,14 +409,19 @@ bool stream() {
 	one.stores({g});
 	two.stores({g});
 	Beats beats;
+	constexpr int N = 4096;
+	static std::int64_t posted[N], sentt[N], deliv[N];
+	std::atomic<int> np{0}, ns{0}, nd{0};
+	auto us = [] { return std::chrono::duration_cast<std::chrono::microseconds>(steady::now().time_since_epoch()).count(); };
 	two.transport->on_deliver(two.transport->loop_of_group(g), [&](const Received &) {
 		beats.beat();
+		int i = nd++; if (i < N) deliv[i] = us();
 		return true;
 	});
 	one.start();
 	two.start();
 	const auto hb = one.transport->loop_of_group(g);
-	auto heartbeat = [&] { one.post(hb, [&] { one.transport->send(hb, LinkLane::Control, FrameKind::control, {g, 1, 2}, 2, "beat"); }); };
+	auto heartbeat = [&] { int i = np++; if (i < N) posted[i] = us(); one.post(hb, [&] { int j = ns++; if (j < N) sentt[j] = us(); one.transport->send(hb, LinkLane::Control, FrameKind::control, {g, 1, 2}, 2, "beat"); }); };
 	if (!until([&] { heartbeat(); return beats.count > 0; }, 10s))
 		return false;
 	beats.worst = 0;
@@ -427,6 +432,13 @@ bool stream() {
 		std::this_thread::sleep_until(start + (tick + 1) * 100ms);
 	}
 	const auto elapsed = std::max<std::uint64_t>(1, ms_since(start));
+	for (int i = 1; i < std::min<int>(N, nd); ++i) {
+		auto gap = (deliv[i] - deliv[i - 1]) / 1000;
+		if (gap > 300)
+			std::printf("DIAG beat %d: deliver gap %lld ms; post gap %lld ms; post->send %lld ms, send->deliver %lld ms (prev %lld/%lld)\n", i, (long long)gap,
+						(long long)((posted[i] - posted[i - 1]) / 1000), (long long)((sentt[i] - posted[i]) / 1000), (long long)((deliv[i] - sentt[i]) / 1000),
+						(long long)((sentt[i - 1] - posted[i - 1]) / 1000), (long long)((deliv[i - 1] - sentt[i - 1]) / 1000));
+	}
 	const auto served = server.last();
 	const auto window = HostTransportOptions{}.rpc.lane.window;
 	const auto serving = two.transport->serving_pool().high_water(), outgoing = one.transport->outgoing_pool().high_water();

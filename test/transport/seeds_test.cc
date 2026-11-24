@@ -17,6 +17,7 @@
 // CI or CONSENSUS_SEEDS_REQUIRE is set.
 #include "consensus/transport/connection.h"
 #include "consensus/transport/seeds.h"
+#include "lag.h"
 #include <asio/io_context.hpp>
 #include <asio/ip/tcp.hpp>
 #include <cassert>
@@ -44,29 +45,6 @@ using Clock = std::chrono::steady_clock;
 
 namespace {
 std::filesystem::path fixture;
-// The longest a thread that only sleeps 1 ms went without running, in ms (rpc_hosts.h's Lag): a
-// runner that pauses the process delays every timer and read, which no seeds rule can.
-struct Lag {
-	std::atomic<bool> stopped{false};
-	std::atomic<std::uint64_t> worst{0};
-	std::thread sampler{[this] {
-		auto last = Clock::now();
-		while (!stopped) {
-			std::this_thread::sleep_for(1ms);
-			const auto now = Clock::now();
-			worst = std::max<std::uint64_t>(worst, std::uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(now - last).count()));
-			last = now;
-		}
-	}};
-	// Stops the sampler and returns its worst: read it once the measured work is over.
-	std::uint64_t stop() {
-		stopped = true;
-		if (sampler.joinable())
-			sampler.join();
-		return worst;
-	}
-	~Lag() { stop(); }
-};
 std::string interface_ = "127.0.0.1";  // where this run's announcements go: loopback, or "" the default
 
 kronuz::consensus::Identity identity(char c, std::uint32_t n = 0) {

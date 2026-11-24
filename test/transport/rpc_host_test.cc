@@ -436,19 +436,19 @@ bool stream() {
 	const auto elapsed = std::max<std::uint64_t>(1, ms_since(start));
 	// Control is in order: once a heartbeat posted after the stream arrives, every delayed one has.
 	heartbeat();
-	until([&] { return beats.count >= posted; }, 10s);
+	const bool arrived = until([&] { return beats.count >= posted; }, 10s);
 	const auto lagged = lag.stop();
 	const auto served = server.last();
 	const auto window = HostTransportOptions{}.rpc.lane.window;
 	const auto serving = two.transport->serving_pool().high_water(), outgoing = one.transport->outgoing_pool().high_water();
 	const auto bound = 1000 + lagged;
 	const bool ok = c->done && c->status.outcome == rpc::Outcome::ok && !c->out.failed && served && served->received == body &&
-					!served->mismatched && beats.worst < bound && serving <= window && outgoing <= window;  // queued within one credit
-	std::printf("stream: %llu MiB in %llu ms (%.1f MB/s), outcome %d, the server read %llu bytes, %llu mismatched; heartbeats' longest gap %llu ms of %llu allowed (1000 plus the host's %llu ms of lag); serving high water %zu (window %zu), outgoing %zu %s\n",
+					!served->mismatched && arrived && beats.worst < bound && serving <= window && outgoing <= window;  // queued within one credit
+	std::printf("stream: %llu MiB in %llu ms (%.1f MB/s), outcome %d, the server read %llu bytes, %llu mismatched; heartbeats' longest gap %llu ms of %llu allowed (1000 plus the host's %llu ms of lag), the last %s; serving high water %zu (window %zu), outgoing %zu %s\n",
 				(unsigned long long)(body >> 20), (unsigned long long)elapsed, double(body) / 1e3 / double(elapsed),
 				int(c->status.outcome), (unsigned long long)(served ? served->received.load() : 0),
 				(unsigned long long)(served ? served->mismatched.load() : 0), (unsigned long long)beats.worst, (unsigned long long)bound,
-				(unsigned long long)lagged, serving, window, outgoing,
+				(unsigned long long)lagged, arrived ? "arrived" : "LOST", serving, window, outgoing,
 				ok ? "ok" : "FAILED");
 	one.stop();
 	two.stop();

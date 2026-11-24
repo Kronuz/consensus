@@ -26,7 +26,10 @@
 //   fetch       D8, A4: fetch is method 1. Beside 4 groups uploading 1 MiB data frames on the same
 //               Bulk connection, a 16 MiB fetch arrives exact while heartbeats on Control keep
 //               every gap under 1,000 ms plus the host's lag; a missing name, a reader that throws, a reply over this
-//               host's fetch_bytes and a fifth concurrent fetch end as D8's table says
+//               host's fetch_bytes and a fifth concurrent fetch end as D8's table says; then
+//               fetch-dead: host 2's connection loop held past host 1's dead_after ends its links
+//               with three fetches on them, and each is asked again and ends as it would have
+//               (control: fetch-not-asked-again)
 //   reader      T5: with host 2's other loop held 2 s, calls whose frames its connection's loop
 //               reads keep their latency (control: lane-via-other-loop)
 //   stop-drain  F18, D102: host 2 runs in a child process that stops itself (SIGSTOP) inside its
@@ -915,6 +918,63 @@ bool fetch() {
 	return ok;
 }
 
+// D8: host 2's reader holds node 1's connection loop 1.5 s past host 1's 1 s dead_after with
+// three fetches on the connection, so host 1 ends both links dead (CI's shape, a kernel write
+// held that loop 5.2 s): each fetch is asked again on the next connection and ends as it would
+// have, the 4 MiB ones exact and the 48 MiB one message_size (control: the fetch not asked again).
+bool fetch_dead() {
+	constexpr std::uint32_t L = 2;
+	const std::string expected = bytes_at(0, 4 << 20);
+	Host one(1, L), two(2, L);
+	HostTransportOptions client, server;
+	client.rpc.fetch_bytes = 32 << 20;
+	client.links.connection.dead_after = 1000ms;
+	server.links.connection.keepalive = 100ms;  // host 1 hears it every 100 ms but while it is held
+	std::atomic<int> held{0};
+	server.rpc.reader = [&](std::string_view name) -> std::optional<std::string> {
+		if (name == "held" && held++ == 0)
+			std::this_thread::sleep_for(1500ms);
+		if (name == "huge")
+			return std::string(48 << 20, 'h');
+		return expected;
+	};
+	one.open(addresses({&two}), client);
+	two.open(addresses({&one}), server);
+	one.start();
+	two.start();
+	struct Got {
+		std::atomic<bool> done{false};
+		std::error_code error;
+		std::optional<std::string> bytes;
+	};
+	std::vector<std::shared_ptr<Got>> got;
+	one.at(2, [&] {
+		for (const char *name : {"held", "huge", "big"}) {
+			auto g = got.emplace_back(std::make_shared<Got>());
+			one.transport->fetch(2, name, [g](std::error_code e, std::optional<std::string> b) {
+				g->error = e;
+				g->bytes = std::move(b);
+				g->done = true;
+			});
+		}
+		return 0;
+	});
+	const bool ended = until([&] { return got[0]->done && got[1]->done && got[2]->done; }, 30s);
+	const auto exact = [&](const Got &g) { return !g.error && g.bytes && *g.bytes == expected; };
+	const auto dead = one.total(&HostTransportStats::dead);
+	const auto again = one.lane(&LaneStats::fetches_asked_again);
+	const bool ok = ended && dead >= 1 && again == 3 && exact(*got[0]) && got[1]->error == std::errc::message_size && exact(*got[2]);
+	const auto said = [](const Got &g) { return !g.done ? std::string("not done") : g.error ? g.error.message() : std::string("bytes"); };
+	std::printf("fetch-dead: host 2's connection loop held 1500 ms against host 1's 1000 ms dead_after: links ended dead %llu, "
+				"links %llu+%llu, fetches asked again %llu; the held 4 MiB %s (%s), 48 MiB over 32 MiB %s, the other 4 MiB %s (%s) %s\n",
+				(unsigned long long)dead, (unsigned long long)one.total(&HostTransportStats::links),
+				(unsigned long long)two.total(&HostTransportStats::links), (unsigned long long)again, exact(*got[0]) ? "exact" : "NOT EXACT",
+				said(*got[0]).c_str(), said(*got[1]).c_str(), exact(*got[2]) ? "exact" : "NOT EXACT", said(*got[2]).c_str(), ok ? "ok" : "FAILED");
+	one.stop();
+	two.stop();
+	return ok;
+}
+
 // T5: host 2's loop that does not read node 1's connection is held 2 s; calls served on the
 // connection's loop keep their latency, since a lane frame never waits on another loop.
 bool reader() {
@@ -988,7 +1048,7 @@ int main(int argc, char **argv) {
 	else if (which == "shutdown")
 		ok = shutdown();
 	else if (which == "fetch")
-		ok = fetch();
+		ok = fetch() & fetch_dead();
 	else if (which == "stop-drain")
 		ok = stop_drain();
 	else

@@ -21,7 +21,7 @@
  */
 
 // A follower's install request (docs/mechanisms/install-request.md), through the Driver on three
-// nodes (each a host on a memory disk with one loop on an inline_scheduler, frames carried in
+// nodes (each a host on a faultfs disk with one loop on an inline_scheduler, frames carried in
 // process) and on a bare Core. `driver_install_request_test [case]`:
 //   lost_state     a current follower whose state is lost gets one image at the leader's base and
 //                  re-delivers its own committed entries past it (A1); also on a bare Core
@@ -37,7 +37,9 @@
 //   witness_bound  Driver::witness_bound is Core's; a witness truncates through it, keeping the
 //                  records above, and not one past it (A4)
 #include "consensus/driver.h"
+#include "faultlab/faultfs.h"
 
+#include <algorithm>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -51,9 +53,16 @@
 
 using namespace kronuz::consensus;
 namespace j = kronuz::journal;
-namespace jt = kronuz::journal::testing;
+namespace fl = kronuz::faultlab;
 
 namespace {
+
+// The host's directory on `disk`, made on first use.
+std::shared_ptr<j::IO> host_io(fl::filesystem& disk) {
+	const auto names = disk.list();
+	if (std::find(names.begin(), names.end(), "host") == names.end()) { disk.make_directory("host"); }
+	return std::make_shared<fl::io>(disk, "host");
+}
 
 int checks = 0, failures = 0;
 void check(bool value, const std::string& what) {
@@ -136,7 +145,7 @@ struct Outcome { bool done = false; std::optional<RepairCompleted> result; std::
 
 struct Node {
 	NodeId id = 0;
-	jt::Disk disk;
+	fl::filesystem disk;
 	task::inline_scheduler scheduler;
 	j::InlineCompletion io;
 	std::unique_ptr<j::Host> host;
@@ -301,7 +310,7 @@ struct Cluster {
 };
 
 void Node::boot(Cluster& c, std::uint64_t now) {
-	host = std::make_unique<j::Host>(std::make_shared<jt::MemoryIO>(disk, "host/"), j::Identity{'H', static_cast<char>('0' + id)}, j::HostOptions{1, turn_options});
+	host = std::make_unique<j::Host>(host_io(disk), j::Identity{'H', static_cast<char>('0' + id)}, j::HostOptions{1, turn_options});
 	sink = Sink{&c, this};
 	scheduler.advance(now * ms - std::min(now * ms, scheduler.now()));
 	driver = std::make_unique<Driver<Sink>>(Seams{task::scheduler_ref::of(scheduler), j::completion_ref::of(io), *host, 0, 17 + id}, sink);

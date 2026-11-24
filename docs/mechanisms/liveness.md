@@ -42,20 +42,32 @@ Each node's one scheduled Tick lives on the node, beside the queue, ordered with
 events by time and then by the same order counter; the queue holds deliveries, persistences and
 applications as small records, a message in flight in a slot vector.
 
+## Threads
+
+The four profiles share nothing, so each runs on its own thread. A profile writes its lines and
+failures into its own report, and `main` prints each report once it and every report before it
+are done: the output, its order and the 20-failure cap are the serial run's. The FreeBSD
+profile, about 43% of the work, bounds the wall time; the CPU time is the serial run's.
+
 ## Cost
 
-ASan, 20 seeds, main's harness and this one on the same host, one after the other (job
-261124-061757-8fb9aa): 129.7 s and 64.8 s. On CI's linux-asan-ubsan, against
-`consensus_shared_worker` in the same job:
+ASan, 20 seeds, main's harness and this one on the same host, one after the other, before the
+threads (job 261124-061757-8fb9aa): 129.7 s and 64.8 s. On CI's linux-asan-ubsan, against
+`consensus_shared_worker` and `consensus_consensus` in the same job:
 
-| Run | consensus_liveness | consensus_shared_worker | Ratio |
-|---|---|---|---|
-| main 54c6599 (typical runner) | 82.09 s | 139.12 s | 0.590 |
-| main 512e3ef (slow runner) | 173.49 s | 238.35 s | 0.728 |
-| held Ticks, 8511ff1 | 40.79 s | 143.55 s | 0.284 |
+| Run | consensus_liveness | shared_worker | consensus | Ratio to shared_worker |
+|---|---|---|---|---|
+| main 54c6599 | 82.09 s | 139.12 s | 2.87 s | 0.590 |
+| main 512e3ef | 173.49 s | 238.35 s | 4.49 s | 0.728 |
+| held Ticks, 8511ff1 | 40.79 s | 143.55 s | 2.91 s | 0.284 |
+| typed events, e71996d | 97.61 s | 241.58 s | 6.95 s | 0.404 |
 
-What is left is the cores' own work on the events main also delivers: a profile of the ASan run
-(job 261124-062325-f25d84) puts 54% in `Core::step`, and no single harness cost above 9%.
+Runner classes differ by more than 2x in every test (docs/mechanisms/simulation.md); against
+`consensus_consensus` both serial fixes run at 14.0 times it, and main at 28.6-38.6.
+
+Without threads, what is left is the cores' own work on the events main also delivers: a profile
+of the ASan run (job 261124-062325-f25d84) puts 54% in `Core::step`, and no single harness cost
+above 9%.
 
 ## Output
 

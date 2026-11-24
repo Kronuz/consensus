@@ -392,13 +392,17 @@ struct Simulation {
 	// A leader's flights to one peer: its appends with entries, sent and not yet answered, in one
 	// term. An append is pipelined when it extends an outstanding flight (its previous entry is
 	// that flight's last); any other append is a first flight or a resend, and starts the chain
-	// over, as the leader's reset does. A flight unanswered for a heartbeat is a lost answer.
+	// over, as the leader's reset does. A flight unanswered for a heartbeat is a lost answer. The
+	// Sink hears a leader's sends after its Worker queued the answers delivered to it, so the
+	// count follows the answers delivered, not the order its Core handled them.
 	void on_append_sent(Node& n, GroupId g, NodeId peer, const AppendRequest& a) {
 		auto& chain = chains_[{n.id, peer, g}];
 		if (chain.term != a.term) { chain = {a.term}; }
 		auto& out = chain.flights;
 		for (auto it = out.begin(); it != out.end();) { it = now_ > it->second.at + timing.heartbeat ? out.erase(it) : std::next(it); }
 		++appends_sent;
+		// An answer the leader already holds covers it: a resend its Worker emitted before it handled that answer.
+		if (a.previous + a.entries.size() <= chain.matched) { return; }
 		std::uint32_t depth = 1;
 		for (const auto& [rpc, f] : out) { if (f.through == a.previous) { depth = f.depth + 1; } }
 		if (depth > 1) { ++appends_pipelined; seed_pipelined = true; } else { out.clear(); }

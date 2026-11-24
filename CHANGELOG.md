@@ -6,6 +6,12 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#consensus) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-23
+
+### Added
+
+- `WorkerLimits::flow` ([docs/DRIVER.md](docs/DRIVER.md), Replication flow): the `Flow` of every `Core` a `Worker` builds, so a Driver host sets it in `GroupOptions::scheduling.flow`. The default is `Flow{}`, as before. With `Flow{4, 4 << 20, 256 << 10}` a leader keeps up to four appends of at most 256 KiB in flight to each verified follower, where one flight of up to `rpc_bytes` was the only choice (at 10 ms round trip, 256 KiB per flight moves 16 MB/s, four move 64). A `Flow` with no pipeline or window is refused when the group opens (`driver_test flow_reaches_core`).
+
 ## 2026-11-21
 
 ### Added
@@ -14,6 +20,7 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 
 ### Fixed
 
+- With `Timing::quiesce`, a leader no longer rests while a woken follower's election timer runs ([docs/mechanisms/quiescence.md](docs/mechanisms/quiescence.md), Rest). A member's pre-vote (a removed member's, which campaigns on) wakes the leader and its followers alike; when the leader's heartbeat reached a follower still at rest, the follower's acknowledgement on waking found the leader awake and changed nothing, so the leader rested with that follower's timer running. The follower then won a pre-vote against the live leader and deposed it, and the group was leaderless until the next election (`driver_replace_test 1 1080 quiesce`, no leader when the settle window closed). A follower that leaves rest under its leader on a wake, or on a stale frame that adds nothing to its log or commit, now re-acknowledges its log at once (or once its persistence completes) and after every heartbeat interval without a frame from that leader, until a frame rests it again; a leader that hears it rests again only on that follower's answer to a later frame. A leader so rests over a running election timer for at most a heartbeat interval, including when the follower was woken while persisting the commit that rested it, or its acknowledgement overtook its answer or was lost, or a stale frame woke it (`quiescence_test`). `driver_replace_test [seeds] [first] quiesce` runs the replacement with groups at rest.
 - A replacement no longer fences its leader with "persistence lacks preowned reservation" when the core removes the leaving member (D3). The core proposed that removal from whichever event drove it after the promotion committed: a leader's `Tick`, which the Worker admitted with no append reservation, or the `Persisted` after an `AppendResponse` whose one hard-state append the commit had used. Only an admitted `Tick` proposes it now, and the Worker plans a leader's `Tick` as that change (`Core::removal()`: its configuration append and the commit continuation), so the removal follows the promotion's commit by at most a heartbeat. `driver_replace_test` runs the replacement through the Driver (add, promote beside any voting member, the leader or a witness included, remove) over 1000 seeds with delayed, dropped and duplicated messages and leadership transfers.
 
 ## 2026-11-20
@@ -35,11 +42,16 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 
 ### Changed
 
+- Nodes join and leave a running host transport ([docs/mechanisms/admission.md](docs/mechanisms/admission.md)): `HostTransport::admit_node(node, address, pin)` routes a node's dials and pins it, and `remove_node(node)` refuses its certificates, aborts its links and ends its calls. `NodePins` copies share one directory, safe from any thread, and name each refusal (`PinRefused`, `PinFault`, `refused()`). A certificate no pin names goes to the trust policy: by default the cluster CA (D149), which admits a certificate the context's CA signed whose URI names a node of the local certificate's cluster and records its pin at first join; `pre_approved_pins()` admits only pins. A pinned node's other certificates are refused (`repinned`), and a removed node's (`removed`) until it is admitted again. A node with no key or certificate joins with the cluster's join token (`admission_join.h`, D150): it makes its own key, pins the CA by the token's fingerprint, and an `Issuer` holding the CA key signs its certificate for the token's secret; a wrong or missing token is refused (`JoinFault::token`). With the default, a certificate the CA signed that names no node of the cluster is refused as `cluster` ("the trust policy refused it: cluster"); a local certificate that names no node leaves only pins admitting, as before.
 - A Worker no longer counts an installed image waiting for its activation as runnable work: it ran reclaim maintenance every turn while the application held a Committed range, a hot loop on a Driver whose IO completes at once.
 - An idle three-voter leader holds 8.4 KB less: `Core`'s per-peer flights are a vector, not a deque that kept a 4 KiB block per peer while idle (100,000 leaders' RSS 2,143 to 1,306 MB, `driver_close_test idle_cpu`, [docs/perf/idle-bytes.md](docs/perf/idle-bytes.md)).
 - An idle row is 1,104 B smaller: 5,703 B through the Driver at its checkpoint, from 6,807 B ([docs/perf/idle-bytes.md](docs/perf/idle-bytes.md)). The Core's and the Worker's rare state (a checkpoint capture, a snapshot installation and result, a transfer, the founding roles) is allocated only while in use; `sizeof(Core)` 1,688 to 1,008 B, `sizeof(Worker)` 1,832 to 1,416 B.
 - The `Propose` and `ChangeMembership` admission plans reserve the hard state with the entry, since a reopened replica's first batch carries its term record; before, the journal refused that batch ("foreign or oversized append reservation") and fenced the group.
 - A Worker on a journal host refuses at construction (`std::invalid_argument`, "worker batch exceeds the host's turn room") a configuration whose largest record exceeds one empty segment of the host's turn log (D132): a batch of `Limits::rpc_entries` and `rpc_bytes` (or `WorkerLimits::follower_batch_*` when larger), or the founding record. Before, it reached the journal and fenced its group at the first append. A caller sets segments big enough for the batch, or lower `rpc_bytes` (and `command_bytes`, which it must not exceed); the default 2 MiB rpc batch needs 64 MiB segments or lower limits. A merged `Receive` a caller submits beyond the operating limits can still fence its group (`worker_test --turn-room`).
+
+### Fixed
+
+- A host connection's writes never raise `SIGPIPE` ([docs/mechanisms/host-connection.md](docs/mechanisms/host-connection.md)): OpenSSL writes through the connection's own BIO, which sends with `MSG_NOSIGNAL`, instead of the socket BIO's `write()`; a write to a peer that closed fails with `EPIPE`. Before, a host that did not ignore `SIGPIPE` died on Linux when a peer closed during a write (a refused handshake's hello, say); hosts no longer need to ignore it, and `SO_NOSIGPIPE` is gone.
 
 ## 2026-11-19
 

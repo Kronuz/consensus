@@ -48,7 +48,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/.scratch")  # the tests' state
 	# faultlab's faultfs, the crash model the journal tests run on; test-only. It reuses the
 	# completion target declared above.
-	FetchContent_Declare(faultlab GIT_REPOSITORY https://github.com/Kronuz/faultlab.git GIT_TAG a3b71d1b9bdcfa3664dbce8725f14c07bb14845f)
+	FetchContent_Declare(faultlab GIT_REPOSITORY https://github.com/Kronuz/faultlab.git GIT_TAG 5d4df9b04d7064fc978c84d29e7db8e6789bb10c)
 	FetchContent_MakeAvailable(faultlab)
 	foreach(t consensus checkpoint_encoder retained_log retirement simulation membership pipeline retained_state)
 		add_executable(consensus_${t}_test test/${t}_test.cc)
@@ -95,8 +95,8 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 		add_test(NAME consensus_waiter_${c} COMMAND consensus_waiter_test ${c})
 		set_tests_properties(consensus_waiter_${c} PROPERTIES TIMEOUT 600)
 	endforeach()
-	# A seeded fault (test/driver_mutants.py), for the waiter, driver, driver replacement and membership tests' mutant jobs.
-	set(CONSENSUS_DRIVER_MUTANT "" CACHE STRING "a test/driver_mutants.py fault built into consensus_waiter_test, consensus_driver_test, consensus_driver_replace_test and consensus_membership_test")
+	# A seeded fault (test/driver_mutants.py), for the waiter, driver, driver replacement, quiescence and membership tests' mutant jobs.
+	set(CONSENSUS_DRIVER_MUTANT "" CACHE STRING "a test/driver_mutants.py fault built into consensus_waiter_test, consensus_driver_test, consensus_driver_replace_test, consensus_quiescence_test and consensus_membership_test")
 	if(CONSENSUS_DRIVER_MUTANT)
 		execute_process(COMMAND python3 "${CMAKE_CURRENT_SOURCE_DIR}/test/driver_mutants.py" "${CONSENSUS_DRIVER_MUTANT}" "${CMAKE_CURRENT_BINARY_DIR}/mutant" RESULT_VARIABLE mutant_result)
 		if(NOT mutant_result EQUAL 0)
@@ -123,6 +123,13 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 		add_test(NAME consensus_driver_install_${c} COMMAND consensus_driver_install_test ${c})
 		set_tests_properties(consensus_driver_install_${c} PROPERTIES TIMEOUT 120)
 	endforeach()
+	# A follower's install request (docs/mechanisms/install-request.md), a ctest entry per case.
+	add_executable(consensus_driver_install_request_test test/driver_install_request_test.cc)
+	target_link_libraries(consensus_driver_install_request_test PRIVATE consensus::consensus)
+	foreach(c lost_state behind current after_install lost_record unrequested leader_lost second_request non_leader witness_bound)
+		add_test(NAME consensus_install_request_${c} COMMAND consensus_driver_install_request_test ${c})
+		set_tests_properties(consensus_install_request_${c} PROPERTIES TIMEOUT 300)
+	endforeach()
 	# D3 through the Driver: a replacement, add, promote and the core's removal, over seeds.
 	add_executable(consensus_driver_replace_test test/driver_replace_test.cc)
 	target_link_libraries(consensus_driver_replace_test PRIVATE consensus::consensus)
@@ -134,6 +141,18 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 		add_test(NAME consensus_driver_replace_${first} COMMAND consensus_driver_replace_test 250 ${first})
 		set_tests_properties(consensus_driver_replace_${first} PROPERTIES TIMEOUT 300)
 	endforeach()
+	add_test(NAME consensus_driver_replace_rest_1080 COMMAND consensus_driver_replace_test 1 1080 quiesce)
+	foreach(first 1 251 501 751)
+		add_test(NAME consensus_driver_replace_rest_${first} COMMAND consensus_driver_replace_test 250 ${first} quiesce)
+		set_tests_properties(consensus_driver_replace_rest_${first} PROPERTIES TIMEOUT 300)
+	endforeach()
+	# Wake orderings at rest, each driven by hand over three cores (docs/mechanisms/quiescence.md).
+	add_executable(consensus_quiescence_test test/quiescence_test.cc)
+	target_link_libraries(consensus_quiescence_test PRIVATE consensus::consensus)
+	if(CONSENSUS_DRIVER_MUTANT)
+		target_include_directories(consensus_quiescence_test BEFORE PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/mutant/include")
+	endif()
+	add_test(NAME consensus_quiescence COMMAND consensus_quiescence_test)
 	add_executable(consensus_driver_close_test test/driver_close_test.cc)
 	target_link_libraries(consensus_driver_close_test PRIVATE consensus::consensus)
 	add_test(NAME consensus_driver_close COMMAND consensus_driver_close_test)
@@ -145,9 +164,24 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	add_test(NAME consensus_worker COMMAND consensus_worker_test)
 	# Each seeded fault in tools/mutants.sh must fail the simulation (it reads Ninja's commands and
 	# needs bash). One test per mutant, so ctest -j runs them in parallel; the TIMEOUT is four
-	# times the slowest of the macOS, Linux and FreeBSD gate hosts' time (floor 600 s), for sanitizers.
+	# times the slowest of the macOS, Linux and FreeBSD gate hosts' time (floor 600 s).
+	# A sanitizer build proves nothing the plain build's mutants do not and cannot fit its CI time, so
+	# they register only without -fsanitize in the flags the shared CI sets (compile, config, link).
+	string(TOUPPER "${CMAKE_BUILD_TYPE}" consensus_build_type)
+	set(consensus_sanitized FALSE)
+	if("${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${consensus_build_type}} ${CMAKE_EXE_LINKER_FLAGS}" MATCHES "-fsanitize")
+		set(consensus_sanitized TRUE)
+	endif()
 	find_program(CONSENSUS_BASH bash)
-	if(CMAKE_GENERATOR MATCHES "Ninja" AND CONSENSUS_BASH)
+	find_program(CONSENSUS_PYTHON3 python3)
+	# Every seeded fault still applies (its pattern matches the source exactly once), where the tools exist.
+	if(CONSENSUS_PYTHON3)
+		add_test(NAME consensus_mutants_apply_driver COMMAND ${CONSENSUS_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/test/driver_mutants.py check ${CMAKE_BINARY_DIR}/mutants-apply-driver)
+	endif()
+	if(CONSENSUS_BASH)
+		add_test(NAME consensus_mutants_apply_core COMMAND ${CONSENSUS_BASH} ${CMAKE_CURRENT_SOURCE_DIR}/tools/mutants.sh --check ${CMAKE_BINARY_DIR}/mutants-apply-core)
+	endif()
+	if(CMAKE_GENERATOR MATCHES "Ninja" AND CONSENSUS_BASH AND NOT consensus_sanitized)
 		set(consensus_mutants
 			recovered-delivery-byte-accounting-underflows=600
 			sends-before-durability=600
@@ -240,7 +274,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	endif()
 
 	# The tests that build a journal run it on faultfs.
-	foreach(t simulation shared_worker shared_cluster wave_open waiter blocking_entry driver driver_close driver_replace worker)
+	foreach(t simulation shared_worker shared_cluster wave_open waiter blocking_entry driver driver_close driver_replace driver_install worker)
 		target_link_libraries(consensus_${t}_test PRIVATE faultlab::faultlab)
 	endforeach()
 
@@ -287,6 +321,26 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	set_tests_properties(consensus_transport_tls consensus_transport_pipe consensus_transport_authentication consensus_transport_connection consensus_transport_links
 		PROPERTIES FIXTURES_REQUIRED consensus_tls TIMEOUT 30)
 	set_tests_properties(consensus_transport_connection PROPERTIES TIMEOUT 120)  # the slow readers run for seconds each
+	# Nodes admitted and removed at runtime (docs/mechanisms/admission.md): its own certificates,
+	# one ctest entry per case and trust policy.
+	add_test(NAME consensus_admission_certificates COMMAND ${CMAKE_COMMAND} -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/admission-fixture
+		-DOPENSSL=${CONSENSUS_TEST_OPENSSL} -P ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/admission_certificates.cmake)
+	set_tests_properties(consensus_admission_certificates PROPERTIES FIXTURES_SETUP consensus_admission TIMEOUT 60)
+	add_executable(consensus_transport_admission_nodes_test test/transport/admission_nodes_test.cc)
+	target_link_libraries(consensus_transport_admission_nodes_test PRIVATE consensus::transport)
+	target_compile_options(consensus_transport_admission_nodes_test PRIVATE -UNDEBUG)
+	foreach(c policy issue save)
+		add_test(NAME consensus_transport_admission_nodes_${c}
+			COMMAND consensus_transport_admission_nodes_test ${CMAKE_CURRENT_BINARY_DIR}/admission-fixture ${c})
+		set_tests_properties(consensus_transport_admission_nodes_${c} PROPERTIES FIXTURES_REQUIRED consensus_admission TIMEOUT 60)
+	endforeach()
+	foreach(c join refused remove epoch)
+		foreach(p ca pins)
+			add_test(NAME consensus_transport_admission_nodes_${c}_${p}
+				COMMAND consensus_transport_admission_nodes_test ${CMAKE_CURRENT_BINARY_DIR}/admission-fixture ${c} ${p})
+			set_tests_properties(consensus_transport_admission_nodes_${c}_${p} PROPERTIES FIXTURES_REQUIRED consensus_admission TIMEOUT 150)
+		endforeach()
+	endforeach()
 	# The host transport (host_transport.h): one ctest entry per case.
 	add_executable(consensus_transport_groups_test test/transport/groups_test.cc)
 	target_link_libraries(consensus_transport_groups_test PRIVATE consensus::transport)

@@ -2,7 +2,8 @@
 # Copies include/ to OUT/include with one seeded fault, which waiter_test, driver_test,
 # membership_test or the Driver simulation must catch (under ASan for the resume-before-unlink
 # pair). Each names its header, the text it replaces and the replacement, or a list of those:
-#   driver_mutants.py NAME OUT      (NAME "list" prints the names)
+#   driver_mutants.py NAME OUT      (NAME "list" prints the names; "check" applies every mutant
+#                                    into OUT and fails if any pattern does not match exactly once)
 import pathlib, shutil, sys
 
 MUTANTS = {
@@ -38,8 +39,8 @@ MUTANTS = {
     ),
     # A local checkpoint captures none of the retained log above its boundary (msg-1).
     "checkpoint-drops-suffix": ("core.h",
-        "\t\tif (capture_mode_) { captured_ = FrozenCheckpoint(*this, id, state, entries_.size() - first); }\n",
-        "\t\tif (capture_mode_) { captured_ = FrozenCheckpoint(*this, id, state, 0); }\n",
+        "\t\tif (capture_mode_) { captured_ = std::make_unique<FrozenCheckpoint>(FrozenCheckpoint(*this, id, state, entries_.size() - first)); }\n",
+        "\t\tif (capture_mode_) { captured_ = std::make_unique<FrozenCheckpoint>(FrozenCheckpoint(*this, id, state, 0)); }\n",
     ),
     # A shared append acknowledges its record (Persisted) once staged, before its loop's turn
     # barrier makes it durable; the Driver simulation's power cuts catch it.
@@ -71,6 +72,32 @@ MUTANTS = {
         ("worker.h", "plan = removal ? plan_event(ChangeMembership{0, std::move(*removal)}, false, limits_, scheduling_.retained) : EventAdmissionPlan{};",
             "plan = EventAdmissionPlan{}; (void)removal;"),
     ],
+    # Quiescence (quiescence_test): a leader takes a woken follower's unprompted acknowledgement
+    # as nothing new and rests with that follower's timer running (s1, s6; driver_replace_test 1 1080 quiesce).
+    "wake-ack-unanswered": ("core.h",
+        "\t\t\tpeer.told = 0; peer.woke = next_token_;\n",
+        "",
+    ),
+    # ... or counts an answer the acknowledgement overtook (s4).
+    "wake-ack-overtaken": ("core.h",
+        "\t\t\tif (at->rpc > peer.woke) { peer.told = std::max(peer.told, at->commit); }\n",
+        "\t\t\tpeer.told = std::max(peer.told, at->commit);\n",
+    ),
+    # A woken follower acknowledges once, not every heartbeat until it rests (s5).
+    "wake-ack-once": ("core.h",
+        "\t\tacknowledge_at_ = deadline(timing_.heartbeat);\n\t\toutput.emplace_back(Send{leader_, AppendResponse{",
+        "\t\tacknowledge_at_ = maximum - 1;\n\t\toutput.emplace_back(Send{leader_, AppendResponse{",
+    ),
+    # A stale frame that ends a follower's rest leaves it owing nothing (s7).
+    "stale-frame-silent": ("core.h",
+        "\t\tif (stale && acknowledge_at_ == maximum) { acknowledge_at_ = deadline(timing_.heartbeat); }  // its answer went with it\n",
+        "",
+    ),
+    # A follower woken while it persists drops its acknowledgement (s2).
+    "wake-ack-dropped-busy": ("core.h",
+        "\t\tif (now_ < acknowledge_at_ || busy()) { return; }\n",
+        "\t\tif (busy() && now_ >= acknowledge_at_) { acknowledge_at_ = deadline(timing_.heartbeat); }\n\t\tif (now_ < acknowledge_at_ || busy()) { return; }\n",
+    ),
     # A witness incarnation may become a learner or voter (R16).
     "witness-becomes-data": ("core.h",
         "\t\t\tif (old && old->role == MemberRole::Witness && x.role != MemberRole::Witness) { reject(RejectReason::InvalidMembership); return; }\n",
@@ -78,21 +105,37 @@ MUTANTS = {
     ),
 }
 
-def main():
-    name = sys.argv[1]
-    if name == "list":
-        print("\n".join(MUTANTS))
-        return
-    out = pathlib.Path(sys.argv[2])
-    root = pathlib.Path(__file__).resolve().parent.parent
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+def apply(name, out):
+    """Copies include/ to out/include with the mutant applied; returns an error text or None.
+    A pattern that does not match exactly once is an error: the mutant would prove nothing."""
     shutil.rmtree(out / "include", ignore_errors=True)
-    shutil.copytree(root / "include", out / "include")
+    shutil.copytree(ROOT / "include", out / "include")
     edits = MUTANTS[name]
     for header, search, replace in edits if isinstance(edits, list) else [edits]:
         path = out / "include" / "consensus" / header
         text = path.read_text()
         if text.count(search) != 1:
-            sys.exit("mutation point not found once: " + name)
+            return "mutation point not found once: " + name
         path.write_text(text.replace(search, replace, 1))
+    return None
+
+def main():
+    name = sys.argv[1]
+    if name == "list":
+        print("\n".join(MUTANTS))
+        return
+    if name == "check":  # applies every mutant into scratch directory OUT; fails if any does not apply
+        out = pathlib.Path(sys.argv[2])
+        errors = [e for n in MUTANTS if (e := apply(n, out))]
+        shutil.rmtree(out / "include", ignore_errors=True)
+        if errors:
+            sys.exit("\n".join(errors))
+        print("all %d mutants apply" % len(MUTANTS))
+        return
+    error = apply(name, pathlib.Path(sys.argv[2]))
+    if error:
+        sys.exit(error)
 
 main()

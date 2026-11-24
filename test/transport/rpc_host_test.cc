@@ -2,7 +2,7 @@
 // loop on its own thread (docs/mechanisms/rpc-lane.md, On Bulk):
 //   calls       deadlines and cancels over shared connections: a caller's deadline ends the
 //               server's call, a cancel mid-stream ends both ends once, and every pool is back to 0
-//   group-full  a group whose receiving loop stalls 4 s fills its credit on Bulk; calls on the
+//   group-full  a group whose receiving loop is held fills its credit on Bulk; calls on the
 //               same connection keep their latency (control: rpc-shared-credit)
 //   call-full   a call whose server never reads fills its credit and pool; another group's
 //               heartbeats keep every gap under the 1,000 ms election timeout
@@ -25,7 +25,7 @@
 //               not_processed, and the Bulk connection closes gracefully
 //   fetch       D8, A4: fetch is method 1. Beside 4 groups uploading 1 MiB data frames on the same
 //               Bulk connection, a 16 MiB fetch arrives exact while heartbeats on Control keep
-//               every gap under 1,000 ms; a missing name, a reader that throws, a reply over this
+//               every gap under 1,000 ms plus the host's lag; a missing name, a reader that throws, a reply over this
 //               host's fetch_bytes and a fifth concurrent fetch end as D8's table says
 //   reader      T5: with host 2's other loop held 2 s, calls whose frames its connection's loop
 //               reads keep their latency (control: lane-via-other-loop)
@@ -257,7 +257,7 @@ bool calls() {
 	return ok;
 }
 
-// reader_test's shape for the lane: group 1's receiving loop stalls 4 s while its sender fills the
+// reader_test's shape for the lane: group 1's receiving loop is held while its sender fills the
 // group's credit on Bulk; small calls on the same Bulk connection keep their latency.
 bool group_full() {
 	constexpr std::uint32_t L = 4;
@@ -281,31 +281,43 @@ bool group_full() {
 	if (!until([&] { return warm->done.load(); }, 10s))
 		return false;
 	const auto sender = one.transport->loop_of_node(2), at = one.transport->loop_of_group(g1);
-	two.post((reading + 1) % L, [] { std::this_thread::sleep_for(4000ms); });
+	std::atomic<bool> held{true};
+	two.post((reading + 1) % L, [&] {
+		while (held)
+			std::this_thread::sleep_for(1ms);
+	});
 	one.post(at, [&] {
 		for (int i = 0; i != 100; ++i)
 			one.transport->send(at, LinkLane::Bulk, FrameKind::data, {g1, 1, 2}, 2, std::string(64 * 1024, 'g'));
 	});
-	// The window less one frame: the next 64 KiB frame no longer fits.
-	const bool full = until([&] { return one.transport->stats(sender).uncredited > (4u << 20) - (64u << 10) - frame_header; }, 2s);
+	// The window less one frame: the next 64 KiB frame no longer fits. The loop stays held until the
+	// calls end, so what the credit holds does not depend on how long this thread waits.
+	const bool full = until([&] { return one.transport->stats(sender).uncredited > (4u << 20) - (64u << 10) - frame_header; }, 30s);
 	const auto uncredited = one.transport->stats(sender).uncredited.load();
-	// 15 calls 50 ms apart, all within the 4 s stall: none of the group's frames is delivered yet.
+	// 15 calls 50 ms apart: none of the group's frames is delivered meanwhile. Each may take
+	// 250 ms plus what the host kept this process from running.
+	Lag lag;
 	std::uint64_t worst = 0, done = 0;
 	for (int i = 0; i != 15; ++i) {
 		auto c = start_call(one, 2, echo, 64, 10s);
-		if (until([&] { return c->done.load(); }, 5s) && c->status.outcome == rpc::Outcome::ok)
+		if (until([&] { return c->done.load(); }, 30s) && c->status.outcome == rpc::Outcome::ok) {
 			++done;
-		worst = std::max<std::uint64_t>(worst, std::chrono::duration_cast<std::chrono::milliseconds>(c->finished - c->started).count());
+			worst = std::max<std::uint64_t>(worst, std::chrono::duration_cast<std::chrono::milliseconds>(c->finished - c->started).count());
+		} else
+			break;
 		std::this_thread::sleep_for(50ms);
 	}
 	const auto stalled = delivered.load();
-	until([&] { return delivered == 100; }, 10s);
+	const auto bound = 250 + lag.worst.load();
+	held = false;
+	until([&] { return delivered == 100; }, 30s);
 	one.stop();
 	two.stop();
-	const bool ok = full && done == 15 && stalled == 0 && worst < 250 && delivered == 100;
-	std::printf("group-full: group 1's credit full (%s, %llu bytes uncredited as the calls began); %llu of 15 calls, largest latency %llu ms; group 1 delivered %llu as the calls ended, %llu of 100 after %s\n",
+	const bool ok = full && done == 15 && stalled == 0 && worst < bound && delivered == 100;
+	std::printf("group-full: group 1's credit full (%s, %llu bytes uncredited as the calls began); %llu of 15 calls, largest latency %llu ms of %llu allowed (250 plus the host's %llu ms of lag); group 1 delivered %llu as the calls ended, %llu of 100 after %s\n",
 				full ? "yes" : "no", (unsigned long long)uncredited, (unsigned long long)done, (unsigned long long)worst,
-				(unsigned long long)stalled, (unsigned long long)delivered.load(), ok ? "ok" : "FAILED");
+				(unsigned long long)bound, (unsigned long long)lag.worst.load(), (unsigned long long)stalled,
+				(unsigned long long)delivered.load(), ok ? "ok" : "FAILED");
 	return ok;
 }
 
@@ -765,18 +777,19 @@ bool fetch() {
 	std::raise(SIGPIPE);
 #endif
 	constexpr std::uint32_t L = 2;
+	const std::string expected = bytes_at(0, 16 << 20);  // made before the loops start: a handler generating it holds its loop
 	Host one(1, L), two(2, L);
 	HostTransportOptions client, server;
 	client.rpc.fetch_bytes = 32 << 20;
-	server.rpc.reader = [](std::string_view name) -> std::optional<std::string> {
+	server.rpc.reader = [&expected](std::string_view name) -> std::optional<std::string> {
 		if (name == "throws")
 			throw std::runtime_error("the disk broke");
 		if (name == "big")
-			return bytes_at(0, 16 << 20);
+			return expected;
 		if (name == "huge")
 			return std::string(48 << 20, 'h');
 		if (name == "slow")
-			return bytes_at(0, 4 << 20);
+			return expected.substr(0, 4 << 20);
 		return std::nullopt;
 	};
 	one.open(addresses({&two}), client);
@@ -802,16 +815,18 @@ bool fetch() {
 	two.start();
 	const auto hb = two.transport->loop_of_group(beat), up = two.transport->loop_of_group(uploads[0]);
 	auto heartbeat = [&] { two.post(hb, [&] { two.transport->send(hb, LinkLane::Control, FrameKind::control, {beat, 2, 1}, 1, "beat"); }); };
-	auto upload = [&] {
-		two.post(up, [&] {
-			for (auto g : uploads)
-				for (int i = 0; i != 8; ++i)
-					two.transport->send(up, LinkLane::Bulk, FrameKind::data, {g, 2, 1}, 1, std::string(1 << 20, 'u'));
-		});
+	// A burst is 4 groups x 8 frames of 1 MiB, one frame per turn of the loop: a heartbeat posted
+	// meanwhile waits for one frame, not the burst.
+	std::function<void(std::size_t)> upload_frame = [&](std::size_t i) {
+		two.transport->send(up, LinkLane::Bulk, FrameKind::data, {uploads[i / 8], 2, 1}, 1, std::string(1 << 20, 'u'));
+		if (i + 1 != uploads.size() * 8)
+			two.post(up, [&upload_frame, i] { upload_frame(i + 1); });
 	};
+	auto upload = [&] { two.post(up, [&] { upload_frame(0); }); };
 	if (!until([&] { heartbeat(); return beats.count > 0; }, 10s))
 		return false;
 	beats.worst = 0;
+	Lag lag;
 	struct Got {
 		std::atomic<bool> done{false};
 		std::error_code error;
@@ -829,20 +844,25 @@ bool fetch() {
 		});
 		return got;
 	};
+	// Uploads start 200 ms before the fetch, heartbeats throughout.
 	const auto start = steady::now();
-	upload();
-	std::this_thread::sleep_for(200ms);
-	const auto before = uploaded.load();
-	auto big = fetch("big");
-	for (std::int64_t tick = 0; !big->done && ms_since(start) < 30'000; ++tick) {
+	std::shared_ptr<Got> big;
+	std::uint64_t before = 0;
+	steady::time_point began = start;
+	for (std::int64_t tick = 0; !(big && big->done) && ms_since(start) < 30'000; ++tick) {
+		if (tick == 2) {
+			before = uploaded.load();
+			began = steady::now();
+			big = fetch("big");
+		}
 		heartbeat();
 		if (tick % 2 == 0)
 			upload();
 		std::this_thread::sleep_until(start + (tick + 1) * 100ms);
 	}
-	const auto fetched_ms = ms_since(start);
+	const auto fetched_ms = ms_since(began);
 	const auto beside = uploaded.load() - before;
-	const bool exact = big->done && !big->error && big->bytes && *big->bytes == bytes_at(0, 16 << 20);
+	const bool exact = big && big->done && !big->error && big->bytes && *big->bytes == expected;
 	auto missing = fetch("none"), throws = fetch("throws"), huge = fetch("huge");
 	std::vector<std::shared_ptr<Got>> slow;
 	for (int i = 0; i != 5; ++i)
@@ -860,16 +880,17 @@ bool fetch() {
 	}
 	const bool table = ended && !missing->error && !missing->bytes && throws->error == std::errc::io_error &&
 					   huge->error == std::errc::message_size && busy >= 1 && busy + slow_ok == 5;
-	const bool ok = exact && beside > 0 && beats.worst < 1000 && table;
-	const auto big_error = !big->done ? std::string("not done") : big->error ? big->error.message() : std::string("ok");
+	const auto bound = 1000 + lag.worst.load();
+	const bool ok = exact && beside > 0 && beats.worst < bound && table;
+	const auto big_error = !big || !big->done ? std::string("not done") : big->error ? big->error.message() : std::string("ok");
 	std::printf("fetch: 16 MiB arrived exact %s (%s) in %llu ms beside %llu MiB of group uploads on Bulk; links %llu+%llu, "
-				"dropped %llu, overrun %llu; heartbeats' longest gap %llu ms; missing %s, "
+				"dropped %llu, overrun %llu; heartbeats' longest gap %llu ms of %llu allowed (1000 plus the host's %llu ms of lag); missing %s, "
 				"a throwing reader %s, 48 MiB over 32 MiB %s, five 4 MiB at once: %d ok, %d refused %s\n",
 				exact ? "yes" : "NO", big_error.c_str(), (unsigned long long)fetched_ms, (unsigned long long)(beside >> 20),
 				(unsigned long long)one.total(&HostTransportStats::links), (unsigned long long)two.total(&HostTransportStats::links),
 				(unsigned long long)(one.total(&HostTransportStats::dropped) + two.total(&HostTransportStats::dropped)),
 				(unsigned long long)(one.total(&HostTransportStats::overrun) + two.total(&HostTransportStats::overrun)),
-				(unsigned long long)beats.worst,
+				(unsigned long long)beats.worst, (unsigned long long)bound, (unsigned long long)lag.worst.load(),
 				!missing->error && !missing->bytes ? "nullopt" : "WRONG", throws->error.message().c_str(), huge->error.message().c_str(), slow_ok,
 				busy, ok ? "ok" : "FAILED");
 	one.stop();

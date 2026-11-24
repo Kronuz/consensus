@@ -42,6 +42,9 @@ before them, sets most of the cost:
 | 60 s `snapshot_timeout`, 4,000 heal rounds | 114 s | 272 s | 387 s |
 | 1 s `snapshot_timeout` | 114 s | 93 s | 208 s |
 
+With both, one ASan run takes 91-124 s on that host, and 57-59 s on CI's typical class
+(171 s before) and 112.5 s on its slow class, under half the TIMEOUT.
+
 ## Output
 
 `main` line-buffers stdout, so a run that times out still shows each phase that completed

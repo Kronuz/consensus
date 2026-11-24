@@ -2,6 +2,7 @@
 // of rpc_host_test and hello_test.
 #pragma once
 #include "consensus/transport/host_transport.h"
+#include "lag.h"
 #include <asio/executor_work_guard.hpp>
 #include <asio/io_context.hpp>
 #include <cassert>
@@ -180,24 +181,5 @@ struct Beats {
 			worst = std::max<std::uint64_t>(worst, std::uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(now - last).count()));
 		last = now;
 		++count;
-	}
-};
-// The longest a thread that only sleeps 1 ms went without running, in ms: a runner that pauses or
-// starves the process delays every thread, which no transport rule can, so a latency bound adds it.
-struct Lag {
-	std::atomic<bool> stopped{false};
-	std::atomic<std::uint64_t> worst{0};
-	std::thread sampler{[this] {
-		auto last = steady::now();
-		while (!stopped) {
-			std::this_thread::sleep_for(1ms);
-			const auto now = steady::now();
-			worst = std::max<std::uint64_t>(worst, std::uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(now - last).count()));
-			last = now;
-		}
-	}};
-	~Lag() {
-		stopped = true;
-		sampler.join();
 	}
 };

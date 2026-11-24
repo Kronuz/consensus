@@ -404,10 +404,11 @@ struct Simulation {
 		out[a.rpc] = {a.term, now_, a.previous + a.entries.size(), depth};
 		in_flight_max = std::max<std::uint64_t>(in_flight_max, depth);
 	}
-	// The leader drops what a success covers, and every flight on a rejection (its reset).
+	// The leader drops what any success covers (a heartbeat's too), and every flight on a
+	// rejection, as its reset does; an answer that is stale to the leader drops no more than that.
 	void on_append_answered(NodeId leader, NodeId peer, GroupId g, const AppendResponse& r) {
 		auto it = in_flight_.find({leader, peer, g});
-		if (it == in_flight_.end() || !it->second.count(r.rpc)) { return; }
+		if (it == in_flight_.end()) { return; }
 		auto& out = it->second;
 		if (!r.success) { out.clear(); return; }
 		for (auto f = out.begin(); f != out.end();) { f = f->second.through <= r.matched ? out.erase(f) : std::next(f); }

@@ -27,8 +27,10 @@
 #include <filesystem>
 #include <netinet/in.h>
 #include <openssl/pem.h>
+#include <atomic>
 #include <spawn.h>
 #include <string>
+#include <thread>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -42,6 +44,29 @@ using Clock = std::chrono::steady_clock;
 
 namespace {
 std::filesystem::path fixture;
+// The longest a thread that only sleeps 1 ms went without running, in ms (rpc_hosts.h's Lag): a
+// runner that pauses the process delays every timer and read, which no seeds rule can.
+struct Lag {
+	std::atomic<bool> stopped{false};
+	std::atomic<std::uint64_t> worst{0};
+	std::thread sampler{[this] {
+		auto last = Clock::now();
+		while (!stopped) {
+			std::this_thread::sleep_for(1ms);
+			const auto now = Clock::now();
+			worst = std::max<std::uint64_t>(worst, std::uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(now - last).count()));
+			last = now;
+		}
+	}};
+	// Stops the sampler and returns its worst: read it once the measured work is over.
+	std::uint64_t stop() {
+		stopped = true;
+		if (sampler.joinable())
+			sampler.join();
+		return worst;
+	}
+	~Lag() { stop(); }
+};
 std::string interface_ = "127.0.0.1";  // where this run's announcements go: loopback, or "" the default
 
 kronuz::consensus::Identity identity(char c, std::uint32_t n = 0) {
@@ -556,21 +581,24 @@ void rate() {
 	socklen_t isize = sizeof interface;
 	assert(::getsockopt(seeds.sending_handle(), IPPROTO_IP, IP_MULTICAST_IF, &interface, &isize) == 0);
 	assert(interface_.empty() || interface.s_addr == htonl(INADDR_LOOPBACK));
+	Lag lag;
 	const auto start = Clock::now();
 	loop.run_for(1500ms);
+	const auto lagged = std::chrono::milliseconds(lag.stop());
 	stop(loop, seeds);
 	raw.close();
 	loop.run_for(20ms);
-	std::printf("rate: %zu datagrams in 1.5 s, %llu sent\n", heard.size(), (unsigned long long)seeds.stats().announced);
+	std::printf("rate: %zu datagrams in 1.5 s, %llu sent, the host's lag %lld ms\n", heard.size(),
+				(unsigned long long)seeds.stats().announced, (long long)lagged.count());
 	// The burst: three within 80 ms of the start (20 ms nominal; without it the third is past 200 ms).
-	assert(heard.size() >= 3 && heard[2] - start < 80ms);
-	// Then each gap is one interval plus at most its jitter, and up to 100 ms of a loaded runner's slack.
+	assert(heard.size() >= 3 && heard[2] - start < 80ms + lagged);
+	// Then each gap is one interval plus at most its jitter, and the host's lag when it stalled one.
 	for (std::size_t i = 3; i < heard.size(); ++i) {
 		const auto gap = heard[i] - heard[i - 1];
-		assert(gap >= 90ms && gap <= 150ms + 100ms);
+		assert(gap >= 90ms && gap <= 150ms + lagged);
 	}
-	// 1.5 s holds at most 3 + 1500 / 100 datagrams; at least 3 + 1500 / 150 - 3 with that slack.
-	assert(heard.size() <= 18 && heard.size() >= 10);
+	// 1.5 s holds at most 3 + 1500 / 100 datagrams; at least 3 + 1500 / 150 - 3, less one per 150 ms of lag.
+	assert(heard.size() <= 18 && heard.size() + std::size_t(lagged / 150ms) >= 10);
 	std::puts("rate: ok");
 }
 // A node started before its network is up seeds once it is: a failed start() is retried with

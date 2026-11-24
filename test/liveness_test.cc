@@ -68,6 +68,12 @@ Profile derive(const char* name, double b, double r) {
 	return {name, b, r, t};
 }
 
+// Idle windows (an isolation, a settling wait) are written in milliseconds of the default
+// profile, whose election_max is 2 s, and scale with each profile's election_max: a window is
+// the same number of election timeouts in every profile, not the same simulated time, which
+// costs a hundred times the events in a profile with a 1 ms tick (docs/mechanisms/liveness.md).
+std::uint64_t window(const Profile& profile, std::uint64_t ms) { return ms * profile.timing.election_max / 2000; }
+
 class Cluster {
 public:
 	// witness: the last voter founds the group as a witness (2 + witness, D9).
@@ -268,7 +274,7 @@ void run(const Profile& profile, std::uint64_t seeds) {
 			if (l && pick() % 2) { side.insert(*l); }
 			while (side.size() < size) { side.insert(1 + NodeId(pick() % voters)); }
 			c.isolate(side);
-			c.run_until(c.now() + 2000 + pick() % 8000);
+			c.run_until(c.now() + window(profile, 2000 + pick() % 8000));
 			c.heal();
 			const auto healed = c.now();
 			if (c.commit_one(all, healed + 30000)) { heal.push_back(double(c.now() - healed)); } else { ++unhealed; }
@@ -284,9 +290,9 @@ void run(const Profile& profile, std::uint64_t seeds) {
 			std::set<NodeId> healthy = all; healthy.erase(lone);
 			const Term before = c.max_term(healthy);
 			c.isolate({lone});
-			c.run_until(c.now() + 20000);
+			c.run_until(c.now() + window(profile, 20000));
 			c.heal();
-			c.run_until(c.now() + 5000);
+			c.run_until(c.now() + window(profile, 5000));
 			if (c.max_term(healthy) != before) { ++raised; if (std::getenv("LIVENESS_DEBUG")) { std::fprintf(stderr, "%s raised: seed %llu voters %zu lone %llu term %llu -> %llu\n", profile.name, (unsigned long long)seed, voters, (unsigned long long)lone, (unsigned long long)before, (unsigned long long)c.max_term(healthy)); } }
 			if (c.core(lone).term() != before) { ++lone_raised; }
 		}
@@ -327,7 +333,7 @@ void run(const Profile& profile, std::uint64_t seeds) {
 				std::set<NodeId> rest = three; rest.erase(failed);
 				// The witness refuses proposals, so a commit means a data voter leads.
 				if (c.commit_one(rest, started + 30000)) { survive.push_back(double(c.now() - started)); } else { ++unsurvived; }
-				c.run_until(c.now() + 5000);
+				c.run_until(c.now() + window(profile, 5000));
 				if (led) { ++unhanded; }
 			}
 		}
@@ -382,7 +388,7 @@ void run(const Profile& profile, std::uint64_t seeds) {
 					++removed_runs;
 					const Term before = c.max_term(kept);
 					c.heal();
-					c.run_until(c.now() + 20000);
+					c.run_until(c.now() + window(profile, 20000));
 					removed_raised += c.max_term(kept) != before;
 				}
 			}
@@ -429,6 +435,7 @@ void run(const Profile& profile, std::uint64_t seeds) {
 }  // namespace
 
 int main(int argc, char** argv) {
+	std::setvbuf(stdout, nullptr, _IOLBF, 0);  // a run killed at its timeout still shows each profile it finished
 	const std::uint64_t seeds = argc > 1 ? std::strtoull(argv[1], nullptr, 10) : 100;
 	// The default profile (R4: Detent's authority profile, macOS x86_64 APFS at b = 80 ms),
 	// and profiles derived from barrier p99 estimates per platform (docs/perf/commit-barriers.md

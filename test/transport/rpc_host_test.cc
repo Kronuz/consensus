@@ -1049,6 +1049,8 @@ int main(int argc, char **argv) {
 		ok = shutdown();
 	else if (which == "fetch")
 		ok = fetch() & fetch_dead();
+	else if (which == "fetch-dead")  // fetch's second half alone, for its control
+		ok = fetch_dead();
 	else if (which == "stop-drain")
 		ok = stop_drain();
 	else

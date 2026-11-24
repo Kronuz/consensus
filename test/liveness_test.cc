@@ -70,8 +70,7 @@ Profile derive(const char* name, double b, double r) {
 
 // Idle windows (an isolation, a settling wait) are written in milliseconds of the default
 // profile, whose election_max is 2 s, and scale with each profile's election_max: a window is
-// the same number of election timeouts in every profile, not the same simulated time, which
-// costs a hundred times the events in a profile with a 1 ms tick (docs/mechanisms/liveness.md).
+// the same number of election timeouts in every profile (docs/mechanisms/liveness.md).
 std::uint64_t window(const Profile& profile, std::uint64_t ms) { return ms * profile.timing.election_max / 2000; }
 
 class Cluster {

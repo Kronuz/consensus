@@ -50,6 +50,24 @@ report a removal that no Tick can append. Retirement is reported first: when the
 nothing is left to retire, so the Tick's own step frees no more room than `next_deadline()` saw.
 While erased entries remain, each Tick retires a slice, and the removal's deadline follows.
 
+## What the Driver re-arms
+
+The Driver keeps one wheel entry per group, armed at `Worker::next_deadline()`. A Tick the Worker
+refuses with Pressure (a Control reservation of its plan does not fit the pool) does not move
+Core's clock or deadline: the deadline stays at or before the clock. The Driver therefore re-arms
+a group whose last turn was Pressure `retry_ns` (1 ms) ahead, or at Core's deadline when that is
+sooner and still ahead, and never at a deadline already behind the clock. It is the retry a
+refused input or call already gets, so a pressured group costs one step per `retry_ns`, not one
+per wheel pass.
+
+Nothing else wakes the group: a pool is one group's (an `Admission` per Store), so each of its
+releases (a permit refunded, a durable reclaim, an IO completion) is a step of that group, which
+retries the Tick in the same step. The retry is the floor for a release that comes from outside
+a step. The refusal loses no deadline: Core's is unchanged, and the Tick that runs after the
+release carries the clock of that time. `test/driver_pressure_test.cc` counts the group's arms
+over 100 ms of 0.1 ms wheel passes (`hold`: at most one per `retry_ns`, none in the past) and the
+refused election Tick pre-voting within one `retry_ns` of the release (`clears`).
+
 ## What a planner reads
 
 A Worker plans each event's storage before stepping it (`plan_event`), after its turn retires a

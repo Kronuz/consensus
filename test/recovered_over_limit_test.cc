@@ -22,12 +22,14 @@
 
 // A group recovered with its store above `hard - control_pool` reclaims before Start, then starts
 // or fails its open by name (docs/mechanisms/deadlines.md, "A recovered store over its control
-// headroom"). A lone voter publishes a checkpoint of a 512 KiB image; the group is recovered in a
-// new Host on the same disk with `hard` lowered so the control pool cannot fund the pre-Start
-// Tick's campaign pack. `reclaims`: the store also holds the staged part of a 1 MiB image, from a
-// checkpoint the process was killed in (a disk snapshot taken from the capture's read); reclaiming
-// it funds the pool and the group leads. `refuses`: nothing is reclaimable and the open fails with
-// fenced(over_headroom). At the code before the rule, neither open completes.
+// headroom"). A Driver group is a Host group, whose appends charge nothing, so only a limit lowered
+// between runs puts it there. A lone voter publishes a checkpoint of a 512 KiB image; the group is
+// recovered in a new Host on the same disk with `hard` lowered under it. `reclaims`: the store also
+// holds the staged part of a 1 MiB image, from a checkpoint the process was killed in (a disk
+// snapshot taken from the capture's read), which puts it over; reclaiming it funds the pool and the
+// group leads. `refuses`: nothing is reclaimable and the open fails with fenced(over_headroom).
+// `owned`: an owned Worker on synchronous storage reclaims step by step, then answers Pressure.
+// At the code before the rule, none of them reclaims and neither open completes.
 // `recovered_over_limit_test`.
 #include "consensus/driver.h"
 #include "faultlab/faultfs.h"
@@ -218,9 +220,10 @@ std::shared_ptr<Loop::Started> recover(Loop& loop, std::uint64_t hard, std::uint
 	return opened;
 }
 
-// A kill mid-checkpoint leaves part of a 1 MiB image staged; the recovery is above its control
-// headroom only by it. Reclaiming it before Start funds the pool: the open completes, the group leads and
-// commits, and the staged image is gone while the published checkpoint stays.
+// A kill mid-checkpoint leaves part of a 1 MiB image staged; the recovery's lowered limit fits
+// the published checkpoint and the pools, and the staged image puts it over. Reclaiming it before
+// Start funds the pool: the open completes, the group leads and commits, and the staged image is
+// gone while the published checkpoint stays.
 void reclaims() {
 	fl::filesystem disk;
 	std::optional<fl::filesystem> killed;
@@ -271,10 +274,66 @@ void refuses() {
 	check(artifacts(disk) == before, "the store keeps its checkpoint");
 }
 
+// An owned Worker on synchronous storage, recovered with `hard` at its store's `used`: its control
+// pool is empty. Each turn before Start whose Tick pack is refused runs one reclaim step (one
+// directory entry each) and answers Maintenance, until the pass completes; then Pressure is its
+// answer, nothing is fenced, and Start is still admitted: the host decides.
+void owned() {
+	fl::filesystem disk;
+	disk.make_directory("owned");
+	fl::io io(disk, "owned");
+	const auto configuration = options(roomy).configuration;
+	const WorkerLimits slow{16, 1};
+	const j::AdmissionLimits first{{256u << 20, 8192}, {16 * 1024, 3}, {64u << 20, 4}, 5, 3};
+	auto pump = [](Worker& w) {
+		w.run_one({100, 100});
+		for (const auto& action : w.take_actions()) { if (auto n = std::get_if<Committed>(&action)) { w.applied({n->entries.back().index}); } }
+	};
+	auto drain = [](Worker& w) { w.close(); for (unsigned turn = 0; turn < 10000 && !w.drained(); ++turn) { w.run_one({100, 100}); } };
+	{
+		Worker w(io, configuration, first, limits(), compact, slow);
+		w.create(j::Identity{'O', 'W'});
+		for (unsigned turn = 0; turn < 1000 && !w.ready(); ++turn) { pump(w); }
+		w.try_submit(Start{});
+		for (unsigned turn = 0; turn < 1000 && w.committed() < 1; ++turn) { pump(w); }
+		RequestId request = 1;
+		for (unsigned turn = 0; turn < 10000 && w.accounting()->used.logical_bytes < 64 * 1024; ++turn) {
+			if (w.try_submit(Propose{request, std::string(1024, 'o')}) == SubmitResult::Accepted) { ++request; }
+			pump(w);
+		}
+		check(w.role() == Role::Leader && w.accounting()->used.logical_bytes >= 64 * 1024, "the first run leads and fills 64 KiB: " + std::to_string(w.accounting()->used.logical_bytes));
+		drain(w);
+	}
+	const auto files = disk.list("owned");
+	std::uint64_t used = 0;
+	{
+		Worker w(io, configuration, first, limits(), compact, slow);
+		w.recover([](auto&) {});
+		for (unsigned turn = 0; turn < 10000 && !w.ready(); ++turn) { w.run_one({100, 100}); }
+		used = w.accounting()->used.logical_bytes;
+		drain(w);
+	}
+	Worker w(io, configuration, {{used, 8192}, {16 * 1024, 3}, {0, 0}, 5, 3}, limits(), compact, slow);
+	w.recover([](auto&) {});
+	for (unsigned turn = 0; turn < 10000 && !w.ready(); ++turn) { w.run_one({100, 100}); }
+	check(w.ready() && w.accounting()->used.logical_bytes == used && w.accounting()->control_available.logical_bytes == 0, "the recovery's control pool is empty");
+	std::vector<TurnResult> turns;
+	for (unsigned turn = 0; turn < 10000 && (turns.empty() || turns.back() == TurnResult::Maintenance); ++turn) { turns.push_back(w.run_one({100, 100})); }
+	const auto steps = std::count(turns.begin(), turns.end(), TurnResult::Maintenance);
+	std::printf("owned: used %llu bytes in %zu files, %lld reclaim steps\n", (unsigned long long)used, files.size(), (long long)steps);
+	check(!turns.empty() && turns.front() == TurnResult::Maintenance, "the first refused turn reclaims instead of answering Pressure");
+	check(steps >= 2 && std::size_t(steps) <= files.size() + 2, "one step per directory entry until the pass completes: " + std::to_string(steps));
+	check(turns.back() == TurnResult::Pressure, "after the pass the answer is Pressure");
+	bool final = true;
+	for (unsigned turn = 0; turn < 8; ++turn) { final &= w.run_one({100, 100}) == TurnResult::Pressure; }
+	check(final && !w.fenced() && w.accounting()->used.logical_bytes == used && disk.list("owned") == files, "Pressure is final, nothing is fenced or removed");
+	check(w.try_submit(Start{}) == SubmitResult::Accepted && !w.fenced(), "Start plans no appends: it is admitted");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-	const std::map<std::string, void (*)()> cases{{"reclaims", reclaims}, {"refuses", refuses}};
+	const std::map<std::string, void (*)()> cases{{"reclaims", reclaims}, {"refuses", refuses}, {"owned", owned}};
 	if (argc > 1) {
 		auto found = cases.find(argv[1]);
 		if (found == cases.end()) { std::cerr << "unknown case " << argv[1] << '\n'; return 2; }

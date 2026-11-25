@@ -73,23 +73,34 @@ deadline when it is ahead (`ahead`) or `maximum` (`rest`).
 
 Journal's admission refills the control pool before the replacement pool, from what `hard`
 leaves after `used`. A store recovered with `used` above `hard - control_pool` has a short control
-pool and no replacement pool: the Driver's pre-Start Tick, which reserves the campaign pack, can
-be refused. Before Start the Driver admits nothing, so no maintenance falls due and the pool never
-changes on its own. Recovery lands there through a limit lowered between runs, a pool drained by
-Control appends before a crash (an owned store's log), or files a crash left for reclaim: a
-superseded checkpoint's generation and artifacts, or a checkpoint's or install's staged ones.
+pool and no replacement pool, so a pre-Start Tick, which reserves the campaign pack, can be
+refused. Before Start nothing is admitted, so no maintenance falls due and the pool never changes
+on its own.
 
-The rule: recovery frees what it can, then fails by name. Before Start, a Worker turn refused with
-Pressure runs a reclaim step instead (`IOPending` or `Maintenance`), until one reclaim pass has
-completed; no root changes before Start, so that pass examined every file. A Pressure turn after
-it is final: the Driver fences the group with `over_headroom`, so the open fails with `fenced`
-naming it, and the Sink hears the same reason. A started group could not do better: with the
-control pool short, a checkpoint or an install cannot get its Replacement permit, `Normal` work
-waits for whole pools, and Control appends only add. A store whose pre-Start turn fits never
-reaches the rule, and a Worker host sees no new refusal: its pre-Start turns reclaim.
-`test/recovered_over_limit_test.cc`: `reclaims` (a killed checkpoint's staged image is reclaimed
-and the lone voter leads and commits) and `refuses` (nothing to reclaim: the open fails with
-`fenced(over_headroom)` and the store keeps its checkpoint).
+Which stores land there depends on who owns them. A Driver group is a Host group: its batches go
+to the turn log and settle nothing into `used`, which counts its artifacts only, so its control
+pool is whole whenever it holds no permit. Only a limit lowered, or a control pool raised, between
+runs puts it above the headroom. What a crash leaves for reclaim (a superseded checkpoint's
+generation and artifacts, a checkpoint's or install's staged ones) was funded under a whole control
+pool, so it only adds to such a limit. An owned store's Control appends settle into `used`, so an
+owned store at its limit can also land there through its own log; no Driver hosts it.
+
+The rule: recovery frees what it can, then the Driver fails the open by name. Before Start, a
+Worker turn refused with Pressure runs a reclaim step instead (`IOPending` on asynchronous storage,
+`Maintenance` on synchronous), until one reclaim pass has completed; no root changes before Start,
+so that pass examined every file. For a Driver group a Pressure turn after the pass is final: the
+Driver fences the group with `over_headroom`, so the open fails with `fenced` naming it, and the
+Sink hears the same reason. A started group could not do better: with the control pool short, a
+checkpoint or an install cannot get its Replacement permit, `Normal` work waits for whole pools,
+and Control appends only add. An owned Worker's host sees Pressure after the pass, never a fence,
+and decides: Start plans no appends, so it is still admitted. A store whose pre-Start turn fits
+never reaches the rule.
+`test/recovered_over_limit_test.cc`: `reclaims` (a limit lowered under a published checkpoint, a
+killed checkpoint's staged image on top: reclaiming it lets the lone voter lead and commit),
+`refuses` (a limit lowered under the checkpoint and the pack, nothing to reclaim: the open fails
+with `fenced(over_headroom)` and the store keeps its checkpoint) and `owned` (an owned Worker on
+synchronous storage: one reclaim step per refused turn until the pass completes, then Pressure, no
+fence).
 
 ## What a planner reads
 

@@ -128,7 +128,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	# (docs/mechanisms/deadlines.md).
 	add_executable(consensus_recovered_over_limit_test test/recovered_over_limit_test.cc)
 	target_link_libraries(consensus_recovered_over_limit_test PRIVATE consensus::consensus)
-	foreach(c reclaims refuses)
+	foreach(c reclaims refuses owned)
 		add_test(NAME consensus_recovered_over_limit_${c} COMMAND consensus_recovered_over_limit_test ${c})
 		set_tests_properties(consensus_recovered_over_limit_${c} PROPERTIES TIMEOUT 120)
 	endforeach()

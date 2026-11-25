@@ -34,6 +34,7 @@
 
 using namespace kronuz::consensus;
 namespace {
+constexpr kronuz::journal::PosixIOOptions full_flush{kronuz::journal::FlushMode::full};
 int checks = 0, failures = 0;
 bool admission_benchmark = false;
 void check(bool value, std::string_view message) { ++checks; if (!value) { ++failures; std::cerr << "FAIL: " << message << '\n'; } }
@@ -45,7 +46,7 @@ Limits limits() { Limits result; result.command_bytes = 1024; result.rpc_bytes =
 kronuz::journal::AdmissionLimits admission() { return {{4000, 100}, {2000, 3}, {1000, 4}, 5, 3}; }
 class FaultIO final : public kronuz::journal::IO {
 public:
-	explicit FaultIO(const std::filesystem::path& directory) : backend(directory) {}
+	explicit FaultIO(const std::filesystem::path& directory) : backend(directory, full_flush) {}
 	bool fail_sync = false; unsigned syncs_until_failure = 0;
 	bool fail_read = false, read_failure_after = false, corrupt_payload_read = false;
 	std::size_t artifact_read_chunk = 65536;
@@ -92,7 +93,7 @@ void terminal_original_settlement() {
  auto directory = std::filesystem::current_path() / ".scratch" / ("worker-terminal-" + std::to_string(::getpid()));
  std::filesystem::create_directories(directory); ::chmod(directory.c_str(), 0700);
  struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
- auto io = std::make_shared<kronuz::journal::PosixIO>(directory);
+ auto io = std::make_shared<kronuz::journal::PosixIO>(directory, full_flush);
  {
   WorkerLimits scheduling; scheduling.async_appends = true;
   Worker worker(io, configuration(), admission(), limits(), compact, scheduling);
@@ -128,7 +129,7 @@ void terminal_checkpoint_originals() {
    ("worker-terminal-checkpoint-" + std::to_string(publishing) + "-" + std::to_string(::getpid()));
   std::filesystem::create_directories(directory); ::chmod(directory.c_str(), 0700);
   struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
-  auto io = std::make_shared<kronuz::journal::PosixIO>(directory);
+  auto io = std::make_shared<kronuz::journal::PosixIO>(directory, full_flush);
   auto capacity = kronuz::journal::AdmissionLimits{{256 * 1024, 512}, {16 * 1024, 3}, {64 * 1024, 4}, 8, 3};
   bool held = false;
   {
@@ -195,7 +196,7 @@ void terminal_output_and_dispatch_failure() {
    ("worker-terminal-output-" + std::to_string(dispatch_failure) + "-" + std::to_string(::getpid()));
   std::filesystem::create_directories(directory); ::chmod(directory.c_str(), 0700);
   struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
-  auto io = std::make_shared<kronuz::journal::PosixIO>(directory);
+  auto io = std::make_shared<kronuz::journal::PosixIO>(directory, full_flush);
   Worker worker(io, configuration(), admission(), limits(), compact, {16,128,true});
   Identity id{}; id[0]='F'; worker.create(id);
   for (unsigned turn=0; turn<100 && !worker.ready(); ++turn) {
@@ -237,7 +238,7 @@ void completion_appends() {
 		auto directory = std::filesystem::current_path() / ".scratch" / ("worker-completion-" + std::to_string(fail) + "-" + std::to_string(::getpid()));
 		std::filesystem::create_directories(directory); ::chmod(directory.c_str(), 0700);
 		struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
-		auto io = std::make_shared<kronuz::journal::PosixIO>(directory);
+		auto io = std::make_shared<kronuz::journal::PosixIO>(directory, full_flush);
 		check(throws([&] { Worker rejected(*io, configuration(), admission(), limits(), compact, {16, 128, true}); }), "asynchronous worker rejects borrowed backend before IO");
 		Worker worker(io, configuration(), admission(), limits(), compact, {16, 128, true});
 		kronuz::journal::Identity identity{}; identity[0] = 'A'; worker.create(identity);
@@ -295,7 +296,7 @@ void completion_storage() {
 		auto directory = std::filesystem::current_path() / ".scratch" / ("worker-all-io-" + std::to_string(cancel_at) + "-" + std::to_string(::getpid()));
 		std::filesystem::create_directories(directory); ::chmod(directory.c_str(), 0700);
 		struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
-		auto io = std::make_shared<kronuz::journal::PosixIO>(directory);
+		auto io = std::make_shared<kronuz::journal::PosixIO>(directory, full_flush);
 		Worker worker(io, configuration(), {{256 * 1024, 512}, {16 * 1024, 3}, {64 * 1024, 4}, 8, 3}, limits(), compact, {16, 128, false, true});
 		kronuz::journal::Identity identity{}; identity[0] = 'Q'; worker.create(identity);
 		auto pump = [&] {
@@ -335,7 +336,7 @@ void retired_completion_worker() {
 	auto directory = std::filesystem::current_path() / ".scratch" / ("worker-retired-completion-" + std::to_string(::getpid()));
 	std::filesystem::create_directories(directory); ::chmod(directory.c_str(), 0700);
 	struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
-	auto io = std::make_shared<kronuz::journal::PosixIO>(directory);
+	auto io = std::make_shared<kronuz::journal::PosixIO>(directory, full_flush);
 	auto worker = std::make_unique<Worker>(io, configuration(), admission(), limits(), compact, WorkerLimits{16, 128, true});
 	kronuz::journal::Identity identity{}; identity[0] = 'R'; worker->create(identity);
 	for (unsigned turn = 0; turn < 10; ++turn) { if (worker->run_one({100, 100}) == TurnResult::IOPending) { break; } }
@@ -345,7 +346,7 @@ void retired_completion_worker() {
 	worker.reset(); io.reset();
 	check(operation->complete(std::move(original)), "accepted original completion survives Worker and backend facade retirement");
 	kronuz::journal::drive_synchronously(*operation); operation.reset();
-	kronuz::journal::PosixIO reopened(directory); Worker recovered(reopened, configuration(), admission(), limits(), compact);
+	kronuz::journal::PosixIO reopened(directory, full_flush); Worker recovered(reopened, configuration(), admission(), limits(), compact);
 	recovered.recover([](auto&) { throw std::runtime_error("unexpected retired checkpoint"); });
 	for (unsigned turn = 0; turn < 10 && !recovered.ready(); ++turn) { recovered.run_one({100, 100}); }
 	check(recovered.ready() && !recovered.fenced(), "retired Worker operation completes typed durable initialization and releases lock");
@@ -356,7 +357,7 @@ void real_worker() {
 	struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
 	std::vector<std::string> commands;
 	{
-		kronuz::journal::PosixIO io(directory); Worker worker(io, configuration(), admission(), limits(), compact, {2, 1});
+		kronuz::journal::PosixIO io(directory, full_flush); Worker worker(io, configuration(), admission(), limits(), compact, {2, 1});
 		kronuz::journal::Identity identity{}; identity[0] = 'W'; worker.create(identity);
 		for (unsigned turn = 0; turn < 10 && !worker.ready(); ++turn) { worker.run_one({100, 100}); }
 		check(worker.ready(), "worker completes bounded bootstrap inventory and initialization");
@@ -433,7 +434,7 @@ void real_worker() {
 		check(accepted == 32 && slices >= 15, "continuous foreground reads cannot bypass mandatory bounded reclamation turns");
 	}
 	{
-		kronuz::journal::PosixIO io(directory); Worker worker(io, configuration(), admission(), limits(), compact, {2, 1});
+		kronuz::journal::PosixIO io(directory, full_flush); Worker worker(io, configuration(), admission(), limits(), compact, {2, 1});
 		worker.recover([](auto&) { throw std::runtime_error("unexpected checkpoint"); });
 		for (unsigned turn = 0; turn < 10 && !worker.ready(); ++turn) { worker.run_one({100, 100}); }
 		check(worker.ready() && worker.committed() == 2, "worker owns typed recovery before protocol admission");
@@ -449,7 +450,7 @@ void partial_control_pack() {
 	struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
 	kronuz::journal::AdmissionLimits scarce{{1343, 100}, {1179, 3}, {0, 0}, 5, 3};
 	{
-		kronuz::journal::PosixIO io(directory); Worker worker(io, configuration(), scarce, limits(), compact);
+		kronuz::journal::PosixIO io(directory, full_flush); Worker worker(io, configuration(), scarce, limits(), compact);
 		kronuz::journal::Identity identity{}; identity[0] = 'P'; worker.create(identity);
 		while (!worker.ready()) { worker.run_one({100, 100}); }
 		worker.try_submit(Start{}); worker.try_submit(Tick{100, 100});
@@ -459,7 +460,7 @@ void partial_control_pack() {
 		check(worker.try_submit(Tick{100, 100}) == SubmitResult::Accepted && worker.accounting()->used == used, "leader tick needs no campaign pack or storage growth under pressure");
 	}
 	{
-		kronuz::journal::PosixIO io(directory); Worker worker(io, configuration(), scarce, limits(), compact);
+		kronuz::journal::PosixIO io(directory, full_flush); Worker worker(io, configuration(), scarce, limits(), compact);
 		worker.recover([](auto&) {}); while (!worker.ready()) { worker.run_one({100, 100}); }
 		worker.try_submit(Start{}); worker.take_actions(); auto used = worker.accounting()->used;
 		check(worker.try_submit(Tick{100, 100}) == SubmitResult::Pressure && worker.term() == 1, "partial campaign pack denial leaves recovered follower term unchanged");
@@ -499,12 +500,12 @@ void interrupted_initialization() {
 	std::filesystem::create_directories(directory); ::chmod(directory.c_str(), 0700);
 	struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
 	{
-		kronuz::journal::PosixIO io(directory); Worker worker(io, configuration(), admission(), limits(), compact);
+		kronuz::journal::PosixIO io(directory, full_flush); Worker worker(io, configuration(), admission(), limits(), compact);
 		kronuz::journal::Identity identity{}; identity[0] = 'B'; worker.create(identity);
 		check(!worker.ready(), "create can return before queued typed initialization is durable");
 	}
 	{
-		kronuz::journal::PosixIO io(directory); Worker worker(io, configuration(), admission(), limits(), compact);
+		kronuz::journal::PosixIO io(directory, full_flush); Worker worker(io, configuration(), admission(), limits(), compact);
 		worker.recover([](auto&) {});
 		for (unsigned turn = 0; turn < 10 && !worker.ready(); ++turn) { worker.run_one({100, 100}); }
 		check(worker.ready() && worker.try_submit(Start{}) == SubmitResult::Accepted, "verified empty bootstrap resumes typed initialization after restart");
@@ -2180,7 +2181,7 @@ void founding_and_join_records() {
  FixedConfiguration joiner = configuration(); joiner.local = 7; joiner.voters.clear();
  for (bool join : {false, true}) {
   auto path = directory / (join ? "join" : "found"); std::filesystem::create_directories(path); ::chmod(path.c_str(), 0700);
-  auto io = std::make_shared<kronuz::journal::PosixIO>(path);
+  auto io = std::make_shared<kronuz::journal::PosixIO>(path, full_flush);
   auto& config = join ? joiner : three;
   {
    Worker worker(io, config, admission(), limits(), compact);
@@ -2196,7 +2197,7 @@ void founding_and_join_records() {
   check(recovered.ready() && m && (join ? m->members.empty() : *m == witness), join ? "a joiner recovers from its join record" : "a 2 + witness group recovers its roles");
   recovered.close(); while (!recovered.drained()) { recovered.run_one({0, 100}); }
  }
- Worker bad(std::make_shared<kronuz::journal::PosixIO>(directory), three, admission(), limits(), compact);
+ Worker bad(std::make_shared<kronuz::journal::PosixIO>(directory, full_flush), three, admission(), limits(), compact);
  Membership wrong{{{1, 1, MemberRole::Voter}, {2, 2, MemberRole::Voter}, {4, 4, MemberRole::Witness}}, 5, 0};
  check(throws([&] { bad.found(wrong); }), "founding roles must name the configured voters");
  Membership greedy{{{1, 1, MemberRole::Voter}, {2, 2, MemberRole::Voter}, {3, 3, MemberRole::Witness}}, 4, 0};
@@ -2209,7 +2210,7 @@ void founding_and_join_records() {
   "founding members are first incarnations, none a learner, none leaving");
  {
   auto path = directory / "maximum-founders"; std::filesystem::create_directories(path); ::chmod(path.c_str(), 0700);
-  auto io = std::make_shared<kronuz::journal::PosixIO>(path);
+  auto io = std::make_shared<kronuz::journal::PosixIO>(path, full_flush);
   auto fixed = configuration(); fixed.voters.clear();
   for (NodeId id = 1; id <= 31; ++id) { fixed.voters.push_back(id); }
   auto small = limits(); small.voters = small.members = 31;
@@ -2238,7 +2239,7 @@ void snapshot_senders() {
  struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
  auto reserve = [&](const char* name, FixedConfiguration config, NodeId sender) {
   auto path = directory / name; std::filesystem::create_directories(path); ::chmod(path.c_str(), 0700);
-  auto io = std::make_shared<kronuz::journal::PosixIO>(path);
+  auto io = std::make_shared<kronuz::journal::PosixIO>(path, full_flush);
   Worker worker(io, config, SnapshotFixture::quota(), limits(), compact, {4, 1, false, false}, SnapshotLimits{7, 100000});
   Identity id{}; id[0] = 'R'; worker.create(id);
   for (unsigned turn = 0; turn < 100 && !worker.ready(); ++turn) { worker.run_one({0, 100}); }

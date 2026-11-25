@@ -686,7 +686,7 @@ void reopen_rows() {
 	auto reopen = [&](const std::string& how, bool table) {
 		check(loop.driver->groups() == 0, how + ": the row is erased");
 		check((loop.host->status(g) == j::GroupStatus::closed) == table, how + (table ? ": closed into the host's table" : ": released, not closed into the table"));
-		check(table || turns.parked(g), how + ": the released group is parked");
+		check(table || turns.evicted(g), how + ": the released group is evicted");
 		const auto image = loop.recover(g, error, options({1}));
 		check(!error, how + ": recovers in the live Host: " + what(error));
 		loop.apply(g);
@@ -740,7 +740,7 @@ void reopen_rows() {
 // A2: 10,000 created rows, each with a record and a checkpoint covering it, opened together and
 // closed: the process heap per row (HeapIO's files left out) returns to its pre-open value,
 // the Driver's and the journal's alike. Then 10,000 rows closed with a record after their
-// checkpoint, which the host releases: each is parked, and what that keeps is reported.
+// checkpoint, which the host releases: each is evicted, and what that keeps is reported.
 void closed_bytes() {
 	const char* scale = std::getenv("CLOSE_BYTES_ROWS");  // another count, for timing
 	const GroupId rows = scale ? std::stoull(scale) : 10'000;
@@ -791,9 +791,9 @@ void closed_bytes() {
 	for (GroupId g = 2 + 2 * rows; g < 2 + 3 * rows; ++g) { close(g); }
 	sweep_ranges(loop, 20 * rows, rows);
 	const auto released = process();
-	std::size_t parked = 0;
-	for (GroupId g = 2 + 2 * rows; g < 2 + 3 * rows; ++g) { parked += loop.host->driver(0).parked(g); }
-	check(parked == rows, "every row with a record after its checkpoint is released and parked: " + std::to_string(parked));
+	std::size_t evicted = 0;
+	for (GroupId g = 2 + 2 * rows; g < 2 + 3 * rows; ++g) { evicted += loop.host->driver(0).evicted(g); }
+	check(evicted == rows, "every row with a record after its checkpoint is released and evicted: " + std::to_string(evicted));
 	std::printf("closed_bytes: %u released rows, process heap per row after close: %.1f B\n", unsigned(rows), per(released, released_before));
 }
 
@@ -1037,7 +1037,7 @@ void failed_close() {
 		disk.add_fault({fl::op::sync_directory});  // the next directory sync fails: the table commit's
 		check(loop.close(g, error) && !error, "close completes when its table commit fails: " + what(error));
 		check(loop.driver->groups() == 0, "the row is erased");
-		check(loop.host->driver(0).parked(g), "the fenced Store released the group: parked");
+		check(loop.host->driver(0).evicted(g), "the fenced Store released the group: evicted");
 		loop.recover(g, error, options({1}));
 		check(is<close_in_doubt>(error), "a live recover of the id refuses with close_in_doubt: " + what(error));
 		if (!error) {  // the reopen the refusal stops: a record acknowledged past the closed base

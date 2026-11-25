@@ -32,6 +32,7 @@
 using namespace kronuz::journal;
 using Clock = std::chrono::steady_clock;
 namespace {
+constexpr kronuz::journal::PosixIOOptions full_flush{kronuz::journal::FlushMode::full};
 task::task<void> wait(asio::steady_timer &timer) {
 	auto error = co_await task::await_asio<void(asio::error_code)>(
 		[&](auto handler) { timer.async_wait(std::move(handler)); });
@@ -223,7 +224,7 @@ task::task<void> worker_exercise(task::asio_scheduler &scheduler, kronuz::consen
 void native_worker(const std::filesystem::path &directory) {
 	std::filesystem::create_directory(directory);
 	::chmod(directory.c_str(), 0700);
-	auto io = std::make_shared<PosixIO>(directory);
+	auto io = std::make_shared<PosixIO>(directory, full_flush);
 	kronuz::consensus::FixedConfiguration fixed;
 	fixed.local = 1;
 	fixed.voters = {1};
@@ -268,7 +269,7 @@ int main() {
 		}
 		::chmod(directory.c_str(), 0700);
 		native_worker(directory / "worker");
-		auto io = std::make_shared<PosixIO>(directory);
+		auto io = std::make_shared<PosixIO>(directory, full_flush);
 		Journal journal(io, 1024);
 		Identity id{};
 		id[0] = 'c';

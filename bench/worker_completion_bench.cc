@@ -35,6 +35,7 @@
 
 using namespace kronuz::consensus;
 namespace {
+constexpr kronuz::journal::PosixIOOptions full_flush{kronuz::journal::FlushMode::full};
 using Clock = std::chrono::steady_clock;
 void require(bool condition, const char *message) {
 	if (!condition)
@@ -74,7 +75,7 @@ void run(std::size_t count) {
 		~Cleanup() { std::filesystem::remove_all(path); }
 	} cleanup{directory};
 	{
-		kronuz::journal::PosixIO io(directory);
+		kronuz::journal::PosixIO io(directory, full_flush);
 		kronuz::journal::Journal journal(io, 4 * 1024 * 1024);
 		kronuz::journal::Identity identity{};
 		identity[0] = 'B';
@@ -94,7 +95,7 @@ void run(std::size_t count) {
 	}
 	asio::io_context executor(1);
 	task::asio_scheduler scheduler(executor.get_executor());
-	auto io = std::make_shared<kronuz::journal::PosixIO>(directory);
+	auto io = std::make_shared<kronuz::journal::PosixIO>(directory, full_flush);
 	Worker worker(io, configuration,
 				  {{512ull * 1024 * 1024, 4096}, {16 * 1024, 3}, {80ull * 1024 * 1024, 4}, 8, 3}, {}, {},
 				  {16, 128, true, true});

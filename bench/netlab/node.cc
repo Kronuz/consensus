@@ -74,6 +74,7 @@ using steady = std::chrono::steady_clock;
 namespace j = kronuz::journal;
 
 namespace {
+constexpr kronuz::journal::PosixIOOptions full_flush{kronuz::journal::FlushMode::full};
 std::filesystem::path fixture;
 std::uint64_t rpc_timeout_ms = Timing{}.rpc_timeout;
 const char *names[] = {"", "one", "two", "three", "four", "five"};
@@ -208,7 +209,7 @@ struct Node {
 													NodePins(n, pins, tls->native_handle()), cluster, peers, options);
 		std::filesystem::create_directories(dir);
 		::chmod(dir.c_str(), 0700);
-		journal = std::make_unique<j::Host>(std::make_shared<j::PosixIO>(dir), j::Identity{'N', char('0' + n)}, j::HostOptions{1, turn_options});
+		journal = std::make_unique<j::Host>(std::make_shared<j::PosixIO>(dir, full_flush), j::Identity{'N', char('0' + n)}, j::HostOptions{1, turn_options});
 		sink.node = this;
 		auto ref = task::scheduler_ref::of(scheduler);
 		driver = std::make_unique<Driver<Sink>>(Seams{ref, j::completion_ref::of(completion), *journal, 0, n * 31}, sink);

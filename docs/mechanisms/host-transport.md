@@ -13,7 +13,9 @@ A host runs L loops. A group runs on loop `(slot x L) >> 12`, `slot` being its i
 4,096 slots (journal's `host_detail::slot`, the one the journal host places its turn logs by),
 and a peer node's connections run on the loop its node id places on by the same rule. Each
 loop has its own `Links`, which holds the connections of the peers placed on it. Nothing is
-looked up: both placements are arithmetic on the id.
+looked up: both placements are arithmetic on the id. So a group shares its loop with some
+peers' links by design, and its journal syncs off the loop (docs/DRIVER.md, Where syncs run):
+a sync on the loop would hold those links.
 
 A dial starts on the peer's loop, so a dialed connection is born there. An accept arrives on
 loop 0's listener before the peer is known; once its TLS handshake authenticates the peer, the
@@ -264,3 +266,6 @@ exports 18,427 symbols, so any name taken from them is the nearest export, wrong
 frames, download the Kernel Debug Kit for that build (Apple developer login; CI does not download
 it), take its release kernel whose UUID matches (`dwarfdump -u`), and run
 `atos -o <kernel> -arch x86_64 -l <base> <base + N>`, or look up the unslid `__TEXT` address plus N.
+The loop-turn probe the Driver cases share (`LoopLags`: slow-sync, fetch-alongside) does the same
+when a loop it alarms on (1,500 ms without turning) is in state U, and prints the report as it
+stops.

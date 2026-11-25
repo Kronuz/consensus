@@ -25,8 +25,9 @@
 //               not_processed, and the Bulk connection closes gracefully
 //   fetch       D8, A4: fetch is method 1. Beside 4 groups uploading 1 MiB data frames on the same
 //               Bulk connection, a 16 MiB fetch arrives exact while heartbeats on Control keep
-//               every gap under 1,000 ms plus the host's lag; a missing name, a reader that throws, a reply over this
-//               host's fetch_bytes and a fifth concurrent fetch end as D8's table says; then
+//               every gap under 1,000 ms plus the host's lag, its replies built before the loops
+//               start; a missing name, a reader that throws, a reply over this host's fetch_bytes
+//               and a fifth concurrent fetch end as D8's table says; then
 //               fetch-dead: host 2's connection loop held past host 1's dead_after ends its links
 //               with three fetches on them, and each is asked again and ends as it would have
 //               (control: fetch-not-asked-again); then each way a connection ends under a fetch
@@ -858,14 +859,11 @@ bool fetch() {
 	std::raise(SIGPIPE);
 #endif
 	constexpr std::uint32_t L = 2;
-	const std::string expected = bytes_at(0, 16 << 20);  // made before the loops start: a handler generating it holds its loop
-	Host one(1, L), two(2, L);
-	HostTransportOptions client, server;
-	client.rpc.fetch_bytes = 32 << 20;
+	const std::string expected = bytes_at(0, 16 << 20);
 	const auto *slow_read = std::getenv("RPC_HOST_FETCH_SLOW_READ");
 	const auto slow_ms = std::chrono::milliseconds(slow_read ? std::strtoull(slow_read, nullptr, 10) : 0);
 	std::atomic<std::uint64_t> built_ms{0}, on_loop{0};
-	server.rpc.reader = [&expected, &built_ms, &on_loop, slow_ms](std::string_view name) -> std::optional<std::string> {
+	auto build = [&expected, &built_ms, slow_ms](std::string_view name) -> std::optional<std::string> {
 		if (name == "throws")
 			throw std::runtime_error("the disk broke");
 		if (name == "big") {
@@ -873,7 +871,6 @@ bool fetch() {
 			std::this_thread::sleep_for(slow_ms);
 			std::string bytes = expected;
 			built_ms = std::max<std::uint64_t>(built_ms, ms_since(t));
-			++on_loop;
 			return bytes;
 		}
 		if (name == "huge")
@@ -881,6 +878,30 @@ bool fetch() {
 		if (name == "slow")
 			return expected.substr(0, 4 << 20);
 		return std::nullopt;
+	};
+	// The replies are built before the loops start and the reader moves one out, so no
+	// connection's loop builds 16 MiB: a host serves from memory (docs/mechanisms/peer-fetch.md).
+	// A name asked past them builds on the loop, counted.
+	std::mutex mutex;
+	std::map<std::string, std::vector<std::string>, std::less<>> ready;
+	for (auto [name, n] : {std::pair{"big", 1}, {"huge", 1}, {"slow", 5}})
+		for (int i = 0; i != n; ++i)
+			ready[name].push_back(*build(name));
+	Host one(1, L), two(2, L);
+	HostTransportOptions client, server;
+	client.rpc.fetch_bytes = 32 << 20;
+	server.rpc.reader = [&mutex, &ready, &build, &on_loop](std::string_view name) -> std::optional<std::string> {
+		{
+			std::lock_guard hold(mutex);
+			if (auto it = ready.find(name); it != ready.end() && !it->second.empty()) {
+				auto bytes = std::move(it->second.back());
+				it->second.pop_back();
+				return bytes;
+			}
+		}
+		auto bytes = build(name);
+		on_loop += bytes.has_value();
+		return bytes;
 	};
 	one.open(addresses({&two}), client);
 	two.open(addresses({&one}), server);
@@ -976,7 +997,7 @@ bool fetch() {
 	turns.stop();
 	const auto bound = 1000 + lagged;
 	const bool ok = exact && beside > 0 && beats.worst < bound && table;
-	std::printf("fetch: the 16 MiB reply took %llu ms to build, built on host 2's loop %llu times; the links' loops' longest turn "
+	std::printf("fetch: the 16 MiB reply took %llu ms to build, replies built on host 2's loop %llu; the links' loops' longest turn "
 				"until it arrived: host 1's %llu ms, host 2's %llu ms (in the whole case: %llu, %llu)\n",
 				(unsigned long long)built_ms.load(), (unsigned long long)on_loop.load(), (unsigned long long)turned[0],
 				(unsigned long long)turned[1], (unsigned long long)turns.worst(0), (unsigned long long)turns.worst(1));

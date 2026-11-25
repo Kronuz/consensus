@@ -29,6 +29,8 @@
 
 // Single-voter integration example, not a service deployment. The caller
 // provisions a dedicated directory. Production identities come from config.
+constexpr kronuz::journal::PosixIOOptions full_flush{kronuz::journal::FlushMode::full};
+
 int main(int argc, char** argv) {
 	if (argc < 3 || argc > 4) {
 		std::cerr << "usage: consensus_demo DIRECTORY create|open [COMMAND]\n";
@@ -38,7 +40,7 @@ int main(int argc, char** argv) {
 		using namespace kronuz::consensus;
 		FixedConfiguration configuration; configuration.cluster[0] = 'D'; configuration.configuration[0] = 'E';
 		configuration.local = 1; configuration.voters = {1};
-		kronuz::journal::PosixIO io(argv[1]); kronuz::journal::Journal journal(io, 4 * 1024 * 1024);
+		kronuz::journal::PosixIO io(argv[1], full_flush); kronuz::journal::Journal journal(io, 4 * 1024 * 1024);
 		RecoveredState state; state.configuration = configuration;
 		std::string_view mode(argv[2]);
 		if (mode == "create") {

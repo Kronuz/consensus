@@ -57,7 +57,7 @@ int main() {
 	auto dir = std::filesystem::temp_directory_path() / "consensus-quick-start";
 	std::filesystem::remove_all(dir);
 	std::filesystem::create_directories(dir);
-	kronuz::journal::PosixIO io(dir.string());
+	kronuz::journal::PosixIO io(dir.string(), {kronuz::journal::FlushMode::full});
 	kronuz::journal::Journal journal(io, 4 * 1024 * 1024);
 	journal.create(Identity{'Q'});
 	journal.append_batch(encode_initialization(config));

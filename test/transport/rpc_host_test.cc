@@ -1153,10 +1153,57 @@ bool fetch_unverified() {
 	return ok;
 }
 
+// A second ask waiting for its connection: the child host 2 stops itself in its reader, host 1's
+// link ends dead, and the redial's TLS handshake waits on the stopped process; then remove_node(2)
+// or drain() ends it connection_aborted at once (control: no-again-map, where fail() gives it the
+// caller's outcome: not_connected, resource_unavailable_try_again).
+bool fetch_waiting(bool drain) {
+	const char *act = drain ? "drain()" : "remove_node(2)";
+	Host one(1, 1);
+	const auto child = spawn_child(one, "fetch-removed");
+	if (!child.pid)
+		return false;
+	HostTransportOptions options;
+	options.rpc.fetch_deadline = 10s;
+	options.rpc.drain_deadline = 300ms;
+	options.links.connection.dead_after = 1000ms;
+	one.open({{2, {"127.0.0.1", child.port}}}, options);
+	one.start();
+	auto first = fetch_of(one, "small");
+	until([&] { return first->done.load(); }, 10s);
+	auto f = fetch_of(one, "frozen");
+	const bool asked = until([&] { return one.lane(&LaneStats::fetches_asked_again) >= 1 || f->done; }, 10s);
+	std::this_thread::sleep_for(300ms);
+	const bool waiting = !f->done;
+	const auto start = steady::now();
+	if (drain)
+		one.transport->drain();
+	else
+		one.at(2, [&] {
+			one.transport->remove_node(2);
+			return 0;
+		});
+	until([&] { return f->done.load(); }, 15s);
+	const bool ok = first->bytes && asked && waiting && f->error == std::errc::connection_aborted && f->ms(start) < 500;
+	std::printf("fetch-removed: %s with the second ask waiting for its connection (asked again %s, waiting %s): it ended %s after %llu ms %s\n",
+				act, asked ? "yes" : "NO", waiting ? "yes" : "NO", f->said().c_str(), (unsigned long long)f->ms(start),
+				ok ? "ok" : "FAILED");
+	one.stop();
+	::kill(child.pid, SIGCONT);
+	::close(child.pipe);
+	int status = 0;
+	if (!until([&] { return ::waitpid(child.pid, &status, WNOHANG) == child.pid; }, 10s)) {
+		::kill(child.pid, SIGKILL);
+		::waitpid(child.pid, &status, 0);
+	}
+	return ok;
+}
+
 // remove_node(2) and drain() past drain_deadline end a fetch in flight connection_aborted, never
-// asked again (control: ea48bc8, which ends them not_connected and resource_unavailable_try_again).
+// asked again (control: ea48bc8, which ends them not_connected and resource_unavailable_try_again),
+// and a second ask waiting for its connection too (fetch_waiting).
 bool fetch_removed() {
-	bool ok = true;
+	bool ok = fetch_waiting(false) & fetch_waiting(true);
 	for (const bool drain : {false, true}) {
 		Host one(1, 2), two(2, 2);
 		HostTransportOptions client, server;

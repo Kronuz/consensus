@@ -51,3 +51,33 @@ With both, one ASan run takes 91-124 s on that host, and 57-59 s on CI's typical
 
 `main` line-buffers stdout, so a run that times out still shows each phase that completed
 (closing, quiescence, the core seeds' summary); the Driver phase prints its summary at its end.
+
+## The Driver simulation's replication flow
+
+Every group of the Driver simulation (test/driver_simulation.cc) runs at a `Flow` set through
+`GroupOptions::scheduling`. `SIM_DRIVER_PIPELINE=N` fixes every seed at depth N (with follower
+batching above 1); otherwise a seed's number picks one of four:
+
+| seed % 4 | Flow {pipeline, window, frame} | follower batching |
+|---|---|---|
+| 0 | {1, 4 MiB, 0} | off |
+| 1 | {4, 16 KiB, 2 KiB} (window and frame cap bind) | on |
+| 2 | {16, 4 MiB, 0} | on |
+| 3 | {4, 4 MiB, 0} | off |
+
+Follower batching (`follower_batch_entries` and `_bytes` at the simulation's `rpc_entries` and
+`rpc_bytes`) makes a follower hold the appends that arrive while its batch persists and step them
+as one `Receive`, so a Worker's merged-append path runs through a Driver.
+
+The summary's last line counts appends with entries: those that extend a flight to the same peer
+still unanswered (their previous entry is that flight's last; a resend or a first flight does not
+count, and a rejection or a covering success clears the flights as the leader does), the most in
+flight, those delivered after a later one, and how many seeds at depth above 1 had a pipelined
+append. A chain deeper than the seed's pipeline fails the seed, so a depth-1 run counts none.
+
+Mutants of append handling that this run kills: an overlapping append no longer skipped, and an
+append accepted whatever its previous entry's term (both also at depth 1); and, only when appends
+pipeline, a leader that takes a success for the pipeline's last flight instead of the answered one
+(a follower is then left behind its leader's count: the heal fails; depth 1 cannot tell it apart).
+The follower's batching bounds and its held chain's contiguity are each also checked again by Core,
+so a mutant of only one of them is not observable.

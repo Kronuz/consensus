@@ -266,3 +266,6 @@ exports 18,427 symbols, so any name taken from them is the nearest export, wrong
 frames, download the Kernel Debug Kit for that build (Apple developer login; CI does not download
 it), take its release kernel whose UUID matches (`dwarfdump -u`), and run
 `atos -o <kernel> -arch x86_64 -l <base> <base + N>`, or look up the unslid `__TEXT` address plus N.
+The loop-turn probe the Driver cases share (`LoopLags`: slow-sync, fetch-alongside) does the same
+when a loop it alarms on (1,500 ms without turning) is in state U, and prints the report as it
+stops.

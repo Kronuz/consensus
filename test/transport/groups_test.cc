@@ -684,13 +684,14 @@ std::string sockets(std::initializer_list<std::uint16_t> ports) {
 // symbolicated offline against the Kernel Debug Kit of the printed build and UUID (CI downloads none).
 class Spindump {
   public:
+	explicit Spindump(std::string label = "upload") : label_(std::move(label)) {}
 	void start() {
 #ifdef __APPLE__
 		const char *named = std::getenv("GROUPS_PROBE_SPINDUMP"), *ci = std::getenv("GITHUB_ACTIONS");
 		if (started_ || !((named && *named) || (ci && std::strcmp(ci, "true") == 0)))
 			return;
 		started_ = true;
-		path_ = named && *named ? named : "spindump-upload-" + std::to_string(::getpid()) + ".txt";
+		path_ = named && *named ? named : "spindump-" + label_ + "-" + std::to_string(::getpid()) + ".txt";
 		// .build: the OS build; .text: the on-disk kernel's unslid __TEXT address.
 		const std::string command = "(sudo -n spindump " + std::to_string(::getpid()) + " 3 10 -o '" + path_ + "' > /dev/null 2>&1; sw_vers -buildVersion > '" +
 									path_ + ".build' 2> /dev/null; otool -l /System/Library/Kernels/kernel 2> /dev/null | awk '/segname __TEXT$/{f=1} f&&/vmaddr/{print $2; exit}' > '" +
@@ -706,7 +707,7 @@ class Spindump {
 			std::this_thread::sleep_for(100ms);
 		std::ifstream in(path_);
 		if (!in) {
-			std::printf("upload: spindump %s: no report (sudo -n spindump failed)\n", path_.c_str());
+			std::printf("%s: spindump %s: no report (sudo -n spindump failed)\n", label_.c_str(), path_.c_str());
 			return;
 		}
 		std::string line, block, image;
@@ -722,10 +723,10 @@ class Spindump {
 		char slide[40] = "unknown";
 		if (base && unslid)
 			std::snprintf(slide, sizeof slide, "0x%llx", base - unslid);
-		std::printf("upload: spindump %s: kernel frames are raw (kernel + 0xN, N from the loaded base); symbolicate offline against the "
+		std::printf("%s: spindump %s: kernel frames are raw (kernel + 0xN, N from the loaded base); symbolicate offline against the "
 					"Kernel Debug Kit for the OS build and UUID below (CI does not download it)\n"
-					"upload: kernel build %s uuid %s base 0x%llx slide %s unslid __TEXT 0x%llx\n",
-					path_.c_str(), first_line(path_ + ".build").c_str(), uuid.c_str(), base, slide, unslid);
+					"%s: kernel build %s uuid %s base 0x%llx slide %s unslid __TEXT 0x%llx\n",
+					label_.c_str(), path_.c_str(), label_.c_str(), first_line(path_ + ".build").c_str(), uuid.c_str(), base, slide, unslid);
 		int printed = 0;
 		const auto flush = [&] {
 			for (const char *mark : {"write", "flush", "getsockopt", "ioctl", "getsockname", "getpeername", "sockets("})
@@ -766,6 +767,7 @@ class Spindump {
 		std::snprintf(hex, sizeof hex, "kernel + 0x%llx", offset);
 		return line.substr(0, at) + hex + (end + 1);
 	}
+	std::string label_;
 	bool started_ = false;
 	std::string path_;
 };
@@ -2549,6 +2551,7 @@ struct LoopLags {
 	std::shared_ptr<std::vector<Probe>> probes;
 	std::atomic<bool> done{false};
 	bool dumped = false;  // the sampler's own
+	Spindump spindump{"loop-lags"};  // a stuck loop in state U: its kernel stacks
 	std::thread thread;
 	LoopLags(std::vector<Node *> of, std::uint32_t loops)
 		: nodes(std::move(of)), L(loops), probes(std::make_shared<std::vector<Probe>>(nodes.size() * L)) {
@@ -2563,6 +2566,8 @@ struct LoopLags {
 							std::printf("node %llu loop %zu has not turned for %lld ms; every thread's stack:\n",
 										(unsigned long long)nodes[i / L]->host.node, i % L, (long long)(now - at));
 							const auto before = threads();
+							if (before[i].second == 'U')
+								spindump.start();
 							const auto t = steady::now();
 							print_stacks();
 							const auto after = threads();
@@ -2594,8 +2599,10 @@ struct LoopLags {
 	}
 	std::uint64_t worst(std::size_t node, std::uint32_t loop) const { return (*probes)[node * L + loop].worst; }
 	void stop() {
-		if (!done.exchange(true))
+		if (!done.exchange(true)) {
 			thread.join();
+			spindump.print();
+		}
 	}
 	~LoopLags() { stop(); }
 };

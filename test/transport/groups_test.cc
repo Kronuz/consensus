@@ -286,6 +286,25 @@ void print_stacks() {
 		std::printf("(no stacks: %s failed)\n", stacks.c_str());
 	std::fflush(stdout);
 }
+// A thread's user and system time in microseconds, and on macOS its run state (R runnable, S
+// stopped, W waiting, U uninterruptible).
+std::uint64_t thread_cpu_us(std::thread &thread, char &state) {
+#ifdef __APPLE__
+	thread_basic_info_data_t info{};
+	mach_msg_type_number_t n = THREAD_BASIC_INFO_COUNT;
+	if (thread_info(pthread_mach_thread_np(thread.native_handle()), THREAD_BASIC_INFO, thread_info_t(&info), &n) != KERN_SUCCESS)
+		return 0;
+	state = "?RSWUH"[info.run_state >= 1 && info.run_state <= 5 ? info.run_state : 0];
+	return std::uint64_t(info.user_time.seconds + info.system_time.seconds) * 1000000 +
+		   std::uint64_t(info.user_time.microseconds + info.system_time.microseconds);
+#else
+	clockid_t clock;
+	timespec t{};
+	if (pthread_getcpuclockid(thread.native_handle(), &clock) != 0 || clock_gettime(clock, &t) != 0)
+		return 0;
+	return std::uint64_t(t.tv_sec) * 1000000 + std::uint64_t(t.tv_nsec) / 1000;
+#endif
+}
 // Reports a hang and exits 3 once `limit` passes, unless done() came first.
 class Watchdog {
   public:
@@ -776,25 +795,7 @@ class LoopProbe {
 		steady::time_point posted{};
 		std::uint64_t cpu = 0;
 	};
-	// The thread's user and system time in microseconds, and its run state.
-	static std::uint64_t cpu_us(Loop &loop, char &state) {
-#ifdef __APPLE__
-		thread_basic_info_data_t info{};
-		mach_msg_type_number_t n = THREAD_BASIC_INFO_COUNT;
-		if (thread_info(pthread_mach_thread_np(loop.thread.native_handle()), THREAD_BASIC_INFO, thread_info_t(&info), &n) !=
-			KERN_SUCCESS)
-			return 0;
-		state = "?RSWUH"[info.run_state >= 1 && info.run_state <= 5 ? info.run_state : 0];
-		return std::uint64_t(info.user_time.seconds + info.system_time.seconds) * 1000000 +
-			   std::uint64_t(info.user_time.microseconds + info.system_time.microseconds);
-#else
-		clockid_t clock;
-		timespec t{};
-		if (pthread_getcpuclockid(loop.thread.native_handle(), &clock) != 0 || clock_gettime(clock, &t) != 0)
-			return 0;
-		return std::uint64_t(t.tv_sec) * 1000000 + std::uint64_t(t.tv_nsec) / 1000;
-#endif
-	}
+	static std::uint64_t cpu_us(Loop &loop, char &state) { return thread_cpu_us(loop.thread, state); }
 	// The thread's program counter and up to 7 return addresses by its frame pointers, read while
 	// it is suspended and named once it resumes (dladdr may take a lock the thread holds).
 	static std::string stack(Loop &loop) {
@@ -2472,7 +2473,9 @@ void owe_order() {
 // The longest each loop of each node went without turning while it runs: a 10 ms probe posted to
 // every loop, its wait counted until it runs. One loop late while the rest turn is a call that
 // blocked that loop; every loop late at once is the host stopping the process. The first loop
-// 1.5 s late prints every thread's stack.
+// 1.5 s late prints every thread's stack, between two readings of each loop's run state and CPU
+// time: a late loop that ran its CPU runs a long handler, one runnable without CPU is a thread the
+// host does not run, one in U waits in the kernel.
 struct LoopLags {
 	struct Probe {
 		std::atomic<std::int64_t> posted{-1};  // ms since `began`, -1 when none waits
@@ -2496,7 +2499,15 @@ struct LoopLags {
 						if (now - at >= 1'500 && !std::exchange(dumped, true)) {
 							std::printf("node %llu loop %zu has not turned for %lld ms; every thread's stack:\n",
 										(unsigned long long)nodes[i / L]->host.node, i % L, (long long)(now - at));
+							const auto before = threads();
+							const auto t = steady::now();
 							print_stacks();
+							const auto after = threads();
+							const auto ms = ms_since(t);
+							for (std::size_t j = 0; j != probes->size(); ++j)
+								std::printf("node %llu loop %zu: %c then %c, %llu ms of CPU in %llu ms\n", (unsigned long long)nodes[j / L]->host.node,
+											j % L, before[j].second, after[j].second,
+											(unsigned long long)((after[j].first - std::min(after[j].first, before[j].first)) / 1000), (unsigned long long)ms);
 						}
 						continue;
 					}
@@ -2510,6 +2521,13 @@ struct LoopLags {
 				std::this_thread::sleep_for(10ms);
 			}
 		});
+	}
+	// Each loop's thread: its CPU microseconds and run state.
+	std::vector<std::pair<std::uint64_t, char>> threads() const {
+		std::vector<std::pair<std::uint64_t, char>> r(probes->size(), {0, '?'});
+		for (std::size_t j = 0; j != r.size(); ++j)
+			r[j].first = thread_cpu_us(nodes[j / L]->host.loops[j % L]->thread, r[j].second);
+		return r;
 	}
 	std::uint64_t worst(std::size_t node, std::uint32_t loop) const { return (*probes)[node * L + loop].worst; }
 	void stop() {
@@ -2527,7 +2545,8 @@ struct LoopLags {
 // runner's slow sync holds the Driver, never the links. The 2 s and the term allow what the
 // host took: the longest journal operation plus the longest process stall, and the term only
 // while that stays under the 1,000 ms election timeout. FETCH_ALONGSIDE_SLOW_SYNC=ms makes one
-// follower's next sync that slow.
+// follower's next sync that slow; FETCH_ALONGSIDE_SLOW_READ=ms makes building each of node 2's
+// first two replies (round 1's) that slow.
 std::string pattern(std::size_t n, unsigned seed) {
 	std::string s(n, '\0');
 	for (std::size_t i = 0; i != n; ++i)
@@ -2549,15 +2568,29 @@ void fetch_alongside() {
 		++group_loop;
 	assert(group_loop != L && "a loop serves no node's links");
 	const GroupId g = groups_on(L, group_loop, 1)[0];
+	std::uint64_t slow_read = 0;
+	std::atomic<int> slow_replies{0};
+	if (const char *ms = std::getenv("FETCH_ALONGSIDE_SLOW_READ")) {
+		slow_read = std::strtoull(ms, nullptr, 10);
+		slow_replies = 2;
+		std::printf("fetch-alongside: building each of node 2's first two replies takes %s ms longer\n", ms);
+	}
+	// Node n's reply.
+	auto reply = [&](NodeId n) {
+		auto bytes = pattern(size, unsigned(n));
+		if (n == 2 && slow_read && slow_replies.fetch_sub(1) > 0)
+			std::this_thread::sleep_for(std::chrono::milliseconds(slow_read));
+		return bytes;
+	};
 	Cluster c("fetch-alongside", {g});
-	c.options_of = [](NodeId n) {
+	c.options_of = [&reply](NodeId n) {
 		HostTransportOptions o;
 		o.rpc.outgoing_bytes = o.rpc.calling_bytes = o.rpc.serving_bytes = budget;
 		o.rpc.fetch_bytes = 2 * size;
-		o.rpc.reader = [n](std::string_view name) -> std::optional<std::string> {
+		o.rpc.reader = [n, &reply](std::string_view name) -> std::optional<std::string> {
 			if (name != "history/table")
 				return std::nullopt;
-			return pattern(size, unsigned(n));
+			return reply(n);
 		};
 		return o;
 	};

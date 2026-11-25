@@ -596,7 +596,7 @@ int serve_stopped(std::uint16_t parent) {
 		if (name == "frozen")
 			::raise(SIGSTOP);  // the placed stop: the reply leaves only after SIGCONT
 		if (name == "gone")
-			::_exit(0);  // the peer's process is gone: its connections end and its port refuses
+			::raise(SIGKILL);  // gone at once: TSan's _exit sleeps atexit_sleep_ms (1 s) with the sockets open
 		return bytes_at(0, late_bytes);
 	};
 	two.open({{1, {"127.0.0.1", parent}}}, options);

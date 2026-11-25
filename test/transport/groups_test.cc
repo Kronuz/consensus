@@ -39,6 +39,7 @@
 #include <asio/executor_work_guard.hpp>
 #include <asio/io_context.hpp>
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <condition_variable>
 #include <csignal>
@@ -2542,7 +2543,9 @@ struct LoopLags {
 // nodes, through 1 MiB lane budgets, while a command commits every 50 ms. Every fetch arrives
 // exact, every commit lands on all three within 2 s, and the leader keeps its term. The group
 // sits on a loop that serves no connection, since its journal syncs inline on its loop: a
-// runner's slow sync holds the Driver, never the links. The 2 s and the term allow what the
+// runner's slow sync holds the Driver, never the links. Each round's replies are built before its
+// fetches go out and the readers move them out, so no connection's loop builds 8 MiB: a host
+// serves from memory (docs/mechanisms/peer-fetch.md). The 2 s and the term allow what the
 // host took: the longest journal operation plus the longest process stall, and the term only
 // while that stays under the 1,000 ms election timeout. FETCH_ALONGSIDE_SLOW_SYNC=ms makes one
 // follower's next sync that slow; FETCH_ALONGSIDE_SLOW_READ=ms makes building each of node 2's
@@ -2582,14 +2585,32 @@ void fetch_alongside() {
 			std::this_thread::sleep_for(std::chrono::milliseconds(slow_read));
 		return bytes;
 	};
+	// Each node's replies built for the round; a fetch asked again past them builds its own on
+	// the loop, counted.
+	struct Replies {
+		std::mutex mutex;
+		std::vector<std::string> ready;
+		std::atomic<std::uint64_t> on_loop{0};
+	};
+	std::array<Replies, 4> replies;
 	Cluster c("fetch-alongside", {g});
-	c.options_of = [&reply](NodeId n) {
+	c.options_of = [&reply, &replies](NodeId n) {
 		HostTransportOptions o;
 		o.rpc.outgoing_bytes = o.rpc.calling_bytes = o.rpc.serving_bytes = budget;
 		o.rpc.fetch_bytes = 2 * size;
-		o.rpc.reader = [n, &reply](std::string_view name) -> std::optional<std::string> {
+		o.rpc.reader = [n, &reply, &replies](std::string_view name) -> std::optional<std::string> {
 			if (name != "history/table")
 				return std::nullopt;
+			auto &r = replies[n];
+			{
+				std::lock_guard hold(r.mutex);
+				if (!r.ready.empty()) {
+					auto bytes = std::move(r.ready.back());
+					r.ready.pop_back();
+					return bytes;
+				}
+			}
+			++r.on_loop;
 			return reply(n);
 		};
 		return o;
@@ -2683,6 +2704,11 @@ void fetch_alongside() {
 			if (round == rounds)
 				break;
 			++round;
+			for (auto [from, peer] : pairs) {
+				auto bytes = reply(peer);
+				std::lock_guard hold(replies[peer].mutex);
+				replies[peer].ready.push_back(std::move(bytes));
+			}
 			for (auto [from, peer] : pairs)
 				fetches.push_back(fetch(from, peer));
 		}
@@ -2737,7 +2763,8 @@ void fetch_alongside() {
 					(unsigned long long)timed_out, !t ? "no state" : t->role == Role::Leader ? "leader" : "not leader",
 					(unsigned long long)(t ? t->term : 0), turned.c_str(), held_by.c_str());
 	}
-	std::printf("fetch-alongside: the host stalled this process at most %llu ms\n", (unsigned long long)stalled);
+	std::printf("fetch-alongside: the host stalled this process at most %llu ms; replies built on a loop (asked again): %llu\n",
+				(unsigned long long)stalled, (unsigned long long)(replies[1].on_loop + replies[2].on_loop + replies[3].on_loop));
 	std::printf("fetch-alongside: %u rounds of %zu x 8 MiB fetched through 1 MiB lane budgets in %llu ms, %u of %u exact; %u commits "
 				"beside them, each on all three within %llu ms (2,000 plus the host's %llu: a journal operation's %llu, a stall's %llu): %s "
 				"(slowest %llu ms; 4 quiet ones before, slowest %llu ms); node %llu leads in term %llu throughout: %s\n",

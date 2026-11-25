@@ -242,9 +242,9 @@ struct Host {
 	static inline std::vector<Host *> hosts;
 };
 
-// Stack dumps begun and ended: odd while one runs. A dump suspends the process, so a nap that
-// overlaps one measures the dump, not the host (Stalls).
-std::atomic<std::uint64_t> dumps{0};
+// Stack dumps begun and ended: odd while one runs. A dump can suspend the process, so a nap that
+// overlaps one measures the dump, not the host: Stalls keeps it apart, in dump_stall.
+std::atomic<std::uint64_t> dumps{0}, dump_stall{0};
 void print_stacks();
 // What a case that hangs leaves: its step, each host's loops (turning, blocked or stopped) with
 // their counters, and every thread's stack.
@@ -392,8 +392,8 @@ struct Stalls {
 			const auto d = dumps.load();
 			std::this_thread::sleep_for(10ms);
 			const auto ms = ms_since(t);
-			if (d % 2 == 0 && dumps.load() == d)
-				worst = std::max<std::uint64_t>(worst, ms - std::min<std::uint64_t>(ms, 10));
+			auto &into = d % 2 == 0 && dumps.load() == d ? worst : dump_stall;
+			into = std::max<std::uint64_t>(into, ms - std::min<std::uint64_t>(ms, 10));
 		}
 	}};
 	std::uint64_t stop() {
@@ -2773,8 +2773,8 @@ void fetch_alongside() {
 					(unsigned long long)timed_out, !t ? "no state" : t->role == Role::Leader ? "leader" : "not leader",
 					(unsigned long long)(t ? t->term : 0), turned.c_str(), held_by.c_str());
 	}
-	std::printf("fetch-alongside: the host stalled this process at most %llu ms; replies built on a loop (asked again): %llu\n",
-				(unsigned long long)stalled, (unsigned long long)(replies[1].on_loop + replies[2].on_loop + replies[3].on_loop));
+	std::printf("fetch-alongside: the host stalled this process at most %llu ms (a stack dump, not counted: %llu ms); replies built on a loop (asked again): %llu\n",
+				(unsigned long long)stalled, (unsigned long long)dump_stall.load(), (unsigned long long)(replies[1].on_loop + replies[2].on_loop + replies[3].on_loop));
 	std::printf("fetch-alongside: %u rounds of %zu x 8 MiB fetched through 1 MiB lane budgets in %llu ms, %u of %u exact; %u commits "
 				"beside them, each on all three within %llu ms (2,000 plus the host's %llu: a journal operation's %llu, a stall's %llu): %s "
 				"(slowest %llu ms; 4 quiet ones before, slowest %llu ms); node %llu leads in term %llu throughout: %s\n",

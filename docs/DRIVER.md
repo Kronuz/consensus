@@ -350,7 +350,11 @@ submit nothing, and so does `reinstall`, which asks the leader; `create`, `recov
 A group's journal IO (the loop's turns and the Worker's own operations, recovery included) runs
 where the completion in `Seams::io` runs it. The slow primitive is the sync (`F_FULLFSYNC` on
 macOS, `fsync` elsewhere), which a busy disk can hold for seconds. While a sync is out, its
-group's step waits for that IO in every case; what differs is whether the loop turns.
+group's step waits for that IO in every case; what differs is whether the loop turns. The group's
+Core does not drive while its persistence is out (ARCHITECTURE.md: one persistence at a time;
+time advances, a completion drives replication): a leader sends no heartbeat or append until its
+own sync completes, so a leader's sync past the election timeout costs its term on any
+completion. A follower's slow sync holds only that follower.
 
 | Completion | Where a sync runs | The loop meanwhile |
 |---|---|---|

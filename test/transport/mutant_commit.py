@@ -164,6 +164,10 @@ MUTANTS = {
                      "\t\tco_await driver_->run(std::move(operation), std::move(token));\n",
                      "\t\tif (const auto ms = delay.exchange(0))\n\t\t\tstd::this_thread::sleep_for(std::chrono::milliseconds(ms));\n"
                      "\t\tj::InlineCompletion inline_io;\n\t\tco_await inline_io.run(std::move(operation), std::move(token));\n"),
+    # groups_test fetch-alongside (consensus-inline-sync-loop R3-F1): the leader's own slow sync no longer excuses the term
+    "leads-ignores-leader-sync": ("test/transport/groups_test.cc",
+                                  "leads = kept || stalled >= 1'000 || led >= 1'000;",
+                                  "leads = kept || stalled >= 1'000;"),
 }
 
 

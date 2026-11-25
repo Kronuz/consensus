@@ -27,6 +27,8 @@
 //   order    control first, round robin across ready groups and per-group credit, as values
 //   fetch-alongside-consensus  rounds of four 8 MiB lane fetches both ways through 1 MiB budgets
 //            while the group commits: each fetch exact, each commit within 2 s, the leader's term kept
+//   fetch-alongside-leader-sync  the same with the leader's next sync held 6 s: it may lose the
+//            term (its Core does not drive while its persistence is out), and the rest holds
 //   install  a follower cut off while the leader checkpoints past it installs the leader's image
 //            (three chunks, as transfer frames on Bulk), validated and activated, then applies
 //            entries past its boundary (consensus-driver-install A1)
@@ -1074,7 +1076,7 @@ task::task<void> transferring(Driver<GroupSink> *d, GroupId g, NodeId target) { 
 // The journal's I/O on the native completion, as detentd runs it (docs/DRIVER.md, Where syncs
 // run): a sync runs off the loop and completes on it, so a slow sync holds its groups' Drivers,
 // never the connections the loop serves. `longest` is the longest one operation took, in ms;
-// `delay` holds the next reaped completion that much longer, as a runner's slow sync.
+// `delay` holds the next turn's reaped sync that much longer, as a runner's slow sync.
 class TimedNative {
 	class SlowQueue {
 		std::atomic<std::uint64_t> &delay_;
@@ -1088,8 +1090,11 @@ class TimedNative {
 		bool submit(const std::shared_ptr<j::IOOperation> &operation) { return queue_.submit(operation); }
 		std::optional<j::OwnedCompletion> poll() {
 			if (!held_)
-				if (held_ = queue_.poll(); held_)
-					release_ = steady::now() + std::chrono::milliseconds(delay_.exchange(0));
+				if (held_ = queue_.poll(); held_) {
+					const auto &operation = *held_->operation;
+					const bool sync = operation.lane() == j::IOLane::Turn && operation.request().kind == j::PrimitiveKind::SyncData;
+					release_ = steady::now() + std::chrono::milliseconds(sync ? delay_.exchange(0) : 0);
+				}
 			if (!held_ || steady::now() < release_)
 				return std::nullopt;
 			return std::exchange(held_, std::nullopt);
@@ -2678,17 +2683,20 @@ void slow_sync() {
 // loop (the native completion), so a runner's slow sync holds the Driver, never the links. Each round's
 // replies are built before its fetches go out and the readers move them out, so no connection's
 // loop builds 8 MiB: a host serves from memory (docs/mechanisms/peer-fetch.md). The 2 s allows
-// what the host took: the longest journal operation plus the longest process stall; the term
-// allows only a process stall past the 1,000 ms election timeout. FETCH_ALONGSIDE_SLOW_SYNC=ms
-// makes one follower's next sync that slow; FETCH_ALONGSIDE_SLOW_READ=ms makes building each of
-// node 2's first two replies (round 1's) that slow.
+// what the host took: the longest journal operation plus the longest process stall. The term
+// allows a process stall past the 1,000 ms election timeout, or the leader's own journal
+// operation past it: a Core whose persistence is out does not drive (ARCHITECTURE.md, Core), so
+// that leader sends nothing until its sync completes. A follower's slow sync keeps the term.
+// FETCH_ALONGSIDE_SLOW_SYNC=ms makes one follower's next sync that slow;
+// FETCH_ALONGSIDE_SLOW_READ=ms makes building each of node 2's first two replies (round 1's)
+// that slow. fetch-alongside-leader-sync makes the leader's next sync 6 s slow.
 std::string pattern(std::size_t n, unsigned seed) {
 	std::string s(n, '\0');
 	for (std::size_t i = 0; i != n; ++i)
 		s[i] = char((i * 2654435761u + seed * 40503u) >> 13);
 	return s;
 }
-void fetch_alongside() {
+void fetch_alongside(std::uint64_t leader_sync = 0) {
 	constexpr std::size_t size = 8 << 20, budget = 1 << 20;
 	// The group on the loop of the links to node 1.
 	constexpr std::uint32_t L = 4;
@@ -2842,6 +2850,11 @@ void fetch_alongside() {
 		c.nodes[slow]->per[c.nodes[slow]->host.transport->loop_of_group(g)]->io.delay = std::strtoull(ms, nullptr, 10);
 		std::printf("fetch-alongside: node %llu's next journal operation takes %s ms longer\n", (unsigned long long)slow, ms);
 	}
+	if (leader_sync) {
+		c.nodes[leader]->per[group_loop]->io.delay = leader_sync;
+		std::printf("fetch-alongside: node %llu's (the leader's) next sync takes %llu ms longer\n", (unsigned long long)leader,
+					(unsigned long long)leader_sync);
+	}
 	Stalls stalls;
 	LoopLags lags(all, L);
 	bool changed = false;
@@ -2888,7 +2901,8 @@ void fetch_alongside() {
 		for (auto &p : n->per)
 			held = std::max<std::uint64_t>(held, p->io.longest);
 	const auto host = held + stalled, bound = 2'000 + host;
-	const bool timely = committed && slowest < bound, leads = kept || stalled >= 1'000;
+	const auto led = c.nodes[leader]->per[group_loop]->io.longest.load();  // the leader's own longest journal operation
+	const bool timely = committed && slowest < bound, leads = kept || stalled >= 1'000 || led >= 1'000;
 	for (auto &m : misses)
 		std::printf("fetch-alongside: %s\n", m.c_str());
 	std::printf("fetch-alongside: links to nodes 1, 2 and 3 on loops %u, %u and %u of %u; the group on loop %u\n",
@@ -2918,11 +2932,12 @@ void fetch_alongside() {
 				(unsigned long long)stalled, (unsigned long long)dump_stall.load(), (unsigned long long)(replies[1].on_loop + replies[2].on_loop + replies[3].on_loop));
 	std::printf("fetch-alongside: %u rounds of %zu x 8 MiB fetched through 1 MiB lane budgets in %llu ms, %u of %u exact; %u commits "
 				"beside them, each on all three within %llu ms (2,000 plus the host's %llu: a journal operation's %llu, a stall's %llu): %s "
-				"(slowest %llu ms; 4 quiet ones before, slowest %llu ms); node %llu leads in term %llu throughout: %s\n",
+				"(slowest %llu ms; 4 quiet ones before, slowest %llu ms); node %llu leads in term %llu throughout "
+				"(its own longest journal operation %llu ms): %s\n",
 				round, pairs.size(), (unsigned long long)elapsed, exact, rounds * unsigned(pairs.size()), commits, (unsigned long long)bound,
 				(unsigned long long)host, (unsigned long long)held, (unsigned long long)stalled, timely ? "yes" : "NO", (unsigned long long)slowest,
-				(unsigned long long)quiet, (unsigned long long)leader, (unsigned long long)term,
-				kept ? "yes" : leads ? "no, allowed: the host held it past the election timeout" : "NO");
+				(unsigned long long)quiet, (unsigned long long)leader, (unsigned long long)term, (unsigned long long)led,
+				kept ? "yes" : leads ? "no, allowed: the host or its own journal operation held it past the election timeout" : "NO");
 	assert(round == rounds && exact == rounds * pairs.size() && timely && leads);
 }
 
@@ -3210,7 +3225,7 @@ void order() {
 
 int main(int argc, char **argv) {
 	if (argc != 3) {
-		std::fprintf(stderr, "usage: %s <fixture dir> threads|credit|reader|upload|driver|slow-sync|refill|identity|joiner|lagging|leftover|reconnect|backlog|owe-order|receive-bound|relayout|scan|order|fetch-alongside-consensus|install\n", argv[0]);
+		std::fprintf(stderr, "usage: %s <fixture dir> threads|credit|reader|upload|driver|slow-sync|refill|identity|joiner|lagging|leftover|reconnect|backlog|owe-order|receive-bound|relayout|scan|order|fetch-alongside-consensus|fetch-alongside-leader-sync|install\n", argv[0]);
 		return 2;
 	}
 #ifndef SO_NOSIGPIPE
@@ -3253,6 +3268,8 @@ int main(int argc, char **argv) {
 		receive_bound();
 	else if (which == "fetch-alongside-consensus")
 		fetch_alongside();
+	else if (which == "fetch-alongside-leader-sync")
+		fetch_alongside(6'000);
 	else if (which == "joiner")
 		joiner();
 	else if (which == "lagging")

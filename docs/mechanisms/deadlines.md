@@ -69,6 +69,39 @@ of 0.1 ms wheel passes (`hold`: at most one per `retry_ns`, none in the past), t
 election Tick pre-voting within one `retry_ns` of the release (`clears`), and no arm beyond Core's
 deadline when it is ahead (`ahead`) or `maximum` (`rest`).
 
+## A recovered store over its control headroom
+
+Journal's admission refills the control pool before the replacement pool, from what `hard`
+leaves after `used`. A store recovered with `used` above `hard - control_pool` has a short control
+pool and no replacement pool, so a pre-Start Tick, which reserves the campaign pack, can be
+refused. Before Start nothing is admitted, so no maintenance falls due and the pool never changes
+on its own.
+
+Which stores land there depends on who owns them. A Driver group is a Host group: its batches go
+to the turn log and settle nothing into `used`, which counts its artifacts only, so its control
+pool is whole whenever it holds no permit. Only a limit lowered, or a control pool raised, between
+runs puts it above the headroom. What a crash leaves for reclaim (a superseded checkpoint's
+generation and artifacts, a checkpoint's or install's staged ones) was funded under a whole control
+pool, so it only adds to such a limit. An owned store's Control appends settle into `used`, so an
+owned store at its limit can also land there through its own log; no Driver hosts it.
+
+The rule: recovery frees what it can, then the Driver fails the open by name. Before Start, a
+Worker turn refused with Pressure runs a reclaim step instead (`IOPending` on asynchronous storage,
+`Maintenance` on synchronous), until one reclaim pass has completed; no root changes before Start,
+so that pass examined every file. For a Driver group a Pressure turn after the pass is final: the
+Driver fences the group with `over_headroom`, so the open fails with `fenced` naming it, and the
+Sink hears the same reason. A started group could not do better: with the control pool short, a
+checkpoint or an install cannot get its Replacement permit, `Normal` work waits for whole pools,
+and Control appends only add. An owned Worker's host sees Pressure after the pass, never a fence,
+and decides: Start plans no appends, so it is still admitted. A store whose pre-Start turn fits
+never reaches the rule.
+`test/recovered_over_limit_test.cc`: `reclaims` (a limit lowered under a published checkpoint, a
+killed checkpoint's staged image on top: reclaiming it lets the lone voter lead and commit),
+`refuses` (a limit lowered under the checkpoint and the pack, nothing to reclaim: the open fails
+with `fenced(over_headroom)` and the store keeps its checkpoint) and `owned` (an owned Worker on
+synchronous storage: one reclaim step per refused turn until the pass completes, then Pressure, no
+fence).
+
 ## What a planner reads
 
 A Worker plans each event's storage before stepping it (`plan_event`), after its turn retires a

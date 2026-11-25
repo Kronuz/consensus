@@ -494,7 +494,19 @@ public:
 		source_->verifier.reset(); source_->reader.reset(); source_->ready = 0; source_->phase = SourcePhase::Failed;
 		return ValidationAck::Accepted;
 	}
+	// Before Start nothing is admitted, so no maintenance falls due: a turn refused with Pressure
+	// reclaims instead, until a whole pass has run. Pressure before Start is then final: the store
+	// is above its control headroom (docs/mechanisms/deadlines.md).
 	TurnResult run_one(Tick current_time) {
+		const auto result = turn(current_time);
+		if (result != TurnResult::Pressure || started_ || reclaimed_) { return result; }
+		try {
+			if (scheduling_.async_storage) { start_maintenance_io(store_.begin_reclaim(1), MaintenanceKind::Reclaim); return TurnResult::IOPending; }
+			reclaimed_ |= store_.reclaim_step(scheduling_.scan_entries).complete; return TurnResult::Maintenance;
+		} catch (const std::exception& error) { fail(error.what()); return TurnResult::Fenced; }
+	}
+private:
+	TurnResult turn(Tick current_time) {
 		if (closing_) { return retirement_turn(); }
 		if (store_.fenced() && !failed_) { fail("storage fenced outside worker"); }
 		if (fenced()) { return TurnResult::Fenced; }
@@ -754,6 +766,7 @@ private:
 				if (!acquired[i]) { return SubmitResult::Pressure; }
 			}
 			pack_ = std::move(acquired); pack_count_ = plan.count; pack_next_ = 0;
+			started_ |= std::holds_alternative<Start>(event);
 			ingest(core_->step(std::move(event))); if (!maintenance_tick) { ++foreground_; }
 			return fenced() ? SubmitResult::Fenced : SubmitResult::Accepted;
 		} catch (const std::exception& error) { fail(error.what()); return SubmitResult::Fenced; }
@@ -884,7 +897,7 @@ private:
 		using namespace kronuz::journal;
 		auto job = maintenance_io_; auto kind = maintenance_kind_; auto token = maintenance_token_;
 		// Observe the original outcome even when its consumer canceled or became stale.
-		if (kind == MaintenanceKind::Reclaim) { std::static_pointer_cast<StoreReclaim>(job)->result(); }
+		if (kind == MaintenanceKind::Reclaim) { reclaimed_ |= std::static_pointer_cast<StoreReclaim>(job)->result().complete; }
 		else if (kind == MaintenanceKind::Publish) { std::static_pointer_cast<StorePublication>(job)->result(); }
 		else if (kind == MaintenanceKind::OpenVerification || kind == MaintenanceKind::SourceOpen) { std::static_pointer_cast<ArtifactOpen>(job)->result(); }
 		else if (kind == MaintenanceKind::Readback || kind == MaintenanceKind::SourceVerify || kind == MaintenanceKind::SourceRead) { std::static_pointer_cast<ArtifactRead>(job)->result(); }
@@ -931,7 +944,7 @@ private:
 		auto owed_timer = timer_due_;
 		for (unsigned attempt = 0; attempt < 3; ++attempt) {
 			auto kind = maintenance_next_; maintenance_next_ = (maintenance_next_ + 1) % 3;
-			if (kind == 0) { if (scheduling_.async_storage) { start_maintenance_io(store_.begin_reclaim(1), MaintenanceKind::Reclaim); } else { store_.reclaim_step(scheduling_.scan_entries); } break; }
+			if (kind == 0) { if (scheduling_.async_storage) { start_maintenance_io(store_.begin_reclaim(1), MaintenanceKind::Reclaim); } else { reclaimed_ |= store_.reclaim_step(scheduling_.scan_entries).complete; } break; }
 			if (kind == 1 && preparation_runnable()) { prepare_one(); break; }
 			if (kind == 2 && source_runnable()) { source_one(); break; }
 		}
@@ -1241,6 +1254,8 @@ private:
 	Token next_source_ = 0, next_source_chunk_ = 0;
 	std::size_t source_next_ = 0; unsigned maintenance_next_ = 1;
 	bool failed_ = false, capture_funding_pressure_ = false, cutover_debt_ = false, timer_due_ = true, timer_blocked_ = false, closing_ = false, store_closed_ = false;
+	bool started_ = false;    // a Start was admitted
+	bool reclaimed_ = false;  // a reclaim pass completed: before Start, every file was examined
 };
 
 } // namespace kronuz::consensus

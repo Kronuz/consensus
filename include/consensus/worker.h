@@ -210,6 +210,8 @@ public:
 	// The index a witness may truncate its log through (Core::witness_bound).
 	Index witness_bound() const noexcept { return core_ ? core_->witness_bound() : 0; }
 	std::optional<Term> term_at(Index index) const { return core_ ? core_->term_at(index) : std::nullopt; }
+	// The recovered log holds `boundary` (Core::retains_suffix): Driver::recover's gate.
+	bool retains_suffix(LogBoundary boundary) const { return core_ && core_->retains_suffix(boundary); }
 	// The closed state, when this replica can close now (Core::closed_state): open, not fenced.
 	std::optional<ClosedState> closed_state() const { return core_ && !closing_ && !fenced() ? core_->closed_state() : std::nullopt; }
 	// After create or recover, before Start: resumes the closed term when `closed` matches the

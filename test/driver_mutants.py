@@ -103,6 +103,12 @@ MUTANTS = {
         "\t\tif (now_ < acknowledge_at_ || busy()) { return; }\n",
         "\t\tif (busy() && now_ >= acknowledge_at_) { acknowledge_at_ = deadline(timing_.heartbeat); }\n\t\tif (now_ < acknowledge_at_ || busy()) { return; }\n",
     ),
+    # recover's gate runs after Start, once the open completes (consensus:recover-gate): a refused
+    # lone voter has already campaigned and a refused follower voted (driver_test recover_gate_*).
+    "gate-after-start": ("driver.h",
+        "\t\t\t\tif (auto refused = refuse(*call.group, accept)) { call.fail(std::move(refused)); }\n\t\t\t\tcall.group->opened = true;\n\t\t\t}\n\t\t\tcatch (...) { call.fail(opening_error(id)); }\n\t\t}\n\t\tco_await call;\n",
+        "\t\t\t\tcall.group->opened = true;\n\t\t\t}\n\t\t\tcatch (...) { call.fail(opening_error(id)); }\n\t\t}\n\t\tco_await call;\n\t\tif (auto* g = live(id)) { if (auto refused = refuse(*g, accept)) { std::rethrow_exception(refused); } }\n",
+    ),
     # A witness incarnation may become a learner or voter (R16).
     "witness-becomes-data": ("core.h",
         "\t\t\tif (old && old->role == MemberRole::Witness && x.role != MemberRole::Witness) { reject(RejectReason::InvalidMembership); return; }\n",

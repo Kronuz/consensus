@@ -325,6 +325,10 @@ public:
 		resume_ = closed.leader; term_record_ = true;
 		return true;
 	}
+	// The log holds `boundary`: it is the base, or an entry the log retains with that term.
+	bool retains_suffix(LogBoundary boundary) const {
+		return boundary.index >= base_index_ && boundary.index <= last_index() && log_term(boundary.index) == boundary.term;
+	}
 	// The term of the entry at `index`, while the retained log or its base holds it.
 	std::optional<Term> term_at(Index index) const {
 		if (index < base_index_ || index > last_index() || (index == 0 && base_index_ == 0)) { return std::nullopt; }
@@ -656,9 +660,6 @@ private:
 	}
 	const Entry& log_entry(Index index) const { return entries_.at(log_offset(index)); }
 	Term log_term(Index index) const { return index == base_index_ ? base_term_ : log_entry(index).term; }
-	bool retains_suffix(LogBoundary boundary) const {
-		return boundary.index >= base_index_ && boundary.index <= last_index() && log_term(boundary.index) == boundary.term;
-	}
 	bool valid_entry(const Entry& entry) const {
 		return entry.index != 0 && entry.index != maximum && entry.term != 0 &&
 			retained_detail::payload_valid(entry.kind, entry.payload, retained_.command_bytes);

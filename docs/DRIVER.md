@@ -26,6 +26,7 @@ struct compacted : std::runtime_error;          // committed(): the index is bel
 struct transfer_failed : std::runtime_error;    // transfer_leadership(): deadline passed, or another node leads
 struct needs_peer : std::runtime_error;         // consensus::run only: the call needs another voting member
 struct close_in_doubt : std::runtime_error;     // create(), recover(): the host holds the id in doubt after a failed close, until it reopens
+struct recover_refused : fenced { LogBoundary base; Index last; Membership membership; };  // recover() with accept: the log retains none (Recover gate)
 using stalled = kronuz::journal::stalled;       // consensus::run only: a lost wake
 
 struct GroupOptions {
@@ -126,6 +127,9 @@ public:
 	// resumes its term with no election (docs/mechanisms/quiescence.md); damaged or another
 	// replica's bytes complete it with kronuz::journal::Corruption before any recovery IO.
 	template <class Restore> task::task<void> recover(GroupId, Restore, std::optional<std::string> closed, task::cancel_token = {});
+	// Gated (Recover gate, below): before Start, a log that retains none of `accept` fails the
+	// call with recover_refused. An empty `accept` is no gate, as the overloads above.
+	template <class Restore> task::task<void> recover(GroupId, Restore, std::optional<std::string> closed, std::vector<LogBoundary> accept, task::cancel_token = {});
 	task::task<Placement> propose(GroupId, std::string command, task::cancel_token = {});
 	task::task<void> committed(GroupId, Placement, task::cancel_token = {});
 	task::task<Placement> change_membership(GroupId, Membership next, task::cancel_token = {});
@@ -238,6 +242,33 @@ From its first acknowledged range on, a witness's apply index follows its commit
 application receives no further range. A restart from a checkpoint taken after the removal finds
 this node a witness at neither index, so its later ranges go to the Sink, which restored that
 checkpoint and continues from its boundary.
+
+## Recover gate
+
+`recover(id, restore, closed, accept)` takes the log boundaries the host accepts (the contract
+`consensus:recover-gate`; strata passes its index's head, and a complete install stage's bundle).
+Once the log is recovered and `closed` applied, and before any turn runs, the Driver checks each
+boundary with `Core::retains_suffix`: the boundary is the log's base, or an entry the log retains
+with that term. When none is retained, the Worker fences and the call fails with
+`recover_refused`, whose `what()` is
+
+```text
+consensus: the recovered log retains no accepted boundary: base (B, term T), last L
+```
+
+and whose fields are the recovered base, last index and membership. Nothing that changes
+consensus state ran: no election, vote, append, checkpoint or term record. The typed
+initialization of a bootstrap-only group and the pre-Start reclaim of a store above its headroom
+run in turns, so they never run either. The row stays open and fenced: later calls fail with
+`fenced` and the same reason, the Sink hears no `Fenced` and the peers no `Gone`, since the call
+carries the refusal. `close` erases the row and writes no close record, so the next `recover`
+finds the same log. The one write before the gate is the journal's own: a group closed into the
+host's table reopens its entry at recovery (the journal's bytes change, its recovered state does
+not). An empty `accept` is no gate (a damaged replica's, a witness's); `Worker::recover` has none.
+
+`driver_test recover_gate_lone`, `recover_gate_closed`, `recover_gate_follower` and
+`recover_gate_accepts` check it by value; `test/driver_mutants.py gate-after-start` runs the gate
+after Start, which they catch.
 
 ## Install
 

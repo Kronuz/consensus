@@ -6,6 +6,12 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#consensus) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-25
+
+### Added
+
+- `Driver::recover(id, restore, closed, accept)` ([docs/DRIVER.md](docs/DRIVER.md), Recover gate): before Start, a recovered log that retains none of the `accept` boundaries (`Core::retains_suffix`, now public) fences the group and fails the call with `recover_refused`, a `fenced` carrying the log's base boundary, last index and membership; its reason reads `consensus: the recovered log retains no accepted boundary: base (B, term T), last L`. Nothing that changes consensus state runs first (no election, vote, append, checkpoint or term record), so a refused lone voter no longer gains a term and a NoOp per retry, and a refused follower grants no vote. An empty `accept` is no gate; the other `recover` overloads and `Worker::recover` are unchanged. `Worker::retains_suffix` exposes the predicate (`driver_test recover_gate_*`, mutant `gate-after-start`).
+
 ## 2026-11-24
 
 ### Added

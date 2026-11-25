@@ -965,6 +965,227 @@ void group_last() {
 	}
 }
 
+// recover's gate (docs/DRIVER.md, Recover gate): a log that retains none of `accept` is refused
+// before Start, by value: the refusal names the recovered base, last and membership, and nothing
+// that changes consensus state ran, so every retry recovers the same log.
+namespace gate {
+std::exception_ptr recover(Loop& loop, GroupId g, std::vector<LogBoundary> accept, std::optional<std::string> closed = std::nullopt, GroupOptions o = options({1})) {
+	loop.current = g;
+	loop.driver->open(g, std::move(o));
+	std::exception_ptr error;
+	check(loop.settle(loop.driver->recover(g, [](j::ArtifactReader&) {}, std::move(closed), std::move(accept)), error), "the gated recover completes");
+	return error;
+}
+void close(Loop& loop, GroupId g) {
+	std::exception_ptr error;
+	check(loop.settle(loop.driver->close(g), error) && !error && !loop.driver->state(g), "the row closes: " + what(error));
+}
+std::optional<recover_refused> refusal(std::exception_ptr error) {
+	if (!error) { return std::nullopt; }
+	try { std::rethrow_exception(error); } catch (const recover_refused& r) { return r; } catch (...) {}
+	return std::nullopt;
+}
+std::string reason(LogBoundary base, Index last) {
+	return "consensus: the recovered log retains no accepted boundary: base (" + std::to_string(base.index) + ", term " + std::to_string(base.term) + "), last " + std::to_string(last);
+}
+// Every file under the host's directory, by path, with its bytes.
+void files(const fl::filesystem& disk, const std::string& directory, std::map<std::string, std::string>& out) {
+	for (const auto& name : disk.list(directory)) {
+		const auto path = directory + "/" + name;
+		bool directory = true;
+		try { disk.list(path); } catch (const std::exception&) { directory = false; }
+		if (directory) { files(disk, path, out); } else { out[path] = std::string(disk.view(path)); }
+	}
+}
+std::map<std::string, std::string> files(const fl::filesystem& disk) { std::map<std::string, std::string> out; files(disk, "host", out); return out; }
+// Each committed entry's term, by index, as the Sink heard them.
+std::map<Index, Term> terms(const Sink& sink, GroupId g) {
+	std::map<Index, Term> out;
+	for (const auto& [id, c] : sink.committed) { if (id == g) { for (const auto& e : c.entries) { out[e.index] = e.term; } } }
+	return out;
+}
+// A refused attempt: the refusal by value, and the fenced row's recovered term.
+void refused(Loop& loop, GroupId g, std::exception_ptr error, LogBoundary base, Index last, Term term, const std::string& when) {
+	auto r = refusal(error);
+	check(r.has_value(), when + ": fails with recover_refused: " + what(error));
+	if (!r) { return; }
+	check(r->base == base && r->last == last, when + ": names base (" + std::to_string(r->base.index) + ", " + std::to_string(r->base.term) + "), last " + std::to_string(r->last));
+	check(std::string(r->what()) == reason(base, last), when + ": the reason's text: " + r->what());
+	check(r->membership.members.size() == 1 && r->membership.members[0].node == 1, when + ": names the recovered membership");
+	auto s = loop.driver->state(g);
+	check(s && s->term == term && s->last == last && s->role != Role::Leader, when + ": the row holds the recovered term, unled: term " + std::to_string(s ? s->term : 0));
+	auto again = loop.start(loop.driver->propose(g, "x"));
+	loop.release();
+	check(again->done && is<fenced>(again->error) && what(again->error) == reason(base, last), when + ": a later call on the row fails fenced with the reason: " + what(again->error));
+}
+}  // namespace gate
+
+// A1: a lone voter recovered from the turn log, refused at the gate three times (each a process
+// restart): it persists no term and appends no NoOp, each refusal names the same base and last,
+// and the host's files stay byte-equal to those of a restart that opens no group. Accepted at its last entry, it then starts and replays
+// every entry with its original term.
+void recover_gate_lone() {
+	constexpr GroupId g = 141;
+	fl::filesystem disk;
+	Index last = 0; Term term = 0;
+	std::map<Index, Term> before;
+	{
+		Loop loop(disk);
+		loop.lone(g);
+		std::exception_ptr error; std::optional<Placement> placed;
+		for (const char* c : {"a", "b", "c"}) { check(loop.settle(loop.driver->propose(g, c), placed, error) && placed, "placed"); }
+		loop.apply(g);
+		last = loop.driver->state(g)->last; term = loop.driver->state(g)->term;
+		before = gate::terms(loop.sink, g);
+		check(last == 4 && term == 1 && before.size() == 4, "the lone voter's log: a no-op and three commands at term 1");
+	}
+	for (int attempt = 1; attempt <= 3; ++attempt) {
+		const auto when = "refused attempt " + std::to_string(attempt);
+		// The control: the same host restarted with no group opened (each start begins a turn log segment).
+		auto control = disk.snapshot();
+		{ Loop idle(control); }
+		const auto bytes = gate::files(control);
+		{
+			Loop loop(disk);
+			auto error = gate::recover(loop, g, {LogBoundary{last + Index(attempt), term}});
+			gate::refused(loop, g, error, {0, 0}, last, term, when);
+			check(loop.sink.committed.empty() && loop.sink.sent.empty() && loop.sink.roles.empty(), when + ": the Sink hears nothing");
+			gate::close(loop, g);
+		}
+		check(gate::files(disk) == bytes, when + ": the turn log and the host's table stay byte-equal to an idle restart's");
+	}
+	Loop loop(disk);
+	auto error = gate::recover(loop, g, {LogBoundary{last, term}});
+	check(!error, "accepted at its last entry, it starts: " + what(error));
+	loop.apply(g);
+	auto s = loop.driver->state(g);
+	check(s && s->role == Role::Leader && s->term == term + 1 && s->last == last + 1, "and leads the next term, its no-op after the recovered log");
+	auto after = gate::terms(loop.sink, g);
+	after.erase(last + 1);
+	check(after == before, "every recovered entry replays with its original term");
+}
+
+// A1: a closed lone voter (its closed record kept) refused three times in the live host: each
+// refusal names the same base and last at the same term; accepted at its base, the closed
+// record still matches and resumes its term with no election.
+void recover_gate_closed() {
+	constexpr GroupId g = 142;
+	fl::filesystem disk; Loop loop(disk);
+	loop.lone(g);
+	std::exception_ptr error; std::optional<Placement> placed;
+	for (const char* c : {"a", "b"}) { check(loop.settle(loop.driver->propose(g, c), placed, error) && placed, "placed"); }
+	loop.apply(g);
+	std::optional<CheckpointPublished> published;
+	check(loop.settle(loop.driver->checkpoint(g, 1 << 20, Capture{"ab", 0, placed->index, placed->term}), published, error) && published, "the checkpoint publishes: " + what(error));
+	auto closed = loop.driver->closed_state(g);
+	const auto s0 = *loop.driver->state(g);
+	check(closed.has_value() && s0.last == placed->index, "a closed state at the checkpoint");
+	gate::close(loop, g);
+	check(loop.host->status(g) == j::GroupStatus::closed, "closed into the host's table");
+	const LogBoundary base{placed->index, placed->term};
+	for (int attempt = 1; attempt <= 3; ++attempt) {
+		const auto when = "closed, refused attempt " + std::to_string(attempt);
+		error = gate::recover(loop, g, {LogBoundary{base.index + 1, base.term}, LogBoundary{base.index - 1, base.term}}, closed);
+		gate::refused(loop, g, error, base, s0.last, s0.term, when);
+		gate::close(loop, g);
+	}
+	error = gate::recover(loop, g, {base}, closed);
+	check(!error, "accepted at its base, it starts: " + what(error));
+	auto s = loop.driver->state(g);
+	check(s && s->role == Role::Leader && s->term == s0.term && s->last == s0.last, "and the closed record resumes its term with no election: term " + std::to_string(s ? s->term : 0) + ", last " + std::to_string(s ? s->last : 0));
+}
+
+// A1: a follower refused at the gate grants no vote: a vote request it would grant waits in its
+// inbox through the refused recover; no answer goes out and its term stays.
+void recover_gate_follower() {
+	constexpr GroupId g = 143;
+	fl::filesystem disk;
+	auto follower = [] { return options({1, 2, 3}, 2); };
+	{
+		Loop loop(disk);
+		loop.current = g;
+		loop.driver->open(g, follower());
+		std::exception_ptr error;
+		check(loop.settle(loop.driver->create(g, j::Identity{'V', 'F'}), error) && !error, "create");
+		loop.driver->receive(g, Receive{1, AppendRequest{1, 1, 0, 0, 0, 0, {Entry{1, 1, EntryKind::Command, "x"}, Entry{2, 1, EntryKind::Command, "y"}}}});
+		loop.release();
+		auto s = loop.driver->state(g);
+		check(s && s->role == Role::Follower && s->term == 1 && s->last == 2, "a follower of leader 1 holds two entries at term 1");
+	}
+	auto granted = [](const Sink& sink) {
+		for (const auto& [id, send] : sink.sent) { if (auto v = std::get_if<VoteResponse>(&send.message); v && v->granted) { return true; } }
+		return false;
+	};
+	{
+		Loop loop(disk);
+		loop.current = g;
+		loop.driver->open(g, follower());
+		loop.driver->receive(g, Receive{3, VoteRequest{5, 2, 1}});
+		std::exception_ptr error;
+		check(loop.settle(loop.driver->recover(g, [](j::ArtifactReader&) {}, std::nullopt, std::vector<LogBoundary>{{3, 1}}), error), "the gated recover completes");
+		auto r = gate::refusal(error);
+		check(r && r->last == 2 && r->base == LogBoundary{0, 0}, "the follower is refused: " + what(error));
+		check(!granted(loop.sink) && loop.sink.sent.empty(), "and answers no vote");
+		gate::close(loop, g);
+	}
+	Loop loop(disk);
+	auto error = gate::recover(loop, g, {LogBoundary{2, 1}}, std::nullopt, follower());
+	auto s = loop.driver->state(g);
+	check(!error && s && s->term == 1 && s->last == 2, "accepted, it recovers term 1 and the same log: no vote persisted: term " + std::to_string(s ? s->term : 0));
+}
+
+// A1: a boundary at the base, one inside the log, any one of several, and an empty `accept` each
+// start; below the base, past the last and another term are refused, naming base and last.
+void recover_gate_accepts() {
+	constexpr GroupId g = 144;
+	fl::filesystem disk;
+	LogBoundary base;
+	{
+		Loop loop(disk);
+		loop.lone(g);
+		std::exception_ptr error; std::optional<Placement> placed;
+		for (const char* c : {"a", "b", "c"}) { check(loop.settle(loop.driver->propose(g, c), placed, error) && placed, "placed"); }
+		loop.apply(g);
+		std::optional<CheckpointPublished> published;
+		check(loop.settle(loop.driver->checkpoint(g, 1 << 20, Capture{"abc", 0, placed->index, placed->term}), published, error) && published, "the checkpoint publishes");
+		base = {placed->index, placed->term};
+		for (const char* c : {"d", "e"}) { check(loop.settle(loop.driver->propose(g, c), placed, error) && placed, "placed"); }
+		loop.apply(g);
+	}
+	check(base == LogBoundary{4, 1}, "the checkpoint's base (4, term 1)");
+	Index last = 6; Term term = 1;
+	auto starts = [&](std::vector<LogBoundary> accept, const std::string& when) {
+		Loop loop(disk);
+		auto error = gate::recover(loop, g, std::move(accept));
+		auto s = loop.driver->state(g);
+		check(!error && s && s->role == Role::Leader && s->term == term + 1 && s->last == last + 1, when + ": starts and leads: " + what(error));
+		if (s) { last = s->last; term = s->term; }
+	};
+	auto refuses = [&](std::vector<LogBoundary> accept, const std::string& when) {
+		Loop loop(disk);
+		auto error = gate::recover(loop, g, std::move(accept));
+		gate::refused(loop, g, error, base, last, term, when);
+		gate::close(loop, g);
+	};
+	refuses({{base.index - 1, base.term}}, "below the base");
+	refuses({{last + 1, term}}, "past the last");
+	refuses({{5, 2}}, "another term at an entry it holds");
+	starts({base}, "at the base");
+	starts({{5, 1}}, "inside the log");
+	starts({{last + 9, term}, {5, 1}}, "one of several");
+	starts({}, "an empty accept");
+	{
+		Loop loop(disk);
+		loop.current = g + 1;
+		loop.driver->open(g + 1, options({1}));
+		std::exception_ptr error;
+		check(loop.settle(loop.driver->create(g + 1, j::Identity{'G', 'Z'}), error) && !error, "create");
+	}
+	Loop loop(disk);
+	auto error = gate::recover(loop, g + 1, {LogBoundary{0, 0}});
+	check(!error, "(0, 0) starts a log whose base is 0: " + what(error));
+}
+
 const std::map<std::string, void (*)()> cases{
 	{"flow_reaches_core", &flow_reaches_core},
 	{"fence_tells_peers", &fence_tells_peers},
@@ -982,6 +1203,10 @@ const std::map<std::string, void (*)()> cases{
 	{"witness_removal", &witness_removal},
 	{"witness_removal_restart", &witness_removal_restart},
 	{"entry_wake_threads", &entry_wake_threads},
+	{"recover_gate_lone", &recover_gate_lone},
+	{"recover_gate_closed", &recover_gate_closed},
+	{"recover_gate_follower", &recover_gate_follower},
+	{"recover_gate_accepts", &recover_gate_accepts},
 };
 
 }  // namespace

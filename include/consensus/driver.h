@@ -61,6 +61,15 @@ struct fenced : std::runtime_error { using std::runtime_error::runtime_error; };
 // reclaim pass left its pool short of the first turn, and nothing before Start frees more
 // (docs/mechanisms/deadlines.md). The open fails with fenced(over_headroom).
 inline constexpr const char* over_headroom = "storage above its control headroom at start";
+// recover's gate refused the recovered log (docs/DRIVER.md, Recover gate): it retains none of the
+// boundaries the host accepts. What the host needs to pick a remedy: the log's base, last index
+// and membership, as recovered.
+struct recover_refused : fenced {
+	recover_refused(const std::string& reason, LogBoundary b, Index l, Membership m) : fenced(reason), base(b), last(l), membership(std::move(m)) {}
+	LogBoundary base;
+	Index last;
+	Membership membership;
+};
 struct rejected : std::runtime_error {
 	explicit rejected(RejectReason why) : std::runtime_error("consensus call rejected"), reason(why) {}
 	RejectReason reason;
@@ -343,6 +352,14 @@ public:
 	// Damaged bytes or another replica's fail the call with kronuz::journal::Corruption.
 	template <class Restore>
 	task::task<void> recover(GroupId id, Restore restore, std::optional<std::string> closed, task::cancel_token token = {}) {
+		return recover(id, std::move(restore), std::move(closed), {}, std::move(token));
+	}
+	// Gated (docs/DRIVER.md, Recover gate): once the log is recovered and `closed` applied, and
+	// before Start, a log that retains none of `accept` (Core::retains_suffix) fences the group and
+	// the call fails with recover_refused; nothing that changes consensus state has run. An empty
+	// `accept` is no gate.
+	template <class Restore>
+	task::task<void> recover(GroupId id, Restore restore, std::optional<std::string> closed, std::vector<LogBoundary> accept, task::cancel_token token = {}) {
 		Call call(*this, Kind::open, std::move(token));
 		co_await call.enter();
 		if (call.begin(id, false) && !call.resume_open()) {
@@ -352,6 +369,7 @@ public:
 				if (closed) { reopen = decode_closed_state(*closed, closed_identity(id, w)); }
 				w.recover(std::move(restore));
 				if (reopen) { w.reopen(*reopen); }
+				if (auto refused = refuse(*call.group, accept)) { call.fail(std::move(refused)); }
 				call.group->opened = true;
 			}
 			catch (...) { call.fail(opening_error(id)); }
@@ -757,6 +775,18 @@ private:
 		if (!entry) { throw kronuz::journal::Corruption("closed state of a group the host does not hold"); }
 		const auto& c = w.configuration();
 		return {c.cluster, c.configuration, id, entry->incarnation, c.local};
+	}
+	// recover's gate: the recovered log retains none of `accept` (none is no gate). The refusal
+	// fences the Worker, so the row only closes and its close writes no record; the call carries
+	// it, so the Sink hears no Fenced and the peers no Gone.
+	std::exception_ptr refuse(Group& g, const std::vector<LogBoundary>& accept) {
+		auto& w = *g.worker;
+		if (accept.empty() || std::any_of(accept.begin(), accept.end(), [&](LogBoundary b) { return w.retains_suffix(b); })) { return nullptr; }
+		const auto base = w.base_boundary();
+		const auto last = w.last_index();
+		g.fence_reason = "consensus: the recovered log retains no accepted boundary: base (" + std::to_string(base.index) + ", term " + std::to_string(base.term) + "), last " + std::to_string(last);
+		w.fence(g.fence_reason); g.fence_seen = true;
+		return std::make_exception_ptr(recover_refused(g.fence_reason, base, last, w.membership().value_or(Membership{})));
 	}
 	// create's or recover's failure. The host's hold refuses a group a failed close left in
 	// doubt with EIO before any IO, holding nothing; an EIO from later IO leaves the hold held.

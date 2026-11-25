@@ -2894,10 +2894,10 @@ void fetch_alongside() {
 	for (NodeId n = 1; n <= 3; ++n) {
 		auto &h = c.nodes[n]->host;
 		std::uint64_t gone = 0, links = 0, aborted = 0, timed_out = 0;
-		std::string turned, held_by;  // per loop, "a/b/c/d"
+		std::string turned, took;  // per loop, "a/b/c/d"
 		for (std::uint32_t k = 0; k != h.loops.size(); ++k) {
 			turned += (k ? "/" : "") + std::to_string(lags.worst(n - 1, k));
-			held_by += (k ? "/" : "") + std::to_string(c.nodes[n]->per[k]->io.longest.load());
+			took += (k ? "/" : "") + std::to_string(c.nodes[n]->per[k]->io.longest.load());
 			gone += h.transport->stats(k).gone;
 			links += h.loops[k]->at([&] { return h.transport->link_stats(k).established; });
 			aborted += h.transport->lane_stats(k).ended(rpc::Outcome::connection_aborted);
@@ -2905,11 +2905,11 @@ void fetch_alongside() {
 		}
 		auto t = c.nodes[n]->state(g);
 		std::printf("fetch-alongside: node %llu: %llu links established, %llu peers gone, calls ended connection_aborted %llu, "
-					"timed_out %llu; %s in term %llu; its loops went at most %s ms without turning, their journal I/O held them at "
-					"most %s ms at once\n",
+					"timed_out %llu; %s in term %llu; its loops went at most %s ms without turning, their longest journal "
+					"operations took %s ms\n",
 					(unsigned long long)n, (unsigned long long)links, (unsigned long long)gone, (unsigned long long)aborted,
 					(unsigned long long)timed_out, !t ? "no state" : t->role == Role::Leader ? "leader" : "not leader",
-					(unsigned long long)(t ? t->term : 0), turned.c_str(), held_by.c_str());
+					(unsigned long long)(t ? t->term : 0), turned.c_str(), took.c_str());
 	}
 	std::printf("fetch-alongside: the host stalled this process at most %llu ms (a stack dump, not counted: %llu ms); replies built on a loop (asked again): %llu\n",
 				(unsigned long long)stalled, (unsigned long long)dump_stall.load(), (unsigned long long)(replies[1].on_loop + replies[2].on_loop + replies[3].on_loop));

@@ -807,7 +807,51 @@ bool shutdown() {
 	return ok;
 }
 
+// The longest each loop went without turning, in ms: a probe posted every 5 ms, timed to its run.
+class Turns {
+	struct Probe {
+		std::atomic<std::int64_t> posted{-1};  // ms since `began`, -1 when none waits
+		std::atomic<std::uint64_t> worst{0};
+	};
+	std::vector<std::pair<Host *, std::uint32_t>> loops_;
+	std::shared_ptr<std::vector<Probe>> probes_;
+	steady::time_point began_ = steady::now();
+	std::atomic<bool> done_{false};
+	std::thread thread_;
+
+public:
+	explicit Turns(std::vector<std::pair<Host *, std::uint32_t>> loops)
+		: loops_(std::move(loops)), probes_(std::make_shared<std::vector<Probe>>(loops_.size())) {
+		thread_ = std::thread([this] {
+			while (!done_) {
+				for (std::size_t i = 0; i != loops_.size(); ++i) {
+					auto &p = (*probes_)[i];
+					const auto now = std::int64_t(ms_since(began_));
+					if (const auto at = p.posted.load(); at >= 0) {
+						p.worst = std::max<std::uint64_t>(p.worst, std::uint64_t(now - at));
+						continue;
+					}
+					p.posted = now;
+					loops_[i].first->post(loops_[i].second, [probes = probes_, began = began_, i] {
+						auto &q = (*probes)[i];
+						q.worst = std::max<std::uint64_t>(q.worst, ms_since(began) - std::uint64_t(q.posted.load()));
+						q.posted = -1;
+					});
+				}
+				std::this_thread::sleep_for(5ms);
+			}
+		});
+	}
+	std::uint64_t worst(std::size_t i) const { return (*probes_)[i].worst; }
+	void stop() {
+		if (!done_.exchange(true))
+			thread_.join();
+	}
+	~Turns() { stop(); }
+};
+
 // D8, A4: fetch beside a maximal upload on one Bulk connection, against heartbeats.
+// RPC_HOST_FETCH_SLOW_READ=ms makes building the 16 MiB reply that much slower.
 bool fetch() {
 #ifndef SO_NOSIGPIPE
 	// A write() to a peer that closed raises SIGPIPE here: the host ignores it (main).
@@ -818,11 +862,20 @@ bool fetch() {
 	Host one(1, L), two(2, L);
 	HostTransportOptions client, server;
 	client.rpc.fetch_bytes = 32 << 20;
-	server.rpc.reader = [&expected](std::string_view name) -> std::optional<std::string> {
+	const auto *slow_read = std::getenv("RPC_HOST_FETCH_SLOW_READ");
+	const auto slow_ms = std::chrono::milliseconds(slow_read ? std::strtoull(slow_read, nullptr, 10) : 0);
+	std::atomic<std::uint64_t> built_ms{0}, on_loop{0};
+	server.rpc.reader = [&expected, &built_ms, &on_loop, slow_ms](std::string_view name) -> std::optional<std::string> {
 		if (name == "throws")
 			throw std::runtime_error("the disk broke");
-		if (name == "big")
-			return expected;
+		if (name == "big") {
+			const auto t = steady::now();
+			std::this_thread::sleep_for(slow_ms);
+			std::string bytes = expected;
+			built_ms = std::max<std::uint64_t>(built_ms, ms_since(t));
+			++on_loop;
+			return bytes;
+		}
 		if (name == "huge")
 			return std::string(48 << 20, 'h');
 		if (name == "slow")
@@ -864,6 +917,7 @@ bool fetch() {
 		return false;
 	beats.worst = 0;
 	Lag lag;
+	Turns turns({{&one, reader}, {&two, two.transport->loop_of_node(1)}});
 	struct Got {
 		std::atomic<bool> done{false};
 		std::error_code error;
@@ -898,6 +952,7 @@ bool fetch() {
 		std::this_thread::sleep_until(start + (tick + 1) * 100ms);
 	}
 	const auto fetched_ms = ms_since(began);
+	const std::uint64_t turned[] = {turns.worst(0), turns.worst(1)};
 	const auto beside = uploaded.load() - before;
 	const bool exact = big && big->done && !big->error && big->bytes && *big->bytes == expected;
 	auto missing = fetch("none"), throws = fetch("throws"), huge = fetch("huge");
@@ -918,8 +973,13 @@ bool fetch() {
 	const bool table = ended && !missing->error && !missing->bytes && throws->error == std::errc::io_error &&
 					   huge->error == std::errc::message_size && busy >= 1 && busy + slow_ok == 5;
 	const auto lagged = lag.stop();
+	turns.stop();
 	const auto bound = 1000 + lagged;
 	const bool ok = exact && beside > 0 && beats.worst < bound && table;
+	std::printf("fetch: the 16 MiB reply took %llu ms to build, built on host 2's loop %llu times; the links' loops' longest turn "
+				"until it arrived: host 1's %llu ms, host 2's %llu ms (in the whole case: %llu, %llu)\n",
+				(unsigned long long)built_ms.load(), (unsigned long long)on_loop.load(), (unsigned long long)turned[0],
+				(unsigned long long)turned[1], (unsigned long long)turns.worst(0), (unsigned long long)turns.worst(1));
 	const auto big_error = !big || !big->done ? std::string("not done") : big->error ? big->error.message() : std::string("ok");
 	std::printf("fetch: 16 MiB arrived exact %s (%s) in %llu ms beside %llu MiB of group uploads on Bulk; links %llu+%llu, "
 				"ended dead %llu, stuck %llu, failed %llu; dropped %llu, overrun %llu; heartbeats' longest gap %llu ms of %llu allowed (1000 plus the host's %llu ms of lag); missing %s, "

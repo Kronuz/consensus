@@ -27,7 +27,8 @@
 //               Bulk connection, a 16 MiB fetch arrives exact while heartbeats on Control keep
 //               every gap under 1,000 ms plus the host's lag, its replies built before the loops
 //               start; a missing name, a reader that throws, a reply over this host's fetch_bytes
-//               and a fifth concurrent fetch end as D8's table says; then
+//               and a fifth concurrent fetch end as D8's table says, and the 16 MiB fetched again
+//               arrives exact; then
 //               fetch-dead: host 2's connection loop held past host 1's dead_after ends its links
 //               with three fetches on them, and each is asked again and ends as it would have
 //               (control: fetch-not-asked-again); then each way a connection ends under a fetch
@@ -884,7 +885,7 @@ bool fetch() {
 	// A name asked past them builds on the loop, counted.
 	std::mutex mutex;
 	std::map<std::string, std::vector<std::string>, std::less<>> ready;
-	for (auto [name, n] : {std::pair{"big", 1}, {"huge", 1}, {"slow", 5}})
+	for (auto [name, n] : {std::pair{"big", 2}, {"huge", 1}, {"slow", 5}})
 		for (int i = 0; i != n; ++i)
 			ready[name].push_back(*build(name));
 	Host one(1, L), two(2, L);
@@ -987,12 +988,16 @@ bool fetch() {
 		return all;
 	}, 30s);
 	int busy = 0, slow_ok = 0;
+	const auto first_4 = expected.substr(0, 4 << 20);
 	for (auto &g : slow) {
 		busy += g->error == std::errc::resource_unavailable_try_again;
-		slow_ok += !g->error && g->bytes && g->bytes->size() == 4 << 20;
+		slow_ok += !g->error && g->bytes && *g->bytes == first_4;
 	}
+	// The same name again: the reader must not serve a reply it already moved out.
+	auto again = fetch("big");
+	const bool again_exact = until([&] { return again->done.load(); }, 30s) && !again->error && again->bytes && *again->bytes == expected;
 	const bool table = ended && !missing->error && !missing->bytes && throws->error == std::errc::io_error &&
-					   huge->error == std::errc::message_size && busy >= 1 && busy + slow_ok == 5;
+					   huge->error == std::errc::message_size && busy >= 1 && busy + slow_ok == 5 && again_exact;
 	const auto lagged = lag.stop();
 	turns.stop();
 	const auto bound = 1000 + lagged;
@@ -1004,7 +1009,7 @@ bool fetch() {
 	const auto big_error = !big || !big->done ? std::string("not done") : big->error ? big->error.message() : std::string("ok");
 	std::printf("fetch: 16 MiB arrived exact %s (%s) in %llu ms beside %llu MiB of group uploads on Bulk; links %llu+%llu, "
 				"ended dead %llu, stuck %llu, failed %llu; dropped %llu, overrun %llu; heartbeats' longest gap %llu ms of %llu allowed (1000 plus the host's %llu ms of lag); missing %s, "
-				"a throwing reader %s, 48 MiB over 32 MiB %s, five 4 MiB at once: %d ok, %d refused %s\n",
+				"a throwing reader %s, 48 MiB over 32 MiB %s, five 4 MiB at once: %d ok, %d refused; the 16 MiB again exact %s %s\n",
 				exact ? "yes" : "NO", big_error.c_str(), (unsigned long long)fetched_ms, (unsigned long long)(beside >> 20),
 				(unsigned long long)one.total(&HostTransportStats::links), (unsigned long long)two.total(&HostTransportStats::links),
 				(unsigned long long)(one.total(&HostTransportStats::dead) + two.total(&HostTransportStats::dead)),
@@ -1014,7 +1019,7 @@ bool fetch() {
 				(unsigned long long)(one.total(&HostTransportStats::overrun) + two.total(&HostTransportStats::overrun)),
 				(unsigned long long)beats.worst, (unsigned long long)bound, (unsigned long long)lagged,
 				!missing->error && !missing->bytes ? "nullopt" : "WRONG", throws->error.message().c_str(), huge->error.message().c_str(), slow_ok,
-				busy, ok ? "ok" : "FAILED");
+				busy, again_exact ? "yes" : "NO", ok ? "ok" : "FAILED");
 	one.stop();
 	two.stop();
 	return ok;

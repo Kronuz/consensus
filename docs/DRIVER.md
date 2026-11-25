@@ -138,8 +138,8 @@ public:
 	task::task<ReadReady> read(GroupId, task::cancel_token = {});
 	task::task<void> close(GroupId);            // retirement until drained; no caller token
 
-	// On the loop: an open group's role, term, leader, indexes and membership in force.
-	struct GroupState { Role role; Term term; NodeId leader; Index committed, applied; Membership membership; };
+	// On the loop: an open group's role, term, leader, indexes (last: its log end) and membership in force.
+	struct GroupState { Role role; Term term; NodeId leader; Index committed, applied, last; Membership membership; bool resting = false; };
 	std::optional<GroupState> state(GroupId) const;
 	// The closed state (RFTCLOS1) when the group can close now: started, no call or frame
 	// waiting, at rest at a checkpoint covering applied; bound to the host table's incarnation.

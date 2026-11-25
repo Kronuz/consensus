@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
@@ -41,15 +42,28 @@
 #include <random>
 #include <set>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 using namespace kronuz::consensus;
 
 namespace {
 
-int failures = 0;
+const bool verify = std::getenv("LIVENESS_VERIFY") != nullptr;
+// Each profile runs on its own thread into its own report: lines in order (true for stderr),
+// printed once it and every profile before it finish, so the output is the serial run's.
+struct Report { std::vector<std::pair<bool, std::string>> lines; int failures = 0; };
+thread_local Report* report = nullptr;
+void say(const char* format, ...) {
+	va_list args, again; va_start(args, format); va_copy(again, args);
+	std::string line(std::size_t(std::vsnprintf(nullptr, 0, format, args)), '\0');
+	std::vsnprintf(line.data(), line.size() + 1, format, again);
+	va_end(again); va_end(args);
+	report->lines.emplace_back(false, std::move(line));
+}
 void check(bool value, const std::string& what) {
-	if (!value && failures++ < 20) { std::fprintf(stderr, "FAIL: %s\n", what.c_str()); }
+	if (!value) { ++report->failures; report->lines.emplace_back(true, "FAIL: " + what + "\n"); }
 }
 
 struct Profile {
@@ -85,7 +99,7 @@ public:
 			step(id, Tick{0, delay()});
 			step(id, Start{});
 		}
-		for (auto& [id, n] : nodes_) { at(tick_ + random_() % tick_, [this, id] { tick(id); }); }
+		for (auto& [id, n] : nodes_) { at_tick(tick_ + random_() % tick_, id); }
 	}
 	std::uint64_t now() const { return now_; }
 	std::function<void()> observe;  // called after every event
@@ -96,7 +110,7 @@ public:
 		nodes_[id].core = std::make_unique<Core>(c, std::move(state), Limits{}, profile_.timing);
 		step(id, Tick{now_, delay()});
 		step(id, Start{});
-		at(now_ + tick_, [this, id] { tick(id); });
+		at_tick(now_ + tick_, id);
 	}
 	// Proposes a membership change on `leader` until it is placed; true once placed.
 	bool change(NodeId leader, const Membership& next, std::uint64_t until) {
@@ -109,18 +123,30 @@ public:
 		return false;
 	}
 	void run_until(std::uint64_t until, const std::function<bool()>& done = {}) {
-		while (!events_.empty() && events_.top().at <= until) {
-			auto event = events_.top(); events_.pop();
-			now_ = event.at;
-			event.run();
+		while (true) {
+			// The next event is the earliest of the queue's and the nodes' Ticks, by time, then order.
+			const std::pair<NodeId, Node*>* ticking = nullptr;
+			for (const auto& entry : ticking_) {
+				if (!ticking || std::pair{entry.second->tick_at, entry.second->tick_order} < std::pair{ticking->second->tick_at, ticking->second->tick_order}) { ticking = &entry; }
+			}
+			const bool queued = !events_.empty() && std::pair{events_.top().at, events_.top().order} < std::pair{ticking->second->tick_at, ticking->second->tick_order};
+			if ((queued ? events_.top().at : ticking->second->tick_at) > until) { break; }
+			if (queued) {
+				const auto event = events_.top(); events_.pop();
+				now_ = event.at;
+				run(event);
+			} else {
+				now_ = ticking->second->tick_at;
+				tick(ticking->first, *ticking->second);
+			}
 			if (observe) { observe(); }
 			if (done && done()) { return; }
 		}
 		now_ = until;
 	}
 	// Links are directional: cut(a, b) drops what a sends to b.
-	void cut(NodeId from, NodeId to) { cut_.insert({from, to}); }
-	void heal() { cut_.clear(); }
+	void cut(NodeId from, NodeId to) { cut_ |= link(from, to); }
+	void heal() { cut_ = 0; }
 	void isolate(const std::set<NodeId>& side) {
 		for (auto& [a, x] : nodes_) {
 			for (auto& [b, y] : nodes_) { if (a != b && side.contains(a) != side.contains(b)) { cut(a, b); } }
@@ -163,7 +189,13 @@ public:
 		return false;
 	}
 	Actions step(NodeId id, Event event) {
-		auto actions = nodes_.at(id).core->step(std::move(event));
+		auto& n = nodes_.at(id);
+		// A held Tick reaches the core before its next event, so that event sees the same clock.
+		if (auto held = std::exchange(n.held, std::nullopt); held && !std::holds_alternative<Tick>(event)) {
+			auto early = n.core->step(*held); consume(id, early);
+		}
+		auto actions = n.core->step(std::move(event));
+		n.hold_until.reset();
 		consume(id, actions);
 		return actions;
 	}
@@ -172,13 +204,49 @@ private:
 	struct Node {
 		std::unique_ptr<Core> core;
 		std::vector<std::pair<NodeId, Message>> inbox;  // held while the core persists, as a Worker's caller holds them
+		std::optional<Tick> held;  // the last Tick before hold_until, not yet delivered
+		std::optional<std::uint64_t> hold_until;  // Core::next_deadline() since the core's last step, when holdable; 0 when not
+		std::uint64_t tick_at = 0, tick_order = 0;  // its one scheduled Tick, ordered with the queue's events
 	};
+	// A delivery (its message in messages_[value]), a persistence completing (its token), or an
+	// application (through its index).
+	enum class Kind : std::uint8_t { Deliver, Persisted, Applied };
 	struct Scheduled {
 		std::uint64_t at, order;
-		std::function<void()> run;
+		Kind kind; NodeId from, to; std::uint64_t value;
 		bool operator<(const Scheduled& o) const { return at != o.at ? at > o.at : order > o.order; }
 	};
-	void at(std::uint64_t when, std::function<void()> run) { events_.push({when, ++order_, std::move(run)}); }
+	void at(std::uint64_t when, Kind kind, NodeId from, NodeId to, std::uint64_t value) { events_.push({when, ++order_, kind, from, to, value}); }
+	static std::uint64_t link(NodeId from, NodeId to) { return std::uint64_t{1} << (from * 8 + to); }  // ids 1-5
+	std::uint64_t stash(Message message) {
+		if (spare_.empty()) { messages_.push_back(std::move(message)); return messages_.size() - 1; }
+		const auto slot = spare_.back(); spare_.pop_back(); messages_[slot] = std::move(message); return slot;
+	}
+	void run(const Scheduled& event) {
+		const NodeId id = event.to;
+		if (event.kind == Kind::Deliver) {
+			auto message = std::move(messages_[event.value]); spare_.push_back(event.value);
+			if (cut_ & link(event.from, id)) { return; }
+			step(id, Tick{now_, delay()});
+			auto& n = nodes_.at(id);
+			if (n.core->busy() || !n.inbox.empty()) { n.inbox.emplace_back(event.from, std::move(message)); return; }
+			step(id, Receive{event.from, std::move(message)});
+		} else if (event.kind == Kind::Persisted) {
+			step(id, Tick{now_, delay()}); step(id, Persisted{event.value});
+			auto& n = nodes_.at(id);
+			while (!n.inbox.empty() && !n.core->busy()) {
+				auto [from, message] = std::move(n.inbox.front()); n.inbox.erase(n.inbox.begin());
+				step(id, Receive{from, std::move(message)});
+			}
+		} else {
+			step(id, Applied{event.value});
+		}
+	}
+	void at_tick(std::uint64_t when, NodeId id) {
+		auto& n = nodes_.at(id);
+		if (!n.tick_order) { ticking_.emplace_back(id, &n); }
+		n.tick_at = when; n.tick_order = ++order_;
+	}
 	std::uint64_t delay() {
 		const auto& t = profile_.timing;
 		return t.election_min + random_() % (t.election_max - t.election_min + 1);
@@ -193,38 +261,45 @@ private:
 		std::uniform_real_distribution<double> d(profile_.r / 4, profile_.r / 2);
 		return std::max<std::uint64_t>(1, std::uint64_t(std::ceil(d(random_))));
 	}
-	void tick(NodeId id) {
-		step(id, Tick{now_, delay()});
-		at(now_ + tick_, [this, id] { tick(id); });
+	// A voter's Tick before Core::next_deadline() changes nothing but the core's clock, so it is
+	// held rather than stepped (its delay is still drawn). A leader's is held only with its
+	// membership settled: a D3 removal, a witness's or a removed leader's hand-off waits for a
+	// Tick, not a deadline. LIVENESS_VERIFY steps each held Tick and fails one that acts or
+	// moves the deadline.
+	bool holdable(NodeId id) {
+		const Core& core = *nodes_.at(id).core;
+		const auto& m = core.membership();
+		if (!votes_in(m, id)) { return false; }
+		if (core.role() != Role::Leader) { return true; }
+		const auto* self = find_member(m, id);
+		return self->role != MemberRole::Witness && !m.leaving && core.committed_membership() == m;
+	}
+	void tick(NodeId id, Node& n) {
+		const Tick tick{now_, delay()};
+		if (!n.hold_until) { n.hold_until = holdable(id) ? n.core->next_deadline() : 0; }
+		if (tick.now < *n.hold_until) {
+			if (!verify) { n.held = tick; at_tick(now_ + tick_, id); return; }
+			const auto deadline = *n.hold_until;
+			auto actions = step(id, tick);
+			check(actions.empty() && n.core->next_deadline() == deadline, "a held Tick changes nothing");
+		} else {
+			step(id, tick);
+		}
+		at_tick(now_ + tick_, id);
 	}
 	void consume(NodeId id, Actions& actions) {
 		for (auto& action : actions) {
 			if (auto persist = std::get_if<Persist>(&action)) {
-				const Token token = persist->token;
-				at(now_ + barrier(), [this, id, token] {
-					step(id, Tick{now_, delay()}); step(id, Persisted{token});
-					auto& n = nodes_.at(id);
-					while (!n.inbox.empty() && !n.core->busy()) {
-						auto [from, message] = std::move(n.inbox.front()); n.inbox.erase(n.inbox.begin());
-						step(id, Receive{from, std::move(message)});
-					}
-				});
+				at(now_ + barrier(), Kind::Persisted, 0, id, persist->token);
 			} else if (auto send = std::get_if<Send>(&action)) {
 				const NodeId to = send->peer;
-				if (cut_.contains({id, to})) { continue; }
-				auto message = send->message;
-				at(now_ + one_way(), [this, id, to, message] {
-					if (cut_.contains({id, to})) { return; }
-					step(to, Tick{now_, delay()});
-					auto& n = nodes_.at(to);
-					if (n.core->busy() || !n.inbox.empty()) { n.inbox.emplace_back(id, message); return; }
-					step(to, Receive{id, message});
-				});
+				if (cut_ & link(id, to)) { continue; }
+				const auto when = now_ + one_way();
+				at(when, Kind::Deliver, id, to, stash(std::move(send->message)));
 			} else if (auto p = std::get_if<ProposalPlaced>(&action)) {
 				placed_[p->request] = p->index;
 			} else if (auto committed = std::get_if<Committed>(&action)) {
-				const Index through = committed->entries.back().index;
-				at(now_, [this, id, through] { step(id, Applied{through}); });
+				at(now_, Kind::Applied, 0, id, committed->entries.back().index);
 			} else if (std::holds_alternative<Fenced>(action)) {
 				check(false, "a node fenced");
 			}
@@ -235,7 +310,10 @@ private:
 	Profile profile_;
 	std::map<NodeId, Node> nodes_;
 	std::priority_queue<Scheduled> events_;
-	std::set<std::pair<NodeId, NodeId>> cut_;
+	std::vector<std::pair<NodeId, Node*>> ticking_;  // each node with its Tick scheduled
+	std::uint64_t cut_ = 0;  // link(from, to) bits: what from sends to to is dropped
+	std::vector<Message> messages_;  // messages in flight, by slot
+	std::vector<std::uint64_t> spare_;  // free slots of messages_
 	std::map<RequestId, Index> placed_;
 	std::uint64_t now_ = 0, order_ = 0, tick_ = 1;
 	RequestId request_ = 0;
@@ -403,10 +481,10 @@ void run(const Profile& profile, std::uint64_t seeds) {
 	}
 	const auto heal99 = percentile(heal, 0.99), heal_max = percentile(heal, 1.0);
 	const auto transfer99 = percentile(transfer, 0.99), down_max = percentile(stepdown, 1.0), recover99 = percentile(recover, 0.99);
-	std::printf("%-26s b=%3.0f r=%2.0f hb=%4llu rpc=%4llu elect=%llu-%llu  heal p99 %6.0f max %6.0f  transfer p99 %5.0f  step-down max %5.0f  recover p99 %6.0f  term raised %llu\n",
+	say("%-26s b=%3.0f r=%2.0f hb=%4llu rpc=%4llu elect=%llu-%llu  heal p99 %6.0f max %6.0f  transfer p99 %5.0f  step-down max %5.0f  recover p99 %6.0f  term raised %llu\n",
 		profile.name, profile.b, profile.r, (unsigned long long)t.heartbeat, (unsigned long long)t.rpc_timeout,
 		(unsigned long long)t.election_min, (unsigned long long)t.election_max, heal99, heal_max, transfer99, down_max, recover99, (unsigned long long)raised);
-	std::printf("%26s samples: heal %zu (%llu failed), transfer %zu (%llu failed), recover %zu (%llu failed), isolated node's own term raised %llu\n", "", heal.size(), (unsigned long long)unhealed,
+	say("%26s samples: heal %zu (%llu failed), transfer %zu (%llu failed), recover %zu (%llu failed), isolated node's own term raised %llu\n", "", heal.size(), (unsigned long long)unhealed,
 		transfer.size(), (unsigned long long)untransferred, recover.size(), (unsigned long long)unrecovered, (unsigned long long)lone_raised);
 	check(!unhealed && heal99 <= 5000 && heal_max <= 10000, std::string(profile.name) + ": a healed partition commits within 5 s at p99, 10 s worst");
 	check(!raised, std::string(profile.name) + ": a partitioned node never raises the healthy group's term");
@@ -414,12 +492,12 @@ void run(const Profile& profile, std::uint64_t seeds) {
 	check(down_max <= double(t.election_max) + double(t.heartbeat), std::string(profile.name) + ": a deaf leader steps down within election_max");
 	check(!unrecovered && recover99 <= 5000, std::string(profile.name) + ": a new leader commits within 5 s of a deaf leader");
 	const auto survive99 = percentile(survive, 0.99), handoff_max = percentile(handoff, 1.0);
-	std::printf("%26s 2 + witness: single failure recovered p99 %6.0f (%zu, %llu failed); witness hand-offs %zu, max %5.0f, unfinished %llu\n", "",
+	say("%26s 2 + witness: single failure recovered p99 %6.0f (%zu, %llu failed); witness hand-offs %zu, max %5.0f, unfinished %llu\n", "",
 		survive99, survive.size(), (unsigned long long)unsurvived, handoff.size(), handoff_max, (unsigned long long)unhanded);
 	check(!unsurvived && survive99 <= 5000, std::string(profile.name) + ": 2 + witness survives any single failure");
 	check(!unhanded && handoff_max <= double(t.election_max), std::string(profile.name) + ": a witness leader hands off within election_max");
 	const auto promotion99 = percentile(promotion, 0.99), replacement99 = percentile(replacement, 0.99);
-	std::printf("%26s membership: leader fails in a promotion's window, new leader commits p99 %6.0f (%zu, %llu failed); in a replacement's window p99 %6.0f (%zu, %llu failed); removed voter raised the term %llu of %llu\n", "",
+	say("%26s membership: leader fails in a promotion's window, new leader commits p99 %6.0f (%zu, %llu failed); in a replacement's window p99 %6.0f (%zu, %llu failed); removed voter raised the term %llu of %llu\n", "",
 		promotion99, promotion.size(), (unsigned long long)unpromoted, replacement99, replacement.size(), (unsigned long long)unreplaced, (unsigned long long)removed_raised, (unsigned long long)removed_runs);
 	check(!unpromoted && promotion99 <= 5000, std::string(profile.name) + ": a leader failing in a promotion's window is replaced within 5 s");
 	check(!unreplaced && replacement99 <= 5000, std::string(profile.name) + ": a leader failing in a replacement's window is replaced within 5 s");
@@ -429,6 +507,7 @@ void run(const Profile& profile, std::uint64_t seeds) {
 }  // namespace
 
 int main(int argc, char** argv) {
+	std::setvbuf(stdout, nullptr, _IOLBF, 0);  // a run killed at its timeout still shows each profile it finished
 	const std::uint64_t seeds = argc > 1 ? std::strtoull(argv[1], nullptr, 10) : 100;
 	// The default profile (R4: Detent's authority profile, macOS x86_64 APFS at b = 80 ms),
 	// and profiles derived from barrier p99 estimates per platform (docs/perf/commit-barriers.md
@@ -440,7 +519,16 @@ int main(int argc, char** argv) {
 		derive("Linux ext4", 30, 2),
 		derive("FreeBSD UFS", 15, 2),
 	};
-	for (const auto& p : profiles) { run(p, seeds); }
+	std::vector<Report> reports(std::size(profiles));
+	std::vector<std::thread> threads;
+	for (std::size_t i = 0; i < std::size(profiles); ++i) { threads.emplace_back([&, i] { report = &reports[i]; run(profiles[i], seeds); }); }
+	int failures = 0;  // the first 20 are printed
+	for (std::size_t i = 0; i < std::size(profiles); ++i) {
+		threads[i].join();
+		for (const auto& [error, line] : reports[i].lines) {
+			if (!error) { std::fputs(line.c_str(), stdout); } else if (failures++ < 20) { std::fputs(line.c_str(), stderr); }
+		}
+	}
 	std::printf("%d failures\n", failures);
 	return failures ? 1 : 0;
 }

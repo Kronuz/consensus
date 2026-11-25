@@ -81,6 +81,7 @@ using steady = std::chrono::steady_clock;
 namespace j = kronuz::journal;
 
 namespace {
+constexpr kronuz::journal::PosixIOOptions full_flush{kronuz::journal::FlushMode::full};
 std::filesystem::path fixture;
 const char *names[] = {"", "one", "two", "three", "four"};
 
@@ -1348,7 +1349,7 @@ struct Cluster {
 		for (NodeId m = 1; m <= 4; ++m)
 			if (m != n)
 				peers[m] = {"127.0.0.1", ports[m]};
-		nodes[n] = std::make_unique<Node>(n, L, ports[n], std::make_shared<j::PosixIO>(directory(n)), groups, peers, std::move(voters),
+		nodes[n] = std::make_unique<Node>(n, L, ports[n], std::make_shared<j::PosixIO>(directory(n), full_flush), groups, peers, std::move(voters),
 										  options_of(n), quiesce);
 	}
 	std::vector<Node *> of(std::initializer_list<NodeId> ids) {

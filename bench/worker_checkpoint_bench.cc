@@ -28,6 +28,7 @@
 
 using namespace kronuz::consensus;
 namespace {
+constexpr kronuz::journal::PosixIOOptions full_flush{kronuz::journal::FlushMode::full};
 using Clock = std::chrono::steady_clock;
 double cpu() {
 	rusage value{}; if (::getrusage(RUSAGE_SELF, &value)) { throw std::runtime_error("getrusage failed"); }
@@ -51,7 +52,7 @@ void run(std::size_t commands) {
 	{
 		// Seed a maximal legal recovered log with bounded batches. This is a
 		// checkpoint fixture, not a measured proposal-throughput workload.
-		kronuz::journal::PosixIO io(directory); kronuz::journal::Journal journal(io, 4 * 1024 * 1024);
+		kronuz::journal::PosixIO io(directory, full_flush); kronuz::journal::Journal journal(io, 4 * 1024 * 1024);
 		kronuz::journal::Identity identity{}; identity[0] = 'B'; journal.create(identity);
 		journal.append_batch(encode_initialization(configuration));
 		journal.append_batch(encode_storage_batch({HardState{1, 1, 1}, LogMutation{1, {{1, 1, EntryKind::NoOp, ""}}}}));
@@ -62,7 +63,7 @@ void run(std::size_t commands) {
 			batch.hard = HardState{1, 1, first + count + 1}; journal.append_batch(encode_storage_batch(batch)); first += count;
 		}
 	}
-	kronuz::journal::PosixIO io(directory);
+	kronuz::journal::PosixIO io(directory, full_flush);
 	Worker worker(io, configuration, {{512ull * 1024 * 1024, 4096}, {16 * 1024, 3}, {80ull * 1024 * 1024, 4}, 8, 3});
 	worker.recover([](auto&) { throw std::runtime_error("unexpected initial checkpoint"); });
 	while (!worker.ready()) { worker.run_one({0, 100}); }

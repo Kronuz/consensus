@@ -30,6 +30,8 @@
 #include <iostream>
 #include <sys/resource.h>
 
+constexpr kronuz::journal::PosixIOOptions full_flush{kronuz::journal::FlushMode::full};
+
 static double cpu_seconds() {
 	rusage usage{};
 	if (::getrusage(RUSAGE_SELF, &usage)) { throw std::runtime_error("getrusage failed"); }
@@ -45,7 +47,7 @@ int main() {
 			if (!std::filesystem::create_directory(directory)) { throw std::runtime_error("benchmark directory exists"); }
 			::chmod(directory.c_str(), 0700);
 			struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
-			kronuz::journal::PosixIO io(directory); kronuz::journal::Journal journal(io);
+			kronuz::journal::PosixIO io(directory, full_flush); kronuz::journal::Journal journal(io);
 			Identity identity{}; identity[0] = 'B'; journal.create(identity);
 			FixedConfiguration configuration; configuration.cluster[0] = 'C'; configuration.configuration[0] = 'V'; configuration.local = 1; configuration.voters = {1};
 			journal.append_batch(encode_initialization(configuration));

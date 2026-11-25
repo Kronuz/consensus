@@ -66,6 +66,7 @@ namespace j = kronuz::journal;
 #endif
 
 namespace {
+constexpr kronuz::journal::PosixIOOptions full_flush{kronuz::journal::FlushMode::full};
 
 // A sanitizer's allocator pads every block and reports no zone statistics: bytes go unchecked.
 // Heap bytes are read from macOS's zone statistics and glibc's mallinfo2 only.
@@ -138,7 +139,7 @@ void measure(std::size_t groups, bool three) {
 		task::inline_scheduler scheduler;
 		auto ref = task::scheduler_ref::of(scheduler);
 		j::InlineCompletion io;
-		j::Host host(std::make_shared<j::PosixIO>(directory), j::Identity{'I', 'D'}, j::HostOptions{1, turn_options});
+		j::Host host(std::make_shared<j::PosixIO>(directory, full_flush), j::Identity{'I', 'D'}, j::HostOptions{1, turn_options});
 		Sink sink;
 		Driver<Sink> driver(Seams{ref, j::completion_ref::of(io), host, 0, 11}, sink);
 		task::cancel_source stop;

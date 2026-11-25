@@ -37,6 +37,7 @@
 
 using namespace kronuz::consensus;
 namespace {
+constexpr kronuz::journal::PosixIOOptions full_flush{kronuz::journal::FlushMode::full};
 // The unit tests run on a compact timing profile (ticks of 10 to 20); the library default is
 // Track C's R4 profile, which the liveness test covers.
 constexpr Timing compact{20, 40, 100, 200, 60000};
@@ -985,7 +986,7 @@ void real_journal_integration() {
 	struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
 	std::vector<std::string> commands;
 	{
-		kronuz::journal::PosixIO io(directory); kronuz::journal::Journal journal(io, 1024 * 1024);
+		kronuz::journal::PosixIO io(directory, full_flush); kronuz::journal::Journal journal(io, 1024 * 1024);
 		kronuz::journal::Identity identity{}; identity[0] = 'J'; journal.create(identity);
 		journal.append_batch(encode_initialization(config(1, 1)));
 		TestCore core(config(1, 1), empty(1, 1));
@@ -1027,7 +1028,7 @@ void real_journal_integration() {
 		check(core.base_index() == 0 && core.applied() == 3 && core.busy(), "durable checkpoint cannot compact the old core without its completion");
 	}
 	{
-		kronuz::journal::PosixIO io(directory); kronuz::journal::Journal journal(io, 1024 * 1024);
+		kronuz::journal::PosixIO io(directory, full_flush); kronuz::journal::Journal journal(io, 1024 * 1024);
 		Recovery recovery(config(1, 1)); std::vector<std::string> restored_commands;
 		auto frontier = journal.recover([&](auto sequence, std::string_view batch) { recovery.replay(sequence, batch); },
 			[&](const auto& selected, auto& bundle, auto dependencies) {
@@ -1061,7 +1062,7 @@ void real_store_integration() {
 	struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
 	std::vector<std::string> commands;
 	{
-		kronuz::journal::PosixIO io(directory); kronuz::journal::Store journal(io, {{16 * 1024 * 1024, 256}, {16 * 1024, 4}, {2 * 1024 * 1024 + 1024, 4}, 32}, 1024 * 1024);
+		kronuz::journal::PosixIO io(directory, full_flush); kronuz::journal::Store journal(io, {{16 * 1024 * 1024, 256}, {16 * 1024, 4}, {2 * 1024 * 1024 + 1024, 4}, 32}, 1024 * 1024);
 		kronuz::journal::Identity identity{}; identity[0] = 'J'; journal.create(identity);
 		while (!journal.inventory_step(1).complete) {}
 		auto append = [&](kronuz::journal::AdmissionClass kind, std::string_view bytes) {
@@ -1114,7 +1115,7 @@ void real_store_integration() {
 		check(core.base_index() == 0 && core.applied() == 3 && core.busy(), "durable checkpoint cannot compact the old core without its completion");
 	}
 	{
-		kronuz::journal::PosixIO io(directory); kronuz::journal::Store journal(io, {{16 * 1024 * 1024, 256}, {16 * 1024, 4}, {2 * 1024 * 1024 + 1024, 4}, 32}, 1024 * 1024);
+		kronuz::journal::PosixIO io(directory, full_flush); kronuz::journal::Store journal(io, {{16 * 1024 * 1024, 256}, {16 * 1024, 4}, {2 * 1024 * 1024 + 1024, 4}, 32}, 1024 * 1024);
 		Recovery recovery(config(1, 1)); std::vector<std::string> restored_commands;
 		auto frontier = journal.recover([&](auto sequence, std::string_view batch) { recovery.replay(sequence, batch); },
 			[&](const auto& selected, auto& bundle, auto dependencies) {

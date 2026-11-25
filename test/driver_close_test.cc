@@ -686,7 +686,7 @@ void reopen_rows() {
 	auto reopen = [&](const std::string& how, bool table) {
 		check(loop.driver->groups() == 0, how + ": the row is erased");
 		check((loop.host->status(g) == j::GroupStatus::closed) == table, how + (table ? ": closed into the host's table" : ": released, not closed into the table"));
-		check(table || turns.parked(g), how + ": the released group is parked");
+		check(table || turns.evicted(g), how + ": the released group is evicted");
 		const auto image = loop.recover(g, error, options({1}));
 		check(!error, how + ": recovers in the live Host: " + what(error));
 		loop.apply(g);
@@ -740,7 +740,7 @@ void reopen_rows() {
 // A2: 10,000 created rows, each with a record and a checkpoint covering it, opened together and
 // closed: the process heap per row (HeapIO's files left out) returns to its pre-open value,
 // the Driver's and the journal's alike. Then 10,000 rows closed with a record after their
-// checkpoint, which the host releases: each is parked, and what that keeps is reported.
+// checkpoint, which the host releases: each is evicted, and what that keeps is reported.
 void closed_bytes() {
 	const char* scale = std::getenv("CLOSE_BYTES_ROWS");  // another count, for timing
 	const GroupId rows = scale ? std::stoull(scale) : 10'000;
@@ -791,9 +791,9 @@ void closed_bytes() {
 	for (GroupId g = 2 + 2 * rows; g < 2 + 3 * rows; ++g) { close(g); }
 	sweep_ranges(loop, 20 * rows, rows);
 	const auto released = process();
-	std::size_t parked = 0;
-	for (GroupId g = 2 + 2 * rows; g < 2 + 3 * rows; ++g) { parked += loop.host->driver(0).parked(g); }
-	check(parked == rows, "every row with a record after its checkpoint is released and parked: " + std::to_string(parked));
+	std::size_t evicted = 0;
+	for (GroupId g = 2 + 2 * rows; g < 2 + 3 * rows; ++g) { evicted += loop.host->driver(0).evicted(g); }
+	check(evicted == rows, "every row with a record after its checkpoint is released and evicted: " + std::to_string(evicted));
 	std::printf("closed_bytes: %u released rows, process heap per row after close: %.1f B\n", unsigned(rows), per(released, released_before));
 }
 
@@ -1037,7 +1037,7 @@ void failed_close() {
 		disk.add_fault({fl::op::sync_directory});  // the next directory sync fails: the table commit's
 		check(loop.close(g, error) && !error, "close completes when its table commit fails: " + what(error));
 		check(loop.driver->groups() == 0, "the row is erased");
-		check(loop.host->driver(0).parked(g), "the fenced Store released the group: parked");
+		check(loop.host->driver(0).evicted(g), "the fenced Store released the group: evicted");
 		loop.recover(g, error, options({1}));
 		check(is<close_in_doubt>(error), "a live recover of the id refuses with close_in_doubt: " + what(error));
 		if (!error) {  // the reopen the refusal stops: a record acknowledged past the closed base
@@ -1250,6 +1250,30 @@ void idle_cpu() {
 	if (m.empty() || m == "heartbeat") { idle_cpu_mode(false, groups, seconds); }
 }
 
+// GroupState::last after a recover from a closed record is the log end the record names, and
+// advances with appends after it.
+void group_last_closed() {
+	constexpr GroupId g = 131;
+	fl::filesystem disk; Loop loop(disk);
+	std::exception_ptr error;
+	std::vector<std::string> applied;
+	loop.lone(g);
+	std::optional<Placement> placed;
+	for (const char* c : {"a", "b", "c"}) { placed = loop.propose(g, c); applied.emplace_back(c); }
+	loop.apply(g);
+	auto published = loop.start(checkpoint_of(loop, g, applied));
+	loop.release();
+	check(published->done && !published->error, "the checkpoint publishes: " + what(published->error));
+	auto closed = loop.driver->closed_state(g);
+	check(closed && placed && loop.driver->state(g)->last == placed->index, "the open group's last is its newest entry");
+	check(loop.close(g, error) && !error, "closes: " + what(error));
+	loop.recover(g, error, options({1}), closed);
+	auto s = loop.driver->state(g);
+	check(!error && s && placed && s->last == placed->index, "recovered from the closed record, last is its log end: " + std::to_string(s ? s->last : 0) + " of " + std::to_string(placed ? placed->index : 0));
+	auto next = loop.propose(g, "d");
+	check(next && placed && next->index > placed->index && loop.driver->state(g)->last == next->index, "and advances with appends");
+}
+
 const std::map<std::string, void (*)()> cases{
 	{"idle_cpu", &idle_cpu},
 	{"created_bytes", &created_bytes},
@@ -1268,6 +1292,7 @@ const std::map<std::string, void (*)()> cases{
 	{"closed_bytes", &closed_bytes},
 	{"close_crash", &close_crash},
 	{"reopen_barriers", &reopen_barriers},
+	{"group_last_closed", &group_last_closed},
 	{"pool_bound", &pool_bound},
 	{"failed_close", &failed_close},
 	{"second_driver", &second_driver},

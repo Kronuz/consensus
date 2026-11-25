@@ -891,6 +891,80 @@ void flow_reaches_core() {
 	check(throws_as([&] { loop.driver->open(1, o); }, [](std::exception_ptr e) { return is<std::invalid_argument>(e); }), "a Flow with no pipeline is refused");
 }
 
+// GroupState::last is the log end (the worker's last_index) once recover returns: from a plain
+// log, and from a checkpoint plus a tail above it; it advances with appends.
+void group_last() {
+	constexpr GroupId g = 81;
+	fl::filesystem disk;
+	std::exception_ptr error;
+	auto recover = [&](Loop& loop) {
+		loop.driver->open(g, options({1}));
+		check(loop.settle(loop.driver->recover(g, [](j::ArtifactReader&) {}), error) && !error, "recover: " + what(error));
+	};
+	auto place = [&](Loop& loop, GroupId id, const std::string& command) {
+		std::optional<Placement> placed;
+		check(loop.settle(loop.driver->propose(id, command), placed, error) && !error && placed, "placed " + command + ": " + what(error));
+		loop.apply(id);
+		return placed;
+	};
+	Index last = 0;
+	{  // a plain log of N entries: the leader's no-op, then N-1 commands, none checkpointed
+		Loop loop(disk);
+		loop.lone(g);
+		check(loop.driver->state(g)->last == 1, "a created lone voter's log is its no-op: " + std::to_string(loop.driver->state(g)->last));
+		for (int n = 0; n < 5; ++n) {
+			auto placed = place(loop, g, "c" + std::to_string(n));
+			check(placed && loop.driver->state(g)->last == placed->index, "last advances with append " + std::to_string(n));
+			if (placed) { last = placed->index; }
+		}
+		check(last == 6, "five commands follow the no-op: " + std::to_string(last));
+	}
+	{
+		Loop loop(disk);
+		recover(loop);
+		auto s = loop.driver->state(g);
+		// The recovered lone voter leads a new term: its no-op follows the log it read.
+		check(s && s->last == last + 1, "recovered from a plain log, last is its end plus the new term's no-op: " + std::to_string(s ? s->last : 0) + " of " + std::to_string(last));
+		if (s) { last = s->last; }
+		auto placed = place(loop, g, "after");
+		check(placed && loop.driver->state(g)->last == placed->index && placed->index > last, "and advances after recover");
+		if (placed) { last = placed->index; }
+	}
+	{  // a checkpoint at the applied index, then a tail above it
+		Loop loop(disk);
+		recover(loop);
+		loop.apply(g);
+		const auto through = loop.sink.last_committed(g);
+		auto s = loop.driver->state(g);
+		check(s && s->last == last + 1, "recovered again, last follows the log read by the new no-op: " + std::to_string(s ? s->last : 0));
+		if (s) { last = s->last; }
+		std::optional<CheckpointPublished> published;
+		check(loop.settle(loop.driver->checkpoint(g, 1 << 20, Capture{std::string(5000, 'x'), 0, through, s ? s->term : 0}), published, error) && !error && published, "the checkpoint publishes: " + what(error));
+		for (int n = 0; n < 3; ++n) { auto placed = place(loop, g, "tail" + std::to_string(n)); if (placed) { last = placed->index; } }
+		check(published && published->through < last && loop.driver->state(g)->last == last, "the tail lies above the checkpoint");
+	}
+	{
+		Loop loop(disk);
+		recover(loop);
+		auto s = loop.driver->state(g);
+		check(s && s->last == last + 1, "recovered from a checkpoint plus a tail, last is the tail's end plus the no-op: " + std::to_string(s ? s->last : 0) + " of " + std::to_string(last));
+		auto placed = place(loop, g, "more");
+		check(placed && loop.driver->state(g)->last == placed->index, "last advances after appends on the recovered log");
+	}
+	{  // an accepted proposal whose record waits in a held turn: the log end moves, the commit index does not
+		Loop loop(disk, true);
+		recover(loop);
+		loop.release(); loop.apply(g);
+		const auto before = *loop.driver->state(g);
+		auto call = loop.start(loop.driver->propose(g, "staged"));
+		check(!call->done, "the record waits in a held turn");
+		const auto during = *loop.driver->state(g);
+		check(during.last == before.last + 1 && during.committed == before.committed, "last counts the staged entry, committed does not: " + std::to_string(during.last) + " / " + std::to_string(during.committed));
+		loop.release();
+		check(call->done && !call->error && loop.driver->state(g)->last == during.last, "and last stays once it is written");
+	}
+}
+
 const std::map<std::string, void (*)()> cases{
 	{"flow_reaches_core", &flow_reaches_core},
 	{"fence_tells_peers", &fence_tells_peers},
@@ -898,6 +972,7 @@ const std::map<std::string, void (*)()> cases{
 	{"lone_voter", &lone_voter},
 	{"rows", &rows},
 	{"checkpoints", &checkpoints},
+	{"group_last", &group_last},
 	{"checkpoint_keeps_acknowledged", &checkpoint_keeps_acknowledged},
 	{"close", &close_rows},
 	{"fence", &fence_and_shutdown},

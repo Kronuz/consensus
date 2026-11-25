@@ -7,6 +7,11 @@
 import pathlib, shutil, sys
 
 MUTANTS = {
+    # GroupState::last reports the commit index instead of the log end.
+    "group-last-committed": ("driver.h",
+        "w.committed(), w.applied_index(), w.last_index(), w.membership()",
+        "w.committed(), w.applied_index(), w.committed(), w.membership()",
+    ),
     # Completion resumes the caller before it unlinks the waiter from the group.
     "complete-resumes-before-unlink": ("driver.h",
         "\t\tunlink(g, w);\n\t\tif (!w.claim(Waiter::completed)) { return; }\n\t\tw.error = std::move(error);\n\t\tw.home.post(w.handle);\n",

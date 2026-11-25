@@ -38,6 +38,8 @@
 #include "consensus/transport/host_transport.h"
 #include "../support/ports.h"
 #include "lag.h"
+#include <completion/asio_completion.h>
+#include <completion/native_completion.h>
 #include <completion/posix.h>
 #include <asio/executor_work_guard.hpp>
 #include <asio/io_context.hpp>
@@ -45,13 +47,11 @@
 #include <array>
 #include <cassert>
 #include <condition_variable>
-#include <coroutine>
 #include <csignal>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -1069,88 +1069,55 @@ task::task<void> changing(Driver<GroupSink> *d, GroupId g, Membership next) {
 }
 task::task<void> transferring(Driver<GroupSink> *d, GroupId g, NodeId target) { co_await d->transfer_leadership(g, target); }
 
-// The journal's I/O off its loop (docs/DRIVER.md, Where syncs run): each operation's primitives
-// run on this loop's sync thread, as InlineCompletion runs them, and the caller resumes on its
-// loop, so a slow sync holds its groups' Drivers, never the connections the loop serves.
-// `longest` is the longest one operation took, in ms; `delay` makes the next one that much
-// slower, as a runner's slow sync.
-class SyncThread {
-	struct Off {
-		SyncThread &sync;
-		std::shared_ptr<j::IOOperation> operation;
-		task::cancel_token token;
-		std::coroutine_handle<> waiter{};
-		task::scheduler_ref home{};
-		bool done = false;  // false: the token stopped it before a primitive
-		bool await_ready() const noexcept { return false; }
-		void await_suspend(std::coroutine_handle<> handle) {
-			waiter = handle;
-			home = task::current();
-			sync.push(this);
+// The journal's I/O on the native completion, as detentd runs it (docs/DRIVER.md, Where syncs
+// run): a sync runs off the loop and completes on it, so a slow sync holds its groups' Drivers,
+// never the connections the loop serves. `longest` is the longest one operation took, in ms;
+// `delay` holds the next reaped completion that much longer, as a runner's slow sync.
+class TimedNative {
+	class SlowQueue {
+		std::atomic<std::uint64_t> &delay_;
+		j::NativeCompletionQueue queue_;
+		std::optional<j::OwnedCompletion> held_;
+		steady::time_point release_;
+
+	  public:
+		explicit SlowQueue(std::atomic<std::uint64_t> &delay) : delay_(delay) {}
+		int notification_descriptor() const noexcept { return queue_.notification_descriptor(); }
+		bool submit(const std::shared_ptr<j::IOOperation> &operation) { return queue_.submit(operation); }
+		std::optional<j::OwnedCompletion> poll() {
+			if (!held_)
+				if (held_ = queue_.poll(); held_)
+					release_ = steady::now() + std::chrono::milliseconds(delay_.exchange(0));
+			if (!held_ || steady::now() < release_)
+				return std::nullopt;
+			return std::exchange(held_, std::nullopt);
 		}
-		bool await_resume() const noexcept { return done; }
 	};
-	std::mutex mutex_;
-	std::condition_variable wake_;
-	std::deque<Off *> queue_;
-	bool stopping_ = false;
-	std::thread thread_{[this] { serve(); }};
-	void push(Off *off) {
-		{
-			std::lock_guard hold(mutex_);
-			queue_.push_back(off);
-		}
-		wake_.notify_one();
-	}
-	void serve() {
-		for (;;) {
-			Off *off;
-			{
-				std::unique_lock hold(mutex_);
-				wake_.wait(hold, [&] { return stopping_ || !queue_.empty(); });
-				if (queue_.empty())
-					return;
-				off = queue_.front();
-				queue_.pop_front();
-			}
-			const auto t = steady::now();
-			if (const auto ms = delay.exchange(0))
-				std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-			off->done = j::drive_synchronously(*off->operation, [off] { return !off->token.requested(); });
-			longest = std::max<std::uint64_t>(longest, ms_since(t));
-			off->home.post(off->waiter);
-		}
-	}
 
   public:
 	std::atomic<std::uint64_t> longest{0}, delay{0};
-	SyncThread() = default;
-	SyncThread(const SyncThread &) = delete;
-	SyncThread &operator=(const SyncThread &) = delete;
-	// Once every caller resumed: its Driver and turn driver stopped.
-	~SyncThread() {
-		{
-			std::lock_guard hold(mutex_);
-			stopping_ = true;
-		}
-		wake_.notify_one();
-		thread_.join();
-	}
+
+  private:
+	std::shared_ptr<j::AsioCompletionDriver<SlowQueue>> driver_;
+
+  public:
+	explicit TimedNative(task::asio_scheduler &scheduler)
+		: driver_(std::make_shared<j::AsioCompletionDriver<SlowQueue>>(scheduler, std::make_shared<SlowQueue>(delay))) {}
 	task::task<void> run(std::shared_ptr<j::IOOperation> operation, task::cancel_token token = {}) {
-		if (!operation || operation->in_flight())
-			throw std::logic_error("sync thread needs an idle operation");
-		if (!co_await Off{*this, std::move(operation), std::move(token)})
-			throw task::cancelled{};
+		const auto t = steady::now();
+		co_await driver_->run(std::move(operation), std::move(token));
+		longest = std::max<std::uint64_t>(longest, ms_since(t));
 	}
 };
 
 struct Node {
 	struct PerLoop {
-		SyncThread io;
+		TimedNative io;
 		GroupSink sink;
 		std::unique_ptr<Driver<GroupSink>> driver;
 		task::cancel_source stop;
 		std::atomic<bool> turns_done{false}, driver_done{false};
+		explicit PerLoop(task::asio_scheduler &scheduler) : io(scheduler) {}
 	};
 	Host host;
 	std::unique_ptr<j::Host> journal;
@@ -1177,7 +1144,7 @@ struct Node {
 		journal = std::make_unique<j::Host>(std::move(io), j::Identity{'N', char('0' + id)}, j::HostOptions{L, turn_options});
 		assert(journal->loops() == L);
 		for (std::uint32_t k = 0; k != L; ++k) {
-			auto p = std::make_unique<PerLoop>();
+			auto p = std::make_unique<PerLoop>(host.loops[k]->scheduler);
 			p->sink = {this, k};
 			auto ref = task::scheduler_ref::of(host.loops[k]->scheduler);
 			p->driver = std::make_unique<Driver<GroupSink>>(Seams{ref, j::completion_ref::of(p->io), *journal, k, id * 31 + k}, p->sink);
@@ -2700,8 +2667,8 @@ void slow_sync() {
 // nodes, through 1 MiB lane budgets, while a command commits every 50 ms. Every fetch arrives
 // exact, every commit lands on all three within 2 s, and the leader keeps its term. The group
 // shares its loop with links that serve fetches, as a host places them by default: on nodes 2
-// and 3 it sits with the link to node 1, which serves node 1's fetches. Its journal syncs on the
-// loop's sync thread, so a runner's slow sync holds the Driver, never the links. Each round's
+// and 3 it sits with the link to node 1, which serves node 1's fetches. Its journal syncs off the
+// loop (the native completion), so a runner's slow sync holds the Driver, never the links. Each round's
 // replies are built before its fetches go out and the readers move them out, so no connection's
 // loop builds 8 MiB: a host serves from memory (docs/mechanisms/peer-fetch.md). The 2 s allows
 // what the host took: the longest journal operation plus the longest process stall; the term
@@ -2798,9 +2765,38 @@ void fetch_alongside() {
 	};
 	std::uint64_t quiet = 0;
 	for (int i = 0; i != 4; ++i) {
+		for (auto *n : all)
+			for (auto &p : n->per)
+				p->io.longest = 0;
+		Stalls stalls;
+		LoopLags lags(all, L);
 		const auto begun = steady::now();
-		assert(commit_everywhere(all, g, "quiet " + std::to_string(i), 2'000));
-		quiet = std::max(quiet, ms_since(begun));
+		const auto command = "quiet " + std::to_string(i);
+		const bool ok = commit_everywhere(all, g, command, 2'000);
+		const auto took = ms_since(begun);
+		const auto stalled = stalls.stop();
+		lags.stop();
+		quiet = std::max(quiet, took);
+		if (!ok) {
+			std::printf("fetch-alongside: command %s not on all three within 2,000 ms (%llu ms); the host stalled this process at most %llu ms\n",
+						command.c_str(), (unsigned long long)took, (unsigned long long)stalled);
+			for (NodeId n = 1; n <= 3; ++n) {
+				auto *node = c.nodes[n].get();
+				std::string turned, longest;  // per loop, "a/b/c/d"
+				for (std::uint32_t k = 0; k != L; ++k) {
+					turned += (k ? "/" : "") + std::to_string(lags.worst(n - 1, k));
+					longest += (k ? "/" : "") + std::to_string(node->per[k]->io.longest.load());
+				}
+				auto s = node->state(g);
+				std::printf("fetch-alongside: node %llu has it: %s; %s in term %llu, committed %llu, applied %llu, last %llu; its loops "
+							"went at most %s ms without turning, their longest journal operations took %s ms\n",
+							(unsigned long long)n, node->has(g, command) ? "yes" : "NO",
+							!s ? "no state" : s->role == Role::Leader ? "leader" : "not leader", (unsigned long long)(s ? s->term : 0),
+							(unsigned long long)(s ? s->committed : 0), (unsigned long long)(s ? s->applied : 0),
+							(unsigned long long)(s ? s->last : 0), turned.c_str(), longest.c_str());
+			}
+		}
+		assert(ok);
 		std::this_thread::sleep_for(50ms);
 	}
 	const std::vector<std::pair<NodeId, NodeId>> pairs{{1, 2}, {1, 3}, {3, 2}, {2, 3}};

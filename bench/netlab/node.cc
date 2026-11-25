@@ -40,6 +40,8 @@
 // reason; "superseded" and "rejected" are definite failures, anything else is unknown.
 #include "consensus/driver.h"
 #include "consensus/transport/host_transport.h"
+#include <completion/asio_completion.h>
+#include <completion/native_completion.h>
 #include <completion/posix.h>
 #include <asio/executor_work_guard.hpp>
 #include <asio/io_context.hpp>
@@ -169,7 +171,9 @@ struct Node {
 	tcp::acceptor acceptor;
 	std::unique_ptr<HostTransport> transport;
 	std::unique_ptr<j::Host> journal;
-	j::InlineCompletion completion;
+	// The journal's IO off the loop, so a sync never holds the links (docs/DRIVER.md, Where syncs run).
+	std::shared_ptr<j::AsioCompletionDriver<j::NativeCompletionQueue>> completion =
+		std::make_shared<j::AsioCompletionDriver<j::NativeCompletionQueue>>(scheduler, std::make_shared<j::NativeCompletionQueue>());
 	Sink sink;
 	std::unique_ptr<Driver<Sink>> driver;
 	task::cancel_source stop;
@@ -212,8 +216,8 @@ struct Node {
 		journal = std::make_unique<j::Host>(std::make_shared<j::PosixIO>(dir, full_flush), j::Identity{'N', char('0' + n)}, j::HostOptions{1, turn_options});
 		sink.node = this;
 		auto ref = task::scheduler_ref::of(scheduler);
-		driver = std::make_unique<Driver<Sink>>(Seams{ref, j::completion_ref::of(completion), *journal, 0, n * 31}, sink);
-		task::spawn(ref, journal->driver(0).run(j::completion_ref::of(completion), stop.token()), [this](std::exception_ptr) { turns_done = true; });
+		driver = std::make_unique<Driver<Sink>>(Seams{ref, j::completion_ref::of(*completion), *journal, 0, n * 31}, sink);
+		task::spawn(ref, journal->driver(0).run(j::completion_ref::of(*completion), stop.token()), [this](std::exception_ptr) { turns_done = true; });
 		task::spawn(ref, driver->run(stop.token()), [this](std::exception_ptr) { driver_done = true; });
 		transport->on_deliver(0, [this](const Received &r) {
 			auto receive = receive_message(r);
@@ -299,6 +303,7 @@ struct Node {
 		post([&] {
 			driver.reset();
 			journal.reset();
+			completion.reset();
 			stopped.set_value();
 		});
 		done.wait();

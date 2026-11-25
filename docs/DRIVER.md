@@ -355,16 +355,16 @@ group's step waits for that IO in every case; what differs is whether the loop t
 | Completion | Where a sync runs | The loop meanwhile |
 |---|---|---|
 | native (`AsioCompletionDriver` over the platform queue) | AIO or io_uring, or the queue's worker thread (`F_FULLFSYNC`, Linux's fallback) | turns: its links, its other groups and their timers go on |
-| a sync thread of the loop's (`SyncThread` in `test/transport/groups_test.cc`) | that thread, which drives the operation as `InlineCompletion` does; the caller resumes on its loop | turns, as with native |
 | `InlineCompletion` | the calling thread, inside the call | held for the sync's length |
 
 `InlineCompletion` belongs to the blocking entry: a `task::blocking_scheduler` thread with no
 reactor and no peer (`needs_peer`), so it carries no links. A Driver on a loop that carries
 host-transport links (docs/mechanisms/host-transport.md, Placement: groups and peers share
-loops by the same hash) syncs off the loop, natively or on a sync thread. An inline sync there
-holds every link the loop serves: no heartbeat goes out or is read, and a sync past
-`dead_after` (5 s) ends the links, so their peers count the node gone and its followers elect.
-The transport cannot see a Driver's completion and does not check this.
+loops by the same hash) syncs off the loop: the native completion, as detentd, groups_test and
+bench/netlab run it. An inline sync there holds every link the loop serves: no heartbeat goes
+out or is read, and a sync past `dead_after` (5 s) ends the links, so their peers count the
+node gone and its followers elect. The transport cannot see a Driver's completion and does not
+check this.
 
 ## From the Worker's `try_submit`
 

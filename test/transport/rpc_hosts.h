@@ -30,10 +30,11 @@ inline Fingerprint pin_of(const std::string &name) {
 	assert(leaf);
 	return key_pin(leaf.get());
 }
-inline std::shared_ptr<asio::ssl::context> context(const std::string &name) {
+// `name`'s certificate and key, trusting the CAs in `ca`.pem.
+inline std::shared_ptr<asio::ssl::context> context(const std::string &name, const std::string &ca = "ca") {
 	auto c = std::make_shared<asio::ssl::context>(asio::ssl::context::tls);
 	reactor::tls::configure(*c, {(fixture / (name + ".pem")).string(), (fixture / (name + ".key")).string(),
-								 (fixture / "ca.pem").string()},
+								 (fixture / (ca + ".pem")).string()},
 							reactor::tls::Role::Peer);
 	return c;
 }

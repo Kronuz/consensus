@@ -12,7 +12,8 @@ namespace kronuz::consensus::transport {
 // transfer frames, one per lane frame, told apart by their magic.
 //
 // A host's reader: a name's bytes, or nullopt when it holds none. It runs on the owner executor,
-// so its run time adds to consensus latency, and gets the peer's name unchecked.
+// so its run time adds to consensus latency, and gets the peer's name unchecked. A fetch whose
+// connection ends under it asks once more, so one fetch may read a name twice.
 using FetchReader = std::function<std::optional<std::string>(std::string_view name)>;
 // A fetch's outcome, on the owner executor: an error when no answer came, else the peer's bytes,
 // or nullopt when the peer holds none.

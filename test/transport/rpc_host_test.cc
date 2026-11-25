@@ -26,7 +26,12 @@
 //   fetch       D8, A4: fetch is method 1. Beside 4 groups uploading 1 MiB data frames on the same
 //               Bulk connection, a 16 MiB fetch arrives exact while heartbeats on Control keep
 //               every gap under 1,000 ms plus the host's lag; a missing name, a reader that throws, a reply over this
-//               host's fetch_bytes and a fifth concurrent fetch end as D8's table says
+//               host's fetch_bytes and a fifth concurrent fetch end as D8's table says; then
+//               fetch-dead: host 2's connection loop held past host 1's dead_after ends its links
+//               with three fetches on them, and each is asked again and ends as it would have
+//               (control: fetch-not-asked-again); then each way a connection ends under a fetch
+//               (rpc-lane.md's table): fetch-partial, fetch-twice, fetch-gone, fetch-unverified,
+//               fetch-removed and fetch-oversize, each runnable alone for its control
 //   reader      T5: with host 2's other loop held 2 s, calls whose frames its connection's loop
 //               reads keep their latency (control: lane-via-other-loop)
 //   stop-drain  F18, D102: host 2 runs in a child process that stops itself (SIGSTOP) inside its
@@ -590,6 +595,8 @@ int serve_stopped(std::uint16_t parent) {
 	options.rpc.reader = [](std::string_view name) -> std::optional<std::string> {
 		if (name == "frozen")
 			::raise(SIGSTOP);  // the placed stop: the reply leaves only after SIGCONT
+		if (name == "gone")
+			::raise(SIGKILL);  // gone at once: TSan's _exit sleeps atexit_sleep_ms (1 s) with the sockets open
 		return bytes_at(0, late_bytes);
 	};
 	two.open({{1, {"127.0.0.1", parent}}}, options);
@@ -602,11 +609,18 @@ int serve_stopped(std::uint16_t parent) {
 	two.stop();
 	return 0;
 }
-bool stop_drain() {
-	Host one(1, 1);
+// Host 2 as serve_stopped in a child process dialing `one`: its pid, its port (0 when it did not
+// start) and the pipe whose close ends it.
+struct Child {
+	pid_t pid = 0;
+	std::uint16_t port = 0;
+	int pipe = -1;
+};
+Child spawn_child(Host &one, const char *test) {
+	Child child;
 	int to_child[2], from_child[2];
 	if (::pipe(to_child) || ::pipe(from_child))
-		return false;
+		return child;
 	posix_spawn_file_actions_t actions;
 	posix_spawn_file_actions_init(&actions);
 	posix_spawn_file_actions_adddup2(&actions, to_child[0], STDIN_FILENO);
@@ -616,20 +630,30 @@ bool stop_drain() {
 	const std::string port = std::to_string(one.port());
 	char *args[] = {const_cast<char *>(self), const_cast<char *>(fixture.c_str()), const_cast<char *>("serve-stopped"),
 					const_cast<char *>(port.c_str()), nullptr};
-	pid_t child = 0;
-	const int spawned = ::posix_spawn(&child, self, &actions, nullptr, args, environ);
+	const int spawned = ::posix_spawn(&child.pid, self, &actions, nullptr, args, environ);
 	posix_spawn_file_actions_destroy(&actions);
 	::close(to_child[0]);
 	::close(from_child[1]);
+	child.pipe = to_child[1];
 	if (spawned) {
-		std::printf("stop-drain: posix_spawn %s: %s FAILED\n", self, std::strerror(spawned));
-		return false;
+		std::printf("%s: posix_spawn %s: %s FAILED\n", test, self, std::strerror(spawned));
+		::close(from_child[0]);
+		return child;
 	}
 	std::string line;
 	for (char c; line.find('\n') == std::string::npos && ::read(from_child[0], &c, 1) == 1;)
 		line += c;
 	::close(from_child[0]);
-	const auto child_port = std::uint16_t(std::strtoul(line.c_str(), nullptr, 10));
+	child.port = std::uint16_t(std::strtoul(line.c_str(), nullptr, 10));
+	return child;
+}
+bool stop_drain() {
+	Host one(1, 1);
+	const auto spawned = spawn_child(one, "stop-drain");
+	if (!spawned.pid)
+		return false;
+	const auto child = spawned.pid;
+	const auto child_port = spawned.port;
 	HostTransportOptions options;
 	options.rpc.fetch_deadline = 1s;
 	one.open({{2, {"127.0.0.1", child_port}}}, options);
@@ -673,7 +697,7 @@ bool stop_drain() {
 				ok ? "ok" : "FAILED");
 	one.stop();
 	::kill(child, SIGCONT);
-	::close(to_child[1]);
+	::close(spawned.pipe);
 	if (!until([&] { return ::waitpid(child, &status, WNOHANG) == child; }, 10s)) {
 		::kill(child, SIGKILL);
 		::waitpid(child, &status, 0);
@@ -898,10 +922,13 @@ bool fetch() {
 	const bool ok = exact && beside > 0 && beats.worst < bound && table;
 	const auto big_error = !big || !big->done ? std::string("not done") : big->error ? big->error.message() : std::string("ok");
 	std::printf("fetch: 16 MiB arrived exact %s (%s) in %llu ms beside %llu MiB of group uploads on Bulk; links %llu+%llu, "
-				"dropped %llu, overrun %llu; heartbeats' longest gap %llu ms of %llu allowed (1000 plus the host's %llu ms of lag); missing %s, "
+				"ended dead %llu, stuck %llu, failed %llu; dropped %llu, overrun %llu; heartbeats' longest gap %llu ms of %llu allowed (1000 plus the host's %llu ms of lag); missing %s, "
 				"a throwing reader %s, 48 MiB over 32 MiB %s, five 4 MiB at once: %d ok, %d refused %s\n",
 				exact ? "yes" : "NO", big_error.c_str(), (unsigned long long)fetched_ms, (unsigned long long)(beside >> 20),
 				(unsigned long long)one.total(&HostTransportStats::links), (unsigned long long)two.total(&HostTransportStats::links),
+				(unsigned long long)(one.total(&HostTransportStats::dead) + two.total(&HostTransportStats::dead)),
+				(unsigned long long)(one.total(&HostTransportStats::stuck) + two.total(&HostTransportStats::stuck)),
+				(unsigned long long)(one.total(&HostTransportStats::failed) + two.total(&HostTransportStats::failed)),
 				(unsigned long long)(one.total(&HostTransportStats::dropped) + two.total(&HostTransportStats::dropped)),
 				(unsigned long long)(one.total(&HostTransportStats::overrun) + two.total(&HostTransportStats::overrun)),
 				(unsigned long long)beats.worst, (unsigned long long)bound, (unsigned long long)lagged,
@@ -911,6 +938,349 @@ bool fetch() {
 	two.stop();
 	return ok;
 }
+
+// D8: host 2's reader holds node 1's connection loop 1.5 s past host 1's 1 s dead_after with
+// three fetches on the connection, so host 1 ends both links dead (CI's shape, a kernel write
+// held that loop 5.2 s): each fetch is asked again on the next connection and ends as it would
+// have, the 4 MiB ones exact and the 48 MiB one message_size (control: the fetch not asked again).
+bool fetch_dead() {
+	constexpr std::uint32_t L = 2;
+	const std::string expected = bytes_at(0, 4 << 20);
+	Host one(1, L), two(2, L);
+	HostTransportOptions client, server;
+	client.rpc.fetch_bytes = 32 << 20;
+	client.links.connection.dead_after = 1000ms;
+	server.links.connection.keepalive = 100ms;  // host 1 hears it every 100 ms but while it is held
+	std::atomic<int> held{0};
+	server.rpc.reader = [&](std::string_view name) -> std::optional<std::string> {
+		if (name == "held" && held++ == 0)
+			std::this_thread::sleep_for(1500ms);
+		if (name == "huge")
+			return std::string(48 << 20, 'h');
+		return expected;
+	};
+	one.open(addresses({&two}), client);
+	two.open(addresses({&one}), server);
+	one.start();
+	two.start();
+	struct Got {
+		std::atomic<bool> done{false};
+		std::error_code error;
+		std::optional<std::string> bytes;
+	};
+	std::vector<std::shared_ptr<Got>> got;
+	one.at(2, [&] {
+		for (const char *name : {"held", "huge", "big"}) {
+			auto g = got.emplace_back(std::make_shared<Got>());
+			one.transport->fetch(2, name, [g](std::error_code e, std::optional<std::string> b) {
+				g->error = e;
+				g->bytes = std::move(b);
+				g->done = true;
+			});
+		}
+		return 0;
+	});
+	const bool ended = until([&] { return got[0]->done && got[1]->done && got[2]->done; }, 30s);
+	const auto exact = [&](const Got &g) { return !g.error && g.bytes && *g.bytes == expected; };
+	const auto dead = one.total(&HostTransportStats::dead);
+	const auto again = one.lane(&LaneStats::fetches_asked_again);
+	const bool ok = ended && dead >= 1 && again == 3 && exact(*got[0]) && got[1]->error == std::errc::message_size && exact(*got[2]);
+	const auto said = [](const Got &g) { return !g.done ? std::string("not done") : g.error ? g.error.message() : std::string("bytes"); };
+	std::printf("fetch-dead: host 2's connection loop held 1500 ms against host 1's 1000 ms dead_after: links ended dead %llu, "
+				"links %llu+%llu, fetches asked again %llu; the held 4 MiB %s (%s), 48 MiB over 32 MiB %s, the other 4 MiB %s (%s) %s\n",
+				(unsigned long long)dead, (unsigned long long)one.total(&HostTransportStats::links),
+				(unsigned long long)two.total(&HostTransportStats::links), (unsigned long long)again, exact(*got[0]) ? "exact" : "NOT EXACT",
+				said(*got[0]).c_str(), said(*got[1]).c_str(), exact(*got[2]) ? "exact" : "NOT EXACT", said(*got[2]).c_str(), ok ? "ok" : "FAILED");
+	one.stop();
+	two.stop();
+	return ok;
+}
+
+// A fetch from host 1 to node 2 and what it ended with, `ms` after `from`.
+struct Fetched {
+	std::atomic<bool> done{false};
+	std::error_code error;
+	std::optional<std::string> bytes;
+	steady::time_point at{};
+	std::string said() const { return !done ? "not done" : error ? error.message() : bytes ? "bytes" : "nullopt"; }
+	std::uint64_t ms(steady::time_point from) const {
+		return done ? std::uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(at - from).count()) : 0;
+	}
+};
+std::shared_ptr<Fetched> fetch_of(Host &one, const char *name) {
+	auto f = std::make_shared<Fetched>();
+	one.at(2, [&] {
+		one.transport->fetch(2, name, [f](std::error_code e, std::optional<std::string> b) {
+			f->error = e;
+			f->bytes = std::move(b);
+			f->at = steady::now();
+			f->done = true;
+		});
+		return 0;
+	});
+	return f;
+}
+
+// A fetch whose connection ends with 2 MiB of a 48 MiB reply in (host 2's reader then holds the
+// connection's loop past host 1's dead_after) is asked again and arrives exact: the first
+// attempt's bytes are dropped (control: the retry keeps them, no-clear).
+bool fetch_partial() {
+	const std::string expected = bytes_at(0, 48 << 20);
+	Host one(1, 2), two(2, 2);
+	HostTransportOptions client, server;
+	client.rpc.fetch_bytes = 64 << 20;
+	client.links.connection.dead_after = 1000ms;
+	server.links.connection.keepalive = 100ms;
+	std::atomic<int> held{0}, partials{0};
+	server.rpc.reader = [&](std::string_view name) -> std::optional<std::string> {
+		if (name == "held") {
+			if (held++ == 0)
+				std::this_thread::sleep_for(1500ms);
+			return std::string("h");
+		}
+		++partials;
+		return expected;
+	};
+	one.open(addresses({&two}), client);
+	two.open(addresses({&one}), server);
+	one.start();
+	two.start();
+	auto partial = fetch_of(one, "partial");
+	until([&] { return one.lane(&LaneStats::bytes_in) >= (std::uint64_t(2) << 20) || partial->done; }, 10s);
+	const auto in = one.lane(&LaneStats::bytes_in);
+	auto h = fetch_of(one, "held");
+	const bool ended = until([&] { return partial->done && h->done; }, 30s);
+	const bool exact = !partial->error && partial->bytes && *partial->bytes == expected;
+	const bool ok = ended && partials == 2 && exact && !h->error && h->bytes == "h";
+	std::printf("fetch-partial: %llu KiB of 48 MiB in when the link was held; the reader ran %d times; it ended %s, %s (%zu bytes); held %s %s\n",
+				(unsigned long long)(in >> 10), partials.load(), partial->said().c_str(), exact ? "exact" : "NOT EXACT",
+				partial->bytes ? partial->bytes->size() : 0, h->said().c_str(), ok ? "ok" : "FAILED");
+	one.stop();
+	two.stop();
+	return ok;
+}
+
+// Every connection dies under the fetch: it ends connection_aborted at the second end, asked
+// twice and never a third time.
+bool fetch_twice() {
+	Host one(1, 2), two(2, 2);
+	HostTransportOptions client, server;
+	client.links.connection.dead_after = 1000ms;
+	server.links.connection.keepalive = 100ms;
+	std::atomic<int> calls{0};
+	server.rpc.reader = [&](std::string_view) -> std::optional<std::string> {
+		++calls;
+		std::this_thread::sleep_for(1500ms);
+		return std::string("x");
+	};
+	one.open(addresses({&two}), client);
+	two.open(addresses({&one}), server);
+	one.start();
+	two.start();
+	const auto start = steady::now();
+	auto f = fetch_of(one, "held");
+	until([&] { return f->done.load(); }, 20s);
+	std::this_thread::sleep_for(1s);
+	const auto again = one.lane(&LaneStats::fetches_asked_again);
+	const bool ok = f->error == std::errc::connection_aborted && calls == 2 && again == 1;
+	std::printf("fetch-twice: every connection held past dead_after: it ended %s after %llu ms, asked again %llu, the reader ran %d times %s\n",
+				f->said().c_str(), (unsigned long long)f->ms(start), (unsigned long long)again, calls.load(), ok ? "ok" : "FAILED");
+	one.stop();
+	two.stop();
+	return ok;
+}
+
+// The peer's process exits in its reader: the connection ends, the redial is refused, and the
+// fetch ends connection_aborted at once, not at its 4 s fetch_deadline (control: ea48bc8).
+bool fetch_gone() {
+	Host one(1, 1);
+	const auto child = spawn_child(one, "fetch-gone");
+	if (!child.pid)
+		return false;
+	HostTransportOptions options;
+	options.rpc.fetch_deadline = 4s;
+	one.open({{2, {"127.0.0.1", child.port}}}, options);
+	one.start();
+	auto first = fetch_of(one, "small");
+	until([&] { return first->done.load(); }, 10s);
+	const auto start = steady::now();
+	auto f = fetch_of(one, "gone");
+	until([&] { return f->done.load(); }, 10s);
+	const auto again = one.lane(&LaneStats::fetches_asked_again);
+	const bool ok = child.port && first->bytes && f->error == std::errc::connection_aborted && f->ms(start) < 1000 && again == 1;
+	std::printf("fetch-gone: first fetch %s; the peer's process exits in its reader: it ended %s after %llu ms of 4000, asked again %llu %s\n",
+				first->said().c_str(), f->said().c_str(), (unsigned long long)f->ms(start), (unsigned long long)again, ok ? "ok" : "FAILED");
+	one.stop();
+	::close(child.pipe);
+	int status = 0;
+	if (!until([&] { return ::waitpid(child.pid, &status, WNOHANG) == child.pid; }, 10s)) {
+		::kill(child.pid, SIGKILL);
+		::waitpid(child.pid, &status, 0);
+	}
+	return ok;
+}
+
+// Host 1 reloads trusting only another CA: its link to node 2 aborts, the redial fails the TLS
+// verification, and the fetch ends connection_aborted at once, not at its 4 s fetch_deadline
+// (control: ea48bc8).
+bool fetch_unverified() {
+	Host one(1, 2), two(2, 2);
+	HostTransportOptions client, server;
+	client.rpc.fetch_deadline = 4s;
+	server.rpc.reader = [&](std::string_view) -> std::optional<std::string> {
+		std::this_thread::sleep_for(500ms);
+		return std::string("x");
+	};
+	one.open(addresses({&two}), client);
+	two.open(addresses({&one}), server);
+	one.start();
+	two.start();
+	const auto start = steady::now();
+	auto f = fetch_of(one, "held");
+	std::this_thread::sleep_for(100ms);
+	one.transport->reload(context(names[1], "rogue"));
+	until([&] { return f->done.load(); }, 10s);
+	std::uint64_t unverified = 0;
+	for (std::uint32_t k = 0; k != one.loops.size(); ++k)
+		unverified += one.loops[k]->at([&] { return one.transport->link_stats(k).unverified; });
+	const auto again = one.lane(&LaneStats::fetches_asked_again);
+	const bool ok = unverified >= 1 && f->error == std::errc::connection_aborted && f->ms(start) < 2500 && again == 1;
+	std::printf("fetch-unverified: a reload trusting another CA ended %llu links; the fetch ended %s after %llu ms of 4000, asked again %llu %s\n",
+				(unsigned long long)unverified, f->said().c_str(), (unsigned long long)f->ms(start), (unsigned long long)again,
+				ok ? "ok" : "FAILED");
+	one.stop();
+	two.stop();
+	return ok;
+}
+
+// A second ask waiting for its connection: the child host 2 stops itself in its reader, host 1's
+// link ends dead, and the redial's TLS handshake waits on the stopped process; then remove_node(2)
+// or drain() ends it connection_aborted at once (control: no-again-map, where fail() gives it the
+// caller's outcome: not_connected, resource_unavailable_try_again).
+bool fetch_waiting(bool drain) {
+	const char *act = drain ? "drain()" : "remove_node(2)";
+	Host one(1, 1);
+	const auto child = spawn_child(one, "fetch-removed");
+	if (!child.pid)
+		return false;
+	HostTransportOptions options;
+	options.rpc.fetch_deadline = 10s;
+	options.rpc.drain_deadline = 300ms;
+	options.links.connection.dead_after = 1000ms;
+	one.open({{2, {"127.0.0.1", child.port}}}, options);
+	one.start();
+	auto first = fetch_of(one, "small");
+	until([&] { return first->done.load(); }, 10s);
+	auto f = fetch_of(one, "frozen");
+	const bool asked = until([&] { return one.lane(&LaneStats::fetches_asked_again) >= 1 || f->done; }, 10s);
+	std::this_thread::sleep_for(300ms);
+	const bool waiting = !f->done;
+	const auto start = steady::now();
+	if (drain)
+		one.transport->drain();
+	else
+		one.at(2, [&] {
+			one.transport->remove_node(2);
+			return 0;
+		});
+	until([&] { return f->done.load(); }, 15s);
+	const bool ok = first->bytes && asked && waiting && f->error == std::errc::connection_aborted && f->ms(start) < 500;
+	std::printf("fetch-removed: %s with the second ask waiting for its connection (asked again %s, waiting %s): it ended %s after %llu ms %s\n",
+				act, asked ? "yes" : "NO", waiting ? "yes" : "NO", f->said().c_str(), (unsigned long long)f->ms(start),
+				ok ? "ok" : "FAILED");
+	one.stop();
+	::kill(child.pid, SIGCONT);
+	::close(child.pipe);
+	int status = 0;
+	if (!until([&] { return ::waitpid(child.pid, &status, WNOHANG) == child.pid; }, 10s)) {
+		::kill(child.pid, SIGKILL);
+		::waitpid(child.pid, &status, 0);
+	}
+	return ok;
+}
+
+// remove_node(2) and drain() past drain_deadline end a fetch in flight connection_aborted, never
+// asked again (control: ea48bc8, which ends them not_connected and resource_unavailable_try_again),
+// and a second ask waiting for its connection too (fetch_waiting).
+bool fetch_removed() {
+	bool ok = fetch_waiting(false) & fetch_waiting(true);
+	for (const bool drain : {false, true}) {
+		Host one(1, 2), two(2, 2);
+		HostTransportOptions client, server;
+		client.rpc.drain_deadline = 300ms;
+		server.rpc.reader = [&](std::string_view) -> std::optional<std::string> {
+			std::this_thread::sleep_for(1500ms);
+			return std::string("x");
+		};
+		one.open(addresses({&two}), client);
+		two.open(addresses({&one}), server);
+		one.start();
+		two.start();
+		const auto start = steady::now();
+		auto f = fetch_of(one, "held");
+		std::this_thread::sleep_for(200ms);
+		if (drain)
+			one.transport->drain();
+		else
+			one.at(2, [&] {
+				one.transport->remove_node(2);
+				return 0;
+			});
+		until([&] { return f->done.load(); }, 10s);
+		const auto again = one.lane(&LaneStats::fetches_asked_again);
+		const bool fine = f->error == std::errc::connection_aborted && f->ms(start) < 1000 && again == 0;
+		std::printf("fetch-removed: %s with a fetch in flight: it ended %s after %llu ms, asked again %llu %s\n",
+					drain ? "drain() past its 300 ms drain_deadline" : "remove_node(2)", f->said().c_str(),
+					(unsigned long long)f->ms(start), (unsigned long long)again, fine ? "ok" : "FAILED");
+		ok &= fine;
+		one.stop();
+		two.stop();
+	}
+	return ok;
+}
+
+// With no link ended, the oversize refusal leaves the connection alone: a 48 MiB reply over the
+// 32 MiB fetch_bytes ends message_size and the 4 MiB beside it arrives on the same connection
+// (control: oversize-aborts, whose refusal also aborts it). A run where a link ended dead or
+// stuck proves nothing either way, and says so.
+bool fetch_oversize() {
+	const std::string expected = bytes_at(0, 4 << 20);
+	Host one(1, 2), two(2, 2);
+	HostTransportOptions client, server;
+	client.rpc.fetch_bytes = 32 << 20;
+	server.rpc.reader = [&](std::string_view name) -> std::optional<std::string> {
+		if (name == "huge")
+			return std::string(48 << 20, 'h');
+		return expected;
+	};
+	one.open(addresses({&two}), client);
+	two.open(addresses({&one}), server);
+	one.start();
+	two.start();
+	auto warm = fetch_of(one, "big");
+	until([&] { return warm->done.load(); }, 10s);
+	const auto links = one.total(&HostTransportStats::links);
+	auto huge = fetch_of(one, "huge"), big = fetch_of(one, "big");
+	until([&] { return huge->done && big->done; }, 30s);
+	std::this_thread::sleep_for(200ms);
+	const auto stalled = one.total(&HostTransportStats::dead) + one.total(&HostTransportStats::stuck) +
+						 two.total(&HostTransportStats::dead) + two.total(&HostTransportStats::stuck);
+	const auto failed = one.total(&HostTransportStats::failed) + two.total(&HostTransportStats::failed);
+	const auto again = one.lane(&LaneStats::fetches_asked_again);
+	const bool kept = one.total(&HostTransportStats::links) == links && failed == 0 && again == 0;
+	const bool ok = huge->error == std::errc::message_size && big->bytes == expected && (kept || stalled);
+	std::printf("fetch-oversize: 48 MiB over 32 MiB %s, the 4 MiB beside it %s; links %llu then %llu, ended failed %llu, asked again %llu: "
+				"the connection %s %s\n",
+				huge->said().c_str(), big->bytes == expected ? "exact" : "NOT EXACT", (unsigned long long)links,
+				(unsigned long long)one.total(&HostTransportStats::links), (unsigned long long)failed, (unsigned long long)again,
+				kept ? "stayed" : stalled ? "ended in a stall: inconclusive" : "ENDED", ok ? "ok" : "FAILED");
+	one.stop();
+	two.stop();
+	return ok;
+}
+
+// The ways a connection ends under a fetch (docs/mechanisms/rpc-lane.md, A fetch whose connection ends).
+bool fetch_ends() { return fetch_partial() & fetch_twice() & fetch_gone() & fetch_unverified() & fetch_removed() & fetch_oversize(); }
 
 // T5: host 2's loop that does not read node 1's connection is held 2 s; calls served on the
 // connection's loop keep their latency, since a lane frame never waits on another loop.
@@ -985,7 +1355,21 @@ int main(int argc, char **argv) {
 	else if (which == "shutdown")
 		ok = shutdown();
 	else if (which == "fetch")
-		ok = fetch();
+		ok = fetch() & fetch_dead() & fetch_ends();
+	else if (which == "fetch-dead")  // fetch's parts alone, for their controls
+		ok = fetch_dead();
+	else if (which == "fetch-partial")
+		ok = fetch_partial();
+	else if (which == "fetch-twice")
+		ok = fetch_twice();
+	else if (which == "fetch-gone")
+		ok = fetch_gone();
+	else if (which == "fetch-unverified")
+		ok = fetch_unverified();
+	else if (which == "fetch-removed")
+		ok = fetch_removed();
+	else if (which == "fetch-oversize")
+		ok = fetch_oversize();
 	else if (which == "stop-drain")
 		ok = stop_drain();
 	else

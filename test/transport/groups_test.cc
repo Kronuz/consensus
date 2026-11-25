@@ -242,6 +242,9 @@ struct Host {
 	static inline std::vector<Host *> hosts;
 };
 
+// Stack dumps begun and ended: odd while one runs. A dump suspends the process, so a nap that
+// overlaps one measures the dump, not the host (Stalls).
+std::atomic<std::uint64_t> dumps{0};
 void print_stacks();
 // What a case that hangs leaves: its step, each host's loops (turning, blocked or stopped) with
 // their counters, and every thread's stack.
@@ -283,7 +286,10 @@ void print_stacks() {
 	const std::string stacks = "gdb -p " + pid + " -batch -ex 'thread apply all bt' 2>&1";
 #endif
 	std::fflush(stdout);
-	if (std::system(stacks.c_str()) != 0)
+	++dumps;
+	const bool sampled = std::system(stacks.c_str()) == 0;
+	++dumps;
+	if (!sampled)
 		std::printf("(no stacks: %s failed)\n", stacks.c_str());
 	std::fflush(stdout);
 }
@@ -375,15 +381,19 @@ std::string number(std::uint64_t v) {
 }
 std::uint64_t number(std::string_view s) { return j::get64(s); }
 
-// The longest oversleep of a 10 ms nap while it runs: how long the host stopped this process.
+// The longest oversleep of a 10 ms nap while it runs: how long the host stopped this process. A
+// nap that overlaps a stack dump does not count.
 struct Stalls {
 	std::atomic<bool> done{false};
 	std::atomic<std::uint64_t> worst{0};
 	std::thread thread{[this] {
 		while (!done) {
 			const auto t = steady::now();
+			const auto d = dumps.load();
 			std::this_thread::sleep_for(10ms);
-			worst = std::max<std::uint64_t>(worst, ms_since(t) - std::min<std::uint64_t>(ms_since(t), 10));
+			const auto ms = ms_since(t);
+			if (d % 2 == 0 && dumps.load() == d)
+				worst = std::max<std::uint64_t>(worst, ms - std::min<std::uint64_t>(ms, 10));
 		}
 	}};
 	std::uint64_t stop() {

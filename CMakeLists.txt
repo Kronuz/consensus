@@ -50,7 +50,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	# completion target declared above.
 	FetchContent_Declare(faultlab GIT_REPOSITORY https://github.com/Kronuz/faultlab.git GIT_TAG 5d4df9b04d7064fc978c84d29e7db8e6789bb10c)
 	FetchContent_MakeAvailable(faultlab)
-	foreach(t consensus checkpoint_encoder retained_log retirement simulation membership pipeline retained_state)
+	foreach(t consensus checkpoint_encoder retained_log retirement simulation membership pipeline retained_state follower_read core_deadline)
 		add_executable(consensus_${t}_test test/${t}_test.cc)
 		target_link_libraries(consensus_${t}_test PRIVATE consensus::consensus)
 		add_test(NAME consensus_${t} COMMAND consensus_${t}_test)
@@ -116,6 +116,14 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	endif()
 	add_test(NAME consensus_driver COMMAND consensus_driver_test)
 	set_tests_properties(consensus_driver PROPERTIES TIMEOUT 120)
+	# A refused Tick re-arms once the pressure can have cleared (docs/mechanisms/deadlines.md).
+	add_executable(consensus_driver_pressure_test test/driver_pressure_test.cc)
+	target_link_libraries(consensus_driver_pressure_test PRIVATE consensus::consensus)
+	set_source_files_properties(test/driver_pressure_test.cc PROPERTIES COMPILE_OPTIONS -fno-access-control)  # it holds the Worker's Store permit
+	foreach(c hold clears ahead rest)
+		add_test(NAME consensus_driver_pressure_${c} COMMAND consensus_driver_pressure_test ${c})
+		set_tests_properties(consensus_driver_pressure_${c} PROPERTIES TIMEOUT 120)
+	endforeach()
 	# A Driver group's install (docs/DRIVER.md, Install), a ctest entry per case.
 	add_executable(consensus_driver_install_test test/driver_install_test.cc)
 	target_link_libraries(consensus_driver_install_test PRIVATE consensus::consensus)
@@ -281,7 +289,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	endif()
 
 	# The tests that build a journal run it on faultfs.
-	foreach(t simulation shared_worker shared_cluster wave_open waiter blocking_entry driver driver_close driver_replace driver_install driver_install_request worker)
+	foreach(t simulation shared_worker shared_cluster wave_open waiter blocking_entry driver driver_close driver_replace driver_install driver_install_request driver_pressure worker)
 		target_link_libraries(consensus_${t}_test PRIVATE faultlab::faultlab)
 	endforeach()
 

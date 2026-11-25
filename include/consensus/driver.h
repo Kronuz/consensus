@@ -476,7 +476,7 @@ private:
 		Group* ready_next = nullptr;
 		std::uint64_t dropped = 0;
 		unsigned io = 0;  // IO tasks and turn watches in flight
-		bool queued = false, opened = false, started = false, closing = false, retiring = false, closed = false, watching = false, fence_seen = false;
+		bool queued = false, opened = false, started = false, closing = false, retiring = false, closed = false, watching = false, fence_seen = false, pressured = false;
 		bool witnessed = false;  // acknowledged a range as a witness's own: acknowledges every later one
 	};
 
@@ -789,10 +789,12 @@ private:
 		}
 		auto& w = *g.worker;
 		bool exhausted = true;
+		g.pressured = false;
 		try {
 			for (unsigned turn = 0; turn < turn_budget; ++turn) {
 				bool progress = deliver(g);
 				const auto result = w.run_one(tick(g));
+				g.pressured = result == TurnResult::Pressure;
 				progress |= result == TurnResult::Inventory || result == TurnResult::Stored || result == TurnResult::Completed || result == TurnResult::Maintenance;
 				progress |= result == TurnResult::Idle && w.runnable();  // the Tick left work behind it
 				progress |= drain(g);
@@ -809,6 +811,7 @@ private:
 			// A throw mid-step (a Sink's included) leaves its batch half delivered: the group fences.
 			if (g.fence_reason.empty()) { g.fence_reason = error.what(); }
 			w.fence(g.fence_reason);
+			g.pressured = false;
 			fail_all(g, std::make_exception_ptr(fenced(fence_reason(g))));
 		}
 		if (g.closed) { return; }
@@ -828,11 +831,13 @@ private:
 	}
 
 	// The group's next wake on the wheel: Core's deadline, or a short retry while inputs or
-	// calls wait for an admission nothing in flight will free.
+	// calls wait for an admission nothing in flight will free. A turn refused with Pressure
+	// leaves Core's clock and deadline behind: a deadline behind the clock retries in retry_ns.
 	void arm(Group& g) {
 		auto& w = *g.worker;
 		std::uint64_t at = w.next_deadline();
 		at = at > max_ms ? never : at * 1'000'000;
+		if (g.pressured && at <= scheduler_.now()) { at = scheduler_.now() + retry_ns; }
 		const bool waiting = !g.inbox.empty() || !g.notices.empty() || unadmitted(g) || g.retiring || (g.install && !g.install->frames.empty());
 		if (waiting && !g.io && !g.watching) { at = std::min(at, scheduler_.now() + retry_ns); }
 		// An incoming image ends at the channel's receive timeout, which only a step sees: a
@@ -845,6 +850,13 @@ private:
 		}
 		if (at == never) { disarm(g); return; }
 		scheduler_.arm(g, at);
+	}
+	// Start::nonce, from the system's entropy rather than the seeded stream: a host restarted
+	// with the same seed still names a new start (docs/mechanisms/follower-read.md).
+	static Token start_nonce() {
+		std::random_device entropy;
+		const Token nonce = (Token(entropy()) << 32) ^ entropy();
+		return nonce ? nonce : 1;
 	}
 	bool unadmitted(const Group& g) const {
 		for (auto* w = g.head; w; w = w->next) { if (!w->admitted && w->kind != Kind::open) { return true; } }
@@ -875,7 +887,7 @@ private:
 		if (!g.started) {
 			if (!g.opened || !w.ready()) { return false; }
 			// D5/X5: a Tick first, so Start sees the loop's clock, then Start.
-			if (w.try_submit(tick(g)) != SubmitResult::Accepted || w.try_submit(Start{}) != SubmitResult::Accepted) { return false; }
+			if (w.try_submit(tick(g)) != SubmitResult::Accepted || w.try_submit(Start{start_nonce()}) != SubmitResult::Accepted) { return false; }
 			g.started = true;
 			for (auto* x = g.head; x;) { auto* next = x->next; if (x->kind == Kind::open) { complete(g, *x); } x = next; }
 			return true;

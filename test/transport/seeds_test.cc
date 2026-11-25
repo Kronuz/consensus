@@ -17,6 +17,7 @@
 // CI or CONSENSUS_SEEDS_REQUIRE is set.
 #include "consensus/transport/connection.h"
 #include "consensus/transport/seeds.h"
+#include "lag.h"
 #include <asio/io_context.hpp>
 #include <asio/ip/tcp.hpp>
 #include <cassert>
@@ -27,8 +28,10 @@
 #include <filesystem>
 #include <netinet/in.h>
 #include <openssl/pem.h>
+#include <atomic>
 #include <spawn.h>
 #include <string>
+#include <thread>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -556,21 +559,24 @@ void rate() {
 	socklen_t isize = sizeof interface;
 	assert(::getsockopt(seeds.sending_handle(), IPPROTO_IP, IP_MULTICAST_IF, &interface, &isize) == 0);
 	assert(interface_.empty() || interface.s_addr == htonl(INADDR_LOOPBACK));
+	Lag lag;
 	const auto start = Clock::now();
 	loop.run_for(1500ms);
+	const auto lagged = std::chrono::milliseconds(lag.stop());
 	stop(loop, seeds);
 	raw.close();
 	loop.run_for(20ms);
-	std::printf("rate: %zu datagrams in 1.5 s, %llu sent\n", heard.size(), (unsigned long long)seeds.stats().announced);
+	std::printf("rate: %zu datagrams in 1.5 s, %llu sent, the host's lag %lld ms\n", heard.size(),
+				(unsigned long long)seeds.stats().announced, (long long)lagged.count());
 	// The burst: three within 80 ms of the start (20 ms nominal; without it the third is past 200 ms).
-	assert(heard.size() >= 3 && heard[2] - start < 80ms);
-	// Then each gap is one interval plus at most its jitter, and up to 100 ms of a loaded runner's slack.
+	assert(heard.size() >= 3 && heard[2] - start < 80ms + lagged);
+	// Then each gap is one interval plus at most its jitter, and the host's lag when it stalled one.
 	for (std::size_t i = 3; i < heard.size(); ++i) {
 		const auto gap = heard[i] - heard[i - 1];
-		assert(gap >= 90ms && gap <= 150ms + 100ms);
+		assert(gap >= 90ms && gap <= 150ms + lagged);
 	}
-	// 1.5 s holds at most 3 + 1500 / 100 datagrams; at least 3 + 1500 / 150 - 3 with that slack.
-	assert(heard.size() <= 18 && heard.size() >= 10);
+	// 1.5 s holds at most 3 + 1500 / 100 datagrams; at least 3 + 1500 / 150 - 3, less one per 150 ms of lag.
+	assert(heard.size() <= 18 && heard.size() + std::size_t(lagged / 150ms) >= 10);
 	std::puts("rate: ok");
 }
 // A node started before its network is up seeds once it is: a failed start() is retried with

@@ -133,9 +133,14 @@ groups' snapshot frames:
   bytes under the call's credit with `total` the file's size, `Error` 256 (`fetch_missing`) for a
   name it holds none of, `handler_failed` when the reader throws and `message_size` past its
   `fetch_bytes`. The fetcher maps them to bytes, nullopt and `io_error`; it cancels a reply past
-  its own `fetch_bytes` (`message_size`) once the bytes it holds would exceed it; past `fetches`
+  its own `fetch_bytes` (`message_size`) once the bytes it holds would exceed it: a `Cancel` of
+  that call alone, so the connection stays and every other call on it goes on; past `fetches`
   (4) awaiting the node a fetch ends `resource_unavailable_try_again`, as does one a drain refused
-  (`not_processed`); `timed_out`, `connection_aborted` and `not_connected` pass through. Its reply
+  (`not_processed`); `timed_out` and `not_connected` pass through. A fetch is a read, so one whose
+  connection ends under it is asked once more, on a connection that is up, with the same deadline
+  and `fetches` slot; when none comes up it ends `connection_aborted` at once
+  ([A fetch whose connection ends](#a-fetch-whose-connection-ends)). The oversize refusal so
+  costs no other fetch even when the connection ends meanwhile. Its reply
   shares the lane's pools and Bulk's alternation with groups' data frames, so heartbeats on Control
   keep their gaps (`fetch`). `Peers` and `DTFT0001` stay until worker-pump-removal deletes them.
 - **Holds and lane_idle (T3, D7).** `hold(node)` dials Bulk to `node` and keeps it, sharing a
@@ -151,6 +156,31 @@ groups' snapshot frames:
   still live at `drain_deadline` (5 s) aborts the connection. `drain()` drains every lane for a
   shutdown before `stop()`: new calls end `not_processed`, and `lanes_drained(loop)` says when the
   loop's lanes are closed. `LaneStats::drains` and `retired` count them.
+
+### A fetch whose connection ends
+
+A connection ends under a fetch in one of these ways; the first row asks it again, and the
+second table gives what that ask ends with. A fetch is asked at most twice, and every row ends
+within `fetch_deadline`.
+
+| The connection ends | The fetch |
+|---|---|
+| The peer is silent for `dead_after`, a write is stuck, a socket or TLS failure, the peer's process is gone, a frame breaks a rule, a new Bulk connection replaces it, or a `reload` whose CAs no longer verify the peer's chain | asked again: the second table (`fetches_asked_again` counts it) |
+| This host drains past `drain_deadline` | `connection_aborted` at `drain_deadline`; not asked again |
+| `remove_node` | `connection_aborted` at once; not asked again |
+| `stop()` | `connection_aborted` at once; not asked again (a first ask still waiting for its connection ends `not_connected`) |
+| The fetcher's oversize refusal | not an end: a `Cancel` of that call alone, `message_size` |
+| The second connection ends too | `connection_aborted` at its end |
+
+| The second ask | The fetch |
+|---|---|
+| A Bulk connection is up, or the redial or the peer's dial brings one up | asked on it, and ends as that call ends: bytes, nullopt, `io_error`, `message_size`, `timed_out`, `resource_unavailable_try_again` (the peer drains), or `connection_aborted` |
+| The redial makes no connection: refused, unreachable (within `dial`, 5 s), or the TLS handshake fails, verification included | `connection_aborted` when that dial fails |
+| The redial loses the tie-break, or an incoming connection wins | waits for that connection: the first row |
+| The redial's hellos fail | `connection_aborted` at the next redial, `redial` (200 ms) later, when it makes no connection |
+| The peer refuses this node's boot or wire version | redials every `redial` and ends `timed_out` at `fetch_deadline`: the peer answers, so the connection is not what failed |
+| `remove_node`, `drain()` or `stop()` while it waits | `connection_aborted` at once |
+| `fetch_deadline` passes while it waits | `timed_out` |
 
 ## Evidence
 
@@ -181,7 +211,7 @@ so calls wait for `calling`, `outgoing` and room (N4); its corpus `fuzz/corpus/r
 | `hold` | `hold(2)` on a lane-only pair with a 300 ms lane_idle: Bulk comes up and stays 1 s; `release(2)` drains it about 300 ms later (1 Drain, closed gracefully) | `hold-ignored` |
 | `idle-race` | host 1's 300 ms lane_idle drains while host 2's loop is held 600 ms, in which it starts 5 calls on the old connection: all 5 end `not_processed`, none `connection_aborted`, and the next call dials again and completes | `rpc-no-drain` |
 | `shutdown` | `drain()` with a 4 MiB echo streaming: it completes whole, a later call ends `not_processed`, the lanes close, no call ends `connection_aborted` | |
-| `fetch` | host 2 uploads 4 groups' 1 MiB data frames to host 1 on Bulk while host 1 fetches 16 MiB on the same connection: it arrives exact beside the uploads (one 1 MiB frame per loop turn), heartbeats on Control keep every gap under 1,000 ms plus the host's measured lag, as `group-full` allows (longest 106-258 ms in 96 runs, plain and TSan); a missing name gives nullopt, a throwing reader `io_error`, 48 MiB against a 32 MiB `fetch_bytes` `message_size`, and past 4 awaiting `resource_unavailable_try_again`. It guards heartbeat stalls, not head-of-line blocking: the Bulk rings serve groups round robin, one frame a turn, so heartbeats sent on Bulk (gaps 150-161 ms) or with `bulk-ahead-of-control` (105-121 ms) pass it | heartbeats withheld 1.5 s (the loop sleeps before its fourth beat) |
+| `fetch` | host 2 uploads 4 groups' 1 MiB data frames to host 1 on Bulk while host 1 fetches 16 MiB on the same connection: it arrives exact beside the uploads (one 1 MiB frame per loop turn), heartbeats on Control keep every gap under 1,000 ms plus the host's measured lag, as `group-full` allows (longest 106-258 ms in 96 runs, plain and TSan); a missing name gives nullopt, a throwing reader `io_error`, 48 MiB against a 32 MiB `fetch_bytes` `message_size`, and past 4 awaiting `resource_unavailable_try_again`. Its line counts how links ended (`dead`, `stuck`, `failed`), so a run whose Bulk link ended names the rule that ended it. Then `fetch-dead`: host 2's reader holds node 1's connection loop 1.5 s against host 1's 1 s `dead_after` with three fetches on the connection (CI's shape: on macos-15-intel a `sendto` held that loop 5.2 s in an uninterruptible kernel wait, run 45453078372), host 1 ends the link dead, and each fetch is asked again: the 4 MiB ones exact, the 48 MiB one `message_size`. Then a case per row of [A fetch whose connection ends](#a-fetch-whose-connection-ends): `fetch-partial` (2 MiB of a 48 MiB reply in when its link ends: asked again, exact), `fetch-twice` (`connection_aborted` at the second end, the reader run twice), `fetch-gone` (the peer's process exits in its reader: `connection_aborted` within 1 s of a 4 s deadline), `fetch-unverified` (a `reload` trusting another CA: the redial fails verification, `connection_aborted` within 2.5 s), `fetch-removed` (`remove_node` and `drain()`: `connection_aborted`, not asked again) and `fetch-oversize` (the oversize refusal leaves the connection: links unchanged, none failed). It guards heartbeat stalls, not head-of-line blocking: the Bulk rings serve groups round robin, one frame a turn, so heartbeats sent on Bulk (gaps 150-161 ms) or with `bulk-ahead-of-control` (105-121 ms) pass it | heartbeats withheld 1.5 s (the loop sleeps before its fourth beat); `fetch-not-asked-again` for `fetch-dead`; consensus:ea48bc8's `host_transport.h` (asks again on any connection) for `fetch-gone`, `fetch-unverified` and `fetch-removed`; `no-clear` for `fetch-partial`; `oversize-aborts` for `fetch-oversize` |
 | `reader` | host 2's loop that does not read node 1's connection is held; 10 echoes on that connection complete, the slowest in under 200 ms (T5) | `lane-via-other-loop` |
 | `stop-drain` | host 2 runs in a child process that raises SIGSTOP in its reader; host 1's fetch ends `timed_out`, and after SIGCONT the late reply arrives, is dropped (rule 9) on the same connection, and the next fetch is exact on it (F18) | `forget-is-violation` (never drain), `fetch-deadline-io-error` |
 | `local-throw` | a handler acting outside its events and a body consumer that throw each end their call `handler_failed`; the link count, `malformed` 0, a group's frames on Bulk and the next 1 MiB echo show the connection went on | `local-throw-closes` (a local throw closes the connection) |

@@ -100,7 +100,7 @@ inline EventAdmissionPlan plan_event(const Event& event, bool busy, Limits limit
 				} else if constexpr (std::is_same_v<M, VoteResponse>) {
 					if (!busy) { add(AdmissionClass::Control, noop); add(AdmissionClass::Control, hard); }
 				} else if constexpr (std::is_same_v<M, VoteRequest> || std::is_same_v<M, AppendResponse> || std::is_same_v<M, SnapshotResponse> || std::is_same_v<M, Gone> ||
-					std::is_same_v<M, InstallRequest> || std::is_same_v<M, InstallRequestResponse>) {
+					std::is_same_v<M, InstallRequest> || std::is_same_v<M, InstallRequestResponse> || std::is_same_v<M, ReadIndexRequest> || std::is_same_v<M, ReadIndexResponse>) {
 					if constexpr (std::is_same_v<M, SnapshotResponse>) { if (!valid_snapshot_response(message)) { throw std::invalid_argument("invalid snapshot response"); } }
 					if (!busy) { add(AdmissionClass::Control, hard); }
 				} else {

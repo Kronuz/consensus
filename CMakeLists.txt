@@ -124,6 +124,14 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 		add_test(NAME consensus_driver_pressure_${c} COMMAND consensus_driver_pressure_test ${c})
 		set_tests_properties(consensus_driver_pressure_${c} PROPERTIES TIMEOUT 120)
 	endforeach()
+	# A recovered group above its control headroom reclaims, then starts or fails by name
+	# (docs/mechanisms/deadlines.md).
+	add_executable(consensus_recovered_over_limit_test test/recovered_over_limit_test.cc)
+	target_link_libraries(consensus_recovered_over_limit_test PRIVATE consensus::consensus)
+	foreach(c reclaims refuses owned)
+		add_test(NAME consensus_recovered_over_limit_${c} COMMAND consensus_recovered_over_limit_test ${c})
+		set_tests_properties(consensus_recovered_over_limit_${c} PROPERTIES TIMEOUT 120)
+	endforeach()
 	# A Driver group's install (docs/DRIVER.md, Install), a ctest entry per case.
 	add_executable(consensus_driver_install_test test/driver_install_test.cc)
 	target_link_libraries(consensus_driver_install_test PRIVATE consensus::consensus)
@@ -289,7 +297,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	endif()
 
 	# The tests that build a journal run it on faultfs.
-	foreach(t simulation shared_worker shared_cluster wave_open waiter blocking_entry driver driver_close driver_replace driver_install driver_install_request driver_pressure worker)
+	foreach(t simulation shared_worker shared_cluster wave_open waiter blocking_entry driver driver_close driver_replace driver_install driver_install_request driver_pressure recovered_over_limit worker)
 		target_link_libraries(consensus_${t}_test PRIVATE faultlab::faultlab)
 	endforeach()
 

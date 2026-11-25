@@ -57,6 +57,10 @@ struct Placement {
 
 struct closed : std::runtime_error { closed() : std::runtime_error("consensus group closed") {} };
 struct fenced : std::runtime_error { using std::runtime_error::runtime_error; };
+// The fence reason of a recovered group whose store is above its control headroom: a whole
+// reclaim pass left its pool short of the first turn, and nothing before Start frees more
+// (docs/mechanisms/deadlines.md). The open fails with fenced(over_headroom).
+inline constexpr const char* over_headroom = "storage above its control headroom at start";
 struct rejected : std::runtime_error {
 	explicit rejected(RejectReason why) : std::runtime_error("consensus call rejected"), reason(why) {}
 	RejectReason reason;
@@ -795,6 +799,8 @@ private:
 				bool progress = deliver(g);
 				const auto result = w.run_one(tick(g));
 				g.pressured = result == TurnResult::Pressure;
+				// Before Start the Worker reclaims a pressured store first, so Pressure is final.
+				if (g.pressured && !g.started) { g.fence_reason = over_headroom; w.fence(g.fence_reason); }
 				progress |= result == TurnResult::Inventory || result == TurnResult::Stored || result == TurnResult::Completed || result == TurnResult::Maintenance;
 				progress |= result == TurnResult::Idle && w.runnable();  // the Tick left work behind it
 				progress |= drain(g);

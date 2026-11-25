@@ -1250,6 +1250,30 @@ void idle_cpu() {
 	if (m.empty() || m == "heartbeat") { idle_cpu_mode(false, groups, seconds); }
 }
 
+// GroupState::last after a recover from a closed record is the log end the record names, and
+// advances with appends after it.
+void group_last_closed() {
+	constexpr GroupId g = 131;
+	fl::filesystem disk; Loop loop(disk);
+	std::exception_ptr error;
+	std::vector<std::string> applied;
+	loop.lone(g);
+	std::optional<Placement> placed;
+	for (const char* c : {"a", "b", "c"}) { placed = loop.propose(g, c); applied.emplace_back(c); }
+	loop.apply(g);
+	auto published = loop.start(checkpoint_of(loop, g, applied));
+	loop.release();
+	check(published->done && !published->error, "the checkpoint publishes: " + what(published->error));
+	auto closed = loop.driver->closed_state(g);
+	check(closed && placed && loop.driver->state(g)->last == placed->index, "the open group's last is its newest entry");
+	check(loop.close(g, error) && !error, "closes: " + what(error));
+	loop.recover(g, error, options({1}), closed);
+	auto s = loop.driver->state(g);
+	check(!error && s && placed && s->last == placed->index, "recovered from the closed record, last is its log end: " + std::to_string(s ? s->last : 0) + " of " + std::to_string(placed ? placed->index : 0));
+	auto next = loop.propose(g, "d");
+	check(next && placed && next->index > placed->index && loop.driver->state(g)->last == next->index, "and advances with appends");
+}
+
 const std::map<std::string, void (*)()> cases{
 	{"idle_cpu", &idle_cpu},
 	{"created_bytes", &created_bytes},
@@ -1268,6 +1292,7 @@ const std::map<std::string, void (*)()> cases{
 	{"closed_bytes", &closed_bytes},
 	{"close_crash", &close_crash},
 	{"reopen_barriers", &reopen_barriers},
+	{"group_last_closed", &group_last_closed},
 	{"pool_bound", &pool_bound},
 	{"failed_close", &failed_close},
 	{"second_driver", &second_driver},

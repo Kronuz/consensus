@@ -10,6 +10,7 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 
 ### Added
 
+- `Driver::GroupState::last`: the group's log end, the Worker's `last_index()`, so a consumer reads it right after `recover` returns (from a plain log, a closed record, or a checkpoint plus a tail) and compares it with what it already applied. `GroupState` gains the field after `applied`; nothing else changes (`driver_test group_last`, `driver_close_test group_last_closed`).
 - Follower reads ([docs/mechanisms/follower-read.md](docs/mechanisms/follower-read.md)): `Read` at a follower is forwarded to its leader (`ReadIndexRequest`, DTC2 kind 12), which confirms its leadership with its usual quorum probe and answers its commit index (`ReadIndexResponse`, kind 13); the follower emits `ReadReady` once it applied that index. Before, a follower refused every `Read` with `NotLeader`. The leader's refusals reach the follower at once with their reason (`NotReady`, `Busy`, `NotLeader`); a change of the follower's term or leader refuses `NotLeader` at once; and a read neither answered and applied within `election_max` of its send refuses `NotLeader`. A read is named by `Start::nonce`, a random value the host draws at each start (the Driver does), and a token, so a follower restarted in the same term never takes an answer meant for a read before its restart. With `Start{}` (no nonce) a follower keeps refusing, as before. A follower holding a read does not rest, and its deadline is in `next_deadline()` (`follower_read_test`).
 
 ## 2026-11-23

@@ -25,16 +25,14 @@ node only in a long heal window (Linux, seed 7).
 
 ## Held Ticks
 
-`Core::next_deadline()` is the earliest Tick time at which a Tick may change anything. The
-harness reads it at a node's first Tick after a core step, and a Tick before it is held rather
-than stepped:
-its delay is still drawn, so the random stream and every schedule stay the same, and the held
-Tick reaches the core just before the node's next event, so that event sees the clock it would
-have. A leader's Tick is held only while its membership is settled and it is not a witness: a
-D3 removal and a hand-off wait for a Tick, which `next_deadline()` does not report.
+`Core::next_deadline()` is the earliest Tick time at which a Tick changes Core's state
+(docs/mechanisms/deadlines.md). The harness reads it at a node's first Tick after a core step,
+whatever the node's role or membership, and a Tick before it is held rather than stepped: its
+delay is still drawn, so the random stream and every schedule stay the same, and the held Tick
+reaches the core just before the node's next event, so that event sees the clock it would have.
 
-`LIVENESS_VERIFY=1` steps every held Tick instead and fails one that returns an action or moves
-the deadline. With it, and with a hash of every action each core returns (time, node, kind, a
+`LIVENESS_VERIFY=1` steps every held Tick instead and fails one that returns an action, moves
+the deadline or retires log entries. With it, and with a hash of every action each core returns (time, node, kind, a
 message's kind and term), main's harness and this one produce the same output and the same hash
 in every profile.
 

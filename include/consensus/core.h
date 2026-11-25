@@ -330,14 +330,21 @@ public:
 		if (index < base_index_ || index > last_index() || (index == 0 && base_index_ == 0)) { return std::nullopt; }
 		return log_term(index);
 	}
-	// The earliest Tick time (as Tick::now) by which a Tick may change anything; `maximum` when
-	// none would: before Start, while a persistence is outstanding (its Persisted is the next
-	// event), fenced, retiring, or a member that never campaigns. A host that ticks by then
-	// misses no timer; an earlier Tick is harmless. A due leader heartbeat or election may be
-	// now or past; every other deadline counts only while ahead of the clock.
+	// The earliest Tick time (as Tick::now) at which a Tick changes Core's state beyond its clock
+	// (docs/mechanisms/deadlines.md); `maximum` when none would: before Start, while a persistence
+	// is outstanding (its Persisted is the next event), fenced, retiring, at rest, or a member
+	// that never campaigns. A host that ticks by then delays nothing; an earlier Tick is harmless.
+	// Retirement, a D3 removal and a witness's hand-off are due at once; a follower's deadlines and
+	// a leader's heartbeat may be past; a leader's others count only while ahead of the clock.
 	std::uint64_t next_deadline() const {
-		if (!started_ || retiring_ || role_ == Role::Fenced || busy() || resting_) { return maximum; }
+		if (!started_ || retiring_ || role_ == Role::Fenced || busy()) { return maximum; }
+		if (entries_.retired_entries()) { return now_; }  // each step retires a slice of erased entries
+		if (resting_) { return maximum; }
 		if (role_ != Role::Leader) { return std::min({is_voter(configuration_.local) && hard_.term != maximum ? election_deadline_ : maximum, acknowledge_at_, install_deadline(), forwarded_deadline()}); }
+		// D3, D9: no clock, only a drive. A removal is due once its entry fits: nothing is left to
+		// retire here, so the Tick's step frees no more room than this sees.
+		if (auto next = removal(); next && configuration_fits(encode_membership(*next).size())) { return now_; }
+		if (!transfer_ && witness_self() && handoff_target()) { return now_; }
 		auto at = peers_.empty() ? maximum : heartbeat_deadline_;  // a leader with nobody to heartbeat sleeps
 		auto later = [&](std::uint64_t base, std::uint64_t delay) {
 			const auto due = delay > maximum - base ? maximum : base + delay;
@@ -399,9 +406,9 @@ public:
 
 	Actions step(Event event) {
 		if (retiring_) { return {}; }
-		retire_log();
 		Actions output;
 		if (role_ == Role::Fenced) { return output; }
+		retire_log();
 		try {
 			const bool rested = resting_; const auto followed = std::pair{hard_.term, leader_}; const auto held = std::pair{last_index(), hard_.commit_index};
 			if (resting_ && wakes(event)) { wake(output); }
@@ -981,14 +988,15 @@ private:
 		}
 		propose_membership(change.request, change.next, output);
 	}
+	// Whether a Configuration entry of `bytes` fits the retained log now, its control reserve included.
+	bool configuration_fits(std::size_t bytes) const {
+		const auto byte_cap = retained_.log_bytes;
+		return last_index() < maximum - 1 && entries_.charged_entries() < std::min(limits_in_force().log_entries, retained_.log_entries) &&
+			entries_.charged_bytes() <= byte_cap && bytes <= byte_cap - entries_.charged_bytes();
+	}
 	void propose_membership(RequestId request, const Membership& next, Actions& output) {
-		if (last_index() >= maximum - 1 || entries_.charged_entries() >= std::min(limits_in_force().log_entries, retained_.log_entries)) {
-			if (request) { output.emplace_back(Reject{request, RejectReason::LogFull}); }
-			return;
-		}
 		Entry entry{last_index() + 1, hard_.term, EntryKind::Configuration, encode_membership(next)};
-		auto byte_cap = retained_.log_bytes;
-		if (entries_.charged_bytes() > byte_cap || entry.payload.size() > byte_cap - entries_.charged_bytes()) {
+		if (!configuration_fits(entry.payload.size())) {
 			if (request) { output.emplace_back(Reject{request, RejectReason::LogFull}); }
 			return;
 		}
@@ -1457,7 +1465,7 @@ private:
 			// Campaigns require a separately admitted Tick. Slow persistence
 			// must not start another election from its completion callback.
 			if (!tick || now_ < election_deadline_ || hard_.term == maximum) { return; }
-			if (!is_voter(configuration_.local)) { reset_election(); return; }  // learners and joiners never campaign
+			if (!is_voter(configuration_.local)) { return; }  // learners and joiners never campaign
 			if (quorum() == 1) { campaign(output); return; }
 			// Pre-vote first (Track C, D7): only a quorum of grants starts a campaign, so a
 			// node that cannot win never raises the group's term.
@@ -1497,7 +1505,7 @@ private:
 		if (!votes_in(committed, configuration_.local) && committed == membership()) {
 			if (!handed_off_) {
 				handed_off_ = true;
-				if (auto target = handoff_target()) { start_transfer(*target, output); return; }
+				if (auto target = handoff_target()) { start_transfer(*target, output); }
 			}
 			if (!transfer_) { follower(0, output); return; }
 		}

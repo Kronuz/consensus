@@ -120,7 +120,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	add_executable(consensus_driver_pressure_test test/driver_pressure_test.cc)
 	target_link_libraries(consensus_driver_pressure_test PRIVATE consensus::consensus)
 	set_source_files_properties(test/driver_pressure_test.cc PROPERTIES COMPILE_OPTIONS -fno-access-control)  # it holds the Worker's Store permit
-	foreach(c hold clears)
+	foreach(c hold clears ahead rest)
 		add_test(NAME consensus_driver_pressure_${c} COMMAND consensus_driver_pressure_test ${c})
 		set_tests_properties(consensus_driver_pressure_${c} PROPERTIES TIMEOUT 120)
 	endforeach()

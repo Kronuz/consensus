@@ -274,10 +274,49 @@ void clears() {
 	check(f.pre_votes() == 1, "within one retry_ns of the release the refused Tick pre-votes: " + std::to_string(f.pre_votes()));
 }
 
+// A pressured turn whose Core deadline is ahead arms at that deadline, with no retry poll: from a
+// step the held pool pressures at clock 0 (a Wake) to the election deadline, the group's entry
+// is armed once, at Core's deadline (at e61ac8f: once per retry_ns, 190 times).
+void ahead() {
+	Pressured f;
+	const auto base = f.loop.scheduler.arms.size();
+	f.loop.driver->wake(g); f.loop.run();
+	f.pass(f.due - f.loop.scheduler.now() - 2 * retry_ns);
+	std::size_t arms = 0;
+	std::uint64_t last = 0;
+	for (auto arm = f.loop.scheduler.arms.begin() + base; arm != f.loop.scheduler.arms.end(); ++arm) { if (arm->entry == &f.group()) { ++arms; last = arm->at; } }
+	check(f.group().worker->next_deadline() * 1'000'000 == f.due, "Core's deadline is ahead and unchanged");
+	check(arms == 1 && last == f.due, "the pressured step arms once, at Core's deadline, and no step follows: " + std::to_string(arms));
+}
+
+// The same at rest: a quiescent follower's deadline is `maximum`, and a pressured step (a peer's
+// limits arrive) arms nothing, as it did at main.
+void rest() {
+	fl::filesystem disk; Loop loop(disk);
+	loop.current = g;
+	auto o = options({1, 2}); o.timing.quiesce = true;
+	loop.driver->open(g, std::move(o));
+	std::exception_ptr error;
+	check(loop.settle(loop.driver->create(g, j::Identity{'P', 'Q'}), error) && !error, "create");
+	loop.driver->receive(g, Receive{2, AppendRequest{1, 1, 0, 0, 0, 0, {}}}); loop.release();
+	auto state = loop.driver->state(g);
+	check(state && state->resting && loop.driver->armed_group_timers() == 0, "the group follows at rest with no timer");
+	auto& group = *loop.driver->groups_.at(g);
+	std::vector<std::optional<j::AppendReservation>> held;
+	for (int n = 0; n < 4; ++n) { held.push_back(group.worker->store_.reserve_append(j::AdmissionClass::Control, storage_batch_size(true, false))); }
+	const auto base = loop.scheduler.arms.size();
+	loop.driver->peer_limits(g, PeerLimits{2, limits()}); loop.release();
+	loop.scheduler.advance(10'000'000); loop.run();
+	std::size_t arms = 0;
+	for (auto arm = loop.scheduler.arms.begin() + base; arm != loop.scheduler.arms.end(); ++arm) { arms += arm->entry == &group; }
+	state = loop.driver->state(g);
+	check(state && state->resting && arms == 0 && loop.driver->armed_group_timers() == 0, "a pressured step at rest arms nothing: " + std::to_string(arms));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-	const std::map<std::string, void (*)()> cases{{"hold", hold}, {"clears", clears}};
+	const std::map<std::string, void (*)()> cases{{"hold", hold}, {"clears", clears}, {"ahead", ahead}, {"rest", rest}};
 	if (argc > 1) {
 		auto found = cases.find(argv[1]);
 		if (found == cases.end()) { std::cerr << "unknown case " << argv[1] << '\n'; return 2; }

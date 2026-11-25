@@ -811,6 +811,7 @@ private:
 			// A throw mid-step (a Sink's included) leaves its batch half delivered: the group fences.
 			if (g.fence_reason.empty()) { g.fence_reason = error.what(); }
 			w.fence(g.fence_reason);
+			g.pressured = false;
 			fail_all(g, std::make_exception_ptr(fenced(fence_reason(g))));
 		}
 		if (g.closed) { return; }
@@ -830,16 +831,13 @@ private:
 	}
 
 	// The group's next wake on the wheel: Core's deadline, or a short retry while inputs or
-	// calls wait for an admission nothing in flight will free. A Tick refused with Pressure
-	// leaves Core's clock and deadline behind: it retries in retry_ns, never at that past clock.
+	// calls wait for an admission nothing in flight will free. A turn refused with Pressure
+	// leaves Core's clock and deadline behind: a deadline behind the clock retries in retry_ns.
 	void arm(Group& g) {
 		auto& w = *g.worker;
 		std::uint64_t at = w.next_deadline();
 		at = at > max_ms ? never : at * 1'000'000;
-		if (g.pressured) {
-			const auto retry = scheduler_.now() + retry_ns;
-			if (at <= scheduler_.now() || at > retry) { at = retry; }
-		}
+		if (g.pressured && at <= scheduler_.now()) { at = scheduler_.now() + retry_ns; }
 		const bool waiting = !g.inbox.empty() || !g.notices.empty() || unadmitted(g) || g.retiring || (g.install && !g.install->frames.empty());
 		if (waiting && !g.io && !g.watching) { at = std::min(at, scheduler_.now() + retry_ns); }
 		// An incoming image ends at the channel's receive timeout, which only a step sees: a

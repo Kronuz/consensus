@@ -159,6 +159,13 @@ MUTANTS = {
     "orphan-no-wake": ("include/consensus/driver.h",
                        "if (g.install && g.install->channel.incoming_snapshot()) {",
                        "if (false && g.install && g.install->channel.incoming_snapshot()) {"),
+    # groups_test (consensus-inline-sync-loop A1): the journal syncs on its loop, as InlineCompletion
+    "sync-on-loop": ("test/transport/groups_test.cc",
+                     "\t\tif (!co_await Off{*this, std::move(operation), std::move(token)})\n\t\t\tthrow task::cancelled{};\n",
+                     "\t\tconst auto t = steady::now();\n\t\tif (const auto ms = delay.exchange(0))\n"
+                     "\t\t\tstd::this_thread::sleep_for(std::chrono::milliseconds(ms));\n"
+                     "\t\tif (!j::drive_synchronously(*operation, [&] { return !token.requested(); }))\n\t\t\tthrow task::cancelled{};\n"
+                     "\t\tlongest = std::max<std::uint64_t>(longest, ms_since(t));\n\t\tco_return;\n"),
 }
 
 

@@ -9,7 +9,9 @@
 //            never delays another group's heartbeat or vote past the election timeout, or past 1.6
 //            windows of the reader's measured delivery time when the runner slows it
 //   driver   three Drivers' Sinks over the transport: a three-voter group elects, commits and
-//            survives a peer's restart
+//            survives a peer's restart; then slow-sync
+//   slow-sync a follower's journal operation held 6 s on a loop that also carries its links: no
+//            peer is lost, the leader keeps its term, commits go on (run by driver too)
 //   refill   credit comes back: for refused frames, and with a new connection after the
 //            receiver restarts with the window full
 //   identity the per-frame rule and the group-open exchange over the wire: each refusal, with
@@ -35,6 +37,7 @@
 #include "consensus/driver.h"
 #include "consensus/transport/host_transport.h"
 #include "../support/ports.h"
+#include "lag.h"
 #include <completion/posix.h>
 #include <asio/executor_work_guard.hpp>
 #include <asio/io_context.hpp>
@@ -42,11 +45,13 @@
 #include <array>
 #include <cassert>
 #include <condition_variable>
+#include <coroutine>
 #include <csignal>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -562,7 +567,8 @@ bool credit() {
 
 // reader_test (async-drivers D10): group 1's admission is full for 3 s, so its frames are refused,
 // while its leader sends an append every 10 ms; group 2, on the same loop, gets a heartbeat every
-// 100 ms. Its longest gap stays under its 1,000 ms election timeout.
+// 100 ms. Its longest gap stays under its 1,000 ms election timeout plus what the host kept this
+// process from running (Lag).
 bool reader() {
 	constexpr std::uint32_t L = 2;
 	Host one(1, L), two(2, L);
@@ -599,6 +605,7 @@ bool reader() {
 	warm([&] { one.post(hb, [&] { send_message(*one.transport, hb, g2, 1, 2, Send{2, heartbeat}); }); },
 		 [&] { return beats_2.count > 0; });
 	step("reader: 5 s of appends and heartbeats");
+	Lag lag;
 	start = steady::now();
 	busy = true;
 	// A signed tick: libc++'s steady sleep_until subtracts in the time point's own rep, so with an
@@ -611,13 +618,17 @@ bool reader() {
 		std::this_thread::sleep_until(start + (tick + 1) * 10ms);
 	}
 	std::this_thread::sleep_for(200ms);
+	const auto lagged = lag.stop();
 	step("reader: the hosts stop");
 	one.stop();
 	two.stop();
-	const bool ok = beats_2.worst < 1000 && refused_1 && delivered_1;
-	std::printf("reader_test: group2_heartbeats=%llu group2_longest_gap_ms=%llu group1_delivered=%llu group1_refused=%llu %s\n",
-				(unsigned long long)beats_2.count.load(), (unsigned long long)beats_2.worst, (unsigned long long)delivered_1,
-				(unsigned long long)refused_1, ok ? "ok" : "FAILS: group 2 would start an election");
+	const auto bound = 1000 + lagged;
+	const bool ok = beats_2.worst < bound && refused_1 && delivered_1;
+	std::printf("reader_test: group2_heartbeats=%llu group2_longest_gap_ms=%llu of %llu allowed (1,000 plus the host's %llu ms of lag) "
+				"group1_delivered=%llu group1_refused=%llu %s\n",
+				(unsigned long long)beats_2.count.load(), (unsigned long long)beats_2.worst, (unsigned long long)bound,
+				(unsigned long long)lagged, (unsigned long long)delivered_1, (unsigned long long)refused_1,
+				ok ? "ok" : "FAILS: group 2 would start an election");
 	return ok;
 }
 
@@ -1058,24 +1069,84 @@ task::task<void> changing(Driver<GroupSink> *d, GroupId g, Membership next) {
 }
 task::task<void> transferring(Driver<GroupSink> *d, GroupId g, NodeId target) { co_await d->transfer_leadership(g, target); }
 
-// The journal's I/O on the calling loop (InlineCompletion), with the longest one operation held
-// it, in ms: a slow sync blocks every connection that loop serves. `delay` makes the next
-// operation that much slower, as a runner's slow sync.
-struct TimedInline {
-	j::InlineCompletion inline_io;
+// The journal's I/O off its loop (docs/DRIVER.md, Where syncs run): each operation's primitives
+// run on this loop's sync thread, as InlineCompletion runs them, and the caller resumes on its
+// loop, so a slow sync holds its groups' Drivers, never the connections the loop serves.
+// `longest` is the longest one operation took, in ms; `delay` makes the next one that much
+// slower, as a runner's slow sync.
+class SyncThread {
+	struct Off {
+		SyncThread &sync;
+		std::shared_ptr<j::IOOperation> operation;
+		task::cancel_token token;
+		std::coroutine_handle<> waiter{};
+		task::scheduler_ref home{};
+		bool done = false;  // false: the token stopped it before a primitive
+		bool await_ready() const noexcept { return false; }
+		void await_suspend(std::coroutine_handle<> handle) {
+			waiter = handle;
+			home = task::current();
+			sync.push(this);
+		}
+		bool await_resume() const noexcept { return done; }
+	};
+	std::mutex mutex_;
+	std::condition_variable wake_;
+	std::deque<Off *> queue_;
+	bool stopping_ = false;
+	std::thread thread_{[this] { serve(); }};
+	void push(Off *off) {
+		{
+			std::lock_guard hold(mutex_);
+			queue_.push_back(off);
+		}
+		wake_.notify_one();
+	}
+	void serve() {
+		for (;;) {
+			Off *off;
+			{
+				std::unique_lock hold(mutex_);
+				wake_.wait(hold, [&] { return stopping_ || !queue_.empty(); });
+				if (queue_.empty())
+					return;
+				off = queue_.front();
+				queue_.pop_front();
+			}
+			const auto t = steady::now();
+			if (const auto ms = delay.exchange(0))
+				std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+			off->done = j::drive_synchronously(*off->operation, [off] { return !off->token.requested(); });
+			longest = std::max<std::uint64_t>(longest, ms_since(t));
+			off->home.post(off->waiter);
+		}
+	}
+
+  public:
 	std::atomic<std::uint64_t> longest{0}, delay{0};
+	SyncThread() = default;
+	SyncThread(const SyncThread &) = delete;
+	SyncThread &operator=(const SyncThread &) = delete;
+	// Once every caller resumed: its Driver and turn driver stopped.
+	~SyncThread() {
+		{
+			std::lock_guard hold(mutex_);
+			stopping_ = true;
+		}
+		wake_.notify_one();
+		thread_.join();
+	}
 	task::task<void> run(std::shared_ptr<j::IOOperation> operation, task::cancel_token token = {}) {
-		const auto t = steady::now();
-		if (const auto ms = delay.exchange(0))
-			std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-		co_await inline_io.run(std::move(operation), std::move(token));
-		longest = std::max<std::uint64_t>(longest, ms_since(t));
+		if (!operation || operation->in_flight())
+			throw std::logic_error("sync thread needs an idle operation");
+		if (!co_await Off{*this, std::move(operation), std::move(token)})
+			throw task::cancelled{};
 	}
 };
 
 struct Node {
 	struct PerLoop {
-		TimedInline io;
+		SyncThread io;
 		GroupSink sink;
 		std::unique_ptr<Driver<GroupSink>> driver;
 		task::cancel_source stop;
@@ -1092,6 +1163,7 @@ struct Node {
 	std::atomic<std::uint64_t> misplaced{0};  // frames delivered off their group's loop
 	std::atomic<bool> hold_apply{false};  // Committed ranges stay out for application, the last in `held`
 	std::atomic<Index> held{0};
+	std::map<GroupId, Index> recovered;  // each recovered group's state().last as recover returned
 	// Each group is founded by `voters`; with none, this node is a joiner (D5).
 	Node(NodeId id, std::uint32_t L, std::uint16_t port, std::shared_ptr<j::IO> io, const std::vector<GroupId> &groups,
 		 const std::map<NodeId, PeerAddress> &peers, std::vector<NodeId> voters = {1, 2, 3}, HostTransportOptions options = {}, bool quiesce = false)
@@ -1152,11 +1224,14 @@ struct Node {
 				}
 				o.timing.quiesce = quiesce;
 				driver->open(g, std::move(o));
-				auto opening = journal->status(g) == j::GroupStatus::stored ? driver->recover(g, [this, g](j::ArtifactReader &image) { restore(g, image); })
-																			: driver->create(g, j::Identity{'G', char('0' + host.node)});
+				const bool stored = journal->status(g) == j::GroupStatus::stored;
+				auto opening = stored ? driver->recover(g, [this, g](j::ArtifactReader &image) { restore(g, image); })
+									  : driver->create(g, j::Identity{'G', char('0' + host.node)});
 				// stored once member_of answers for it (host-transport.md, Identity)
-				task::spawn(task::scheduler_ref::of(host.loops[k]->scheduler), std::move(opening), [this, g, &opened](std::exception_ptr e) {
+				task::spawn(task::scheduler_ref::of(host.loops[k]->scheduler), std::move(opening), [this, g, stored, driver, &opened](std::exception_ptr e) {
 					assert(!e && "create or recover");
+					if (stored)
+						recovered[g] = driver->state(g)->last;
 					host.store(g, host.node, Host::test_open());
 					opened.set_value();
 				});
@@ -1390,8 +1465,17 @@ void driver() {
 	}
 	NodeId restarted = c.leader({1, 2, 3}, groups[0]);
 	restarted = restarted ? restarted : 1;
+	std::map<GroupId, Index> ended;  // each group's log end on that node as it stops
+	for (auto g : groups)
+		ended[g] = c.nodes[restarted]->state(g)->last;
 	step("driver: node " + std::to_string(restarted) + " restarts");
 	c.start(restarted, 2);
+	// strata reads state().last as the recovered log end the moment recover returns.
+	for (auto g : groups) {
+		std::printf("driver: group %llu's log ended at %llu on node %llu; recover returned with last %llu\n", (unsigned long long)g,
+					(unsigned long long)ended[g], (unsigned long long)restarted, (unsigned long long)c.nodes[restarted]->recovered.at(g));
+		assert(ended[g] && c.nodes[restarted]->recovered.at(g) == ended[g]);
+	}
 	all = c.of({1, 2, 3});
 	for (auto g : groups) {
 		step("driver: group " + std::to_string(g) + " commits again");
@@ -2549,18 +2633,81 @@ struct LoopLags {
 	~LoopLags() { stop(); }
 };
 
+// slow-sync (consensus-inline-sync-loop A1): three nodes of one loop each, so the group's journal
+// and every link of a node share its one loop; a follower's next journal operation is held 6 s
+// (a runner's slow sync). Its loop keeps turning, so no node loses a peer and the leader keeps its
+// term, and commits go on through the leader and the other follower meanwhile.
+void slow_sync() {
+	const GroupId g = groups_on(1, 0, 1)[0];
+	Cluster c("slow-sync", {g});
+	for (NodeId n = 1; n <= 3; ++n)
+		c.start(n, 1);
+	auto all = c.of({1, 2, 3});
+	step("slow-sync: the group elects and commits");
+	assert(commit_everywhere(all, g, "before", 30'000));
+	const NodeId leader = c.leader({1, 2, 3}, g);
+	assert(leader);
+	const Term term = c.nodes[leader]->state(g)->term;
+	const NodeId slow = leader == 1 ? 2 : 1, other = 6 - leader - slow;
+	auto gone = [&] {
+		std::uint64_t sum = 0;
+		for (auto *n : all)
+			sum += n->host.transport->stats(0).gone;
+		return sum;
+	};
+	const auto gone_before = gone();
+	step("slow-sync: node " + std::to_string(slow) + "'s next journal operation takes 6 s; commits go on");
+	Lag lag;
+	LoopLags lags(all, 1);
+	c.nodes[slow]->per[0]->io.delay = 6'000;
+	const auto start = steady::now();
+	unsigned commits = 0;
+	bool quorum = true;  // each command on the leader and the other follower within 2 s
+	std::uint64_t slowest = 0;
+	while (ms_since(start) < 7'000) {
+		const auto begun = steady::now();
+		const auto command = "during " + std::to_string(++commits);
+		const bool ok = commit_everywhere(c.of({NodeId(leader), NodeId(other)}), g, command, 2'000);
+		quorum &= ok;
+		slowest = std::max(slowest, ms_since(begun));
+		std::this_thread::sleep_for(100ms);
+	}
+	step("slow-sync: every node catches up");
+	const bool caught_up = commit_everywhere(all, g, "after", 30'000);
+	lags.stop();
+	const auto lagged = lag.stop();
+	const auto held = c.nodes[slow]->per[0]->io.longest.load();
+	auto s = c.nodes[leader]->state(g);
+	const bool kept = s && s->role == Role::Leader && s->term == term;
+	const auto lost = gone() - gone_before;
+	std::uint64_t turned = 0;
+	for (std::size_t n = 0; n != all.size(); ++n)
+		turned = std::max(turned, lags.worst(n, 0));
+	const auto bound = 1'000 + lagged;
+	const bool ok = held >= 6'000 && lost == 0 && kept && quorum && caught_up && turned < bound;
+	std::printf("slow-sync: node %llu's journal operation held %llu ms; its loop and every node's turned within %llu ms (%llu allowed: "
+				"1,000 plus the host's %llu ms of lag); peers lost %llu; node %llu %s term %llu; %u commits on the leader and node %llu "
+				"within 2 s each: %s (slowest %llu ms); all three caught up: %s; %s\n",
+				(unsigned long long)slow, (unsigned long long)held, (unsigned long long)turned, (unsigned long long)bound,
+				(unsigned long long)lagged, (unsigned long long)lost, (unsigned long long)leader, kept ? "keeps" : "LOST", (unsigned long long)term,
+				commits, (unsigned long long)other, quorum ? "yes" : "NO", (unsigned long long)slowest, caught_up ? "yes" : "NO",
+				ok ? "ok" : "FAILED");
+	assert(ok);
+}
+
 // fetch-alongside-consensus (D102, Peers' F2 on the lane's fetch): three nodes of 4 loops, a
 // group's Drivers over the transport; rounds of four 8 MiB fetches (method 1), both ways between
 // nodes, through 1 MiB lane budgets, while a command commits every 50 ms. Every fetch arrives
 // exact, every commit lands on all three within 2 s, and the leader keeps its term. The group
-// sits on a loop that serves no connection, since its journal syncs inline on its loop: a
-// runner's slow sync holds the Driver, never the links. Each round's replies are built before its
-// fetches go out and the readers move them out, so no connection's loop builds 8 MiB: a host
-// serves from memory (docs/mechanisms/peer-fetch.md). The 2 s and the term allow what the
-// host took: the longest journal operation plus the longest process stall, and the term only
-// while that stays under the 1,000 ms election timeout. FETCH_ALONGSIDE_SLOW_SYNC=ms makes one
-// follower's next sync that slow; FETCH_ALONGSIDE_SLOW_READ=ms makes building each of node 2's
-// first two replies (round 1's) that slow.
+// shares its loop with links that serve fetches, as a host places them by default: on nodes 2
+// and 3 it sits with the link to node 1, which serves node 1's fetches. Its journal syncs on the
+// loop's sync thread, so a runner's slow sync holds the Driver, never the links. Each round's
+// replies are built before its fetches go out and the readers move them out, so no connection's
+// loop builds 8 MiB: a host serves from memory (docs/mechanisms/peer-fetch.md). The 2 s allows
+// what the host took: the longest journal operation plus the longest process stall; the term
+// allows only a process stall past the 1,000 ms election timeout. FETCH_ALONGSIDE_SLOW_SYNC=ms
+// makes one follower's next sync that slow; FETCH_ALONGSIDE_SLOW_READ=ms makes building each of
+// node 2's first two replies (round 1's) that slow.
 std::string pattern(std::size_t n, unsigned seed) {
 	std::string s(n, '\0');
 	for (std::size_t i = 0; i != n; ++i)
@@ -2569,18 +2716,9 @@ std::string pattern(std::size_t n, unsigned seed) {
 }
 void fetch_alongside() {
 	constexpr std::size_t size = 8 << 20, budget = 1 << 20;
-	// Nodes 1, 2 and 3 place their links on loops 1, 3 and 0 of 4: the group takes the free one.
+	// The group on the loop of the links to node 1.
 	constexpr std::uint32_t L = 4;
-	auto links_on = [&](std::uint32_t k) {
-		for (NodeId n = 1; n <= 3; ++n)
-			if (j::host_detail::loop(j::host_detail::slot(n), L) == k)
-				return true;
-		return false;
-	};
-	std::uint32_t group_loop = 0;
-	while (group_loop != L && links_on(group_loop))
-		++group_loop;
-	assert(group_loop != L && "a loop serves no node's links");
+	const std::uint32_t group_loop = j::host_detail::loop(j::host_detail::slot(1), L);
 	const GroupId g = groups_on(L, group_loop, 1)[0];
 	std::uint64_t slow_read = 0;
 	std::atomic<int> slow_replies{0};
@@ -2628,9 +2766,8 @@ void fetch_alongside() {
 	};
 	for (NodeId n = 1; n <= 3; ++n)
 		c.start(n, L);
-	for (NodeId n = 1; n <= 3; ++n)
-		for (NodeId m = 1; m <= 3; ++m)
-			assert(c.nodes[n]->host.transport->loop_of_node(m) != c.nodes[n]->host.transport->loop_of_group(g) && "the links' loop is not the group's");
+	for (NodeId n = 2; n <= 3; ++n)
+		assert(c.nodes[n]->host.transport->loop_of_node(1) == c.nodes[n]->host.transport->loop_of_group(g) && "the group shares a fetch-serving link's loop");
 	auto all = c.of({1, 2, 3});
 	step("fetch-alongside: the group elects and commits");
 	assert(commit_everywhere(all, g, "before", 30'000));
@@ -2748,7 +2885,7 @@ void fetch_alongside() {
 		for (auto &p : n->per)
 			held = std::max<std::uint64_t>(held, p->io.longest);
 	const auto host = held + stalled, bound = 2'000 + host;
-	const bool timely = committed && slowest < bound, leads = kept || host >= 1'000;
+	const bool timely = committed && slowest < bound, leads = kept || stalled >= 1'000;
 	for (auto &m : misses)
 		std::printf("fetch-alongside: %s\n", m.c_str());
 	std::printf("fetch-alongside: links to nodes 1, 2 and 3 on loops %u, %u and %u of %u; the group on loop %u\n",
@@ -3070,7 +3207,7 @@ void order() {
 
 int main(int argc, char **argv) {
 	if (argc != 3) {
-		std::fprintf(stderr, "usage: %s <fixture dir> threads|credit|reader|upload|driver|refill|identity|joiner|lagging|leftover|reconnect|backlog|owe-order|receive-bound|relayout|scan|order|fetch-alongside-consensus|install\n", argv[0]);
+		std::fprintf(stderr, "usage: %s <fixture dir> threads|credit|reader|upload|driver|slow-sync|refill|identity|joiner|lagging|leftover|reconnect|backlog|owe-order|receive-bound|relayout|scan|order|fetch-alongside-consensus|install\n", argv[0]);
 		return 2;
 	}
 #ifndef SO_NOSIGPIPE
@@ -3094,7 +3231,9 @@ int main(int argc, char **argv) {
 	else if (which == "upload")
 		timed("upload", upload);
 	else if (which == "driver")
-		driver(), quiescent(), quiescent_fence();
+		driver(), quiescent(), quiescent_fence(), slow_sync();
+	else if (which == "slow-sync")
+		slow_sync();
 	else if (which == "refill")
 		refill();
 	else if (which == "identity")
